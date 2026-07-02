@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  goals  Goal[]
+  events Event[]
+}
+
+model Goal {
+  id        String     @id @default(uuid())
+  userId    String
+  title     String
+  category  String
+  status    GoalStatus @default(active)
+  why       String?
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Event {
+  id         String   @id @default(uuid())
+  userId     String
+  type       String
+  timestamp  DateTime
+  source     String
+  data       Json
+  confidence Float
+  evidence   Json?
+  createdAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, timestamp])
+}
+
+enum GoalStatus {
+  active
+  paused
+  archived
+}

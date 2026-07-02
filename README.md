@@ -6,6 +6,9 @@ Adaptive personal AI agent with goals, structured events, user operating profile
 
 ```bash
 pnpm install
+docker compose up -d
+pnpm db:generate
+pnpm db:migrate
 pnpm typecheck
 pnpm build
 ```
@@ -15,6 +18,9 @@ pnpm build
 Start the Fastify API:
 
 ```bash
+docker compose up -d
+pnpm db:generate
+pnpm db:migrate
 pnpm dev:api
 ```
 
@@ -48,7 +54,7 @@ Expected:
 
 - `/health` returns `{ "ok": true, "service": "operator-agent-api" }`
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
-- `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in memory for local development.
+- `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
 - `/users/:userId/review/daily` summarizes today's stored events against active goals.
 
@@ -68,8 +74,9 @@ Expected:
 
 - `packages/core`: shared domain types, Zod schemas, risk states, user operating profile, and the initial event registry.
 - `packages/llm`: placeholder OpenAI wrapper plus intent routing and event extraction result types.
-- `apps/api`: Fastify API exposing health, event type, message processing, in-memory event, and in-memory goal routes.
+- `packages/db`: Prisma schema, client export, and repository functions for users, goals, and events.
+- `apps/api`: Fastify API exposing health, event type, message processing, persisted event, and persisted goal routes.
 
 ## Current Scope
 
-This skeleton intentionally does not include UI, OpenClaw integration, OAuth, or wallet/private-key functionality.
+This skeleton intentionally does not include UI, OpenClaw integration, OAuth/auth, OpenAI calls, Telegram, or wallet/private-key functionality.

@@ -1,0 +1,29 @@
+{
+  "name": "@operator-agent/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && prisma generate --schema prisma/schema.prisma && tsc -p tsconfig.json",
+    "db:generate": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && prisma generate --schema prisma/schema.prisma",
+    "db:migrate": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && prisma migrate dev --schema prisma/schema.prisma --name init",
+    "db:studio": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && prisma studio --schema prisma/schema.prisma",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@operator-agent/core": "workspace:*",
+    "@prisma/client": "^6.1.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.1.0",
+    "typescript": "^5.7.2"
+  }
+}

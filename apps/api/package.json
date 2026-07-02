@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@operator-agent/core": "workspace:*",
+    "@operator-agent/db": "workspace:*",
     "fastify": "^5.2.1"
   },
   "devDependencies": {

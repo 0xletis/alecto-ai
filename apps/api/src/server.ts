@@ -10,17 +10,17 @@ import {
   type StoredEvent
 } from "@operator-agent/core";
 import {
-  archiveUserGoal,
-  createUserGoal,
+  archiveGoal,
+  createEvent,
+  createEventsFromExtracted,
+  createGoal,
   getActiveGoals,
+  getEvents,
   getEventsSince,
+  getGoals,
   getRecentEvents,
-  getRecentUserEvents,
-  getUserEvents,
-  getUserGoals,
-  saveExtractedEvents,
-  saveStoredEvent
-} from "./store.js";
+  ensureUser
+} from "@operator-agent/db";
 
 export function buildServer() {
   const server = Fastify({
@@ -46,17 +46,17 @@ export function buildServer() {
       });
     }
 
-    const recentEvents = getRecentEvents(parsed.data.userId, 50);
+    await ensureUser(parsed.data.userId);
+    const recentEvents = await getRecentEvents(parsed.data.userId, 50);
     const result = processMessage({
       ...parsed.data,
       recentEvents
     });
-    const savedEvents = saveExtractedEvents(result.userId, result.extractedEvents);
+    const savedEvents = await createEventsFromExtracted(result.userId, result.extractedEvents);
     const isRedFinancialRisk = isFinancialRiskIntent(result.intent) && result.riskState === "RED";
 
     if (isRedFinancialRisk) {
-      saveStoredEvent({
-        userId: result.userId,
+      await createEvent(result.userId, {
         type: "finance.betting.cooldown_triggered",
         timestamp: new Date(),
         source: "manual",
@@ -82,15 +82,15 @@ export function buildServer() {
   });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/events", async (request) => ({
-    events: getUserEvents(request.params.userId)
+    events: await getEvents(request.params.userId)
   }));
 
   server.get<{ Params: { userId: string } }>("/users/:userId/events/recent", async (request) => ({
-    events: getRecentUserEvents(request.params.userId)
+    events: await getRecentEvents(request.params.userId)
   }));
 
   server.get<{ Params: { userId: string } }>("/users/:userId/goals", async (request) => ({
-    goals: getUserGoals(request.params.userId)
+    goals: await getGoals(request.params.userId)
   }));
 
   server.get<{ Params: { userId: string } }>("/users/:userId/review/daily", async (request) => {
@@ -100,8 +100,8 @@ export function buildServer() {
     return {
       review: buildDailyReview({
         userId: request.params.userId,
-        activeGoals: getActiveGoals(request.params.userId),
-        todayEvents: getEventsSince(request.params.userId, todayStart)
+        activeGoals: await getActiveGoals(request.params.userId),
+        todayEvents: await getEventsSince(request.params.userId, todayStart)
       })
     };
   });
@@ -117,14 +117,14 @@ export function buildServer() {
     }
 
     return {
-      goal: createUserGoal(request.params.userId, parsed.data)
+      goal: await createGoal(request.params.userId, parsed.data)
     };
   });
 
   server.patch<{ Params: { userId: string; goalId: string } }>(
     "/users/:userId/goals/:goalId/archive",
     async (request, reply) => {
-      const goal = archiveUserGoal(request.params.userId, request.params.goalId);
+      const goal = await archiveGoal(request.params.userId, request.params.goalId);
 
       if (!goal) {
         return reply.status(404).send({
