@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { EventTypeSchema } from "./event-registry.js";
 import { RiskStateSchema } from "./risk.js";
+import type { StoredEvent } from "./events.js";
 
 export const MessageIntentSchema = z.enum([
   "general_chat",
@@ -31,7 +32,8 @@ export const AgentModeSchema = z.enum([
 
 export const ProcessMessageInputSchema = z.object({
   userId: z.string().min(1),
-  message: z.string().min(1)
+  message: z.string().min(1),
+  recentEvents: z.array(z.custom<StoredEvent>()).optional()
 });
 
 export const ExtractedEventSchema = z.object({
@@ -58,15 +60,17 @@ export type ExtractedEvent = z.infer<typeof ExtractedEventSchema>;
 export type ProcessMessageResult = z.infer<typeof ProcessMessageResultSchema>;
 
 const certaintyPattern = /\b(safe|sure|guaranteed|seguro|casi seguro|free money)\b/i;
+const oneDayMs = 24 * 60 * 60 * 1000;
 
 export function processMessage(input: ProcessMessageInput): ProcessMessageResult {
   const parsedInput = ProcessMessageInputSchema.parse(input);
   const intent = routeIntent(parsedInput.message);
   const extractedEvents = extractEvents(parsedInput.message);
   const finalIntent = intent === "general_chat" && extractedEvents.length > 0 ? "event_logging" : intent;
-  const riskState = assessRisk(finalIntent, parsedInput.message);
+  const riskSignals = getRiskSignals(finalIntent, parsedInput.message, parsedInput.recentEvents ?? []);
+  const riskState = assessRisk(finalIntent, parsedInput.message, parsedInput.recentEvents ?? []);
   const mode = selectMode(finalIntent, riskState);
-  const reply = composeReply(finalIntent, mode, riskState, extractedEvents);
+  const reply = composeReply(finalIntent, mode, riskState, extractedEvents, riskSignals);
 
   return ProcessMessageResultSchema.parse({
     userId: parsedInput.userId,
@@ -173,14 +177,48 @@ export function extractEvents(message: string): ExtractedEvent[] {
   return events;
 }
 
-export function assessRisk(intent: MessageIntent, message: string): z.infer<typeof RiskStateSchema> {
+export function assessRisk(
+  intent: MessageIntent,
+  message: string,
+  recentEvents: StoredEvent[] = []
+): z.infer<typeof RiskStateSchema> {
   const isFinancialRiskIntent = intent === "betting_intent" || intent === "trading_intent";
 
   if (!isFinancialRiskIntent) {
     return "GREEN";
   }
 
-  return certaintyPattern.test(message) ? "RED" : "ORANGE";
+  return getRiskSignals(intent, message, recentEvents).length > 0 ? "RED" : "ORANGE";
+}
+
+export function getRiskSignals(intent: MessageIntent, message: string, recentEvents: StoredEvent[] = []): string[] {
+  const isFinancialRiskIntent = intent === "betting_intent" || intent === "trading_intent";
+
+  if (!isFinancialRiskIntent) {
+    return [];
+  }
+
+  const since = new Date(Date.now() - oneDayMs);
+  const eventsInLast24h = recentEvents.filter((event) => event.timestamp >= since);
+  const signals: string[] = [];
+
+  if (certaintyPattern.test(message)) {
+    signals.push("certainty language");
+  }
+
+  if (eventsInLast24h.some((event) => event.type === "finance.betting.cooldown_triggered")) {
+    signals.push("recent cooldown");
+  }
+
+  const recentRiskEvents = eventsInLast24h.filter(
+    (event) => event.type.startsWith("finance.betting.") || event.type.startsWith("finance.trading.")
+  );
+
+  if (recentRiskEvents.length >= 2) {
+    signals.push("repeated risk behavior");
+  }
+
+  return signals;
 }
 
 function selectMode(intent: MessageIntent, riskState: z.infer<typeof RiskStateSchema>): AgentMode {
@@ -215,10 +253,12 @@ function composeReply(
   intent: MessageIntent,
   _mode: AgentMode,
   riskState: z.infer<typeof RiskStateSchema>,
-  extractedEvents: ExtractedEvent[]
+  extractedEvents: ExtractedEvent[],
+  riskSignals: string[] = []
 ): string {
   if ((intent === "betting_intent" || intent === "trading_intent") && riskState === "RED") {
-    return "No. I am not validating this while you are using certainty language. Cooldown first. If it still makes sense later, bring a written thesis, position size, invalidation point, and your current emotional state.";
+    const signalText = riskSignals.length > 0 ? ` Signals: ${riskSignals.join(", ")}.` : "";
+    return `No. I am not validating this right now.${signalText} Cooldown first. If it still makes sense later, bring a written thesis, position size, invalidation point, and your current emotional state.`;
   }
 
   if ((intent === "betting_intent" || intent === "trading_intent") && riskState === "ORANGE") {

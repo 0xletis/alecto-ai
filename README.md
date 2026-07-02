@@ -41,6 +41,7 @@ curl -X POST http://localhost:3000/messages/process \
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
 curl http://localhost:3000/users/local-user/goals
+curl http://localhost:3000/users/local-user/review/daily
 ```
 
 Expected:
@@ -48,6 +49,8 @@ Expected:
 - `/health` returns `{ "ok": true, "service": "operator-agent-api" }`
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in memory for local development.
+- RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
+- `/users/:userId/review/daily` summarizes today's stored events against active goals.
 
 ## API Routes
 
@@ -59,6 +62,7 @@ Expected:
 - `GET /users/:userId/goals`
 - `POST /users/:userId/goals`
 - `PATCH /users/:userId/goals/:goalId/archive`
+- `GET /users/:userId/review/daily`
 
 ## Packages
 

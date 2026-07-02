@@ -24,18 +24,43 @@ export function saveExtractedEvents(userId: string, extractedEvents: ExtractedEv
   return storedEvents;
 }
 
+export function saveStoredEvent(event: Omit<StoredEvent, "id" | "createdAt">): StoredEvent {
+  const storedEvent: StoredEvent = {
+    ...event,
+    id: randomUUID(),
+    createdAt: new Date()
+  };
+
+  const currentEvents = eventsByUserId.get(event.userId) ?? [];
+  eventsByUserId.set(event.userId, [...currentEvents, storedEvent]);
+
+  return storedEvent;
+}
+
 export function getUserEvents(userId: string): StoredEvent[] {
   return eventsByUserId.get(userId) ?? [];
 }
 
-export function getRecentUserEvents(userId: string, limit = 10): StoredEvent[] {
+export function getRecentEvents(userId: string, limit = 10): StoredEvent[] {
   return [...getUserEvents(userId)]
     .sort((left, right) => right.timestamp.getTime() - left.timestamp.getTime())
     .slice(0, limit);
 }
 
+export function getEventsSince(userId: string, sinceDate: Date): StoredEvent[] {
+  return getUserEvents(userId).filter((event) => event.timestamp >= sinceDate);
+}
+
+export function getRecentUserEvents(userId: string, limit = 10): StoredEvent[] {
+  return getRecentEvents(userId, limit);
+}
+
 export function getUserGoals(userId: string): Goal[] {
   return goalsByUserId.get(userId) ?? [];
+}
+
+export function getActiveGoals(userId: string): Goal[] {
+  return getUserGoals(userId).filter((goal) => goal.status === "active");
 }
 
 export function createUserGoal(userId: string, input: CreateGoalInput): Goal {

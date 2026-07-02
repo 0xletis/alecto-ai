@@ -1,3 +1,4 @@
+export * from "./daily-review.js";
 export * from "./event-registry.js";
 export * from "./events.js";
 export * from "./goals.js";
