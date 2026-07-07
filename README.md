@@ -52,6 +52,40 @@ pnpm dev:api
 
 The API defaults to `http://localhost:3000`.
 
+## Telegram Bot
+
+Create a Telegram bot with BotFather, then add the token to your environment:
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:your-token
+API_BASE_URL=http://localhost:3000
+```
+
+Optionally restrict access to specific Telegram numeric user IDs:
+
+```bash
+TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+```
+
+Run the API and the Telegram bot in separate terminals:
+
+```bash
+pnpm dev:api
+```
+
+```bash
+pnpm dev:telegram
+```
+
+Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each Telegram account has separate goals, events, and profile.
+
+Telegram commands:
+
+- `/start`: short intro
+- `/review`: daily review
+- `/goals`: active goals
+- `/events`: recent events
+
 Verify the routes from another terminal:
 
 ```bash
@@ -138,7 +172,8 @@ Expected:
 - `packages/llm`: optional OpenAI structured message analyzer plus analysis result schemas.
 - `packages/db`: Prisma schema, client export, and repository functions for users, goals, and events.
 - `apps/api`: Fastify API exposing health, event type, message processing, persisted event, and persisted goal routes.
+- `apps/telegram-bot`: Telegram channel adapter that forwards messages to the API.
 
 ## Current Scope
 
-This skeleton intentionally does not include UI, OpenClaw integration, OAuth/auth, OpenAI calls, Telegram, or wallet/private-key functionality.
+This skeleton intentionally does not include UI, OpenClaw integration, OAuth/auth, WhatsApp, or wallet/private-key functionality.
