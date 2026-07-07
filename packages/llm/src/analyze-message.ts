@@ -85,6 +85,8 @@ function buildDeveloperPrompt(registry: EventTypeDefinition[]): string {
     "Only use extractedEvents.type values from the provided event registry.",
     "Extract events only from the current message. Recent events are context for patterns, not events to copy into extractedEvents.",
     "If the user asks to track something that does not fit the registry, return proposedCustomEventType instead of inventing an event type.",
+    "If the user asks to change profile style, create a goal, or archive a goal, return proposedAction. Do not apply changes.",
+    "Use proposedAction confidence below 0.7 when the request is ambiguous.",
     "Do not decide final riskState. A deterministic risk engine runs after your analysis.",
     "Do not validate betting, trading, or impulsive financial behavior.",
     "If a user says they sent, mandado, submitted, or applied with CVs/applications, use career.application_sent with data.count when count is clear.",
@@ -107,7 +109,8 @@ function buildAnalysisJsonSchema(registry: EventTypeDefinition[]) {
       "extractedEvents",
       "reasoningSummary",
       "suggestedReplyTone",
-      "proposedCustomEventType"
+      "proposedCustomEventType",
+      "proposedAction"
     ],
     properties: {
       intent: {
@@ -179,6 +182,82 @@ function buildAnalysisJsonSchema(registry: EventTypeDefinition[]) {
             type: "null"
           }
         ]
+      },
+      proposedAction: {
+        anyOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["type", "summary", "payload", "confidence"],
+            properties: {
+              type: {
+                type: "string",
+                enum: ["profile_update", "goal_create", "goal_archive", "none"]
+              },
+              summary: {
+                type: "string"
+              },
+              confidence: {
+                type: "number"
+              },
+              payload: {
+                type: "object",
+                additionalProperties: false,
+                required: ["profilePatch", "title", "category", "why", "goalId"],
+                properties: {
+                  profilePatch: {
+                    anyOf: [
+                      {
+                        type: "object",
+                        additionalProperties: false,
+                        required: [
+                          "directness",
+                          "warmth",
+                          "confrontation",
+                          "profanityAllowed",
+                          "motivationalStyle",
+                          "accountabilityStrictness",
+                          "escalationStyle",
+                          "gamblingGuardrails",
+                          "selfDeceptionSensitivity",
+                          "cooldownPreference",
+                          "vulnerableMode",
+                          "avoidingMode",
+                          "impulsiveMode"
+                        ],
+                        properties: {
+                          directness: { type: ["number", "null"] },
+                          warmth: { type: ["number", "null"] },
+                          confrontation: { type: ["number", "null"] },
+                          profanityAllowed: { type: ["boolean", "null"] },
+                          motivationalStyle: { type: ["string", "null"] },
+                          accountabilityStrictness: { type: ["number", "null"] },
+                          escalationStyle: { type: ["string", "null"] },
+                          gamblingGuardrails: { type: ["string", "null"] },
+                          selfDeceptionSensitivity: { type: ["number", "null"] },
+                          cooldownPreference: { type: ["string", "null"] },
+                          vulnerableMode: { type: ["string", "null"] },
+                          avoidingMode: { type: ["string", "null"] },
+                          impulsiveMode: { type: ["string", "null"] }
+                        }
+                      },
+                      {
+                        type: "null"
+                      }
+                    ]
+                  },
+                  title: { type: ["string", "null"] },
+                  category: { type: ["string", "null"] },
+                  why: { type: ["string", "null"] },
+                  goalId: { type: ["string", "null"] }
+                }
+              }
+            }
+          },
+          {
+            type: "null"
+          }
+        ]
       }
     }
   } satisfies Record<string, unknown>;
@@ -192,6 +271,7 @@ function compactAnalysisJson(value: unknown) {
   const analysis = value as {
     extractedEvents?: Array<{ data?: Record<string, unknown> }>;
     proposedCustomEventType?: { exampleData?: Record<string, unknown> } | null;
+    proposedAction?: { payload?: Record<string, unknown> } | null;
   };
 
   analysis.extractedEvents = (analysis.extractedEvents ?? []).map((event) => ({
@@ -205,7 +285,21 @@ function compactAnalysisJson(value: unknown) {
     );
   }
 
+  if (analysis.proposedAction) {
+    analysis.proposedAction.payload = compactProposedActionPayload(analysis.proposedAction.payload ?? {});
+  }
+
   return analysis;
+}
+
+function compactProposedActionPayload(data: Record<string, unknown>) {
+  const compacted = compactNullValues(data);
+
+  if (compacted.profilePatch && typeof compacted.profilePatch === "object" && !Array.isArray(compacted.profilePatch)) {
+    compacted.profilePatch = compactNullValues(compacted.profilePatch as Record<string, unknown>);
+  }
+
+  return compacted;
 }
 
 function compactNullValues(data: Record<string, unknown>) {

@@ -94,6 +94,11 @@ Telegram commands:
 - `/review`: daily review
 - `/goals`: active goals
 - `/events`: recent events
+- `/pending`: show pending profile/goal changes
+- `/confirm`: confirm the latest pending change
+- `/cancel`: cancel the latest pending change
+
+Normal messages can also confirm or reject pending changes. Send `yes`, `confirm`, `si`, or `dale` to confirm. Send `no`, `cancel`, or `cancelar` to reject.
 
 Verify the routes from another terminal:
 
@@ -145,6 +150,24 @@ curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"quiero apostar 1000 porque esto es seguro"}'
 
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"be stricter with me and do not let me justify bets"}'
+
+curl http://localhost:3000/users/local-user/pending-actions
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"yes"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"I want to focus on gym"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"no"}'
+
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
 curl http://localhost:3000/users/local-user/goals
@@ -156,6 +179,7 @@ Expected:
 - `/health` returns `{ "ok": true, "service": "operator-agent-api" }`
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
+- Events auto-log when detected. Profile changes, goal creation, and goal archiving proposed from natural language are stored as pending actions first and require confirmation.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
@@ -171,6 +195,9 @@ Expected:
 - `GET /users/:userId/goals`
 - `GET /users/:userId/profile`
 - `PATCH /users/:userId/profile`
+- `GET /users/:userId/pending-actions`
+- `POST /users/:userId/pending-actions/:pendingActionId/confirm`
+- `POST /users/:userId/pending-actions/:pendingActionId/reject`
 - `POST /users/:userId/goals`
 - `PATCH /users/:userId/goals/:goalId/archive`
 - `GET /users/:userId/review/daily`

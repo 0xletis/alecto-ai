@@ -189,6 +189,65 @@ bot.command("events", async (ctx) => {
   }
 });
 
+bot.command("pending", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<PendingActionsResponse>(`/users/${getTelegramUserId(ctx)}/pending-actions`);
+    await ctx.reply(formatPendingActions(response.pendingActions));
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not fetch pending actions right now.");
+  }
+});
+
+bot.command("confirm", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const pendingAction = await getLatestPendingAction(ctx);
+
+    if (!pendingAction) {
+      await ctx.reply("No pending action.");
+      return;
+    }
+
+    const response = await apiPost<PendingActionMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/pending-actions/${pendingAction.id}/confirm`,
+      {}
+    );
+    await ctx.reply(response.reply);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not confirm that pending action right now.");
+  }
+});
+
+bot.command("cancel", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const pendingAction = await getLatestPendingAction(ctx);
+
+    if (!pendingAction) {
+      await ctx.reply("No pending action.");
+      return;
+    }
+
+    const response = await apiPost<PendingActionMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/pending-actions/${pendingAction.id}/reject`,
+      {}
+    );
+    await ctx.reply(response.reply);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not cancel that pending action right now.");
+  }
+});
+
 bot.on("message:text", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -383,6 +442,30 @@ function formatEvents(events: Event[]) {
   return events.map(formatEvent).join("\n\n");
 }
 
+async function getLatestPendingAction(ctx: Context) {
+  const response = await apiGet<PendingActionsResponse>(`/users/${getTelegramUserId(ctx)}/pending-actions`);
+  return response.pendingActions.find((action) => action.status === "pending");
+}
+
+function formatPendingActions(pendingActions: PendingAction[]) {
+  const activeActions = pendingActions.filter((action) => action.status === "pending");
+
+  if (activeActions.length === 0) {
+    return "No pending actions.";
+  }
+
+  return activeActions.map(formatPendingAction).join("\n\n");
+}
+
+function formatPendingAction(pendingAction: PendingAction) {
+  return [
+    `id: ${pendingAction.id}`,
+    `type: ${pendingAction.type}`,
+    `summary: ${pendingAction.summary}`,
+    `status: ${pendingAction.status}`
+  ].join("\n");
+}
+
 function formatEvent(event: Event) {
   return [
     `type: ${event.type}`,
@@ -474,6 +557,15 @@ interface ProfileResponse {
   profile: Profile;
 }
 
+interface PendingActionsResponse {
+  pendingActions: PendingAction[];
+}
+
+interface PendingActionMutationResponse {
+  pendingAction: PendingAction;
+  reply: string;
+}
+
 interface DailyReview {
   summary: string;
   wins: string[];
@@ -506,4 +598,11 @@ interface Profile {
   vulnerableMode: string;
   avoidingMode: string;
   impulsiveMode: string;
+}
+
+interface PendingAction {
+  id: string;
+  type: string;
+  summary: string;
+  status: string;
 }

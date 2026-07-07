@@ -19,6 +19,28 @@ export interface CreateEventInput {
   evidence?: string[];
 }
 
+export type PendingActionType = "profile_update" | "goal_create" | "goal_archive";
+export type PendingActionStatus = "pending" | "confirmed" | "rejected" | "expired";
+
+export interface PendingAction {
+  id: string;
+  userId: string;
+  type: PendingActionType;
+  status: PendingActionStatus;
+  summary: string;
+  payload: Record<string, unknown>;
+  expiresAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface CreatePendingActionInput {
+  type: PendingActionType;
+  summary: string;
+  payload: Record<string, unknown>;
+  expiresAt?: Date;
+}
+
 export async function ensureUser(userId: string) {
   return prisma.user.upsert({
     where: { id: userId },
@@ -203,6 +225,119 @@ export async function updateUserOperatingProfile(
   return toUserOperatingProfile(profile);
 }
 
+export async function createPendingAction(
+  userId: string,
+  input: CreatePendingActionInput
+): Promise<PendingAction> {
+  await ensureUser(userId);
+
+  const pendingAction = await prisma.pendingAction.create({
+    data: {
+      userId,
+      type: input.type,
+      summary: input.summary,
+      payload: toJsonObject(input.payload),
+      expiresAt: input.expiresAt
+    }
+  });
+
+  return toPendingAction(pendingAction);
+}
+
+export async function getPendingActions(userId: string): Promise<PendingAction[]> {
+  await expireOldPendingActions(userId);
+
+  const pendingActions = await prisma.pendingAction.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return pendingActions.map(toPendingAction);
+}
+
+export async function getLatestPendingAction(userId: string): Promise<PendingAction | undefined> {
+  await expireOldPendingActions(userId);
+
+  const pendingAction = await prisma.pendingAction.findFirst({
+    where: {
+      userId,
+      status: "pending"
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return pendingAction ? toPendingAction(pendingAction) : undefined;
+}
+
+export async function confirmPendingAction(
+  userId: string,
+  pendingActionId: string
+): Promise<PendingAction | undefined> {
+  await ensureUser(userId);
+
+  const existingAction = await prisma.pendingAction.findFirst({
+    where: {
+      id: pendingActionId,
+      userId,
+      status: "pending"
+    }
+  });
+
+  if (!existingAction) {
+    return undefined;
+  }
+
+  const pendingAction = await prisma.pendingAction.update({
+    where: { id: pendingActionId },
+    data: { status: "confirmed" }
+  });
+
+  return toPendingAction(pendingAction);
+}
+
+export async function rejectPendingAction(
+  userId: string,
+  pendingActionId: string
+): Promise<PendingAction | undefined> {
+  await ensureUser(userId);
+
+  const existingAction = await prisma.pendingAction.findFirst({
+    where: {
+      id: pendingActionId,
+      userId,
+      status: "pending"
+    }
+  });
+
+  if (!existingAction) {
+    return undefined;
+  }
+
+  const pendingAction = await prisma.pendingAction.update({
+    where: { id: pendingActionId },
+    data: { status: "rejected" }
+  });
+
+  return toPendingAction(pendingAction);
+}
+
+export async function expireOldPendingActions(userId: string): Promise<void> {
+  await ensureUser(userId);
+
+  await prisma.pendingAction.updateMany({
+    where: {
+      userId,
+      status: "pending",
+      expiresAt: {
+        lt: new Date()
+      }
+    },
+    data: {
+      status: "expired"
+    }
+  });
+}
+
 function toGoal(goal: Prisma.GoalGetPayload<object>): Goal {
   return {
     id: goal.id,
@@ -260,6 +395,20 @@ function toUserOperatingProfile(
     knownStrengths: toStringArray(profile.knownStrengths),
     createdAt: profile.createdAt,
     updatedAt: profile.updatedAt
+  };
+}
+
+function toPendingAction(pendingAction: Prisma.PendingActionGetPayload<object>): PendingAction {
+  return {
+    id: pendingAction.id,
+    userId: pendingAction.userId,
+    type: pendingAction.type as PendingActionType,
+    status: pendingAction.status as PendingActionStatus,
+    summary: pendingAction.summary,
+    payload: toRecord(pendingAction.payload),
+    expiresAt: pendingAction.expiresAt ?? undefined,
+    createdAt: pendingAction.createdAt,
+    updatedAt: pendingAction.updatedAt
   };
 }
 

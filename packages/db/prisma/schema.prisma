@@ -15,6 +15,7 @@ model User {
   goals            Goal[]
   events           Event[]
   operatingProfile UserOperatingProfile?
+  pendingActions   PendingAction[]
 }
 
 model Goal {
@@ -78,6 +79,23 @@ model UserOperatingProfile {
   updatedAt                DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model PendingAction {
+  id        String    @id @default(uuid())
+  userId    String
+  type      String
+  status    String    @default("pending")
+  summary   String
+  payload   Json
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, status, createdAt])
 }
 
 enum GoalStatus {

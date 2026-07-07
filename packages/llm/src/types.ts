@@ -15,13 +15,21 @@ export const ProposedCustomEventTypeSchema = z.object({
   exampleData: z.record(z.unknown()).default({})
 });
 
+export const ProposedActionSchema = z.object({
+  type: z.enum(["profile_update", "goal_create", "goal_archive", "none"]),
+  summary: z.string(),
+  payload: z.record(z.unknown()).default({}),
+  confidence: z.number().min(0).max(1)
+});
+
 export const OpenAIMessageAnalysisSchema = z.object({
   intent: MessageIntentSchema,
   mode: AgentModeSchema,
   extractedEvents: z.array(ExtractedEventSchema).default([]),
   reasoningSummary: z.string(),
   suggestedReplyTone: z.string(),
-  proposedCustomEventType: ProposedCustomEventTypeSchema.nullable()
+  proposedCustomEventType: ProposedCustomEventTypeSchema.nullable(),
+  proposedAction: ProposedActionSchema.nullable()
 });
 
 export const AnalyzeMessageInputSchema = z.object({
@@ -34,6 +42,6 @@ export const AnalyzeMessageInputSchema = z.object({
 });
 
 export type ProposedCustomEventType = z.infer<typeof ProposedCustomEventTypeSchema>;
+export type ProposedAction = z.infer<typeof ProposedActionSchema>;
 export type OpenAIMessageAnalysis = z.infer<typeof OpenAIMessageAnalysisSchema>;
 export type AnalyzeMessageInput = z.infer<typeof AnalyzeMessageInputSchema>;
-
