@@ -6,6 +6,7 @@ import {
   processMessage,
   processMessageFromAnalysis,
   ProcessMessageInputSchema,
+  UpdateUserOperatingProfileInputSchema,
   type MessageIntent,
   type ProcessMessageResult,
   type StoredEvent
@@ -20,8 +21,10 @@ import {
   getEvents,
   getEventsSince,
   getGoals,
+  getOrCreateUserOperatingProfile,
   getRecentEvents,
-  ensureUser
+  ensureUser,
+  updateUserOperatingProfile
 } from "@operator-agent/db";
 
 export function buildServer() {
@@ -51,11 +54,13 @@ export function buildServer() {
     await ensureUser(parsed.data.userId);
     const recentEvents = await getRecentEvents(parsed.data.userId, 50);
     const activeGoals = await getActiveGoals(parsed.data.userId);
+    const userOperatingProfile = await getOrCreateUserOperatingProfile(parsed.data.userId);
     const processInput = {
       ...parsed.data,
-      recentEvents
+      recentEvents,
+      userOperatingProfile
     };
-    const result = await analyzeMessage(processInput, activeGoals);
+    const result = await analyzeMessage(processInput, activeGoals, userOperatingProfile);
     const savedEvents = await createEventsFromExtracted(result.userId, result.extractedEvents);
     const isRedFinancialRisk = isFinancialRiskIntent(result.intent) && result.riskState === "RED";
 
@@ -96,6 +101,25 @@ export function buildServer() {
   server.get<{ Params: { userId: string } }>("/users/:userId/goals", async (request) => ({
     goals: await getGoals(request.params.userId)
   }));
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/profile", async (request) => ({
+    profile: await getOrCreateUserOperatingProfile(request.params.userId)
+  }));
+
+  server.patch<{ Params: { userId: string } }>("/users/:userId/profile", async (request, reply) => {
+    const parsed = UpdateUserOperatingProfileInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    return {
+      profile: await updateUserOperatingProfile(request.params.userId, parsed.data)
+    };
+  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/review/daily", async (request) => {
     const todayStart = new Date();
@@ -144,8 +168,14 @@ export function buildServer() {
 }
 
 async function analyzeMessage(
-  input: { userId: string; message: string; recentEvents: StoredEvent[] },
-  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>
+  input: {
+    userId: string;
+    message: string;
+    recentEvents: StoredEvent[];
+    userOperatingProfile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>;
+  },
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>,
+  userOperatingProfile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>
 ): Promise<ProcessMessageResult> {
   if (!shouldUseOpenAIAnalysis()) {
     return processMessage(input);
@@ -157,7 +187,8 @@ async function analyzeMessage(
       message: input.message,
       activeGoals,
       recentEvents: input.recentEvents,
-      eventRegistry: [...eventRegistry]
+      eventRegistry: [...eventRegistry],
+      userOperatingProfile
     });
 
     return processMessageFromAnalysis(input, {

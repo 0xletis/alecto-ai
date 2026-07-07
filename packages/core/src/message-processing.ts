@@ -2,6 +2,7 @@ import { z } from "zod";
 import { EventTypeSchema } from "./event-registry.js";
 import { RiskStateSchema } from "./risk.js";
 import type { StoredEvent } from "./events.js";
+import type { UserOperatingProfile } from "./user-operating-profile.js";
 
 export const MessageIntentSchema = z.enum([
   "general_chat",
@@ -33,7 +34,8 @@ export const AgentModeSchema = z.enum([
 export const ProcessMessageInputSchema = z.object({
   userId: z.string().min(1),
   message: z.string().min(1),
-  recentEvents: z.array(z.custom<StoredEvent>()).optional()
+  recentEvents: z.array(z.custom<StoredEvent>()).optional(),
+  userOperatingProfile: z.custom<UserOperatingProfile>().optional()
 });
 
 export const ExtractedEventSchema = z.object({
@@ -107,7 +109,15 @@ export function processMessageFromAnalysis(
   const riskSignals = getRiskSignals(finalIntent, parsedInput.message, parsedInput.recentEvents ?? []);
   const riskState = assessRisk(finalIntent, parsedInput.message, parsedInput.recentEvents ?? []);
   const mode = selectMode(finalIntent, riskState, parsedAnalysis.mode);
-  const reply = composeReply(finalIntent, mode, riskState, extractedEvents, riskSignals);
+  const reply = composeReply(
+    finalIntent,
+    mode,
+    riskState,
+    extractedEvents,
+    riskSignals,
+    parsedInput.message,
+    parsedInput.userOperatingProfile
+  );
 
   return ProcessMessageResultSchema.parse({
     userId: parsedInput.userId,
@@ -299,10 +309,16 @@ function composeReply(
   _mode: AgentMode,
   riskState: z.infer<typeof RiskStateSchema>,
   extractedEvents: ExtractedEvent[],
-  riskSignals: string[] = []
+  riskSignals: string[] = [],
+  message = "",
+  userOperatingProfile?: UserOperatingProfile
 ): string {
   if ((intent === "betting_intent" || intent === "trading_intent") && riskState === "RED") {
     const signalText = riskSignals.length > 0 ? ` Signals: ${riskSignals.join(", ")}.` : "";
+    if (userOperatingProfile?.gamblingGuardrails === "hard_guardian") {
+      return `No. Hard stop.${signalText} I am not helping you turn this into permission. Cooldown now. If it still matters later, bring a written thesis, exact size, invalidation point, and emotional state.`;
+    }
+
     return `No. I am not validating this right now.${signalText} Cooldown first. If it still makes sense later, bring a written thesis, position size, invalidation point, and your current emotional state.`;
   }
 
@@ -320,8 +336,23 @@ function composeReply(
   }
 
   if (intent === "general_chat") {
+    if (shouldSoftenVulnerableReply(message, userOperatingProfile)) {
+      return "I hear you. That sounds heavy and unclear right now. We do not need to force a big decision from this state; start with one small grounding step and then we can sort the day together.";
+    }
+
     return "I hear you. No structured event needed from that message.";
   }
 
+  if (intent === "emotional_reflection" && shouldSoftenVulnerableReply(message, userOperatingProfile)) {
+    return "I hear you. That sounds like a vulnerable moment, so I will keep this softer: pause, breathe, and tell me what feels most confusing right now. We can make the next step small.";
+  }
+
   return "Got it. I routed this message and did not create any events.";
+}
+
+function shouldSoftenVulnerableReply(message: string, userOperatingProfile?: UserOperatingProfile): boolean {
+  return (
+    userOperatingProfile?.vulnerableMode === "soften" &&
+    /\b(sad|lost|raro|perdido|triste|no se que hacer|no sé qué hacer|me siento)\b/i.test(message)
+  );
 }

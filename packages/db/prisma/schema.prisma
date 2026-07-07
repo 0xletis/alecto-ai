@@ -12,8 +12,9 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  goals  Goal[]
-  events Event[]
+  goals            Goal[]
+  events           Event[]
+  operatingProfile UserOperatingProfile?
 }
 
 model Goal {
@@ -46,6 +47,37 @@ model Event {
 
   @@index([userId])
   @@index([userId, timestamp])
+}
+
+model UserOperatingProfile {
+  id                       String   @id @default(uuid())
+  userId                   String   @unique
+  directness               Int      @default(3)
+  warmth                   Int      @default(3)
+  humor                    Int      @default(2)
+  confrontation            Int      @default(3)
+  verbosity                Int      @default(3)
+  profanityAllowed         Boolean  @default(false)
+  motivationalStyle        String   @default("strategic")
+  accountabilityStrictness Int      @default(3)
+  reminderFrequency        String   @default("medium")
+  escalationStyle          String   @default("firm")
+  requiresEvidence         Boolean  @default(true)
+  gamblingGuardrails       String   @default("strict")
+  selfDeceptionSensitivity Int      @default(4)
+  cooldownPreference       String   @default("require_confirmation")
+  vulnerableMode           String   @default("soften")
+  avoidingMode             String   @default("challenge")
+  impulsiveMode            String   @default("guardian_mode")
+  effectivePhrases         Json?
+  ineffectivePhrases       Json?
+  knownTriggers            Json?
+  knownFailureModes        Json?
+  knownStrengths           Json?
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 enum GoalStatus {

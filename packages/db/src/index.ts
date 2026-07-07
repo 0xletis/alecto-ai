@@ -1,5 +1,12 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
-import type { CreateGoalInput, ExtractedEvent, Goal, StoredEvent } from "@operator-agent/core";
+import type {
+  CreateGoalInput,
+  ExtractedEvent,
+  Goal,
+  StoredEvent,
+  UpdateUserOperatingProfileInput,
+  UserOperatingProfile
+} from "@operator-agent/core";
 
 export const prisma = new PrismaClient();
 
@@ -166,6 +173,36 @@ export async function getActiveGoals(userId: string): Promise<Goal[]> {
   return goals.map(toGoal);
 }
 
+export async function getOrCreateUserOperatingProfile(userId: string): Promise<UserOperatingProfile> {
+  await ensureUser(userId);
+
+  const profile = await prisma.userOperatingProfile.upsert({
+    where: { userId },
+    update: {},
+    create: { userId }
+  });
+
+  return toUserOperatingProfile(profile);
+}
+
+export async function updateUserOperatingProfile(
+  userId: string,
+  input: UpdateUserOperatingProfileInput
+): Promise<UserOperatingProfile> {
+  await ensureUser(userId);
+
+  const profile = await prisma.userOperatingProfile.upsert({
+    where: { userId },
+    create: {
+      userId,
+      ...toUserOperatingProfileUpdateData(input)
+    },
+    update: toUserOperatingProfileUpdateData(input)
+  });
+
+  return toUserOperatingProfile(profile);
+}
+
 function toGoal(goal: Prisma.GoalGetPayload<object>): Goal {
   return {
     id: goal.id,
@@ -193,6 +230,50 @@ function toStoredEvent(event: Prisma.EventGetPayload<object>): StoredEvent {
   };
 }
 
+function toUserOperatingProfile(
+  profile: Prisma.UserOperatingProfileGetPayload<object>
+): UserOperatingProfile {
+  return {
+    id: profile.id,
+    userId: profile.userId,
+    directness: profile.directness,
+    warmth: profile.warmth,
+    humor: profile.humor,
+    confrontation: profile.confrontation,
+    verbosity: profile.verbosity,
+    profanityAllowed: profile.profanityAllowed,
+    motivationalStyle: profile.motivationalStyle,
+    accountabilityStrictness: profile.accountabilityStrictness,
+    reminderFrequency: profile.reminderFrequency,
+    escalationStyle: profile.escalationStyle,
+    requiresEvidence: profile.requiresEvidence,
+    gamblingGuardrails: profile.gamblingGuardrails,
+    selfDeceptionSensitivity: profile.selfDeceptionSensitivity,
+    cooldownPreference: profile.cooldownPreference,
+    vulnerableMode: profile.vulnerableMode,
+    avoidingMode: profile.avoidingMode,
+    impulsiveMode: profile.impulsiveMode,
+    effectivePhrases: toStringArray(profile.effectivePhrases),
+    ineffectivePhrases: toStringArray(profile.ineffectivePhrases),
+    knownTriggers: toStringArray(profile.knownTriggers),
+    knownFailureModes: toStringArray(profile.knownFailureModes),
+    knownStrengths: toStringArray(profile.knownStrengths),
+    createdAt: profile.createdAt,
+    updatedAt: profile.updatedAt
+  };
+}
+
+function toUserOperatingProfileUpdateData(input: UpdateUserOperatingProfileInput) {
+  return {
+    ...input,
+    effectivePhrases: input.effectivePhrases ? toJsonArray(input.effectivePhrases) : undefined,
+    ineffectivePhrases: input.ineffectivePhrases ? toJsonArray(input.ineffectivePhrases) : undefined,
+    knownTriggers: input.knownTriggers ? toJsonArray(input.knownTriggers) : undefined,
+    knownFailureModes: input.knownFailureModes ? toJsonArray(input.knownFailureModes) : undefined,
+    knownStrengths: input.knownStrengths ? toJsonArray(input.knownStrengths) : undefined
+  };
+}
+
 function toRecord(value: Prisma.JsonValue): Record<string, unknown> {
   if (value && typeof value === "object" && !Array.isArray(value)) {
     return value as Record<string, unknown>;
@@ -207,4 +288,12 @@ function toJsonObject(value: Record<string, unknown>): Prisma.InputJsonObject {
 
 function toJsonArray(value: string[]): Prisma.InputJsonArray {
   return value as Prisma.InputJsonArray;
+}
+
+function toStringArray(value: Prisma.JsonValue): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value.filter((item): item is string => typeof item === "string");
 }

@@ -62,6 +62,26 @@ curl -X POST http://localhost:3000/users/local-user/goals \
   -H "Content-Type: application/json" \
   -d '{"title":"Apply to better jobs","category":"career","why":"Build a stronger career path"}'
 
+curl http://localhost:3000/users/local-user/profile
+
+curl -X PATCH http://localhost:3000/users/dev-user/profile \
+  -H "Content-Type: application/json" \
+  -d '{
+    "directness": 5,
+    "warmth": 3,
+    "confrontation": 5,
+    "profanityAllowed": true,
+    "motivationalStyle": "tough_love",
+    "accountabilityStrictness": 5,
+    "escalationStyle": "brutal_when_needed",
+    "gamblingGuardrails": "hard_guardian",
+    "selfDeceptionSensitivity": 5,
+    "cooldownPreference": "hard_no",
+    "vulnerableMode": "soften",
+    "avoidingMode": "confront",
+    "impulsiveMode": "guardian_mode"
+  }'
+
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"I sent 2 CVs and trained 45 minutes"}'
@@ -94,6 +114,7 @@ Expected:
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
+- `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
 - `/users/:userId/review/daily` summarizes today's stored events against active goals.
 
@@ -105,6 +126,8 @@ Expected:
 - `GET /users/:userId/events`
 - `GET /users/:userId/events/recent`
 - `GET /users/:userId/goals`
+- `GET /users/:userId/profile`
+- `PATCH /users/:userId/profile`
 - `POST /users/:userId/goals`
 - `PATCH /users/:userId/goals/:goalId/archive`
 - `GET /users/:userId/review/daily`
