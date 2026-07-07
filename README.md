@@ -61,11 +61,13 @@ TELEGRAM_BOT_TOKEN=123456:your-token
 API_BASE_URL=http://localhost:3000
 ```
 
-Optionally restrict access to specific Telegram numeric user IDs:
+Optionally restrict access to specific Telegram users. Entries can be raw numeric IDs or `telegram:<id>` values:
 
 ```bash
-TELEGRAM_ALLOWED_USER_IDS=123456789,987654321
+TELEGRAM_ALLOWED_USER_IDS=123456789,telegram:987654321
 ```
+
+If `TELEGRAM_ALLOWED_USER_IDS` is empty or missing, everyone is allowed. `/whoami` always works, even before a user is allowlisted, so people can send their Telegram ID to the owner.
 
 Run the API and the Telegram bot in separate terminals:
 
@@ -82,6 +84,13 @@ Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each T
 Telegram commands:
 
 - `/start`: short intro
+- `/whoami`: show Telegram ID and derived agent userId
+- `/setup`: setup checklist
+- `/profile`: show operating profile
+- `/set_style hard_guardian`: apply hard guardian profile defaults
+- `/set_style balanced`: apply balanced profile defaults
+- `/create_goal category | title | why`: create a goal
+- `/archive_goal <goalId>`: archive a goal
 - `/review`: daily review
 - `/goals`: active goals
 - `/events`: recent events
