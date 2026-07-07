@@ -1,49 +1,39 @@
 import { z } from "zod";
-import { EventSchema } from "@operator-agent/core";
+import {
+  AgentModeSchema,
+  ExtractedEventSchema,
+  MessageIntentSchema,
+  type EventTypeDefinition,
+  type Goal,
+  type StoredEvent,
+  type UserOperatingProfile
+} from "@operator-agent/core";
 
-export const IntentSchema = z.enum([
-  "general_chat",
-  "emotional_reflection",
-  "goal_creation",
-  "goal_update",
-  "event_logging",
-  "research_request",
-  "coding_help",
-  "financial_impulse",
-  "betting_intent",
-  "trading_intent",
-  "daily_checkin",
-  "weekly_review",
-  "integration_setup",
-  "memory_correction"
-]);
+export const ProposedCustomEventTypeSchema = z.object({
+  name: z.string().min(1),
+  reason: z.string().min(1),
+  exampleData: z.record(z.unknown()).default({})
+});
 
-export const AgentModeSchema = z.enum([
-  "mirror",
-  "support",
-  "guardian",
-  "builder",
-  "research",
-  "fiscal",
-  "review"
-]);
-
-export const IntentRouterResultSchema = z.object({
-  intent: IntentSchema,
+export const OpenAIMessageAnalysisSchema = z.object({
+  intent: MessageIntentSchema,
   mode: AgentModeSchema,
-  confidence: z.number().min(0).max(1),
-  riskRelevant: z.boolean().default(false),
-  rationale: z.string().optional()
+  extractedEvents: z.array(ExtractedEventSchema).default([]),
+  reasoningSummary: z.string(),
+  suggestedReplyTone: z.string(),
+  proposedCustomEventType: ProposedCustomEventTypeSchema.nullable()
 });
 
-export const EventExtractionResultSchema = z.object({
-  events: z.array(EventSchema).default([]),
-  ignored: z.boolean().default(false),
-  rationale: z.string().optional()
+export const AnalyzeMessageInputSchema = z.object({
+  userId: z.string().min(1),
+  message: z.string().min(1),
+  activeGoals: z.array(z.custom<Goal>()).default([]),
+  recentEvents: z.array(z.custom<StoredEvent>()).default([]),
+  eventRegistry: z.array(z.custom<EventTypeDefinition>()),
+  userOperatingProfile: z.custom<UserOperatingProfile>().optional()
 });
 
-export type Intent = z.infer<typeof IntentSchema>;
-export type AgentMode = z.infer<typeof AgentModeSchema>;
-export type IntentRouterResult = z.infer<typeof IntentRouterResultSchema>;
-export type EventExtractionResult = z.infer<typeof EventExtractionResultSchema>;
+export type ProposedCustomEventType = z.infer<typeof ProposedCustomEventTypeSchema>;
+export type OpenAIMessageAnalysis = z.infer<typeof OpenAIMessageAnalysisSchema>;
+export type AnalyzeMessageInput = z.infer<typeof AnalyzeMessageInputSchema>;
 

@@ -1,4 +1,9 @@
+import { config } from "dotenv";
 import { buildServer } from "./server.js";
+
+config({
+  path: new URL("../../../.env", import.meta.url).pathname
+});
 
 const server = buildServer();
 

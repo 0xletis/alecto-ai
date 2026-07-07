@@ -4,11 +4,13 @@ import {
   CreateGoalInputSchema,
   eventRegistry,
   processMessage,
+  processMessageFromAnalysis,
   ProcessMessageInputSchema,
   type MessageIntent,
   type ProcessMessageResult,
   type StoredEvent
 } from "@operator-agent/core";
+import { analyzeMessageWithOpenAI } from "@operator-agent/llm";
 import {
   archiveGoal,
   createEvent,
@@ -48,10 +50,12 @@ export function buildServer() {
 
     await ensureUser(parsed.data.userId);
     const recentEvents = await getRecentEvents(parsed.data.userId, 50);
-    const result = processMessage({
+    const activeGoals = await getActiveGoals(parsed.data.userId);
+    const processInput = {
       ...parsed.data,
       recentEvents
-    });
+    };
+    const result = await analyzeMessage(processInput, activeGoals);
     const savedEvents = await createEventsFromExtracted(result.userId, result.extractedEvents);
     const isRedFinancialRisk = isFinancialRiskIntent(result.intent) && result.riskState === "RED";
 
@@ -137,6 +141,38 @@ export function buildServer() {
   );
 
   return server;
+}
+
+async function analyzeMessage(
+  input: { userId: string; message: string; recentEvents: StoredEvent[] },
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>
+): Promise<ProcessMessageResult> {
+  if (!shouldUseOpenAIAnalysis()) {
+    return processMessage(input);
+  }
+
+  try {
+    const analysis = await analyzeMessageWithOpenAI({
+      userId: input.userId,
+      message: input.message,
+      activeGoals,
+      recentEvents: input.recentEvents,
+      eventRegistry: [...eventRegistry]
+    });
+
+    return processMessageFromAnalysis(input, {
+      intent: analysis.intent,
+      mode: analysis.mode,
+      extractedEvents: analysis.extractedEvents
+    });
+  } catch (error) {
+    console.warn("OpenAI analysis failed; falling back to rule-based pipeline.", error);
+    return processMessage(input);
+  }
+}
+
+function shouldUseOpenAIAnalysis(): boolean {
+  return process.env.USE_OPENAI_ANALYSIS === "true" && Boolean(process.env.OPENAI_API_KEY);
 }
 
 function isFinancialRiskIntent(intent: MessageIntent): boolean {

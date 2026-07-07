@@ -53,11 +53,18 @@ export const ProcessMessageResultSchema = z.object({
   reply: z.string()
 });
 
+export const ProcessMessageAnalysisSchema = z.object({
+  intent: MessageIntentSchema,
+  mode: AgentModeSchema,
+  extractedEvents: z.array(ExtractedEventSchema).default([])
+});
+
 export type MessageIntent = z.infer<typeof MessageIntentSchema>;
 export type AgentMode = z.infer<typeof AgentModeSchema>;
 export type ProcessMessageInput = z.infer<typeof ProcessMessageInputSchema>;
 export type ExtractedEvent = z.infer<typeof ExtractedEventSchema>;
 export type ProcessMessageResult = z.infer<typeof ProcessMessageResultSchema>;
+export type ProcessMessageAnalysis = z.infer<typeof ProcessMessageAnalysisSchema>;
 
 const certaintyPattern = /\b(safe|sure|guaranteed|seguro|casi seguro|free money)\b/i;
 const oneDayMs = 24 * 60 * 60 * 1000;
@@ -67,9 +74,39 @@ export function processMessage(input: ProcessMessageInput): ProcessMessageResult
   const intent = routeIntent(parsedInput.message);
   const extractedEvents = extractEvents(parsedInput.message);
   const finalIntent = intent === "general_chat" && extractedEvents.length > 0 ? "event_logging" : intent;
+
+  return processMessageFromAnalysis(parsedInput, {
+    intent: finalIntent,
+    mode: selectMode(finalIntent, "GREEN"),
+    extractedEvents
+  });
+}
+
+export function processMessageFromAnalysis(
+  input: ProcessMessageInput,
+  analysis: ProcessMessageAnalysis
+): ProcessMessageResult {
+  const parsedInput = ProcessMessageInputSchema.parse(input);
+  const parsedAnalysis = ProcessMessageAnalysisSchema.parse(analysis);
+  const deterministicIntent = routeIntent(parsedInput.message);
+  const deterministicRiskIntent =
+    deterministicIntent === "betting_intent" ||
+    deterministicIntent === "trading_intent" ||
+    deterministicIntent === "financial_impulse"
+      ? deterministicIntent
+      : undefined;
+  const extractedEvents = deterministicRiskIntent ? [] : parsedAnalysis.extractedEvents;
+  const finalIntent =
+    deterministicRiskIntent ??
+    (deterministicIntent === "emotional_reflection" && parsedAnalysis.intent === "general_chat"
+      ? "emotional_reflection"
+      : undefined) ??
+    (parsedAnalysis.intent === "general_chat" && extractedEvents.length > 0
+      ? "event_logging"
+      : parsedAnalysis.intent);
   const riskSignals = getRiskSignals(finalIntent, parsedInput.message, parsedInput.recentEvents ?? []);
   const riskState = assessRisk(finalIntent, parsedInput.message, parsedInput.recentEvents ?? []);
-  const mode = selectMode(finalIntent, riskState);
+  const mode = selectMode(finalIntent, riskState, parsedAnalysis.mode);
   const reply = composeReply(finalIntent, mode, riskState, extractedEvents, riskSignals);
 
   return ProcessMessageResultSchema.parse({
@@ -100,6 +137,10 @@ export function routeIntent(message: string): MessageIntent {
 
   if (/\b(research|investigate|find info)\b/i.test(message)) {
     return "research_request";
+  }
+
+  if (/\b(me siento|i feel|feel weird|sad|anxious|ansioso|raro|perdido)\b/i.test(message)) {
+    return "emotional_reflection";
   }
 
   if (/\b(cv|job|application|applied|recruiter|interview)\b/i.test(message)) {
@@ -221,7 +262,11 @@ export function getRiskSignals(intent: MessageIntent, message: string, recentEve
   return signals;
 }
 
-function selectMode(intent: MessageIntent, riskState: z.infer<typeof RiskStateSchema>): AgentMode {
+function selectMode(
+  intent: MessageIntent,
+  riskState: z.infer<typeof RiskStateSchema>,
+  preferredMode?: AgentMode
+): AgentMode {
   if (riskState === "RED" || riskState === "ORANGE" || intent === "financial_impulse") {
     return "guardian";
   }
@@ -246,7 +291,7 @@ function selectMode(intent: MessageIntent, riskState: z.infer<typeof RiskStateSc
     return "support";
   }
 
-  return "mirror";
+  return preferredMode ?? "mirror";
 }
 
 function composeReply(

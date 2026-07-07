@@ -1,5 +1,17 @@
+import OpenAI from "openai";
+
 export interface OpenAIClientOptions {
   apiKey?: string;
+}
+
+export function createOpenAIClient(options: OpenAIClientOptions = {}) {
+  const apiKey = options.apiKey ?? process.env.OPENAI_API_KEY;
+
+  if (!apiKey) {
+    throw new Error("OPENAI_API_KEY is required to create the OpenAI client.");
+  }
+
+  return new OpenAI({ apiKey });
 }
 
 export class OpenAIClient {
@@ -13,8 +25,7 @@ export class OpenAIClient {
     return Boolean(this.apiKey);
   }
 
-  async respond(): Promise<never> {
-    throw new Error("OpenAI client wrapper is a placeholder.");
+  create() {
+    return createOpenAIClient({ apiKey: this.apiKey });
   }
 }
-
