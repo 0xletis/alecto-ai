@@ -1,10 +1,13 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
 import { findDuplicateActiveGoal, getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
 import type {
+  CreateMemoryInput,
   CreateGoalInput,
   ExtractedEvent,
   Goal,
+  MemoryEntry,
   NotificationSettings,
+  PendingMemoryCreatePayload,
   StoredEvent,
   UpdateNotificationSettingsInput,
   UpdateUserOperatingProfileInput,
@@ -22,7 +25,7 @@ export interface CreateEventInput {
   evidence?: string[];
 }
 
-export type PendingActionType = "profile_update" | "goal_create" | "goal_archive";
+export type PendingActionType = "profile_update" | "goal_create" | "goal_archive" | "memory_create";
 export type PendingActionStatus = "pending" | "confirmed" | "rejected" | "expired";
 
 export interface PendingAction {
@@ -42,6 +45,11 @@ export interface CreatePendingActionInput {
   summary: string;
   payload: Record<string, unknown>;
   expiresAt?: Date;
+}
+
+export interface GetRelevantMemoriesOptions {
+  limit?: number;
+  types?: MemoryEntry["type"][];
 }
 
 export interface NotificationLogInput {
@@ -252,6 +260,97 @@ export async function getActiveGoals(userId: string): Promise<Goal[]> {
   });
 
   return goals.map(toGoal);
+}
+
+export async function createMemory(userId: string, input: CreateMemoryInput): Promise<MemoryEntry> {
+  await ensureUser(userId);
+
+  const memory = await prisma.memoryEntry.create({
+    data: {
+      userId,
+      type: input.type,
+      summary: input.summary,
+      data: input.data ? toJsonObject(input.data) : undefined,
+      evidence: input.evidence ? toJsonObject(input.evidence) : undefined,
+      source: input.source ?? "manual",
+      confidence: input.confidence ?? 1
+    }
+  });
+
+  return toMemoryEntry(memory);
+}
+
+export async function createMemoryFromPendingPayload(
+  userId: string,
+  payload: PendingMemoryCreatePayload
+): Promise<MemoryEntry> {
+  return createMemory(userId, payload);
+}
+
+export async function getActiveMemories(userId: string): Promise<MemoryEntry[]> {
+  await ensureUser(userId);
+
+  const memories = await prisma.memoryEntry.findMany({
+    where: {
+      userId,
+      status: "active"
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return memories.map(toMemoryEntry);
+}
+
+export async function getMemories(userId: string): Promise<MemoryEntry[]> {
+  await ensureUser(userId);
+
+  const memories = await prisma.memoryEntry.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return memories.map(toMemoryEntry);
+}
+
+export async function archiveMemory(userId: string, memoryId: string): Promise<MemoryEntry | undefined> {
+  await ensureUser(userId);
+
+  const existingMemory = await prisma.memoryEntry.findFirst({
+    where: {
+      id: memoryId,
+      userId
+    }
+  });
+
+  if (!existingMemory) {
+    return undefined;
+  }
+
+  const memory = await prisma.memoryEntry.update({
+    where: { id: memoryId },
+    data: { status: "archived" }
+  });
+
+  return toMemoryEntry(memory);
+}
+
+export async function getRelevantMemories(
+  userId: string,
+  options: GetRelevantMemoriesOptions = {}
+): Promise<MemoryEntry[]> {
+  await ensureUser(userId);
+
+  const memories = await prisma.memoryEntry.findMany({
+    where: {
+      userId,
+      status: "active",
+      ...(options.types ? { type: { in: options.types } } : {})
+    },
+    orderBy: { createdAt: "desc" },
+    take: options.limit ?? 10
+  });
+
+  return memories.map(toMemoryEntry);
 }
 
 export async function getOrCreateUserOperatingProfile(userId: string): Promise<UserOperatingProfile> {
@@ -514,6 +613,22 @@ function toStoredEvent(event: Prisma.EventGetPayload<object>): StoredEvent {
     confidence: event.confidence,
     evidence: Array.isArray(event.evidence) ? event.evidence.filter((item) => typeof item === "string") : undefined,
     createdAt: event.createdAt
+  };
+}
+
+function toMemoryEntry(memory: Prisma.MemoryEntryGetPayload<object>): MemoryEntry {
+  return {
+    id: memory.id,
+    userId: memory.userId,
+    type: memory.type as MemoryEntry["type"],
+    status: memory.status as MemoryEntry["status"],
+    summary: memory.summary,
+    data: memory.data ? toRecord(memory.data) : undefined,
+    evidence: memory.evidence ? toRecord(memory.evidence) : undefined,
+    source: memory.source as MemoryEntry["source"],
+    confidence: memory.confidence,
+    createdAt: memory.createdAt,
+    updatedAt: memory.updatedAt
   };
 }
 

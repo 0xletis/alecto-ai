@@ -11,6 +11,8 @@ import {
   findGoalDuplicateWarnings,
   getGoalTemplate,
   goalTemplates,
+  CreateMemoryInputSchema,
+  PendingMemoryCreatePayloadSchema,
   processMessage,
   processMessageFromAnalysis,
   ProcessMessageInputSchema,
@@ -19,6 +21,7 @@ import {
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
   type MessageIntent,
+  type MemoryEntry,
   type ProcessMessageResult,
   type StoredEvent,
   type UpdateUserOperatingProfileInput
@@ -26,13 +29,17 @@ import {
 import { analyzeMessageWithOpenAI, type OpenAIMessageAnalysis } from "@operator-agent/llm";
 import {
   archiveGoal,
+  archiveMemory,
   createEvent,
   createEvents,
   createEventsFromExtracted,
   createGoal,
+  createMemory,
+  createMemoryFromPendingPayload,
   createPendingAction,
   expireOldPendingActions,
   getActiveGoals,
+  getActiveMemories,
   getEvents,
   getEventsSince,
   getGoals,
@@ -40,7 +47,9 @@ import {
   getOrCreateNotificationSettings,
   getPendingActions,
   getOrCreateUserOperatingProfile,
+  getMemories,
   getRecentEvents,
+  getRelevantMemories,
   hasRecentNotificationLog,
   confirmPendingAction,
   ensureUser,
@@ -107,8 +116,24 @@ export function buildServer() {
       return replyOnly(parsed.data.userId, parsed.data.message, "Cancelled. I did not change anything.");
     }
 
+    const explicitMemory = extractExplicitMemory(parsed.data.message);
+
+    if (explicitMemory) {
+      await createMemory(parsed.data.userId, {
+        ...explicitMemory,
+        source: "explicit_user_request",
+        confidence: 1,
+        evidence: {
+          message: parsed.data.message
+        }
+      });
+
+      return replyOnly(parsed.data.userId, parsed.data.message, "Saved to memory.");
+    }
+
     const recentEvents = await getRecentEvents(parsed.data.userId, 50);
     const activeGoals = await getActiveGoals(parsed.data.userId);
+    const activeMemories = await getActiveMemories(parsed.data.userId);
     const userOperatingProfile = await getOrCreateUserOperatingProfile(parsed.data.userId);
     const processInput = {
       ...parsed.data,
@@ -130,7 +155,7 @@ export function buildServer() {
       return replyOnly(parsed.data.userId, parsed.data.message, ruleBasedStructuralProposal.reply);
     }
 
-    const openAIAnalysis = await maybeAnalyzeWithOpenAI(processInput, activeGoals, userOperatingProfile);
+    const openAIAnalysis = await maybeAnalyzeWithOpenAI(processInput, activeGoals, userOperatingProfile, activeMemories);
     const structuralProposal = detectOpenAIStructuralProposal(openAIAnalysis);
 
     if (structuralProposal) {
@@ -146,12 +171,12 @@ export function buildServer() {
       return replyOnly(parsed.data.userId, parsed.data.message, structuralProposal.reply);
     }
 
-    const result = analyzeMessage(processInput, openAIAnalysis);
+    const result = withMemoryContextReply(analyzeMessage(processInput, openAIAnalysis), activeMemories);
     const savedEvents = await createEventsFromExtracted(result.userId, result.extractedEvents);
     const isRedFinancialRisk = isFinancialRiskIntent(result.intent) && result.riskState === "RED";
 
     if (isRedFinancialRisk) {
-      await createEvent(result.userId, {
+      const cooldownEvent = await createEvent(result.userId, {
         type: "finance.betting.cooldown_triggered",
         timestamp: new Date(),
         source: "manual",
@@ -163,7 +188,12 @@ export function buildServer() {
         evidence: [result.message]
       });
 
-      return result;
+      const pendingMemoryReply = await maybeCreateRepeatedCooldownPendingMemory(result.userId, cooldownEvent);
+
+      return {
+        ...result,
+        reply: pendingMemoryReply ? `${result.reply} ${pendingMemoryReply}` : result.reply
+      };
     }
 
     if (savedEvents.length === 0) {
@@ -191,6 +221,49 @@ export function buildServer() {
   server.get<{ Params: { userId: string } }>("/users/:userId/profile", async (request) => ({
     profile: await getOrCreateUserOperatingProfile(request.params.userId)
   }));
+
+  server.get<{ Params: { userId: string }; Querystring: { includeArchived?: string } }>(
+    "/users/:userId/memory",
+    async (request) => ({
+      memories:
+        request.query.includeArchived === "true"
+          ? await getMemories(request.params.userId)
+          : await getActiveMemories(request.params.userId)
+    })
+  );
+
+  server.post<{ Params: { userId: string } }>("/users/:userId/memory", async (request, reply) => {
+    const parsed = CreateMemoryInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    return {
+      memory: await createMemory(request.params.userId, {
+        ...parsed.data,
+        source: "manual"
+      })
+    };
+  });
+
+  server.patch<{ Params: { userId: string; memoryId: string } }>(
+    "/users/:userId/memory/:memoryId/archive",
+    async (request, reply) => {
+      const memory = await archiveMemory(request.params.userId, request.params.memoryId);
+
+      if (!memory) {
+        return reply.status(404).send({
+          error: "Memory not found"
+        });
+      }
+
+      return { memory };
+    }
+  );
 
   server.get<{ Params: { userId: string } }>("/users/:userId/notification-settings", async (request) => ({
     notificationSettings: await getOrCreateNotificationSettings(request.params.userId)
@@ -277,7 +350,11 @@ export function buildServer() {
       review: buildDailyReview({
         userId: request.params.userId,
         activeGoals: await getActiveGoals(request.params.userId),
-        todayEvents: await getEventsSince(request.params.userId, todayStart)
+        todayEvents: await getEventsSince(request.params.userId, todayStart),
+        activeMemories: await getRelevantMemories(request.params.userId, {
+          types: ["risk_pattern"],
+          limit: 3
+        })
       })
     };
   });
@@ -344,10 +421,11 @@ export function buildServer() {
     }
 
     const events = await createDailyCheckInEvents(request.params.userId, parsed.data.answers);
+    const pendingMemoryReply = await maybeCreateLowSleepImpulsePendingMemory(request.params.userId, events);
 
     return {
       events,
-      reply: `Check-in saved: ${formatCheckInConfirmation(parsed.data.answers)}.`
+      reply: appendPendingMemoryNotice(`Check-in saved: ${formatCheckInConfirmation(parsed.data.answers)}.`, pendingMemoryReply)
     };
   });
 
@@ -364,11 +442,12 @@ export function buildServer() {
     const parsedCheckIn = parseDailyCheckinText(parsed.data.text);
     const answers = parsedDailyCheckInToAnswers(parsedCheckIn);
     const events = await createDailyCheckInEvents(request.params.userId, answers, parsed.data.text);
+    const pendingMemoryReply = await maybeCreateLowSleepImpulsePendingMemory(request.params.userId, events);
 
     return {
       parsed: parsedCheckIn,
       events,
-      reply: composeNaturalCheckInReply(parsedCheckIn)
+      reply: appendPendingMemoryNotice(composeNaturalCheckInReply(parsedCheckIn), pendingMemoryReply)
     };
   });
 
@@ -430,7 +509,8 @@ async function maybeAnalyzeWithOpenAI(
     userOperatingProfile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>;
   },
   activeGoals: Awaited<ReturnType<typeof getActiveGoals>>,
-  userOperatingProfile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>
+  userOperatingProfile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>,
+  activeMemories: MemoryEntry[]
 ): Promise<OpenAIMessageAnalysis | undefined> {
   if (!shouldUseOpenAIAnalysis()) {
     return undefined;
@@ -442,6 +522,7 @@ async function maybeAnalyzeWithOpenAI(
       message: input.message,
       activeGoals,
       recentEvents: input.recentEvents,
+      activeMemories,
       eventRegistry: [...eventRegistry],
       userOperatingProfile
     });
@@ -453,6 +534,50 @@ async function maybeAnalyzeWithOpenAI(
 
 function shouldUseOpenAIAnalysis(): boolean {
   return process.env.USE_OPENAI_ANALYSIS === "true" && Boolean(process.env.OPENAI_API_KEY);
+}
+
+function extractExplicitMemory(message: string): { type: MemoryEntry["type"]; summary: string } | undefined {
+  const match = message.match(
+    /\b(?:remember that|remember this|note that|acu[eé]rdate de que|recuerda que|guard[ae] que)\s+(.+)/i
+  );
+  const rawText = match?.[1]?.trim().replace(/[.!?]+$/g, "");
+
+  if (!rawText) {
+    return undefined;
+  }
+
+  const type = inferMemoryType(rawText);
+
+  return {
+    type,
+    summary: normalizeMemorySummary(rawText)
+  };
+}
+
+function inferMemoryType(text: string): MemoryEntry["type"] {
+  if (/\b(prefiero|prefer|hate|odio|generic motivation|hablas? directo|directo|communication)\b/i.test(text)) {
+    if (/\b(hablas? directo|directo|tone|communication|me hables|talk to me)\b/i.test(text)) {
+      return "communication_style";
+    }
+
+    return "preference";
+  }
+
+  if (/\b(risk|apuesta|apostar|gambling|trading|betting)\b/i.test(text)) {
+    return "risk_pattern";
+  }
+
+  if (/\b(goal|objetivo|context|porque|why)\b/i.test(text)) {
+    return "goal_context";
+  }
+
+  return "note";
+}
+
+function normalizeMemorySummary(text: string): string {
+  const trimmed = text.trim();
+  const first = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  return first.endsWith(".") ? first : `${first}.`;
 }
 
 function isConfirmationMessage(message: string): boolean {
@@ -765,6 +890,206 @@ function numberAnswer(value: unknown): number | undefined {
 
 function textAnswer(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+async function maybeCreateRepeatedCooldownPendingMemory(
+  userId: string,
+  cooldownEvent: StoredEvent
+): Promise<string | undefined> {
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const cooldownEvents = (await getEventsSince(userId, since)).filter(
+    (event) => event.type === "finance.betting.cooldown_triggered"
+  );
+
+  if (cooldownEvents.length < 2) {
+    return undefined;
+  }
+
+  const summary = "User has repeated betting/trading cooldown events in the last 7 days.";
+
+  if (await hasSimilarActiveMemory(userId, summary)) {
+    return undefined;
+  }
+
+  if (await hasPendingMemoryCreate(userId, summary)) {
+    return undefined;
+  }
+
+  await createPendingAction(userId, {
+    type: "memory_create",
+    summary,
+    payload: {
+      type: "risk_pattern",
+      summary,
+      source: "system_inferred",
+      confidence: 0.85,
+      evidence: {
+        cooldownCount: cooldownEvents.length,
+        recentEventIds: cooldownEvents.map((event) => event.id),
+        latestEventId: cooldownEvent.id
+      }
+    },
+    expiresAt: tomorrow()
+  });
+
+  return "I also noticed a repeated risk pattern. Reply yes to save it to memory or no to ignore.";
+}
+
+async function maybeCreateLowSleepImpulsePendingMemory(
+  userId: string,
+  newEvents: StoredEvent[]
+): Promise<string | undefined> {
+  if (!hasLowSleepHighImpulsePair(newEvents)) {
+    return undefined;
+  }
+
+  const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+  const recentEvents = await getEventsSince(userId, since);
+  const pairCount = countLowSleepHighImpulseOccurrences(recentEvents);
+
+  if (pairCount < 2) {
+    return undefined;
+  }
+
+  const summary = "Low sleep plus high gambling impulse appears to be a risk state for the user.";
+
+  if (await hasSimilarActiveMemory(userId, summary)) {
+    return undefined;
+  }
+
+  if (await hasPendingMemoryCreate(userId, summary)) {
+    return undefined;
+  }
+
+  await createPendingAction(userId, {
+    type: "memory_create",
+    summary,
+    payload: {
+      type: "risk_pattern",
+      summary,
+      source: "system_inferred",
+      confidence: 0.8,
+      evidence: {
+        matchedOccurrences: pairCount,
+        windowDays: 14
+      }
+    },
+    expiresAt: tomorrow()
+  });
+
+  return "I also noticed a repeated risk pattern. Reply yes to save it to memory or no to ignore.";
+}
+
+async function hasSimilarActiveMemory(userId: string, summary: string): Promise<boolean> {
+  return (await getActiveMemories(userId)).some(
+    (memory) => memory.type === "risk_pattern" && areSimilarMemorySummaries(memory.summary, summary)
+  );
+}
+
+async function hasPendingMemoryCreate(userId: string, summary: string): Promise<boolean> {
+  return (await getPendingActions(userId)).some(
+    (action) =>
+      action.status === "pending" &&
+      action.type === "memory_create" &&
+      areSimilarMemorySummaries(action.summary, summary)
+  );
+}
+
+function areSimilarMemorySummaries(left: string, right: string): boolean {
+  const normalizedLeft = normalizeComparableText(left);
+  const normalizedRight = normalizeComparableText(right);
+
+  return (
+    normalizedLeft === normalizedRight ||
+    (isRepeatedCooldownSummary(normalizedLeft) && isRepeatedCooldownSummary(normalizedRight)) ||
+    (isLowSleepGamblingImpulseSummary(normalizedLeft) && isLowSleepGamblingImpulseSummary(normalizedRight))
+  );
+}
+
+function isRepeatedCooldownSummary(summary: string): boolean {
+  return (
+    summary.includes("repeated") &&
+    (summary.includes("betting") || summary.includes("trading") || summary.includes("risk pattern")) &&
+    summary.includes("cooldown")
+  );
+}
+
+function isLowSleepGamblingImpulseSummary(summary: string): boolean {
+  return summary.includes("low sleep") && summary.includes("gambling impulse");
+}
+
+function normalizeComparableText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasLowSleepHighImpulsePair(events: StoredEvent[]): boolean {
+  const sleep = events.find((event) => event.type === "health.sleep_logged");
+  const impulse = events.find(
+    (event) =>
+      event.type === "reflection.impulse_logged" &&
+      event.data.kind === "gambling" &&
+      typeof event.data.value === "number" &&
+      event.data.value >= 6
+  );
+  const sleepHours = sleep?.data.duration_hours;
+
+  return typeof sleepHours === "number" && sleepHours < 6 && Boolean(impulse);
+}
+
+function countLowSleepHighImpulseOccurrences(events: StoredEvent[]): number {
+  const checkInMatches = events.filter((event) => {
+    if (event.type !== "reflection.daily_checkin_completed") {
+      return false;
+    }
+
+    const answers = event.data.answers;
+
+    if (!answers || typeof answers !== "object" || Array.isArray(answers)) {
+      return false;
+    }
+
+    const record = answers as Record<string, unknown>;
+    const sleep = record.sleep;
+    const gamblingImpulse = record.gambling_impulse ?? record.gambling;
+
+    return (
+      typeof sleep === "number" &&
+      sleep < 6 &&
+      typeof gamblingImpulse === "number" &&
+      gamblingImpulse >= 6
+    );
+  }).length;
+
+  if (checkInMatches > 0) {
+    return checkInMatches;
+  }
+
+  return hasLowSleepHighImpulsePair(events) ? 1 : 0;
+}
+
+function appendPendingMemoryNotice(reply: string, notice?: string): string {
+  return notice ? `${reply} ${notice}` : reply;
+}
+
+function withMemoryContextReply(result: ProcessMessageResult, activeMemories: MemoryEntry[]): ProcessMessageResult {
+  if (result.mode !== "guardian") {
+    return result;
+  }
+
+  const riskMemory = activeMemories.find((memory) => memory.type === "risk_pattern");
+
+  if (!riskMemory) {
+    return result;
+  }
+
+  return {
+    ...result,
+    reply: `${result.reply} Memory signal: ${riskMemory.summary}`
+  };
 }
 
 interface StructuralProposal {
@@ -1163,6 +1488,15 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
 
     return {
       reply: `Confirmed. I archived the goal: ${goal.title}.`
+    };
+  }
+
+  if (pendingAction.type === "memory_create") {
+    const payload = PendingMemoryCreatePayloadSchema.parse(pendingAction.payload);
+    const memory = await createMemoryFromPendingPayload(userId, payload);
+
+    return {
+      reply: `Confirmed. I saved this to memory: ${memory.summary}`
     };
   }
 

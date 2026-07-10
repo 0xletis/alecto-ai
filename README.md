@@ -97,6 +97,9 @@ Telegram commands:
 - `/whoami`: show Telegram ID and derived agent userId
 - `/setup`: setup checklist
 - `/profile`: show operating profile
+- `/memory`: show active user-visible memories
+- `/remember <text>`: save a visible memory immediately
+- `/forget_memory <memoryId>`: archive a memory
 - `/notifications`: show notification settings
 - `/enable_checkin 09:00`: enable daily check-in reminders at local time
 - `/disable_checkin`: disable daily check-in reminders
@@ -118,6 +121,8 @@ Telegram commands:
 
 Normal messages can also confirm or reject pending changes. Send `yes`, `confirm`, `si`, or `dale` to confirm. Send `no`, `cancel`, or `cancelar` to reject.
 
+Events are factual logs. Memories are durable preferences, context, and patterns. Memories are user-visible, and inferred memories are created as pending actions that require confirmation.
+
 Verify the routes from another terminal:
 
 ```bash
@@ -135,6 +140,26 @@ curl -X POST http://localhost:3000/users/local-user/goals/from-template \
   -d '{"templateId":"career.job_search","title":"Find a new Web3 developer job","why":"Build stable career capital"}'
 
 curl http://localhost:3000/users/local-user/profile
+
+curl http://localhost:3000/users/local-user/memory
+
+curl -X POST http://localhost:3000/users/local-user/memory \
+  -H "Content-Type: application/json" \
+  -d '{"type":"preference","summary":"User prefers direct, evidence-based feedback."}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"remember that I hate generic motivation"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"remember that when I talk about gambling I want you to be stricter, not balanced"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"recuerda que prefiero que me hables directo"}'
+
+curl http://localhost:3000/users/local-user/memory
 
 curl -X PATCH http://localhost:3000/users/dev-user/profile \
   -H "Content-Type: application/json" \
@@ -164,6 +189,16 @@ curl -X POST http://localhost:3000/messages/process \
 
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"This bet is guaranteed safe free money"}'
+
+curl http://localhost:3000/users/local-user/pending-actions
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"yes"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"he mandado un par de cvs y luego he ido al gym casi una hora"}'
 
 curl -X POST http://localhost:3000/messages/process \
@@ -173,6 +208,10 @@ curl -X POST http://localhost:3000/messages/process \
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"quiero apostar 1000 porque esto es seguro"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"quiero apostar otra vez porque es casi seguro"}'
 
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
@@ -228,11 +267,23 @@ curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
   -H "Content-Type: application/json" \
   -d '{"text":"hoy fatal, dormí 5h, ansiedad 8, ganas de apostar 7"}'
 
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"quiero apostar, no tengo gambling impulse"}'
+
+curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
+  -H "Content-Type: application/json" \
+  -d '{"text":"dormí 5h, ansiedad 7, ganas de apostar 8"}'
+
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
 curl http://localhost:3000/users/local-user/goals
 curl http://localhost:3000/users/local-user/checkins/daily/prompt
 curl http://localhost:3000/users/local-user/review/daily
+
+curl -X PATCH http://localhost:3000/users/local-user/memory/<memoryId>/archive \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 Expected:
@@ -241,7 +292,13 @@ Expected:
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
 - `/goal-templates` returns structured goal templates such as `career.job_search`, `health.strength_energy`, `health.sleep_better`, `learning.reading_more`, and `finance.control_betting_trading`.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
+- Explicit memory phrases like `remember that`, `recuerda que`, or `guarda que` create visible memories immediately and reply `Saved to memory.`
+- `/users/:userId/memory` returns active memories by default. Use `?includeArchived=true` to include archived/rejected memories.
+- Telegram routes explicit memory and direct betting/trading intent to `/messages/process` before considering natural check-ins.
+- Natural check-ins need state context like sleep/anxiety/energy/focus, at least two progress signals, or a recent daily reminder plus a state/progress signal. Gambling words alone do not make a check-in.
 - Events auto-log when detected. Profile changes, goal creation, and goal archiving proposed from natural language are stored as pending actions first and require confirmation.
+- Inferred risk memories, such as repeated betting cooldowns or repeated low sleep plus high gambling impulse, are stored as `memory_create` pending actions. Reply `yes` to save the memory or `no` to ignore it.
+- Repeated guardian messages should not spam duplicate `memory_create` suggestions when a similar active memory or pending memory already exists.
 - Natural-language goal creation uses a matching template when obvious, but still asks for confirmation before creating the goal.
 - Duplicate active goals are blocked by default when the title, template, or similar category/title already exists. Use `/goals` to review similar goals or archive the older one first.
 - `/users/:userId/checkins/daily` saves a manual check-in as reflection events and daily review includes check-in values.
@@ -257,6 +314,7 @@ Expected:
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
 - `/users/:userId/review/daily` summarizes today's stored events against active goals.
+- Daily review includes a concise `Memory signals` section when active risk-pattern memories are relevant to today's events.
 
 ## API Routes
 
@@ -270,6 +328,9 @@ Expected:
 - `GET /users/:userId/goals`
 - `GET /users/:userId/profile`
 - `PATCH /users/:userId/profile`
+- `GET /users/:userId/memory`
+- `POST /users/:userId/memory`
+- `PATCH /users/:userId/memory/:memoryId/archive`
 - `GET /users/:userId/notification-settings`
 - `PATCH /users/:userId/notification-settings`
 - `GET /users/:userId/pending-actions`

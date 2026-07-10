@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { findDuplicateActiveGoal, findGoalDuplicateWarnings, type Goal } from "./goals.js";
+import type { MemoryEntry } from "./memory.js";
 import type { StoredEvent } from "./events.js";
 import { getGoalTemplate } from "./goal-templates.js";
 
@@ -17,13 +18,15 @@ export const DailyReviewSchema = z.object({
   suggestedFocus: z.string(),
   activeGoals: z.array(DailyReviewGoalStatusSchema).default([]),
   checkIn: z.array(z.string()).default([]),
-  warnings: z.array(z.string()).default([])
+  warnings: z.array(z.string()).default([]),
+  memorySignals: z.array(z.string()).default([])
 });
 
 export interface BuildDailyReviewInput {
   userId: string;
   activeGoals: Goal[];
   todayEvents: StoredEvent[];
+  activeMemories?: MemoryEntry[];
 }
 
 export type DailyReview = z.infer<typeof DailyReviewSchema>;
@@ -38,6 +41,7 @@ export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
   const suggestedFocus = buildSuggestedFocus(uniqueActiveGoals, gaps);
   const activeGoals = buildActiveGoalStatuses(uniqueActiveGoals, input.todayEvents);
   const warnings = buildDuplicateWarnings(input.activeGoals);
+  const memorySignals = buildMemorySignals(input.activeMemories ?? [], input.todayEvents);
   const summary =
     combinedSummaries.length > 0
       ? `Today: ${joinReadableList(combinedSummaries)}.`
@@ -51,7 +55,8 @@ export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
     suggestedFocus,
     activeGoals,
     checkIn: checkInSummaries,
-    warnings
+    warnings,
+    memorySignals
   });
 }
 
@@ -309,4 +314,19 @@ function joinReadableList(items: string[]): string {
   }
 
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+function buildMemorySignals(memories: MemoryEntry[], todayEvents: StoredEvent[]): string[] {
+  const hasRiskEventToday = todayEvents.some(
+    (event) => event.type === "finance.betting.cooldown_triggered" || event.type === "reflection.impulse_logged"
+  );
+
+  if (!hasRiskEventToday) {
+    return [];
+  }
+
+  return memories
+    .filter((memory) => memory.status === "active" && memory.type === "risk_pattern")
+    .slice(0, 3)
+    .map((memory) => memory.summary);
 }

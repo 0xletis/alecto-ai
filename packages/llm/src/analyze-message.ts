@@ -47,6 +47,7 @@ export async function analyzeMessageWithOpenAI(
               message: parsedInput.message,
               activeGoals: parsedInput.activeGoals,
               recentEvents: parsedInput.recentEvents,
+              activeMemories: parsedInput.activeMemories,
               userOperatingProfile: parsedInput.userOperatingProfile ?? null
             })
           }
@@ -84,6 +85,7 @@ function buildDeveloperPrompt(registry: EventTypeDefinition[]): string {
     "Do not invent core event types.",
     "Only use extractedEvents.type values from the provided event registry.",
     "Extract events only from the current message. Recent events are context for patterns, not events to copy into extractedEvents.",
+    "Active memories are user-visible durable preferences and patterns. Use them lightly for context; do not create new memories.",
     "If the user asks to track something that does not fit the registry, return proposedCustomEventType instead of inventing an event type.",
     "If the user asks to change profile style, create a goal, or archive a goal, return proposedAction. Do not apply changes.",
     "Use proposedAction confidence below 0.7 when the request is ambiguous.",

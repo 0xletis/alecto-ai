@@ -18,6 +18,7 @@ model User {
   pendingActions       PendingAction[]
   notificationSettings NotificationSettings?
   notificationLogs     NotificationLog[]
+  memories             MemoryEntry[]
 }
 
 model Goal {
@@ -53,6 +54,25 @@ model Event {
 
   @@index([userId])
   @@index([userId, timestamp])
+}
+
+model MemoryEntry {
+  id         String   @id @default(uuid())
+  userId     String
+  type       String
+  status     String   @default("active")
+  summary    String
+  data       Json?
+  evidence   Json?
+  source     String
+  confidence Float    @default(1)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([userId, status, createdAt])
 }
 
 model UserOperatingProfile {

@@ -1,6 +1,5 @@
 import { config } from "dotenv";
 import { Bot, type Context } from "grammy";
-import { countDailyCheckinSignals } from "@operator-agent/core";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -70,6 +69,62 @@ bot.command("profile", async (ctx) => {
     await ctx.reply(formatProfile(response.profile));
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not fetch your profile right now.");
+  }
+});
+
+bot.command("memory", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<MemoriesResponse>(`/users/${getTelegramUserId(ctx)}/memory`);
+    await ctx.reply(formatMemories(response.memories));
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not fetch your memories right now.");
+  }
+});
+
+bot.command("remember", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply("Usage: /remember I prefer direct feedback");
+    return;
+  }
+
+  try {
+    await apiPost<MemoryResponse>(`/users/${getTelegramUserId(ctx)}/memory`, {
+      type: inferMemoryType(text),
+      summary: normalizeMemorySummary(text)
+    });
+    await ctx.reply("Saved to memory.");
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not save that memory right now.");
+  }
+});
+
+bot.command("forget_memory", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const memoryId = getCommandText(ctx);
+
+  if (!memoryId) {
+    await ctx.reply("Usage: /forget_memory <memoryId>");
+    return;
+  }
+
+  try {
+    await apiPatch<MemoryResponse>(`/users/${getTelegramUserId(ctx)}/memory/${memoryId}/archive`, {});
+    await ctx.reply("Archived memory.");
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not archive that memory. Check the ID and try again.");
   }
 });
 
@@ -432,7 +487,11 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    if (!ctx.message.text.startsWith("/") && (await shouldTreatAsNaturalCheckIn(ctx))) {
+    if (ctx.message.text.startsWith("/")) {
+      return;
+    }
+
+    if (await shouldTreatAsNaturalCheckIn(ctx)) {
       const response = await apiPost<NaturalCheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/text`, {
         text: ctx.message.text
       });
@@ -599,13 +658,17 @@ function parseCheckInValue(value: string): string | number | boolean {
 
 async function shouldTreatAsNaturalCheckIn(ctx: Context): Promise<boolean> {
   const message = ctx.message?.text ?? "";
-  const signalCount = countDailyCheckinSignals(message);
+  const signalCounts = countNaturalCheckInSignals(message);
 
-  if (signalCount >= 2) {
+  if (isExplicitMemoryRequest(message) || isDirectBettingTradingIntent(message)) {
+    return false;
+  }
+
+  if (signalCounts.state >= 1 || signalCounts.progress >= 2) {
     return true;
   }
 
-  if (signalCount < 1) {
+  if (signalCounts.state + signalCounts.progress + signalCounts.reminderOnlyImpulse < 1) {
     return false;
   }
 
@@ -618,6 +681,51 @@ async function shouldTreatAsNaturalCheckIn(ctx: Context): Promise<boolean> {
     console.error("Could not check recent daily check-in reminder", error);
     return false;
   }
+}
+
+function isExplicitMemoryRequest(message: string): boolean {
+  return /\b(remember that|remember this|note that|recuerda que|acu[eé]rdate de que|guard[ae] que)\b/i.test(message);
+}
+
+function isDirectBettingTradingIntent(message: string): boolean {
+  return /\b(quiero apostar|voy a apostar|i want to bet|i'?m going to bet|quiero tradear|voy a tradear|i want to trade|long|short|leverage)\b/i.test(
+    message
+  );
+}
+
+function countNaturalCheckInSignals(message: string): { state: number; progress: number; reminderOnlyImpulse: number } {
+  const normalized = normalizeSignalText(message);
+  const statePatterns = [
+    /\benergy\b|\benergia\b/,
+    /\banxiety\b|\bansiedad\b/,
+    /\bfocus\b|\bfoco\b/,
+    /\bslept\b|\bsleep\b|\bdormi\b|\bdormir\b/
+  ];
+  const progressPatterns = [
+    /\b(?:sent|mande|mandado|envie|enviado)\s+\d*\s*(?:cvs?|applications?)\b|\b\d+\s*(?:cvs?|applications?)\b/,
+    /\btrained\b|\bentrene\b|\bentrenado\b|\bgym\b|\bworkout\b/,
+    /\bread\b|\blei\b|\breading\b/
+  ];
+  const reminderOnlyImpulsePatterns = [
+    /\bganas de apostar\s*\d+(?:\.\d+)?\b/,
+    /\b(?:gambling impulse|trading impulse)\s*(?:is|=|:)?\s*\d+(?:\.\d+)?\b/,
+    /\bno (?:gambling impulse|trading impulse|bets?)\b/
+  ];
+
+  return {
+    state: statePatterns.filter((pattern) => pattern.test(normalized)).length,
+    progress: progressPatterns.filter((pattern) => pattern.test(normalized)).length,
+    reminderOnlyImpulse: reminderOnlyImpulsePatterns.filter((pattern) => pattern.test(normalized)).length
+  };
+}
+
+function normalizeSignalText(message: string): string {
+  return message
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 async function apiGet<T>(path: string): Promise<T> {
@@ -683,6 +791,9 @@ function formatDailyReview(review: DailyReview) {
     "",
     review.activeGoals.length > 0 ? `Active goals:\n${review.activeGoals.map(formatReviewGoal).join("\n")}` : undefined,
     review.warnings.length > 0 ? `Warnings:\n${review.warnings.map((warning) => `- ${warning}`).join("\n")}` : undefined,
+    review.memorySignals.length > 0
+      ? `Memory signals:\n${review.memorySignals.map((signal) => `- ${signal}`).join("\n")}`
+      : undefined,
     review.checkIn.length > 0 ? `Check-in: ${review.checkIn.join(", ")}` : undefined,
     `Wins: ${review.wins.length > 0 ? review.wins.join(", ") : "none logged"}`,
     `Gaps: ${review.gaps.length > 0 ? review.gaps.join(", ") : "none obvious"}`,
@@ -705,6 +816,46 @@ function formatProfile(profile: Profile) {
     `avoidingMode: ${profile.avoidingMode}`,
     `impulsiveMode: ${profile.impulsiveMode}`
   ].join("\n");
+}
+
+function formatMemories(memories: MemoryEntry[]) {
+  if (memories.length === 0) {
+    return "No active memories yet.";
+  }
+
+  return memories.map(formatMemory).join("\n\n");
+}
+
+function formatMemory(memory: MemoryEntry) {
+  return [
+    `id: ${memory.id}`,
+    `type: ${memory.type}`,
+    `summary: ${memory.summary}`,
+    `source: ${memory.source}`,
+    `confidence: ${memory.confidence}`
+  ].join("\n");
+}
+
+function inferMemoryType(text: string): MemoryEntry["type"] {
+  if (/\b(prefiero|prefer|hate|odio|generic motivation|hablas? directo|directo)\b/i.test(text)) {
+    if (/\b(hablas? directo|directo|tone|communication|me hables|talk to me)\b/i.test(text)) {
+      return "communication_style";
+    }
+
+    return "preference";
+  }
+
+  if (/\b(risk|apuesta|apostar|gambling|trading|betting)\b/i.test(text)) {
+    return "risk_pattern";
+  }
+
+  return "note";
+}
+
+function normalizeMemorySummary(text: string): string {
+  const trimmed = text.trim();
+  const first = trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
+  return first.endsWith(".") ? first : `${first}.`;
 }
 
 function formatNotificationSettings(settings: NotificationSettings) {
@@ -929,6 +1080,14 @@ interface ProfileResponse {
   profile: Profile;
 }
 
+interface MemoriesResponse {
+  memories: MemoryEntry[];
+}
+
+interface MemoryResponse {
+  memory: MemoryEntry;
+}
+
 interface NotificationSettingsResponse {
   notificationSettings: NotificationSettings;
 }
@@ -950,6 +1109,7 @@ interface DailyReview {
   activeGoals: DailyReviewGoal[];
   checkIn: string[];
   warnings: string[];
+  memorySignals: string[];
 }
 
 interface DailyReviewGoal {
@@ -996,6 +1156,21 @@ interface Profile {
   vulnerableMode: string;
   avoidingMode: string;
   impulsiveMode: string;
+}
+
+interface MemoryEntry {
+  id: string;
+  type:
+    | "preference"
+    | "goal_context"
+    | "pattern"
+    | "risk_pattern"
+    | "communication_style"
+    | "important_fact"
+    | "note";
+  summary: string;
+  source: string;
+  confidence: number;
 }
 
 interface NotificationSettings {

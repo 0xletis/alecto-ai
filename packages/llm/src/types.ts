@@ -5,6 +5,7 @@ import {
   MessageIntentSchema,
   type EventTypeDefinition,
   type Goal,
+  type MemoryEntry,
   type StoredEvent,
   type UserOperatingProfile
 } from "@operator-agent/core";
@@ -37,6 +38,7 @@ export const AnalyzeMessageInputSchema = z.object({
   message: z.string().min(1),
   activeGoals: z.array(z.custom<Goal>()).default([]),
   recentEvents: z.array(z.custom<StoredEvent>()).default([]),
+  activeMemories: z.array(z.custom<MemoryEntry>()).default([]),
   eventRegistry: z.array(z.custom<EventTypeDefinition>()),
   userOperatingProfile: z.custom<UserOperatingProfile>().optional()
 });
