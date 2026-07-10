@@ -4,7 +4,9 @@ import type {
   CreateGoalInput,
   ExtractedEvent,
   Goal,
+  NotificationSettings,
   StoredEvent,
+  UpdateNotificationSettingsInput,
   UpdateUserOperatingProfileInput,
   UserOperatingProfile
 } from "@operator-agent/core";
@@ -42,6 +44,12 @@ export interface CreatePendingActionInput {
   expiresAt?: Date;
 }
 
+export interface NotificationLogInput {
+  userId: string;
+  type: string;
+  sentForDate: string;
+}
+
 export type CreateGoalResult =
   | {
       duplicate: false;
@@ -53,11 +61,27 @@ export type CreateGoalResult =
     };
 
 export async function ensureUser(userId: string) {
-  return prisma.user.upsert({
-    where: { id: userId },
-    update: {},
-    create: { id: userId }
-  });
+  try {
+    return await prisma.user.upsert({
+      where: { id: userId },
+      update: {},
+      create: { id: userId }
+    });
+  } catch (error) {
+    if (!isPrismaUniqueConstraintError(error)) {
+      throw error;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!user) {
+      throw error;
+    }
+
+    return user;
+  }
 }
 
 export async function createGoal(userId: string, input: CreateGoalInput): Promise<CreateGoalResult> {
@@ -260,6 +284,82 @@ export async function updateUserOperatingProfile(
   return toUserOperatingProfile(profile);
 }
 
+export async function getOrCreateNotificationSettings(userId: string): Promise<NotificationSettings> {
+  await ensureUser(userId);
+
+  const settings = await prisma.notificationSettings.upsert({
+    where: { userId },
+    update: {},
+    create: { userId }
+  });
+
+  return toNotificationSettings(settings);
+}
+
+export async function updateNotificationSettings(
+  userId: string,
+  input: UpdateNotificationSettingsInput
+): Promise<NotificationSettings> {
+  await ensureUser(userId);
+
+  const settings = await prisma.notificationSettings.upsert({
+    where: { userId },
+    create: {
+      userId,
+      ...input
+    },
+    update: input
+  });
+
+  return toNotificationSettings(settings);
+}
+
+export async function getUsersWithDailyCheckinEnabled(): Promise<NotificationSettings[]> {
+  const settings = await prisma.notificationSettings.findMany({
+    where: {
+      dailyCheckinEnabled: true
+    },
+    orderBy: {
+      updatedAt: "desc"
+    }
+  });
+
+  return settings.map(toNotificationSettings);
+}
+
+export async function createNotificationLog(input: NotificationLogInput): Promise<boolean> {
+  try {
+    await prisma.notificationLog.create({
+      data: {
+        userId: input.userId,
+        type: input.type,
+        sentForDate: input.sentForDate
+      }
+    });
+    return true;
+  } catch (error) {
+    if (isPrismaUniqueConstraintError(error)) {
+      return false;
+    }
+
+    throw error;
+  }
+}
+
+export async function hasNotificationLog(input: NotificationLogInput): Promise<boolean> {
+  const log = await prisma.notificationLog.findUnique({
+    where: {
+      userId_type_sentForDate: {
+        userId: input.userId,
+        type: input.type,
+        sentForDate: input.sentForDate
+      }
+    }
+  });
+
+  return Boolean(log);
+}
+
 export async function createPendingAction(
   userId: string,
   input: CreatePendingActionInput
@@ -448,6 +548,29 @@ function toPendingAction(pendingAction: Prisma.PendingActionGetPayload<object>):
     createdAt: pendingAction.createdAt,
     updatedAt: pendingAction.updatedAt
   };
+}
+
+function toNotificationSettings(
+  settings: Prisma.NotificationSettingsGetPayload<object>
+): NotificationSettings {
+  return {
+    id: settings.id,
+    userId: settings.userId,
+    telegramUserId: settings.telegramUserId ?? undefined,
+    dailyCheckinEnabled: settings.dailyCheckinEnabled,
+    dailyCheckinTime: settings.dailyCheckinTime ?? undefined,
+    timezone: settings.timezone,
+    createdAt: settings.createdAt,
+    updatedAt: settings.updatedAt
+  };
+}
+
+function isPrismaUniqueConstraintError(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+
+  return (error as { code?: string }).code === "P2002";
 }
 
 function toUserOperatingProfileUpdateData(input: UpdateUserOperatingProfileInput) {

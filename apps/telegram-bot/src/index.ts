@@ -72,6 +72,66 @@ bot.command("profile", async (ctx) => {
   }
 });
 
+bot.command("notifications", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`
+    );
+    await ctx.reply(formatNotificationSettings(response.notificationSettings));
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not fetch notification settings right now.");
+  }
+});
+
+bot.command("enable_checkin", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const time = getCommandText(ctx);
+
+  if (!/^\d{2}:\d{2}$/.test(time)) {
+    await ctx.reply("Usage: /enable_checkin 09:00");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`,
+      {
+        telegramUserId: getRawTelegramUserId(ctx),
+        dailyCheckinEnabled: true,
+        dailyCheckinTime: time,
+        timezone: "Europe/Madrid"
+      }
+    );
+    await ctx.reply(
+      `Daily check-in enabled at ${response.notificationSettings.dailyCheckinTime} ${response.notificationSettings.timezone}.`
+    );
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not enable daily check-ins right now.");
+  }
+});
+
+bot.command("disable_checkin", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    await apiPatch<NotificationSettingsResponse>(`/users/${getTelegramUserId(ctx)}/notification-settings`, {
+      dailyCheckinEnabled: false
+    });
+    await ctx.reply("Daily check-in disabled.");
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not disable daily check-ins right now.");
+  }
+});
+
 bot.command("set_style", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -384,13 +444,17 @@ function isAllowedTelegramUser(telegramUserId: string): boolean {
 }
 
 function getTelegramUserId(ctx: Context): string {
+  return `telegram:${getRawTelegramUserId(ctx)}`;
+}
+
+function getRawTelegramUserId(ctx: Context): string {
   const telegramUserId = ctx.from?.id;
 
   if (!telegramUserId) {
     throw new Error("Telegram user id is missing.");
   }
 
-  return `telegram:${telegramUserId}`;
+  return String(telegramUserId);
 }
 
 function parseAllowedUserIds(value?: string): Set<string> | undefined {
@@ -579,6 +643,16 @@ function formatProfile(profile: Profile) {
     `vulnerableMode: ${profile.vulnerableMode}`,
     `avoidingMode: ${profile.avoidingMode}`,
     `impulsiveMode: ${profile.impulsiveMode}`
+  ].join("\n");
+}
+
+function formatNotificationSettings(settings: NotificationSettings) {
+  return [
+    "Notification settings:",
+    `dailyCheckinEnabled: ${settings.dailyCheckinEnabled}`,
+    `dailyCheckinTime: ${settings.dailyCheckinTime ?? "not set"}`,
+    `timezone: ${settings.timezone}`,
+    `telegramUserId: ${settings.telegramUserId ?? "not set"}`
   ].join("\n");
 }
 
@@ -782,6 +856,10 @@ interface ProfileResponse {
   profile: Profile;
 }
 
+interface NotificationSettingsResponse {
+  notificationSettings: NotificationSettings;
+}
+
 interface PendingActionsResponse {
   pendingActions: PendingAction[];
 }
@@ -845,6 +923,13 @@ interface Profile {
   vulnerableMode: string;
   avoidingMode: string;
   impulsiveMode: string;
+}
+
+interface NotificationSettings {
+  telegramUserId?: string;
+  dailyCheckinEnabled: boolean;
+  dailyCheckinTime?: string;
+  timezone: string;
 }
 
 interface PendingAction {

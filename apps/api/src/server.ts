@@ -12,6 +12,7 @@ import {
   processMessage,
   processMessageFromAnalysis,
   ProcessMessageInputSchema,
+  UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
   type MessageIntent,
   type ProcessMessageResult,
@@ -32,6 +33,7 @@ import {
   getEventsSince,
   getGoals,
   getLatestPendingAction,
+  getOrCreateNotificationSettings,
   getPendingActions,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
@@ -40,6 +42,7 @@ import {
   rejectPendingAction,
   type PendingAction,
   type PendingActionType,
+  updateNotificationSettings,
   updateUserOperatingProfile
 } from "@operator-agent/db";
 
@@ -183,6 +186,25 @@ export function buildServer() {
   server.get<{ Params: { userId: string } }>("/users/:userId/profile", async (request) => ({
     profile: await getOrCreateUserOperatingProfile(request.params.userId)
   }));
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/notification-settings", async (request) => ({
+    notificationSettings: await getOrCreateNotificationSettings(request.params.userId)
+  }));
+
+  server.patch<{ Params: { userId: string } }>("/users/:userId/notification-settings", async (request, reply) => {
+    const parsed = UpdateNotificationSettingsInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    return {
+      notificationSettings: await updateNotificationSettings(request.params.userId, parsed.data)
+    };
+  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/pending-actions", async (request) => ({
     pendingActions: await getPendingActions(request.params.userId)

@@ -12,10 +12,12 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  goals            Goal[]
-  events           Event[]
-  operatingProfile UserOperatingProfile?
-  pendingActions   PendingAction[]
+  goals                Goal[]
+  events               Event[]
+  operatingProfile     UserOperatingProfile?
+  pendingActions       PendingAction[]
+  notificationSettings NotificationSettings?
+  notificationLogs     NotificationLog[]
 }
 
 model Goal {
@@ -99,6 +101,32 @@ model PendingAction {
 
   @@index([userId])
   @@index([userId, status, createdAt])
+}
+
+model NotificationSettings {
+  id                   String   @id @default(uuid())
+  userId               String   @unique
+  telegramUserId       String?
+  dailyCheckinEnabled  Boolean  @default(false)
+  dailyCheckinTime     String?
+  timezone             String   @default("Europe/Madrid")
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model NotificationLog {
+  id          String   @id @default(uuid())
+  userId      String
+  type        String
+  sentForDate String
+  sentAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@unique([userId, type, sentForDate])
 }
 
 enum GoalStatus {

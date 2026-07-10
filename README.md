@@ -81,6 +81,14 @@ pnpm dev:api
 pnpm dev:telegram
 ```
 
+Run the reminder worker in a third terminal when you want proactive daily check-ins:
+
+```bash
+pnpm dev:worker
+```
+
+Both the Telegram bot and worker need `TELEGRAM_BOT_TOKEN`. For local dev, reminder times use `Europe/Madrid` by default.
+
 Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each Telegram account has separate goals, events, and profile.
 
 Telegram commands:
@@ -89,6 +97,9 @@ Telegram commands:
 - `/whoami`: show Telegram ID and derived agent userId
 - `/setup`: setup checklist
 - `/profile`: show operating profile
+- `/notifications`: show notification settings
+- `/enable_checkin 09:00`: enable daily check-in reminders at local time
+- `/disable_checkin`: disable daily check-in reminders
 - `/set_style hard_guardian`: apply hard guardian profile defaults
 - `/set_style balanced`: apply balanced profile defaults
 - `/templates`: show available goal templates
@@ -233,6 +244,8 @@ Expected:
 - `GET /users/:userId/goals`
 - `GET /users/:userId/profile`
 - `PATCH /users/:userId/profile`
+- `GET /users/:userId/notification-settings`
+- `PATCH /users/:userId/notification-settings`
 - `GET /users/:userId/pending-actions`
 - `POST /users/:userId/pending-actions/:pendingActionId/confirm`
 - `POST /users/:userId/pending-actions/:pendingActionId/reject`

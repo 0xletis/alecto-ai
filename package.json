@@ -10,6 +10,7 @@
     "db:studio": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && pnpm --filter @operator-agent/db db:studio",
     "dev:api": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && pnpm --filter @operator-agent/core build && pnpm --filter @operator-agent/db build && pnpm --filter @operator-agent/llm build && pnpm --filter @operator-agent/api dev",
     "dev:telegram": "pnpm --filter @operator-agent/telegram-bot dev",
+    "dev:worker": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && pnpm --filter @operator-agent/core build && pnpm --filter @operator-agent/db build && pnpm --filter @operator-agent/worker dev",
     "typecheck": "pnpm -r typecheck"
   },
   "devDependencies": {
