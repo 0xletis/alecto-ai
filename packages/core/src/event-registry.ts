@@ -76,6 +76,7 @@ export const eventRegistry = [
   { type: "reflection.daily_checkin_completed", domain: "reflection" },
   { type: "reflection.journal_entry_created", domain: "reflection" },
   { type: "reflection.mood_logged", domain: "reflection" },
+  { type: "reflection.energy_logged", domain: "reflection" },
   { type: "reflection.anxiety_logged", domain: "reflection" },
   { type: "reflection.focus_logged", domain: "reflection" },
   { type: "reflection.impulse_logged", domain: "reflection" },

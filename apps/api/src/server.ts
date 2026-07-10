@@ -1,8 +1,12 @@
 import Fastify from "fastify";
 import {
   buildDailyReview,
+  CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
+  DailyCheckInInputSchema,
   eventRegistry,
+  getGoalTemplate,
+  goalTemplates,
   processMessage,
   processMessageFromAnalysis,
   ProcessMessageInputSchema,
@@ -16,6 +20,7 @@ import { analyzeMessageWithOpenAI, type OpenAIMessageAnalysis } from "@operator-
 import {
   archiveGoal,
   createEvent,
+  createEvents,
   createEventsFromExtracted,
   createGoal,
   createPendingAction,
@@ -49,6 +54,22 @@ export function buildServer() {
   server.get("/events/types", async () => ({
     eventTypes: eventRegistry
   }));
+
+  server.get("/goal-templates", async () => ({
+    goalTemplates
+  }));
+
+  server.get<{ Params: { templateId: string } }>("/goal-templates/:templateId", async (request, reply) => {
+    const template = getGoalTemplate(request.params.templateId);
+
+    if (!template) {
+      return reply.status(404).send({
+        error: "Goal template not found"
+      });
+    }
+
+    return { goalTemplate: template };
+  });
 
   server.post("/messages/process", async (request, reply) => {
     const parsed = ProcessMessageInputSchema.safeParse(request.body);
@@ -247,6 +268,53 @@ export function buildServer() {
     };
   });
 
+  server.post<{ Params: { userId: string } }>("/users/:userId/goals/from-template", async (request, reply) => {
+    const parsed = CreateGoalFromTemplateInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    const template = getGoalTemplate(parsed.data.templateId);
+
+    if (!template) {
+      return reply.status(404).send({
+        error: "Goal template not found"
+      });
+    }
+
+    return {
+      goal: await createGoal(request.params.userId, {
+        title: parsed.data.title,
+        category: template.category,
+        why: parsed.data.why,
+        templateId: template.id,
+        targetMetrics: parsed.data.targetMetrics
+      })
+    };
+  });
+
+  server.post<{ Params: { userId: string } }>("/users/:userId/checkins/daily", async (request, reply) => {
+    const parsed = DailyCheckInInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    const events = await createDailyCheckInEvents(request.params.userId, parsed.data.answers);
+
+    return {
+      events,
+      reply: `Check-in saved: ${formatCheckInConfirmation(parsed.data.answers)}.`
+    };
+  });
+
   server.patch<{ Params: { userId: string; goalId: string } }>(
     "/users/:userId/goals/:goalId/archive",
     async (request, reply) => {
@@ -330,6 +398,128 @@ function isFinancialRiskIntent(intent: MessageIntent): boolean {
   return intent === "betting_intent" || intent === "trading_intent";
 }
 
+async function createDailyCheckInEvents(
+  userId: string,
+  answers: Array<{ key: string; value: string | number | boolean }>
+) {
+  const answerMap = new Map(answers.map((answer) => [answer.key, answer.value]));
+  const eventInputs: Parameters<typeof createEvents>[1] = [
+    {
+      type: "reflection.daily_checkin_completed",
+      source: "manual",
+      data: {
+        answers: Object.fromEntries(answerMap)
+      },
+      confidence: 1,
+      evidence: ["manual daily check-in"]
+    }
+  ];
+
+  const energy = numberAnswer(answerMap.get("energy"));
+  const anxiety = numberAnswer(answerMap.get("anxiety"));
+  const focus = numberAnswer(answerMap.get("focus"));
+  const gamblingImpulse = numberAnswer(answerMap.get("gambling_impulse") ?? answerMap.get("gambling"));
+  const tradingImpulse = numberAnswer(answerMap.get("trading_impulse") ?? answerMap.get("trading"));
+  const notes = textAnswer(answerMap.get("notes"));
+
+  if (energy !== undefined) {
+    eventInputs.push({
+      type: "reflection.energy_logged",
+      source: "manual",
+      data: { value: energy },
+      confidence: 1,
+      evidence: [`energy=${energy}`]
+    });
+  }
+
+  if (anxiety !== undefined) {
+    eventInputs.push({
+      type: "reflection.anxiety_logged",
+      source: "manual",
+      data: { value: anxiety },
+      confidence: 1,
+      evidence: [`anxiety=${anxiety}`]
+    });
+  }
+
+  if (focus !== undefined) {
+    eventInputs.push({
+      type: "reflection.focus_logged",
+      source: "manual",
+      data: { value: focus },
+      confidence: 1,
+      evidence: [`focus=${focus}`]
+    });
+  }
+
+  if (gamblingImpulse !== undefined) {
+    eventInputs.push({
+      type: "reflection.impulse_logged",
+      source: "manual",
+      data: { kind: "gambling", value: gamblingImpulse },
+      confidence: 1,
+      evidence: [`gambling_impulse=${gamblingImpulse}`]
+    });
+  }
+
+  if (tradingImpulse !== undefined) {
+    eventInputs.push({
+      type: "reflection.impulse_logged",
+      source: "manual",
+      data: { kind: "trading", value: tradingImpulse },
+      confidence: 1,
+      evidence: [`trading_impulse=${tradingImpulse}`]
+    });
+  }
+
+  if (notes) {
+    eventInputs.push({
+      type: "reflection.journal_entry_created",
+      source: "manual",
+      data: { text: notes },
+      confidence: 1,
+      evidence: [notes]
+    });
+  }
+
+  return createEvents(userId, eventInputs);
+}
+
+function formatCheckInConfirmation(answers: Array<{ key: string; value: string | number | boolean }>) {
+  const labels: Record<string, string> = {
+    energy: "energy",
+    anxiety: "anxiety",
+    focus: "focus",
+    gambling_impulse: "gambling impulse",
+    gambling: "gambling impulse",
+    trading_impulse: "trading impulse",
+    trading: "trading impulse"
+  };
+
+  const parts = answers
+    .filter((answer) => answer.key !== "notes")
+    .map((answer) => `${labels[answer.key] ?? answer.key} ${answer.value}`);
+
+  return parts.length > 0 ? joinReadableList(parts) : "daily check-in";
+}
+
+function numberAnswer(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return value;
+  }
+
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+
+  return undefined;
+}
+
+function textAnswer(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
 interface StructuralProposal {
   type: PendingActionType;
   summary: string;
@@ -406,17 +596,23 @@ function detectStructuralProposal(
   }
 
   if (
-    /\b(i want to focus on|create a goal to|my new focus is|i want to find|quiero centrarme en|quiero mejorar)\b/i.test(
+    /\b(i want to focus on|create a goal to|my new focus is|i want to find|i want to get|i want to read|i want to stop|i want to build|quiero centrarme en|quiero mejorar|quiero buscar|quiero dormir)\b/i.test(
       message
     )
   ) {
-    const category = inferGoalCategory(normalized);
-    const title = inferGoalTitle(normalized, category);
+    const templateId = inferGoalTemplateId(normalized);
+    const template = templateId ? getGoalTemplate(templateId) : undefined;
+    const category = template?.category ?? inferGoalCategory(normalized);
+    const title = inferGoalTitle(normalized, category, templateId);
 
     return {
       type: "goal_create",
       summary: `Create goal: ${title}`,
-      payload: { title, category },
+      payload: {
+        title,
+        category,
+        ...(templateId ? { templateId } : {})
+      },
       reply: `I can create this goal: ${title} (${category}). Reply yes to confirm or no to cancel.`
     };
   }
@@ -491,7 +687,63 @@ function inferGoalCategory(message: string): string {
   return "custom";
 }
 
-function inferGoalTitle(message: string, category: string): string {
+function inferGoalTemplateId(message: string): string | undefined {
+  if (/\b(find a new job|find.*job|buscar trabajo|job search|cv|recruiter|interview)\b/.test(message)) {
+    return "career.job_search";
+  }
+
+  if (/\b(get stronger|strength|gym|train|entrenar|fuerte)\b/.test(message)) {
+    return "health.strength_energy";
+  }
+
+  if (/\b(sleep better|dormir mejor|sleep)\b/.test(message)) {
+    return "health.sleep_better";
+  }
+
+  if (/\b(read more|leer m[aá]s|reading)\b/.test(message)) {
+    return "learning.reading_more";
+  }
+
+  if (/\b(learn|study|course|rust|aprender|estudiar)\b/.test(message)) {
+    return "learning.skill_learning";
+  }
+
+  if (/\b(stop betting|betting impulsively|control betting|control trading|apostar|apuestas|trading)\b/.test(message)) {
+    return "finance.control_betting_trading";
+  }
+
+  if (/\b(build a startup|build.*project|startup|project|product)\b/.test(message)) {
+    return "creative.build_project";
+  }
+
+  return undefined;
+}
+
+function inferGoalTitle(message: string, category: string, templateId?: string): string {
+  if (templateId === "career.job_search") {
+    return "Find a new job";
+  }
+
+  if (templateId === "health.strength_energy") {
+    return "Improve strength and energy";
+  }
+
+  if (templateId === "health.sleep_better") {
+    return "Sleep better";
+  }
+
+  if (templateId === "learning.reading_more") {
+    return "Read more";
+  }
+
+  if (templateId === "finance.control_betting_trading") {
+    return "Control betting and trading";
+  }
+
+  if (templateId === "creative.build_project") {
+    return "Build project momentum";
+  }
+
   if (category === "career") {
     return "Find a new job";
   }
@@ -590,17 +842,19 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
   }
 
   if (pendingAction.type === "goal_create") {
-    const { title, category, why } = pendingAction.payload;
+    const { title, category, why, templateId, targetMetrics } = pendingAction.payload;
 
     if (typeof title !== "string" || typeof category !== "string") {
       throw new Error("Invalid goal_create payload.");
     }
 
-    await createGoal(userId, {
+    await createGoal(userId, CreateGoalInputSchema.parse({
       title,
       category,
-      why: typeof why === "string" ? why : undefined
-    });
+      why: typeof why === "string" ? why : undefined,
+      templateId: typeof templateId === "string" ? templateId : undefined,
+      targetMetrics: Array.isArray(targetMetrics) ? targetMetrics : undefined
+    }));
 
     return {
       reply: `Confirmed. I created the goal: ${title}.`

@@ -129,6 +129,44 @@ bot.command("create_goal", async (ctx) => {
   }
 });
 
+bot.command("templates", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<GoalTemplatesResponse>("/goal-templates");
+    await ctx.reply(formatGoalTemplates(response.goalTemplates));
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not fetch goal templates right now.");
+  }
+});
+
+bot.command("create_goal_from_template", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseCreateGoalFromTemplate(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply(
+      [
+        "Usage:",
+        "/create_goal_from_template career.job_search | Find a new Web3 developer job | Build stable career capital"
+      ].join("\n")
+    );
+    return;
+  }
+
+  try {
+    const response = await apiPost<GoalResponse>(`/users/${getTelegramUserId(ctx)}/goals/from-template`, parsed);
+    await ctx.reply(`Goal created:\n${formatGoal(response.goal)}`);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not create that template goal right now.");
+  }
+});
+
 bot.command("archive_goal", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -186,6 +224,26 @@ bot.command("events", async (ctx) => {
     await ctx.reply(formatEvents(response.events));
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not fetch your recent events right now.");
+  }
+});
+
+bot.command("checkin", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseCheckIn(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Reply with:\n/checkin energy=6 anxiety=4 focus=7 gambling=2 notes=Felt okay today");
+    return;
+  }
+
+  try {
+    const response = await apiPost<CheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily`, parsed);
+    await ctx.reply(response.reply);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not save that check-in right now.");
   }
 });
 
@@ -332,6 +390,80 @@ function parseCreateGoal(text: string) {
   };
 }
 
+function parseCreateGoalFromTemplate(text: string) {
+  const [templateId, title, why] = text.split("|").map((part) => part.trim());
+
+  if (!templateId || !title) {
+    return undefined;
+  }
+
+  return {
+    templateId,
+    title,
+    why: why || undefined
+  };
+}
+
+function parseCheckIn(text: string) {
+  if (!text) {
+    return undefined;
+  }
+
+  const answers: Array<{ key: string; value: string | number | boolean }> = [];
+  const notesIndex = text.search(/\bnotes=/i);
+  const pairText = notesIndex >= 0 ? text.slice(0, notesIndex).trim() : text;
+  const notes = notesIndex >= 0 ? text.slice(notesIndex + "notes=".length).trim() : "";
+  const pairs = pairText.split(/\s+/).filter(Boolean);
+
+  for (const pair of pairs) {
+    const [key, ...valueParts] = pair.split("=");
+    const value = valueParts.join("=");
+
+    if (!key || !value) {
+      continue;
+    }
+
+    answers.push({
+      key: normalizeCheckInKey(key),
+      value: parseCheckInValue(value)
+    });
+  }
+
+  if (notes) {
+    answers.push({
+      key: "notes",
+      value: notes
+    });
+  }
+
+  return answers.length > 0 ? { answers } : undefined;
+}
+
+function normalizeCheckInKey(key: string) {
+  if (key === "gambling") {
+    return "gambling_impulse";
+  }
+
+  if (key === "trading") {
+    return "trading_impulse";
+  }
+
+  return key;
+}
+
+function parseCheckInValue(value: string): string | number | boolean {
+  if (/^(true|yes)$/i.test(value)) {
+    return true;
+  }
+
+  if (/^(false|no)$/i.test(value)) {
+    return false;
+  }
+
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : value;
+}
+
 async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`);
 
@@ -393,10 +525,14 @@ function formatDailyReview(review: DailyReview) {
   return [
     review.summary,
     "",
+    review.activeGoals.length > 0 ? `Active goals:\n${review.activeGoals.map(formatReviewGoal).join("\n")}` : undefined,
+    review.checkIn.length > 0 ? `Check-in: ${review.checkIn.join(", ")}` : undefined,
     `Wins: ${review.wins.length > 0 ? review.wins.join(", ") : "none logged"}`,
     `Gaps: ${review.gaps.length > 0 ? review.gaps.join(", ") : "none obvious"}`,
     `Focus: ${review.suggestedFocus}`
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function formatProfile(profile: Profile) {
@@ -422,11 +558,24 @@ function formatGoals(goals: Goal[]) {
   return goals.map(formatGoal).join("\n\n");
 }
 
+function formatGoalTemplates(goalTemplates: GoalTemplate[]) {
+  if (goalTemplates.length === 0) {
+    return "No goal templates available.";
+  }
+
+  return goalTemplates.map((template) => `${template.id}: ${template.title}`).join("\n");
+}
+
+function formatReviewGoal(goal: DailyReviewGoal) {
+  return `- ${goal.title}: ${goal.status}`;
+}
+
 function formatGoal(goal: Goal) {
   return [
     `id: ${goal.id}`,
     `title: ${goal.title}`,
     `category: ${goal.category}`,
+    goal.templateId ? `template: ${goal.templateId}` : undefined,
     `status: ${goal.status}`,
     goal.why ? `why: ${goal.why}` : undefined
   ]
@@ -488,6 +637,20 @@ function formatEventData(event: Event) {
 
   if (event.type === "health.sleep_logged" && typeof event.data.duration_hours === "number") {
     return `${event.data.duration_hours} hours of sleep`;
+  }
+
+  if (
+    ["reflection.energy_logged", "reflection.anxiety_logged", "reflection.focus_logged", "reflection.impulse_logged"].includes(
+      event.type
+    ) &&
+    typeof event.data.value === "number"
+  ) {
+    const label = event.type.replace("reflection.", "").replace("_logged", "").replace("_", " ");
+    return `${label}: ${event.data.value}/10`;
+  }
+
+  if (event.type === "reflection.journal_entry_created" && typeof event.data.text === "string") {
+    return event.data.text;
   }
 
   if (event.type === "learning.reading_session_completed" && typeof event.data.duration_minutes === "number") {
@@ -553,6 +716,14 @@ interface EventsResponse {
   events: Event[];
 }
 
+interface GoalTemplatesResponse {
+  goalTemplates: GoalTemplate[];
+}
+
+interface CheckInResponse {
+  reply: string;
+}
+
 interface ProfileResponse {
   profile: Profile;
 }
@@ -571,6 +742,14 @@ interface DailyReview {
   wins: string[];
   gaps: string[];
   suggestedFocus: string;
+  activeGoals: DailyReviewGoal[];
+  checkIn: string[];
+}
+
+interface DailyReviewGoal {
+  title: string;
+  status: string;
+  templateId?: string;
 }
 
 interface Goal {
@@ -579,6 +758,13 @@ interface Goal {
   category: string;
   status: string;
   why?: string;
+  templateId?: string;
+}
+
+interface GoalTemplate {
+  id: string;
+  title: string;
+  category: string;
 }
 
 interface Event {

@@ -1,4 +1,5 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
+import { getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
 import type {
   CreateGoalInput,
   ExtractedEvent,
@@ -51,13 +52,25 @@ export async function ensureUser(userId: string) {
 
 export async function createGoal(userId: string, input: CreateGoalInput): Promise<Goal> {
   await ensureUser(userId);
+  const template = input.templateId ? getGoalTemplate(input.templateId) : undefined;
 
   const goal = await prisma.goal.create({
     data: {
       userId,
       title: input.title,
       category: input.category,
-      why: input.why
+      why: input.why,
+      templateId: input.templateId,
+      targetMetrics: input.targetMetrics
+        ? toJsonArray(input.targetMetrics)
+        : template
+          ? toJsonArray(template.suggestedMetrics)
+          : undefined,
+      checkInConfig: input.checkInConfig
+        ? toJsonArray(input.checkInConfig)
+        : template
+          ? toJsonArray(template.checkInQuestions)
+          : undefined
     }
   });
 
@@ -346,6 +359,9 @@ function toGoal(goal: Prisma.GoalGetPayload<object>): Goal {
     category: goal.category,
     status: goal.status,
     why: goal.why ?? undefined,
+    templateId: goal.templateId ?? undefined,
+    targetMetrics: parseGoalMetrics(goal.targetMetrics),
+    checkInConfig: parseGoalCheckInQuestions(goal.checkInConfig),
     createdAt: goal.createdAt,
     updatedAt: goal.updatedAt
   };
@@ -431,11 +447,33 @@ function toRecord(value: Prisma.JsonValue): Record<string, unknown> {
   return {};
 }
 
+function toRecordArray(value: Prisma.JsonValue): Record<string, unknown>[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  return value.filter(isRecordLike).map((item) => item as Record<string, unknown>);
+}
+
+function isRecordLike(value: Prisma.JsonValue): boolean {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseGoalMetrics(value: Prisma.JsonValue): Goal["targetMetrics"] {
+  const records = toRecordArray(value);
+  return records ? GoalMetricSchema.array().parse(records) : undefined;
+}
+
+function parseGoalCheckInQuestions(value: Prisma.JsonValue): Goal["checkInConfig"] {
+  const records = toRecordArray(value);
+  return records ? GoalCheckInQuestionSchema.array().parse(records) : undefined;
+}
+
 function toJsonObject(value: Record<string, unknown>): Prisma.InputJsonObject {
   return value as Prisma.InputJsonObject;
 }
 
-function toJsonArray(value: string[]): Prisma.InputJsonArray {
+function toJsonArray(value: unknown[]): Prisma.InputJsonArray {
   return value as Prisma.InputJsonArray;
 }
 

@@ -89,8 +89,11 @@ Telegram commands:
 - `/profile`: show operating profile
 - `/set_style hard_guardian`: apply hard guardian profile defaults
 - `/set_style balanced`: apply balanced profile defaults
+- `/templates`: show available goal templates
 - `/create_goal category | title | why`: create a goal
+- `/create_goal_from_template templateId | title | why`: create a structured goal from a template
 - `/archive_goal <goalId>`: archive a goal
+- `/checkin energy=6 anxiety=4 focus=7 gambling=2 notes=Felt okay today`: save a manual daily check-in
 - `/review`: daily review
 - `/goals`: active goals
 - `/events`: recent events
@@ -105,10 +108,16 @@ Verify the routes from another terminal:
 ```bash
 curl http://localhost:3000/health
 curl http://localhost:3000/events/types
+curl http://localhost:3000/goal-templates
+curl http://localhost:3000/goal-templates/career.job_search
 
 curl -X POST http://localhost:3000/users/local-user/goals \
   -H "Content-Type: application/json" \
   -d '{"title":"Apply to better jobs","category":"career","why":"Build a stronger career path"}'
+
+curl -X POST http://localhost:3000/users/local-user/goals/from-template \
+  -H "Content-Type: application/json" \
+  -d '{"templateId":"career.job_search","title":"Find a new Web3 developer job","why":"Build stable career capital"}'
 
 curl http://localhost:3000/users/local-user/profile
 
@@ -166,7 +175,23 @@ curl -X POST http://localhost:3000/messages/process \
 
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"I want to find a new job"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"no"}'
+
+curl -X POST http://localhost:3000/users/local-user/checkins/daily \
+  -H "Content-Type: application/json" \
+  -d '{
+    "answers": [
+      { "key": "energy", "value": 6 },
+      { "key": "anxiety", "value": 4 },
+      { "key": "focus", "value": 7 },
+      { "key": "gambling_impulse", "value": 2 },
+      { "key": "notes", "value": "Felt okay, applied to jobs." }
+    ]
+  }'
 
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
@@ -178,8 +203,11 @@ Expected:
 
 - `/health` returns `{ "ok": true, "service": "operator-agent-api" }`
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
+- `/goal-templates` returns structured goal templates such as `career.job_search`, `health.strength_energy`, `health.sleep_better`, `learning.reading_more`, and `finance.control_betting_trading`.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Events auto-log when detected. Profile changes, goal creation, and goal archiving proposed from natural language are stored as pending actions first and require confirmation.
+- Natural-language goal creation uses a matching template when obvious, but still asks for confirmation before creating the goal.
+- `/users/:userId/checkins/daily` saves a manual check-in as reflection events and daily review includes check-in values.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
@@ -189,6 +217,8 @@ Expected:
 
 - `GET /health`
 - `GET /events/types`
+- `GET /goal-templates`
+- `GET /goal-templates/:templateId`
 - `POST /messages/process`
 - `GET /users/:userId/events`
 - `GET /users/:userId/events/recent`
@@ -199,7 +229,9 @@ Expected:
 - `POST /users/:userId/pending-actions/:pendingActionId/confirm`
 - `POST /users/:userId/pending-actions/:pendingActionId/reject`
 - `POST /users/:userId/goals`
+- `POST /users/:userId/goals/from-template`
 - `PATCH /users/:userId/goals/:goalId/archive`
+- `POST /users/:userId/checkins/daily`
 - `GET /users/:userId/review/daily`
 
 ## Packages
