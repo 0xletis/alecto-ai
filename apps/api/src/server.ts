@@ -5,6 +5,8 @@ import {
   CreateGoalInputSchema,
   DailyCheckInInputSchema,
   eventRegistry,
+  extractEvents,
+  findGoalDuplicateWarnings,
   getGoalTemplate,
   goalTemplates,
   processMessage,
@@ -175,7 +177,7 @@ export function buildServer() {
   }));
 
   server.get<{ Params: { userId: string } }>("/users/:userId/goals", async (request) => ({
-    goals: await getGoals(request.params.userId)
+    ...formatGoalsResponse(await getGoals(request.params.userId))
   }));
 
   server.get<{ Params: { userId: string } }>("/users/:userId/profile", async (request) => ({
@@ -263,9 +265,7 @@ export function buildServer() {
       });
     }
 
-    return {
-      goal: await createGoal(request.params.userId, parsed.data)
-    };
+    return formatCreateGoalResult(await createGoal(request.params.userId, parsed.data));
   });
 
   server.post<{ Params: { userId: string } }>("/users/:userId/goals/from-template", async (request, reply) => {
@@ -286,15 +286,16 @@ export function buildServer() {
       });
     }
 
-    return {
-      goal: await createGoal(request.params.userId, {
+    return formatCreateGoalResult(
+      await createGoal(request.params.userId, {
         title: parsed.data.title,
         category: template.category,
         why: parsed.data.why,
         templateId: template.id,
-        targetMetrics: parsed.data.targetMetrics
+        targetMetrics: parsed.data.targetMetrics,
+        allowDuplicate: parsed.data.allowDuplicate
       })
-    };
+    );
   });
 
   server.post<{ Params: { userId: string } }>("/users/:userId/checkins/daily", async (request, reply) => {
@@ -398,6 +399,42 @@ function isFinancialRiskIntent(intent: MessageIntent): boolean {
   return intent === "betting_intent" || intent === "trading_intent";
 }
 
+function formatGoalsResponse(goals: Awaited<ReturnType<typeof getGoals>>) {
+  return {
+    goals: sortGoalsForDisplay(goals),
+    duplicateWarnings: findGoalDuplicateWarnings(goals)
+  };
+}
+
+function sortGoalsForDisplay(goals: Awaited<ReturnType<typeof getGoals>>) {
+  return [...goals].sort((left, right) => {
+    if (left.status === "active" && right.status !== "active") {
+      return -1;
+    }
+
+    if (left.status !== "active" && right.status === "active") {
+      return 1;
+    }
+
+    return right.createdAt.getTime() - left.createdAt.getTime();
+  });
+}
+
+function formatCreateGoalResult(result: Awaited<ReturnType<typeof createGoal>>) {
+  if (result.duplicate) {
+    return {
+      duplicate: true,
+      existingGoal: result.existingGoal,
+      message: `You already have a similar active goal: ${result.existingGoal.title}. Use /goals to review it or /archive_goal ${result.existingGoal.id} first.`
+    };
+  }
+
+  return {
+    duplicate: false,
+    goal: result.goal
+  };
+}
+
 async function createDailyCheckInEvents(
   userId: string,
   answers: Array<{ key: string; value: string | number | boolean }>
@@ -420,6 +457,10 @@ async function createDailyCheckInEvents(
   const focus = numberAnswer(answerMap.get("focus"));
   const gamblingImpulse = numberAnswer(answerMap.get("gambling_impulse") ?? answerMap.get("gambling"));
   const tradingImpulse = numberAnswer(answerMap.get("trading_impulse") ?? answerMap.get("trading"));
+  const applications = numberAnswer(answerMap.get("applications"));
+  const workoutMinutes = numberAnswer(answerMap.get("workout"));
+  const readingMinutes = numberAnswer(answerMap.get("reading"));
+  const sleepHours = numberAnswer(answerMap.get("sleep"));
   const notes = textAnswer(answerMap.get("notes"));
 
   if (energy !== undefined) {
@@ -472,7 +513,51 @@ async function createDailyCheckInEvents(
     });
   }
 
+  if (applications !== undefined) {
+    eventInputs.push({
+      type: "career.application_sent",
+      source: "manual",
+      data: { count: applications },
+      confidence: 1,
+      evidence: [`applications=${applications}`]
+    });
+  }
+
+  if (workoutMinutes !== undefined) {
+    eventInputs.push({
+      type: "health.workout_completed",
+      source: "manual",
+      data: { duration_minutes: workoutMinutes },
+      confidence: 1,
+      evidence: [`workout=${workoutMinutes}`]
+    });
+  }
+
+  if (readingMinutes !== undefined) {
+    eventInputs.push({
+      type: "learning.reading_session_completed",
+      source: "manual",
+      data: { duration_minutes: readingMinutes },
+      confidence: 1,
+      evidence: [`reading=${readingMinutes}`]
+    });
+  }
+
+  if (sleepHours !== undefined) {
+    eventInputs.push({
+      type: "health.sleep_logged",
+      source: "manual",
+      data: { duration_hours: sleepHours },
+      confidence: 1,
+      evidence: [`sleep=${sleepHours}`]
+    });
+  }
+
   if (notes) {
+    for (const event of extractHighConfidenceNoteEvents(notes, eventInputs.map((item) => item.type))) {
+      eventInputs.push(event);
+    }
+
     eventInputs.push({
       type: "reflection.journal_entry_created",
       source: "manual",
@@ -493,7 +578,11 @@ function formatCheckInConfirmation(answers: Array<{ key: string; value: string |
     gambling_impulse: "gambling impulse",
     gambling: "gambling impulse",
     trading_impulse: "trading impulse",
-    trading: "trading impulse"
+    trading: "trading impulse",
+    applications: "applications",
+    workout: "workout minutes",
+    reading: "reading minutes",
+    sleep: "sleep hours"
   };
 
   const parts = answers
@@ -501,6 +590,29 @@ function formatCheckInConfirmation(answers: Array<{ key: string; value: string |
     .map((answer) => `${labels[answer.key] ?? answer.key} ${answer.value}`);
 
   return parts.length > 0 ? joinReadableList(parts) : "daily check-in";
+}
+
+function extractHighConfidenceNoteEvents(notes: string, existingTypes: string[]): Parameters<typeof createEvents>[1] {
+  const existingTypeSet = new Set(existingTypes);
+
+  return extractEvents(notes)
+    .filter((event) => event.confidence >= 0.9 && isSpecificExtractedEvent(event) && !existingTypeSet.has(event.type))
+    .map((event) => ({
+      type: event.type,
+      source: "manual",
+      data: event.data,
+      confidence: event.confidence,
+      evidence: event.evidence
+    }));
+}
+
+function isSpecificExtractedEvent(event: ReturnType<typeof extractEvents>[number]): boolean {
+  return (
+    (event.type === "career.application_sent" && typeof event.data.count === "number") ||
+    (event.type === "health.workout_completed" && typeof event.data.duration_minutes === "number") ||
+    (event.type === "health.sleep_logged" && typeof event.data.duration_hours === "number") ||
+    (event.type === "learning.reading_session_completed" && typeof event.data.duration_minutes === "number")
+  );
 }
 
 function numberAnswer(value: unknown): number | undefined {
@@ -603,7 +715,7 @@ function detectStructuralProposal(
     const templateId = inferGoalTemplateId(normalized);
     const template = templateId ? getGoalTemplate(templateId) : undefined;
     const category = template?.category ?? inferGoalCategory(normalized);
-    const title = inferGoalTitle(normalized, category, templateId);
+    const title = inferGoalTitle(message, category, templateId);
 
     return {
       type: "goal_create",
@@ -720,6 +832,14 @@ function inferGoalTemplateId(message: string): string | undefined {
 }
 
 function inferGoalTitle(message: string, category: string, templateId?: string): string {
+  const customTitle = inferSpecificGoalTitle(message);
+
+  if (customTitle) {
+    return customTitle;
+  }
+
+  const normalized = message.toLowerCase();
+
   if (templateId === "career.job_search") {
     return "Find a new job";
   }
@@ -748,7 +868,7 @@ function inferGoalTitle(message: string, category: string, templateId?: string):
     return "Find a new job";
   }
 
-  if (category === "health" && /\b(sleep|sueñ)/.test(message)) {
+  if (category === "health" && /\b(sleep|sueñ)/.test(normalized)) {
     return "Improve sleep";
   }
 
@@ -756,11 +876,11 @@ function inferGoalTitle(message: string, category: string, templateId?: string):
     return "Improve strength and energy";
   }
 
-  if (category === "learning" && /\brust\b/.test(message)) {
+  if (category === "learning" && /\brust\b/i.test(message)) {
     return "Learn Rust";
   }
 
-  if (category === "learning" && /\b(read|leer)\b/.test(message)) {
+  if (category === "learning" && /\b(read|leer)\b/.test(normalized)) {
     return "Read more";
   }
 
@@ -777,6 +897,32 @@ function inferGoalTitle(message: string, category: string, templateId?: string):
   }
 
   return "Clarify new focus";
+}
+
+function inferSpecificGoalTitle(message: string): string | undefined {
+  const cleaned = message
+    .replace(/^\s*(i want to focus on|create a goal to|my new focus is|i want to|quiero centrarme en|quiero mejorar|quiero buscar|quiero)\s+/i, "")
+    .trim()
+    .replace(/[.!?]+$/g, "");
+
+  if (!cleaned || cleaned.length < 8) {
+    return undefined;
+  }
+
+  if (/\b(read more|study|learn|leer m[aá]s|estudiar|aprender)\b/i.test(cleaned)) {
+    return titleCaseGoal(
+      cleaned
+        .replace(/^read more and study consistently\s+(.+)$/i, "read more and study $1 consistently")
+        .replace(/^leer m[aá]s y estudiar consistentemente\s+/i, "leer más y estudiar ")
+    );
+  }
+
+  return undefined;
+}
+
+function titleCaseGoal(title: string): string {
+  const trimmed = title.trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : title;
 }
 
 function detectOpenAIStructuralProposal(analysis: OpenAIMessageAnalysis | undefined): StructuralProposal | undefined {
@@ -848,13 +994,19 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
       throw new Error("Invalid goal_create payload.");
     }
 
-    await createGoal(userId, CreateGoalInputSchema.parse({
+    const result = await createGoal(userId, CreateGoalInputSchema.parse({
       title,
       category,
       why: typeof why === "string" ? why : undefined,
       templateId: typeof templateId === "string" ? templateId : undefined,
       targetMetrics: Array.isArray(targetMetrics) ? targetMetrics : undefined
     }));
+
+    if (result.duplicate) {
+      return {
+        reply: `You already have a similar active goal: ${result.existingGoal.title}. Use /goals to review it or /archive_goal ${result.existingGoal.id} first.`
+      };
+    }
 
     return {
       reply: `Confirmed. I created the goal: ${title}.`

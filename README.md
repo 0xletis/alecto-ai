@@ -67,6 +67,8 @@ Optionally restrict access to specific Telegram users. Entries can be raw numeri
 TELEGRAM_ALLOWED_USER_IDS=123456789,telegram:987654321
 ```
 
+Replace placeholder IDs with your real Telegram user ID. Do not paste `telegram:YOUR_ID` literally. Run `/whoami` in the bot to get your ID.
+
 If `TELEGRAM_ALLOWED_USER_IDS` is empty or missing, everyone is allowed. `/whoami` always works, even before a user is allowlisted, so people can send their Telegram ID to the owner.
 
 Run the API and the Telegram bot in separate terminals:
@@ -93,7 +95,7 @@ Telegram commands:
 - `/create_goal category | title | why`: create a goal
 - `/create_goal_from_template templateId | title | why`: create a structured goal from a template
 - `/archive_goal <goalId>`: archive a goal
-- `/checkin energy=6 anxiety=4 focus=7 gambling=2 notes=Felt okay today`: save a manual daily check-in
+- `/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today`: save a manual daily check-in
 - `/review`: daily review
 - `/goals`: active goals
 - `/events`: recent events
@@ -189,6 +191,10 @@ curl -X POST http://localhost:3000/users/local-user/checkins/daily \
       { "key": "anxiety", "value": 4 },
       { "key": "focus", "value": 7 },
       { "key": "gambling_impulse", "value": 2 },
+      { "key": "applications", "value": 2 },
+      { "key": "workout", "value": 45 },
+      { "key": "reading", "value": 30 },
+      { "key": "sleep", "value": 7 },
       { "key": "notes", "value": "Felt okay, applied to jobs." }
     ]
   }'
@@ -207,7 +213,9 @@ Expected:
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Events auto-log when detected. Profile changes, goal creation, and goal archiving proposed from natural language are stored as pending actions first and require confirmation.
 - Natural-language goal creation uses a matching template when obvious, but still asks for confirmation before creating the goal.
+- Duplicate active goals are blocked by default when the title, template, or similar category/title already exists. Use `/goals` to review similar goals or archive the older one first.
 - `/users/:userId/checkins/daily` saves a manual check-in as reflection events and daily review includes check-in values.
+- Check-in fields `applications`, `workout`, `reading`, and `sleep` create structured progress events. Notes are journal context unless they contain clear numeric phrases like `sent 2 CVs`, `trained 45 minutes`, or `read 30 minutes`.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.

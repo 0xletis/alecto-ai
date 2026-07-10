@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { Goal } from "./goals.js";
+import { findDuplicateActiveGoal, findGoalDuplicateWarnings, type Goal } from "./goals.js";
 import type { StoredEvent } from "./events.js";
 import { getGoalTemplate } from "./goal-templates.js";
 
@@ -16,7 +16,8 @@ export const DailyReviewSchema = z.object({
   gaps: z.array(z.string()),
   suggestedFocus: z.string(),
   activeGoals: z.array(DailyReviewGoalStatusSchema).default([]),
-  checkIn: z.array(z.string()).default([])
+  checkIn: z.array(z.string()).default([]),
+  warnings: z.array(z.string()).default([])
 });
 
 export interface BuildDailyReviewInput {
@@ -32,9 +33,11 @@ export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
   const checkInSummaries = summarizeCheckIn(input.todayEvents);
   const combinedSummaries = [...eventSummaries, ...checkInSummaries];
   const wins = eventSummaries.length > 0 ? eventSummaries : ["No logged wins yet today"];
-  const gaps = buildGaps(input.activeGoals, input.todayEvents);
-  const suggestedFocus = buildSuggestedFocus(input.activeGoals, gaps);
-  const activeGoals = buildActiveGoalStatuses(input.activeGoals, input.todayEvents);
+  const uniqueActiveGoals = dedupeActiveGoalsForReview(input.activeGoals);
+  const gaps = buildGaps(uniqueActiveGoals, input.todayEvents);
+  const suggestedFocus = buildSuggestedFocus(uniqueActiveGoals, gaps);
+  const activeGoals = buildActiveGoalStatuses(uniqueActiveGoals, input.todayEvents);
+  const warnings = buildDuplicateWarnings(input.activeGoals);
   const summary =
     combinedSummaries.length > 0
       ? `Today: ${joinReadableList(combinedSummaries)}.`
@@ -47,7 +50,8 @@ export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
     gaps,
     suggestedFocus,
     activeGoals,
-    checkIn: checkInSummaries
+    checkIn: checkInSummaries,
+    warnings
   });
 }
 
@@ -83,7 +87,6 @@ function buildGaps(activeGoals: Goal[], todayEvents: StoredEvent[]): string[] {
   }
 
   const todayEventTypes = new Set<string>(todayEvents.map((event) => event.type));
-  const eventDomains = new Set(todayEvents.map((event) => event.type.split(".")[0]));
   const gaps = activeGoals
     .filter((goal) => {
       if (goal.templateId) {
@@ -91,7 +94,7 @@ function buildGaps(activeGoals: Goal[], todayEvents: StoredEvent[]): string[] {
         return template ? !template.relevantEventTypes.some((eventType) => todayEventTypes.has(eventType)) : true;
       }
 
-      return !eventDomains.has(goal.category);
+      return false;
     })
     .map((goal) => `No logged progress for ${goal.title}`);
 
@@ -134,14 +137,52 @@ function buildActiveGoalStatuses(activeGoals: Goal[], todayEvents: StoredEvent[]
       };
     }
 
-    const hasProgress = todayEvents.some((event) => event.type.split(".")[0] === goal.category);
-
     return {
       title: goal.title,
-      status: hasProgress ? "progress logged" : "no relevant event today",
+      status: "custom goal, no template metrics configured",
       templateId: goal.templateId
     };
   });
+}
+
+function dedupeActiveGoalsForReview(activeGoals: Goal[]): Goal[] {
+  const uniqueGoals: Goal[] = [];
+
+  for (const goal of activeGoals) {
+    if (
+      findDuplicateActiveGoal(
+        {
+          title: goal.title,
+          category: goal.category,
+          templateId: goal.templateId
+        },
+        uniqueGoals
+      )
+    ) {
+      continue;
+    }
+
+    uniqueGoals.push(goal);
+  }
+
+  return uniqueGoals;
+}
+
+function buildDuplicateWarnings(activeGoals: Goal[]): string[] {
+  const warnings = findGoalDuplicateWarnings(activeGoals);
+  const seen = new Set<string>();
+
+  return warnings
+    .map((warning) => warning.similarGoalTitle)
+    .filter((title) => {
+      if (seen.has(title)) {
+        return false;
+      }
+
+      seen.add(title);
+      return true;
+    })
+    .map((title) => `Possible duplicate goals: ${title} appears more than once.`);
 }
 
 function summarizeCheckIn(events: StoredEvent[]): string[] {

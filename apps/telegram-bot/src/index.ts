@@ -123,6 +123,16 @@ bot.command("create_goal", async (ctx) => {
 
   try {
     const response = await apiPost<GoalResponse>(`/users/${getTelegramUserId(ctx)}/goals`, parsed);
+    if (response.duplicate) {
+      await ctx.reply(formatDuplicateGoalMessage(response));
+      return;
+    }
+
+    if (!response.goal) {
+      await ctx.reply("I could not create that goal right now.");
+      return;
+    }
+
     await ctx.reply(`Goal created:\n${formatGoal(response.goal)}`);
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not create that goal right now.");
@@ -161,6 +171,16 @@ bot.command("create_goal_from_template", async (ctx) => {
 
   try {
     const response = await apiPost<GoalResponse>(`/users/${getTelegramUserId(ctx)}/goals/from-template`, parsed);
+    if (response.duplicate) {
+      await ctx.reply(formatDuplicateGoalMessage(response));
+      return;
+    }
+
+    if (!response.goal) {
+      await ctx.reply("I could not create that template goal right now.");
+      return;
+    }
+
     await ctx.reply(`Goal created:\n${formatGoal(response.goal)}`);
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not create that template goal right now.");
@@ -181,6 +201,11 @@ bot.command("archive_goal", async (ctx) => {
 
   try {
     const response = await apiPatch<GoalResponse>(`/users/${getTelegramUserId(ctx)}/goals/${goalId}/archive`, {});
+    if (!response.goal) {
+      await ctx.reply("I could not archive that goal. Check the goal ID and try again.");
+      return;
+    }
+
     await ctx.reply(`Goal archived:\n${formatGoal(response.goal)}`);
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not archive that goal. Check the goal ID and try again.");
@@ -207,8 +232,7 @@ bot.command("goals", async (ctx) => {
 
   try {
     const response = await apiGet<GoalsResponse>(`/users/${getTelegramUserId(ctx)}/goals`);
-    const activeGoals = response.goals.filter((goal) => goal.status === "active");
-    await ctx.reply(formatGoals(activeGoals));
+    await ctx.reply(formatGoals(response.goals, response.duplicateWarnings ?? []));
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not fetch your goals right now.");
   }
@@ -235,7 +259,14 @@ bot.command("checkin", async (ctx) => {
   const parsed = parseCheckIn(getCommandText(ctx));
 
   if (!parsed) {
-    await ctx.reply("Reply with:\n/checkin energy=6 anxiety=4 focus=7 gambling=2 notes=Felt okay today");
+    await ctx.reply(
+      [
+        "/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today",
+        "",
+        "applications/workout/reading/sleep count as progress events.",
+        "notes are journal context, not guaranteed structured progress unless you include clear numbers."
+      ].join("\n")
+    );
     return;
   }
 
@@ -526,6 +557,7 @@ function formatDailyReview(review: DailyReview) {
     review.summary,
     "",
     review.activeGoals.length > 0 ? `Active goals:\n${review.activeGoals.map(formatReviewGoal).join("\n")}` : undefined,
+    review.warnings.length > 0 ? `Warnings:\n${review.warnings.map((warning) => `- ${warning}`).join("\n")}` : undefined,
     review.checkIn.length > 0 ? `Check-in: ${review.checkIn.join(", ")}` : undefined,
     `Wins: ${review.wins.length > 0 ? review.wins.join(", ") : "none logged"}`,
     `Gaps: ${review.gaps.length > 0 ? review.gaps.join(", ") : "none obvious"}`,
@@ -550,12 +582,16 @@ function formatProfile(profile: Profile) {
   ].join("\n");
 }
 
-function formatGoals(goals: Goal[]) {
+function formatGoals(goals: Goal[], duplicateWarnings: GoalDuplicateWarning[] = []) {
   if (goals.length === 0) {
     return "No active goals yet. Create one with /create_goal category | title | why";
   }
 
-  return goals.map(formatGoal).join("\n\n");
+  const warnings = duplicateWarnings.map(
+    (warning) => `Possible duplicate: this goal looks similar to ${warning.similarGoalTitle}.`
+  );
+
+  return [...goals.map((goal) => formatGoal(goal, duplicateWarnings)), ...warnings].join("\n\n");
 }
 
 function formatGoalTemplates(goalTemplates: GoalTemplate[]) {
@@ -570,14 +606,28 @@ function formatReviewGoal(goal: DailyReviewGoal) {
   return `- ${goal.title}: ${goal.status}`;
 }
 
-function formatGoal(goal: Goal) {
+function formatDuplicateGoalMessage(response: GoalResponse) {
+  if (!response.duplicate || !response.existingGoal) {
+    return "I could not create that goal right now.";
+  }
+
+  return (
+    response.message ??
+    `You already have a similar active goal: ${response.existingGoal.title}. Use /goals to review it or /archive_goal ${response.existingGoal.id} first.`
+  );
+}
+
+function formatGoal(goal: Goal, duplicateWarnings: GoalDuplicateWarning[] = []) {
+  const warning = duplicateWarnings.find((item) => item.goalId === goal.id);
+
   return [
     `id: ${goal.id}`,
     `title: ${goal.title}`,
     `category: ${goal.category}`,
     goal.templateId ? `template: ${goal.templateId}` : undefined,
     `status: ${goal.status}`,
-    goal.why ? `why: ${goal.why}` : undefined
+    goal.why ? `why: ${goal.why}` : undefined,
+    warning ? `Possible duplicate: this goal looks similar to ${warning.similarGoalTitle}.` : undefined
   ]
     .filter(Boolean)
     .join("\n");
@@ -706,10 +756,14 @@ interface DailyReviewResponse {
 
 interface GoalsResponse {
   goals: Goal[];
+  duplicateWarnings?: GoalDuplicateWarning[];
 }
 
 interface GoalResponse {
-  goal: Goal;
+  duplicate?: boolean;
+  goal?: Goal;
+  existingGoal?: Goal;
+  message?: string;
 }
 
 interface EventsResponse {
@@ -744,6 +798,7 @@ interface DailyReview {
   suggestedFocus: string;
   activeGoals: DailyReviewGoal[];
   checkIn: string[];
+  warnings: string[];
 }
 
 interface DailyReviewGoal {
@@ -759,6 +814,12 @@ interface Goal {
   status: string;
   why?: string;
   templateId?: string;
+}
+
+interface GoalDuplicateWarning {
+  goalId: string;
+  similarGoalId: string;
+  similarGoalTitle: string;
 }
 
 interface GoalTemplate {

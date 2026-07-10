@@ -1,5 +1,5 @@
 import { PrismaClient, type Prisma } from "@prisma/client";
-import { getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
+import { findDuplicateActiveGoal, getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
 import type {
   CreateGoalInput,
   ExtractedEvent,
@@ -42,6 +42,16 @@ export interface CreatePendingActionInput {
   expiresAt?: Date;
 }
 
+export type CreateGoalResult =
+  | {
+      duplicate: false;
+      goal: Goal;
+    }
+  | {
+      duplicate: true;
+      existingGoal: Goal;
+    };
+
 export async function ensureUser(userId: string) {
   return prisma.user.upsert({
     where: { id: userId },
@@ -50,9 +60,18 @@ export async function ensureUser(userId: string) {
   });
 }
 
-export async function createGoal(userId: string, input: CreateGoalInput): Promise<Goal> {
+export async function createGoal(userId: string, input: CreateGoalInput): Promise<CreateGoalResult> {
   await ensureUser(userId);
   const template = input.templateId ? getGoalTemplate(input.templateId) : undefined;
+  const activeGoals = await getActiveGoals(userId);
+  const duplicateGoal = input.allowDuplicate ? undefined : findDuplicateActiveGoal(input, activeGoals);
+
+  if (duplicateGoal) {
+    return {
+      duplicate: true,
+      existingGoal: duplicateGoal
+    };
+  }
 
   const goal = await prisma.goal.create({
     data: {
@@ -74,7 +93,10 @@ export async function createGoal(userId: string, input: CreateGoalInput): Promis
     }
   });
 
-  return toGoal(goal);
+  return {
+    duplicate: false,
+    goal: toGoal(goal)
+  };
 }
 
 export async function getGoals(userId: string): Promise<Goal[]> {
