@@ -45,6 +45,9 @@ importers:
 
   apps/telegram-bot:
     dependencies:
+      '@operator-agent/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       dotenv:
         specifier: ^16.4.7
         version: 16.6.1
@@ -61,6 +64,9 @@ importers:
 
   apps/worker:
     dependencies:
+      '@operator-agent/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@operator-agent/db':
         specifier: workspace:*
         version: link:../../packages/db

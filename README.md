@@ -100,6 +100,7 @@ Telegram commands:
 - `/notifications`: show notification settings
 - `/enable_checkin 09:00`: enable daily check-in reminders at local time
 - `/disable_checkin`: disable daily check-in reminders
+- `/send_checkin_now`: send the daily check-in reminder text immediately for testing
 - `/set_style hard_guardian`: apply hard guardian profile defaults
 - `/set_style balanced`: apply balanced profile defaults
 - `/templates`: show available goal templates
@@ -107,6 +108,7 @@ Telegram commands:
 - `/create_goal_from_template templateId | title | why`: create a structured goal from a template
 - `/archive_goal <goalId>`: archive a goal
 - `/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today`: save a manual daily check-in
+- `/checkin_natural`: show natural-language daily check-in examples
 - `/review`: daily review
 - `/goals`: active goals
 - `/events`: recent events
@@ -210,6 +212,22 @@ curl -X POST http://localhost:3000/users/local-user/checkins/daily \
     ]
   }'
 
+curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
+  -H "Content-Type: application/json" \
+  -d '{"text":"slept 6h, energy 5, anxiety 7, sent 2 cvs, trained 40 min, read 20 min, no gambling impulse"}'
+
+curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
+  -H "Content-Type: application/json" \
+  -d '{"text":"dormi 7 horas, energia 6, ansiedad 4, foco 7, mande 3 cvs y entrené 45 min"}'
+
+curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
+  -H "Content-Type: application/json" \
+  -d '{"text":"energy 6 anxiety 3 focus 8, no bets, read for half an hour"}'
+
+curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
+  -H "Content-Type: application/json" \
+  -d '{"text":"hoy fatal, dormí 5h, ansiedad 8, ganas de apostar 7"}'
+
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
 curl http://localhost:3000/users/local-user/goals
@@ -226,7 +244,12 @@ Expected:
 - Natural-language goal creation uses a matching template when obvious, but still asks for confirmation before creating the goal.
 - Duplicate active goals are blocked by default when the title, template, or similar category/title already exists. Use `/goals` to review similar goals or archive the older one first.
 - `/users/:userId/checkins/daily` saves a manual check-in as reflection events and daily review includes check-in values.
+- `/users/:userId/checkins/daily/text` parses natural-language check-ins and creates the same structured events as `/checkins/daily`.
 - Check-in fields `applications`, `workout`, `reading`, and `sleep` create structured progress events. Notes are journal context unless they contain clear numeric phrases like `sent 2 CVs`, `trained 45 minutes`, or `read 30 minutes`.
+- Telegram normal messages that look like daily check-ins are sent to `/checkins/daily/text`. Structured `/checkin key=value` still works.
+- Natural check-in warnings include high anxiety plus gambling impulse and low sleep.
+- Daily reminders send once per user per day because of `NotificationLog`. Use `/send_checkin_now` to test the reminder text repeatedly without creating a log.
+- Daily review sums progress metrics like applications, workout minutes, and reading minutes, but uses the latest state metrics for sleep, energy, anxiety, focus, and impulse.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
@@ -253,6 +276,7 @@ Expected:
 - `POST /users/:userId/goals/from-template`
 - `PATCH /users/:userId/goals/:goalId/archive`
 - `POST /users/:userId/checkins/daily`
+- `POST /users/:userId/checkins/daily/text`
 - `GET /users/:userId/review/daily`
 
 ## Packages

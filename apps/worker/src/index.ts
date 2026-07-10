@@ -4,6 +4,7 @@ import {
   getUsersWithDailyCheckinEnabled,
   hasNotificationLog
 } from "@operator-agent/db";
+import { dailyCheckinReminderText } from "@operator-agent/core";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -53,7 +54,7 @@ async function runTick() {
       continue;
     }
 
-    await sendTelegramMessage(item.telegramUserId, dailyCheckinMessage);
+    await sendTelegramMessage(item.telegramUserId, dailyCheckinReminderText);
     const logged = await createNotificationLog(logInput);
 
     if (logged) {
@@ -105,12 +106,3 @@ function formatLocalDate(date: Date, timezone: string): string {
 function getPart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
   return parts.find((part) => part.type === type)?.value ?? "";
 }
-
-const dailyCheckinMessage = [
-  "Daily check-in:",
-  "Reply with:",
-  "/checkin energy= anxiety= focus= gambling= applications= workout= reading= sleep= notes=",
-  "",
-  "Example:",
-  "/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today"
-].join("\n");

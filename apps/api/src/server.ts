@@ -4,6 +4,7 @@ import {
   CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
   DailyCheckInInputSchema,
+  DailyCheckInTextInputSchema,
   eventRegistry,
   extractEvents,
   findGoalDuplicateWarnings,
@@ -12,6 +13,8 @@ import {
   processMessage,
   processMessageFromAnalysis,
   ProcessMessageInputSchema,
+  parsedDailyCheckInToAnswers,
+  parseDailyCheckinText,
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
   type MessageIntent,
@@ -37,6 +40,7 @@ import {
   getPendingActions,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
+  hasRecentNotificationLog,
   confirmPendingAction,
   ensureUser,
   rejectPendingAction,
@@ -338,6 +342,39 @@ export function buildServer() {
     };
   });
 
+  server.post<{ Params: { userId: string } }>("/users/:userId/checkins/daily/text", async (request, reply) => {
+    const parsed = DailyCheckInTextInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    const parsedCheckIn = parseDailyCheckinText(parsed.data.text);
+    const answers = parsedDailyCheckInToAnswers(parsedCheckIn);
+    const events = await createDailyCheckInEvents(request.params.userId, answers, parsed.data.text);
+
+    return {
+      parsed: parsedCheckIn,
+      events,
+      reply: composeNaturalCheckInReply(parsedCheckIn)
+    };
+  });
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/notification-logs/recent-daily-checkin", async (request) => {
+    const now = new Date();
+
+    return {
+      recent: await hasRecentNotificationLog({
+        userId: request.params.userId,
+        type: "daily_checkin",
+        since: new Date(now.getTime() - 2 * 60 * 60 * 1000)
+      })
+    };
+  });
+
   server.patch<{ Params: { userId: string; goalId: string } }>(
     "/users/:userId/goals/:goalId/archive",
     async (request, reply) => {
@@ -459,9 +496,11 @@ function formatCreateGoalResult(result: Awaited<ReturnType<typeof createGoal>>) 
 
 async function createDailyCheckInEvents(
   userId: string,
-  answers: Array<{ key: string; value: string | number | boolean }>
+  answers: Array<{ key: string; value: string | number | boolean }>,
+  evidenceText?: string
 ) {
   const answerMap = new Map(answers.map((answer) => [answer.key, answer.value]));
+  const evidence = evidenceText ? [evidenceText] : undefined;
   const eventInputs: Parameters<typeof createEvents>[1] = [
     {
       type: "reflection.daily_checkin_completed",
@@ -470,7 +509,7 @@ async function createDailyCheckInEvents(
         answers: Object.fromEntries(answerMap)
       },
       confidence: 1,
-      evidence: ["manual daily check-in"]
+      evidence: evidence ?? ["manual daily check-in"]
     }
   ];
 
@@ -491,7 +530,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { value: energy },
       confidence: 1,
-      evidence: [`energy=${energy}`]
+      evidence: evidence ?? [`energy=${energy}`]
     });
   }
 
@@ -501,7 +540,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { value: anxiety },
       confidence: 1,
-      evidence: [`anxiety=${anxiety}`]
+      evidence: evidence ?? [`anxiety=${anxiety}`]
     });
   }
 
@@ -511,7 +550,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { value: focus },
       confidence: 1,
-      evidence: [`focus=${focus}`]
+      evidence: evidence ?? [`focus=${focus}`]
     });
   }
 
@@ -521,7 +560,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { kind: "gambling", value: gamblingImpulse },
       confidence: 1,
-      evidence: [`gambling_impulse=${gamblingImpulse}`]
+      evidence: evidence ?? [`gambling_impulse=${gamblingImpulse}`]
     });
   }
 
@@ -531,7 +570,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { kind: "trading", value: tradingImpulse },
       confidence: 1,
-      evidence: [`trading_impulse=${tradingImpulse}`]
+      evidence: evidence ?? [`trading_impulse=${tradingImpulse}`]
     });
   }
 
@@ -541,7 +580,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { count: applications },
       confidence: 1,
-      evidence: [`applications=${applications}`]
+      evidence: evidence ?? [`applications=${applications}`]
     });
   }
 
@@ -551,7 +590,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { duration_minutes: workoutMinutes },
       confidence: 1,
-      evidence: [`workout=${workoutMinutes}`]
+      evidence: evidence ?? [`workout=${workoutMinutes}`]
     });
   }
 
@@ -561,7 +600,7 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { duration_minutes: readingMinutes },
       confidence: 1,
-      evidence: [`reading=${readingMinutes}`]
+      evidence: evidence ?? [`reading=${readingMinutes}`]
     });
   }
 
@@ -571,12 +610,12 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { duration_hours: sleepHours },
       confidence: 1,
-      evidence: [`sleep=${sleepHours}`]
+      evidence: evidence ?? [`sleep=${sleepHours}`]
     });
   }
 
   if (notes) {
-    for (const event of extractHighConfidenceNoteEvents(notes, eventInputs.map((item) => item.type))) {
+    for (const event of extractHighConfidenceNoteEvents(notes, eventInputs.map((item) => item.type), evidenceText)) {
       eventInputs.push(event);
     }
 
@@ -585,11 +624,72 @@ async function createDailyCheckInEvents(
       source: "manual",
       data: { text: notes },
       confidence: 1,
-      evidence: [notes]
+      evidence: evidence ?? [notes]
     });
   }
 
   return createEvents(userId, eventInputs);
+}
+
+function composeNaturalCheckInReply(parsed: ReturnType<typeof parseDailyCheckinText>) {
+  const parts: string[] = [];
+
+  if (parsed.sleep !== undefined) {
+    parts.push(`slept ${parsed.sleep}h`);
+  }
+
+  if (parsed.energy !== undefined) {
+    parts.push(`energy ${parsed.energy}`);
+  }
+
+  if (parsed.anxiety !== undefined) {
+    parts.push(`anxiety ${parsed.anxiety}`);
+  }
+
+  if (parsed.focus !== undefined) {
+    parts.push(`focus ${parsed.focus}`);
+  }
+
+  if (parsed.gambling_impulse !== undefined) {
+    parts.push(`gambling impulse ${parsed.gambling_impulse}`);
+  }
+
+  if (parsed.trading_impulse !== undefined) {
+    parts.push(`trading impulse ${parsed.trading_impulse}`);
+  }
+
+  if (parsed.applications !== undefined) {
+    parts.push(`${parsed.applications} application${parsed.applications === 1 ? "" : "s"}`);
+  }
+
+  if (parsed.workout !== undefined) {
+    parts.push(`${parsed.workout} minutes of training`);
+  }
+
+  if (parsed.reading !== undefined) {
+    parts.push(`${parsed.reading} minutes of reading`);
+  }
+
+  const interpretation = composeCheckInInterpretation(parsed);
+  const summary = parts.length > 0 ? joinReadableList(parts) : "daily check-in";
+
+  return `Check-in saved: ${summary}.${interpretation ? ` ${interpretation}` : ""}`;
+}
+
+function composeCheckInInterpretation(parsed: ReturnType<typeof parseDailyCheckinText>) {
+  if ((parsed.anxiety ?? 0) >= 7 && (parsed.gambling_impulse ?? 0) >= 6) {
+    return "Careful: high anxiety plus gambling impulse is a bad decision state.";
+  }
+
+  if (parsed.sleep !== undefined && parsed.sleep < 6) {
+    return "Low sleep. Do not treat today's impulses as reliable signals.";
+  }
+
+  if (parsed.applications || parsed.workout || parsed.reading) {
+    return "Good, there was real progress today.";
+  }
+
+  return "";
 }
 
 function formatCheckInConfirmation(answers: Array<{ key: string; value: string | number | boolean }>) {
@@ -614,7 +714,11 @@ function formatCheckInConfirmation(answers: Array<{ key: string; value: string |
   return parts.length > 0 ? joinReadableList(parts) : "daily check-in";
 }
 
-function extractHighConfidenceNoteEvents(notes: string, existingTypes: string[]): Parameters<typeof createEvents>[1] {
+function extractHighConfidenceNoteEvents(
+  notes: string,
+  existingTypes: string[],
+  evidenceText?: string
+): Parameters<typeof createEvents>[1] {
   const existingTypeSet = new Set(existingTypes);
 
   return extractEvents(notes)
@@ -624,7 +728,7 @@ function extractHighConfidenceNoteEvents(notes: string, existingTypes: string[])
       source: "manual",
       data: event.data,
       confidence: event.confidence,
-      evidence: event.evidence
+      evidence: evidenceText ? [evidenceText] : event.evidence
     }));
 }
 

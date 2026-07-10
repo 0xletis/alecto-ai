@@ -29,10 +29,10 @@ export interface BuildDailyReviewInput {
 export type DailyReview = z.infer<typeof DailyReviewSchema>;
 
 export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
-  const eventSummaries = summarizeEvents(input.todayEvents);
+  const progressSummaries = summarizeProgressEvents(input.todayEvents);
   const checkInSummaries = summarizeCheckIn(input.todayEvents);
-  const combinedSummaries = [...eventSummaries, ...checkInSummaries];
-  const wins = eventSummaries.length > 0 ? eventSummaries : ["No logged wins yet today"];
+  const combinedSummaries = [...progressSummaries, ...checkInSummaries];
+  const wins = progressSummaries.length > 0 ? progressSummaries : ["No logged wins yet today"];
   const uniqueActiveGoals = dedupeActiveGoalsForReview(input.activeGoals);
   const gaps = buildGaps(uniqueActiveGoals, input.todayEvents);
   const suggestedFocus = buildSuggestedFocus(uniqueActiveGoals, gaps);
@@ -56,9 +56,12 @@ export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
 }
 
 export function summarizeEvents(events: StoredEvent[]): string[] {
+  return [...summarizeProgressEvents(events), ...summarizeCheckIn(events)];
+}
+
+function summarizeProgressEvents(events: StoredEvent[]): string[] {
   const applications = sumNumber(events, "career.application_sent", "count");
   const trainingMinutes = sumNumber(events, "health.workout_completed", "duration_minutes");
-  const sleepHours = sumNumber(events, "health.sleep_logged", "duration_hours");
   const readingMinutes = sumNumber(events, "learning.reading_session_completed", "duration_minutes");
   const summaries: string[] = [];
 
@@ -68,10 +71,6 @@ export function summarizeEvents(events: StoredEvent[]): string[] {
 
   if (trainingMinutes > 0) {
     summaries.push(`${trainingMinutes} minutes of training`);
-  }
-
-  if (sleepHours > 0) {
-    summaries.push(`${sleepHours} hours of sleep`);
   }
 
   if (readingMinutes > 0) {
@@ -90,8 +89,7 @@ function buildGaps(activeGoals: Goal[], todayEvents: StoredEvent[]): string[] {
   const gaps = activeGoals
     .filter((goal) => {
       if (goal.templateId) {
-        const template = getGoalTemplate(goal.templateId);
-        return template ? !template.relevantEventTypes.some((eventType) => todayEventTypes.has(eventType)) : true;
+        return goalStatusForTemplate(goal.templateId, todayEvents, todayEventTypes) === "no relevant event today";
       }
 
       return false;
@@ -127,12 +125,9 @@ function buildActiveGoalStatuses(activeGoals: Goal[], todayEvents: StoredEvent[]
 
   return activeGoals.map((goal) => {
     if (goal.templateId) {
-      const template = getGoalTemplate(goal.templateId);
-      const hasProgress = template?.relevantEventTypes.some((eventType) => todayEventTypes.has(eventType)) ?? false;
-
       return {
         title: goal.title,
-        status: hasProgress ? "progress logged" : "no relevant event today",
+        status: goalStatusForTemplate(goal.templateId, todayEvents, todayEventTypes),
         templateId: goal.templateId
       };
     }
@@ -143,6 +138,64 @@ function buildActiveGoalStatuses(activeGoals: Goal[], todayEvents: StoredEvent[]
       templateId: goal.templateId
     };
   });
+}
+
+function goalStatusForTemplate(templateId: string, events: StoredEvent[], todayEventTypes: Set<string>): string {
+  if (templateId === "career.job_search") {
+    return hasAny(todayEventTypes, [
+      "career.application_sent",
+      "career.recruiter_reply_received",
+      "career.interview_scheduled",
+      "career.interview_completed",
+      "career.cv_updated",
+      "career.portfolio_updated"
+    ])
+      ? "progress logged"
+      : "no relevant event today";
+  }
+
+  if (templateId === "health.strength_energy") {
+    return hasAny(todayEventTypes, ["health.workout_completed", "health.steps_logged"])
+      ? "progress logged"
+      : "no relevant event today";
+  }
+
+  if (templateId === "learning.reading_more") {
+    return hasAny(todayEventTypes, ["learning.reading_session_completed", "learning.note_created"])
+      ? "progress logged"
+      : "no relevant event today";
+  }
+
+  if (templateId === "finance.control_betting_trading") {
+    if (todayEventTypes.has("finance.betting.cooldown_triggered")) {
+      return "risk event logged";
+    }
+
+    if (todayEventTypes.has("finance.betting.bet_thesis_logged") || todayEventTypes.has("finance.trading.thesis_logged")) {
+      return "process progress logged";
+    }
+
+    const impulse = latestImpulse(events);
+
+    if (impulse !== undefined && impulse <= 3) {
+      return "stable today";
+    }
+
+    if (impulse !== undefined) {
+      return "risk state logged";
+    }
+
+    return "no relevant event today";
+  }
+
+  const template = getGoalTemplate(templateId);
+  return template?.relevantEventTypes.some((eventType) => todayEventTypes.has(eventType))
+    ? "progress logged"
+    : "no relevant event today";
+}
+
+function hasAny(eventTypes: Set<string>, expectedTypes: string[]): boolean {
+  return expectedTypes.some((eventType) => eventTypes.has(eventType));
 }
 
 function dedupeActiveGoalsForReview(activeGoals: Goal[]): Goal[] {
@@ -187,10 +240,15 @@ function buildDuplicateWarnings(activeGoals: Goal[]): string[] {
 
 function summarizeCheckIn(events: StoredEvent[]): string[] {
   const summaries: string[] = [];
+  const sleep = latestNumber(events, "health.sleep_logged", "duration_hours");
   const energy = latestNumber(events, "reflection.energy_logged", "value");
   const anxiety = latestNumber(events, "reflection.anxiety_logged", "value");
   const focus = latestNumber(events, "reflection.focus_logged", "value");
-  const impulse = latestNumber(events, "reflection.impulse_logged", "value");
+  const impulse = latestImpulseWithKind(events);
+
+  if (sleep !== undefined) {
+    summaries.push(`slept ${sleep}h`);
+  }
 
   if (energy !== undefined) {
     summaries.push(`energy: ${energy}/10`);
@@ -205,10 +263,29 @@ function summarizeCheckIn(events: StoredEvent[]): string[] {
   }
 
   if (impulse !== undefined) {
-    summaries.push(`impulse: ${impulse}/10`);
+    summaries.push(`${impulse.kind} impulse: ${impulse.value}/10`);
   }
 
   return summaries;
+}
+
+function latestImpulse(events: StoredEvent[]): number | undefined {
+  return latestImpulseWithKind(events)?.value;
+}
+
+function latestImpulseWithKind(events: StoredEvent[]): { kind: string; value: number } | undefined {
+  const event = [...events].reverse().find((item) => item.type === "reflection.impulse_logged");
+  const value = event?.data.value;
+  const kind = event?.data.kind;
+
+  if (typeof value !== "number") {
+    return undefined;
+  }
+
+  return {
+    kind: typeof kind === "string" ? kind : "financial",
+    value
+  };
 }
 
 function latestNumber(events: StoredEvent[], type: StoredEvent["type"], key: string): number | undefined {

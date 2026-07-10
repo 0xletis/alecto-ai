@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@operator-agent/core": "workspace:*",
     "@operator-agent/db": "workspace:*",
     "dotenv": "^16.4.7"
   },

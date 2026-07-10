@@ -1,5 +1,6 @@
 import { config } from "dotenv";
 import { Bot, type Context } from "grammy";
+import { countDailyCheckinSignals, dailyCheckinReminderText } from "@operator-agent/core";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -130,6 +131,14 @@ bot.command("disable_checkin", async (ctx) => {
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not disable daily check-ins right now.");
   }
+});
+
+bot.command("send_checkin_now", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  await ctx.reply(dailyCheckinReminderText);
 });
 
 bot.command("set_style", async (ctx) => {
@@ -338,6 +347,21 @@ bot.command("checkin", async (ctx) => {
   }
 });
 
+bot.command("checkin_natural", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  await ctx.reply(
+    [
+      "Natural check-in examples:",
+      "- slept 6h, energy 5, anxiety 7, sent 2 cvs, trained 40 min",
+      "- dormi 7 horas, energia 6, ansiedad 4, foco 7, mande 3 cvs y entrené 45 min",
+      "- hoy fatal, dormí 5h, ansiedad 8, ganas de apostar 7"
+    ].join("\n")
+  );
+});
+
 bot.command("pending", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -403,6 +427,15 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
+    if (!ctx.message.text.startsWith("/") && (await shouldTreatAsNaturalCheckIn(ctx))) {
+      const response = await apiPost<NaturalCheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/text`, {
+        text: ctx.message.text
+      });
+
+      await ctx.reply(response.reply);
+      return;
+    }
+
     const response = await apiPost<ProcessMessageResponse>("/messages/process", {
       userId: getTelegramUserId(ctx),
       message: ctx.message.text
@@ -557,6 +590,29 @@ function parseCheckInValue(value: string): string | number | boolean {
 
   const numberValue = Number(value);
   return Number.isFinite(numberValue) ? numberValue : value;
+}
+
+async function shouldTreatAsNaturalCheckIn(ctx: Context): Promise<boolean> {
+  const message = ctx.message?.text ?? "";
+  const signalCount = countDailyCheckinSignals(message);
+
+  if (signalCount >= 2) {
+    return true;
+  }
+
+  if (signalCount < 1) {
+    return false;
+  }
+
+  try {
+    const response = await apiGet<RecentDailyCheckInReminderResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-logs/recent-daily-checkin`
+    );
+    return response.recent;
+  } catch (error) {
+    console.error("Could not check recent daily check-in reminder", error);
+    return false;
+  }
 }
 
 async function apiGet<T>(path: string): Promise<T> {
@@ -850,6 +906,14 @@ interface GoalTemplatesResponse {
 
 interface CheckInResponse {
   reply: string;
+}
+
+interface NaturalCheckInResponse {
+  reply: string;
+}
+
+interface RecentDailyCheckInReminderResponse {
+  recent: boolean;
 }
 
 interface ProfileResponse {

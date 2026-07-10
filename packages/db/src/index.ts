@@ -360,6 +360,20 @@ export async function hasNotificationLog(input: NotificationLogInput): Promise<b
   return Boolean(log);
 }
 
+export async function hasRecentNotificationLog(input: Pick<NotificationLogInput, "userId" | "type"> & { since: Date }): Promise<boolean> {
+  const log = await prisma.notificationLog.findFirst({
+    where: {
+      userId: input.userId,
+      type: input.type,
+      sentAt: {
+        gte: input.since
+      }
+    }
+  });
+
+  return Boolean(log);
+}
+
 export async function createPendingAction(
   userId: string,
   input: CreatePendingActionInput
