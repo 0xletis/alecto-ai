@@ -1,6 +1,6 @@
 import { config } from "dotenv";
 import { Bot, type Context } from "grammy";
-import { countDailyCheckinSignals, dailyCheckinReminderText } from "@operator-agent/core";
+import { countDailyCheckinSignals } from "@operator-agent/core";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -138,7 +138,12 @@ bot.command("send_checkin_now", async (ctx) => {
     return;
   }
 
-  await ctx.reply(dailyCheckinReminderText);
+  try {
+    const response = await apiGet<DailyCheckInPromptResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/prompt`);
+    await ctx.reply(response.prompt);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not build your check-in prompt right now.");
+  }
 });
 
 bot.command("set_style", async (ctx) => {
@@ -914,6 +919,10 @@ interface NaturalCheckInResponse {
 
 interface RecentDailyCheckInReminderResponse {
   recent: boolean;
+}
+
+interface DailyCheckInPromptResponse {
+  prompt: string;
 }
 
 interface ProfileResponse {

@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import {
   buildDailyReview,
+  buildDailyCheckinPrompt,
   CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
   DailyCheckInInputSchema,
@@ -280,6 +281,14 @@ export function buildServer() {
       })
     };
   });
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/checkins/daily/prompt", async (request) => ({
+    prompt: buildDailyCheckinPrompt({
+      activeGoals: await getActiveGoals(request.params.userId),
+      userOperatingProfile: await getOrCreateUserOperatingProfile(request.params.userId),
+      recentEvents: await getRecentEvents(request.params.userId, 20)
+    })
+  }));
 
   server.post<{ Params: { userId: string } }>("/users/:userId/goals", async (request, reply) => {
     const parsed = CreateGoalInputSchema.safeParse(request.body);

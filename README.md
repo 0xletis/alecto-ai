@@ -100,7 +100,7 @@ Telegram commands:
 - `/notifications`: show notification settings
 - `/enable_checkin 09:00`: enable daily check-in reminders at local time
 - `/disable_checkin`: disable daily check-in reminders
-- `/send_checkin_now`: send the daily check-in reminder text immediately for testing
+- `/send_checkin_now`: preview the same goal-aware daily check-in prompt the worker sends
 - `/set_style hard_guardian`: apply hard guardian profile defaults
 - `/set_style balanced`: apply balanced profile defaults
 - `/templates`: show available goal templates
@@ -231,6 +231,7 @@ curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
 curl http://localhost:3000/users/local-user/goals
+curl http://localhost:3000/users/local-user/checkins/daily/prompt
 curl http://localhost:3000/users/local-user/review/daily
 ```
 
@@ -249,6 +250,8 @@ Expected:
 - Telegram normal messages that look like daily check-ins are sent to `/checkins/daily/text`. Structured `/checkin key=value` still works.
 - Natural check-in warnings include high anxiety plus gambling impulse and low sleep.
 - Daily reminders send once per user per day because of `NotificationLog`. Use `/send_checkin_now` to test the reminder text repeatedly without creating a log.
+- Daily check-in prompts are goal-aware. Active goal templates influence the prompt, for example career goals ask about applications and interviews, health goals ask about workout/sleep, finance goals ask about impulse and thesis-before-risk.
+- `/send_checkin_now` previews the same goal-aware prompt the worker sends.
 - Daily review sums progress metrics like applications, workout minutes, and reading minutes, but uses the latest state metrics for sleep, energy, anxiety, focus, and impulse.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
@@ -277,6 +280,7 @@ Expected:
 - `PATCH /users/:userId/goals/:goalId/archive`
 - `POST /users/:userId/checkins/daily`
 - `POST /users/:userId/checkins/daily/text`
+- `GET /users/:userId/checkins/daily/prompt`
 - `GET /users/:userId/review/daily`
 
 ## Packages

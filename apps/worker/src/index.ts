@@ -1,10 +1,13 @@
 import { config } from "dotenv";
 import {
   createNotificationLog,
+  getActiveGoals,
+  getOrCreateUserOperatingProfile,
+  getRecentEvents,
   getUsersWithDailyCheckinEnabled,
   hasNotificationLog
 } from "@operator-agent/db";
-import { dailyCheckinReminderText } from "@operator-agent/core";
+import { buildDailyCheckinPrompt } from "@operator-agent/core";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -54,7 +57,13 @@ async function runTick() {
       continue;
     }
 
-    await sendTelegramMessage(item.telegramUserId, dailyCheckinReminderText);
+    const prompt = buildDailyCheckinPrompt({
+      activeGoals: await getActiveGoals(item.userId),
+      userOperatingProfile: await getOrCreateUserOperatingProfile(item.userId),
+      recentEvents: await getRecentEvents(item.userId, 20)
+    });
+
+    await sendTelegramMessage(item.telegramUserId, prompt);
     const logged = await createNotificationLog(logInput);
 
     if (logged) {
