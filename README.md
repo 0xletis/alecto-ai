@@ -113,6 +113,10 @@ Telegram commands:
 - `/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today`: save a manual daily check-in
 - `/checkin_natural`: show natural-language daily check-in examples
 - `/review`: daily review
+- `/insight`: daily interpretive coaching insight
+- `/daily_insight`: alias of `/insight`
+- `/weekly`: weekly interpretive coaching insight
+- `/weekly_insight`: alias of `/weekly`
 - `/goals`: active goals
 - `/events`: recent active events with ids
 - `/events_archived`: recent events including archived/corrected status
@@ -308,6 +312,10 @@ curl -X POST http://localhost:3000/users/local-user/events/<journalEventId>/corr
 curl http://localhost:3000/users/local-user/goals
 curl http://localhost:3000/users/local-user/checkins/daily/prompt
 curl http://localhost:3000/users/local-user/review/daily
+curl http://localhost:3000/users/local-user/insights/daily
+curl 'http://localhost:3000/users/local-user/insights/daily?date=2026-07-11'
+curl http://localhost:3000/users/local-user/insights/weekly
+curl 'http://localhost:3000/users/local-user/insights/weekly?weekStart=2026-07-05'
 
 curl -X PATCH http://localhost:3000/users/local-user/memory/<memoryId>/archive \
   -H "Content-Type: application/json" \
@@ -342,11 +350,22 @@ Expected:
 - Daily check-in prompts are goal-aware. Active goal templates influence the prompt, for example career goals ask about applications and interviews, health goals ask about workout/sleep, finance goals ask about impulse and thesis-before-risk.
 - `/send_checkin_now` previews the same goal-aware prompt the worker sends.
 - Daily review sums progress metrics like applications, workout minutes, and reading minutes, but uses the latest state metrics for sleep, energy, anxiety, focus, and impulse.
+- `/review` is factual. `/insight` and `/weekly` are interpretive coaching reports built from active events, goals, memories, profile, and risk signals.
+- Daily insight identifies meaningful progress, gaps, risk state, relevant memory signals, and 1-3 recommended next actions.
+- Weekly insight aggregates the last 7 days by default and looks for repeated patterns such as cooldowns, low sleep, high anxiety, and clustered progress.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
+- When OpenAI is enabled, insight wording may be lightly polished from the deterministic report. The LLM should not invent facts, metrics, risks, memories, or actions; if polish fails, the deterministic insight is returned.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
 - `/users/:userId/review/daily` summarizes today's stored events against active goals.
 - Daily review includes a concise `Memory signals` section when active risk-pattern memories are relevant to today's events.
+
+Manual insight tests:
+
+- Normal progress day: log applications, workout, reading, and a stable check-in. `/insight` should show real wins and simple next actions.
+- High-risk day: log sleep below 6h, anxiety 7+, gambling impulse 6+, or trigger a betting cooldown. `/insight` should include risks and hard guardian wording for direct/hard profiles.
+- Low activity day: run `/insight` before logging events. It should say the signal is low and recommend one concrete action.
+- Weekly summary: log events across multiple days, then run `/weekly`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
 
 ## API Routes
 
@@ -379,6 +398,10 @@ Expected:
 - `POST /users/:userId/checkins/daily/text`
 - `GET /users/:userId/checkins/daily/prompt`
 - `GET /users/:userId/review/daily`
+- `GET /users/:userId/insights/daily`
+- `GET /users/:userId/insights/daily?date=YYYY-MM-DD`
+- `GET /users/:userId/insights/weekly`
+- `GET /users/:userId/insights/weekly?weekStart=YYYY-MM-DD`
 
 ## Packages
 

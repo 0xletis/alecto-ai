@@ -354,6 +354,22 @@ bot.command("review", async (ctx) => {
   }
 });
 
+bot.command("insight", async (ctx) => {
+  await sendInsight(ctx, "daily");
+});
+
+bot.command("daily_insight", async (ctx) => {
+  await sendInsight(ctx, "daily");
+});
+
+bot.command("weekly", async (ctx) => {
+  await sendInsight(ctx, "weekly");
+});
+
+bot.command("weekly_insight", async (ctx) => {
+  await sendInsight(ctx, "weekly");
+});
+
 bot.command("goals", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -830,6 +846,26 @@ function normalizeSignalText(message: string): string {
     .trim();
 }
 
+async function sendInsight(ctx: Context, periodType: "daily" | "weekly") {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const path = periodType === "daily" ? "/insights/daily" : "/insights/weekly";
+    const response = await apiGet<InsightResponse>(`/users/${getTelegramUserId(ctx)}${path}`);
+    await ctx.reply(formatInsight(response.insight));
+  } catch (error) {
+    await replyWithApiError(
+      ctx,
+      error,
+      periodType === "daily"
+        ? "I could not fetch your daily insight right now."
+        : "I could not fetch your weekly insight right now."
+    );
+  }
+}
+
 async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`);
 
@@ -979,6 +1015,30 @@ function formatDailyReview(review: DailyReview) {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatInsight(insight: InsightReport) {
+  return [
+    insight.headline,
+    insight.summary,
+    "",
+    formatSection("Wins", insight.wins),
+    formatSection("Gaps", insight.gaps),
+    formatSection("Risks", insight.risks),
+    formatSection("Patterns", insight.patterns),
+    insight.goalProgress.length > 0
+      ? `Goals:\n${insight.goalProgress.map((goal) => `- ${goal.title}: ${goal.note}`).join("\n")}`
+      : undefined,
+    formatSection("Memory signals", insight.memorySignals),
+    formatSection("Recommended actions", insight.recommendedActions),
+    insight.hardTruth ? `Hard truth:\n${insight.hardTruth}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatSection(title: string, items: string[]) {
+  return items.length > 0 ? `${title}:\n${items.map((item) => `- ${item}`).join("\n")}` : undefined;
 }
 
 function formatProfile(profile: Profile) {
@@ -1286,6 +1346,10 @@ interface DailyReviewResponse {
   review: DailyReview;
 }
 
+interface InsightResponse {
+  insight: InsightReport;
+}
+
 interface GoalsResponse {
   goals: Goal[];
   duplicateWarnings?: GoalDuplicateWarning[];
@@ -1376,6 +1440,31 @@ interface DailyReviewGoal {
   title: string;
   status: string;
   templateId?: string;
+}
+
+interface InsightReport {
+  userId: string;
+  periodType: "daily" | "weekly";
+  periodStart: string;
+  periodEnd: string;
+  headline: string;
+  summary: string;
+  wins: string[];
+  gaps: string[];
+  risks: string[];
+  patterns: string[];
+  goalProgress: InsightGoalProgress[];
+  memorySignals: string[];
+  recommendedActions: string[];
+  hardTruth?: string;
+  generatedAt: string;
+}
+
+interface InsightGoalProgress {
+  goalId: string;
+  title: string;
+  status: "progress" | "no_progress" | "risk" | "stable" | "custom";
+  note: string;
 }
 
 interface Goal {

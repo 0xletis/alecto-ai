@@ -4,6 +4,7 @@ export * from "./event-registry.js";
 export * from "./events.js";
 export * from "./goal-templates.js";
 export * from "./goals.js";
+export * from "./insights.js";
 export * from "./message-processing.js";
 export * from "./memory.js";
 export * from "./notifications.js";

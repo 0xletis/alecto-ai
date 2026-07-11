@@ -543,13 +543,29 @@ export async function getRelevantMemories(
 export async function getOrCreateUserOperatingProfile(userId: string): Promise<UserOperatingProfile> {
   await ensureUser(userId);
 
-  const profile = await prisma.userOperatingProfile.upsert({
-    where: { userId },
-    update: {},
-    create: { userId }
-  });
+  try {
+    const profile = await prisma.userOperatingProfile.upsert({
+      where: { userId },
+      update: {},
+      create: { userId }
+    });
 
-  return toUserOperatingProfile(profile);
+    return toUserOperatingProfile(profile);
+  } catch (error) {
+    if (!isPrismaUniqueConstraintError(error)) {
+      throw error;
+    }
+
+    const profile = await prisma.userOperatingProfile.findUnique({
+      where: { userId }
+    });
+
+    if (!profile) {
+      throw error;
+    }
+
+    return toUserOperatingProfile(profile);
+  }
 }
 
 export async function updateUserOperatingProfile(
