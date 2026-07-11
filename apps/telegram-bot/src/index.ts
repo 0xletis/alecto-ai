@@ -380,6 +380,108 @@ bot.command("events", async (ctx) => {
   }
 });
 
+bot.command("events_archived", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events/recent?includeArchived=true`);
+    await ctx.reply(formatEvents(response.events.slice(0, 10), { alwaysShowStatus: true }));
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not fetch archived events right now.");
+  }
+});
+
+bot.command("undo_last_event", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiPost<EventArchiveResponse>(`/users/${getTelegramUserId(ctx)}/events/undo-last`, {
+      scope: "group",
+      reason: "undo last event command"
+    });
+    await ctx.reply(formatArchiveResult(response));
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not undo the last event right now.");
+  }
+});
+
+bot.command("delete_event", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const eventId = getCommandText(ctx);
+
+  if (!eventId) {
+    await ctx.reply("Usage: /delete_event <eventId>");
+    return;
+  }
+
+  try {
+    await apiPatch<EventResponse>(`/users/${getTelegramUserId(ctx)}/events/${eventId}/archive`, {
+      reason: "archived from Telegram"
+    });
+    await ctx.reply(`Archived event ${eventId}.`);
+  } catch (error) {
+    if (isFetchError(error)) {
+      await replyWithApiError(ctx, error, "I could not archive that event. Check the ID and try again.");
+      return;
+    }
+
+    const existingEvent = await findEventIncludingArchived(ctx, eventId);
+
+    if (existingEvent && existingEvent.status !== "active") {
+      await ctx.reply("That event is already archived/corrected.");
+      return;
+    }
+
+    await ctx.reply("I could not find that event. Check the ID and try again.");
+  }
+});
+
+bot.command("correct_event", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseCorrectEventCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply('Usage: /correct_event EVENT_ID | {"duration_minutes":30}');
+    return;
+  }
+
+  if ("error" in parsed) {
+    await ctx.reply('Invalid JSON. Example: /correct_event EVENT_ID | {"duration_minutes":30}');
+    return;
+  }
+
+  try {
+    const response = await postCorrectEvent(
+      `/users/${getTelegramUserId(ctx)}/events/${parsed.eventId}/correct`,
+      {
+        type: parsed.type,
+        data: parsed.data,
+        reason: "corrected from Telegram"
+      }
+    );
+
+    if (!response.ok) {
+      await ctx.reply(response.error);
+      return;
+    }
+
+    await ctx.reply(`Corrected event. Old event archived, replacement created: ${response.replacement.id}.`);
+  } catch (error) {
+    console.error("Telegram correct_event failed", error);
+    await replyWithApiError(ctx, error, "I could not correct that event. Check the ID and data format.");
+  }
+});
+
 bot.command("checkin", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -732,7 +834,7 @@ async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`);
 
   if (!response.ok) {
-    throw new Error(`API GET ${path} failed with ${response.status}`);
+    throw await ApiError.fromResponse(response, `API GET ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
@@ -748,7 +850,7 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`API POST ${path} failed with ${response.status}`);
+    throw await ApiError.fromResponse(response, `API POST ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
@@ -764,10 +866,58 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    throw new Error(`API PATCH ${path} failed with ${response.status}`);
+    throw await ApiError.fromResponse(response, `API PATCH ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
+}
+
+async function postCorrectEvent(
+  path: string,
+  body: unknown
+): Promise<
+  | ({ ok: true } & EventCorrectionResponse)
+  | {
+      ok: false;
+      error: string;
+    }
+> {
+  const fallback = "I could not correct that event. Check the ID and data format.";
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (response.ok) {
+    return {
+      ok: true,
+      ...((await response.json()) as EventCorrectionResponse)
+    };
+  }
+
+  const responseText = await response.text();
+  const parsedError = parseApiErrorText(responseText);
+
+  return {
+    ok: false,
+    error: parsedError ?? (responseText.trim() || fallback)
+  };
+}
+
+function parseApiErrorText(responseText: string): string | undefined {
+  if (!responseText.trim()) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(responseText) as { error?: unknown };
+    return typeof parsed.error === "string" && parsed.error.trim() ? parsed.error : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function replyWithApiError(ctx: Context, error: unknown, fallbackMessage: string) {
@@ -783,6 +933,34 @@ async function replyWithApiError(ctx: Context, error: unknown, fallbackMessage: 
 
 function isFetchError(error: unknown) {
   return error instanceof TypeError;
+}
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number
+  ) {
+    super(message);
+  }
+
+  static async fromResponse(response: Response, fallbackMessage: string): Promise<ApiError> {
+    try {
+      const body = (await response.json()) as { error?: unknown };
+      return new ApiError(typeof body.error === "string" ? body.error : fallbackMessage, response.status);
+    } catch {
+      return new ApiError(fallbackMessage, response.status);
+    }
+  }
+}
+
+async function findEventIncludingArchived(ctx: Context, eventId: string): Promise<Event | undefined> {
+  try {
+    const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events?includeArchived=true`);
+    return response.events.find((event) => event.id === eventId);
+  } catch (error) {
+    console.error("Could not fetch event audit history", error);
+    return undefined;
+  }
 }
 
 function formatDailyReview(review: DailyReview) {
@@ -919,12 +1097,12 @@ function formatGoal(goal: Goal, duplicateWarnings: GoalDuplicateWarning[] = []) 
     .join("\n");
 }
 
-function formatEvents(events: Event[]) {
+function formatEvents(events: Event[], options: { alwaysShowStatus?: boolean } = {}) {
   if (events.length === 0) {
     return "No recent events yet.";
   }
 
-  return events.map(formatEvent).join("\n\n");
+  return events.map((event) => formatEvent(event, options)).join("\n\n");
 }
 
 async function getLatestPendingAction(ctx: Context) {
@@ -951,15 +1129,83 @@ function formatPendingAction(pendingAction: PendingAction) {
   ].join("\n");
 }
 
-function formatEvent(event: Event) {
+function formatEvent(event: Event, options: { alwaysShowStatus?: boolean } = {}) {
+  const status = event.status ?? "active";
+
   return [
+    `id: ${event.id}`,
+    event.eventGroupId ? `group: ${event.eventGroupId}` : undefined,
+    options.alwaysShowStatus || status !== "active" ? `status: ${status}` : undefined,
+    status === "corrected" && event.correctedByEventId ? `correctedByEventId: ${event.correctedByEventId}` : undefined,
+    status === "archived" && event.archiveReason ? `archiveReason: ${event.archiveReason}` : undefined,
     `type: ${event.type}`,
     `time: ${new Date(event.timestamp).toLocaleString()}`,
     `data: ${formatEventData(event)}`,
+    correctionHint(event),
     event.evidence && event.evidence.length > 0 ? `evidence: ${event.evidence.slice(0, 2).join("; ")}` : undefined
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function correctionHint(event: Event): string | undefined {
+  const hints: Record<string, string> = {
+    "health.workout_completed": `correct with: /correct_event ${event.id} | {"duration_minutes":30}`,
+    "learning.reading_session_completed": `correct with: /correct_event ${event.id} | {"duration_minutes":30}`,
+    "health.sleep_logged": `correct with: /correct_event ${event.id} | {"duration_hours":7}`,
+    "career.application_sent": `correct with: /correct_event ${event.id} | {"count":2}`,
+    "reflection.energy_logged": `correct with: /correct_event ${event.id} | {"value":6}`
+  };
+
+  return event.status === "active" || !event.status ? hints[event.type] : undefined;
+}
+
+function formatArchiveResult(response: EventArchiveResponse) {
+  if (response.count === 0) {
+    return "No active event to archive.";
+  }
+
+  if (response.count === 1) {
+    return "Archived last event.";
+  }
+
+  return `Archived ${response.count} events from the last action.`;
+}
+
+type ParsedCorrectEventCommand =
+  | { eventId: string; type?: string; data: Record<string, unknown> }
+  | { error: "invalid_json" };
+
+function parseCorrectEventCommand(text: string): ParsedCorrectEventCommand | undefined {
+  const parts = text.split("|").map((part) => part.trim()).filter(Boolean);
+  const [eventId, second, third] = parts;
+
+  if (!eventId || !second) {
+    return undefined;
+  }
+
+  const type = second.startsWith("type=") ? second.replace(/^type=/, "").trim() : undefined;
+  const jsonText = type ? third : second;
+
+  if (!jsonText) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(jsonText) as unknown;
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { error: "invalid_json" };
+    }
+
+    return {
+      eventId,
+      type,
+      data: parsed as Record<string, unknown>
+    };
+  } catch {
+    return { error: "invalid_json" };
+  }
 }
 
 function formatEventData(event: Event) {
@@ -1056,6 +1302,20 @@ interface EventsResponse {
   events: Event[];
 }
 
+interface EventResponse {
+  event: Event;
+}
+
+interface EventArchiveResponse {
+  count: number;
+  events: Event[];
+}
+
+interface EventCorrectionResponse {
+  original: Event;
+  replacement: Event;
+}
+
 interface GoalTemplatesResponse {
   goalTemplates: GoalTemplate[];
 }
@@ -1140,10 +1400,15 @@ interface GoalTemplate {
 }
 
 interface Event {
+  id: string;
   type: string;
   timestamp: string;
   data: Record<string, unknown>;
   evidence?: string[];
+  status?: string;
+  eventGroupId?: string;
+  archiveReason?: string;
+  correctedByEventId?: string;
 }
 
 interface Profile {

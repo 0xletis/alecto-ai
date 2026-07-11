@@ -40,20 +40,27 @@ model Goal {
 }
 
 model Event {
-  id         String   @id @default(uuid())
-  userId     String
-  type       String
-  timestamp  DateTime
-  source     String
-  data       Json
-  confidence Float
-  evidence   Json?
-  createdAt  DateTime @default(now())
+  id                 String   @id @default(uuid())
+  userId             String
+  type               String
+  timestamp          DateTime
+  source             String
+  data               Json
+  confidence         Float
+  evidence           Json?
+  status             String   @default("active")
+  eventGroupId       String?
+  archivedAt         DateTime?
+  archiveReason      String?
+  correctedByEventId String?
+  createdAt          DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([userId, status])
   @@index([userId, timestamp])
+  @@index([userId, eventGroupId])
 }
 
 model MemoryEntry {

@@ -114,7 +114,11 @@ Telegram commands:
 - `/checkin_natural`: show natural-language daily check-in examples
 - `/review`: daily review
 - `/goals`: active goals
-- `/events`: recent events
+- `/events`: recent active events with ids
+- `/events_archived`: recent events including archived/corrected status
+- `/undo_last_event`: archive the latest logged event group
+- `/delete_event <eventId>`: archive one event
+- `/correct_event EVENT_ID | {"duration_minutes":30}`: correct one event while preserving history
 - `/pending`: show pending profile/goal changes
 - `/confirm`: confirm the latest pending change
 - `/cancel`: cancel the latest pending change
@@ -277,6 +281,30 @@ curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
 
 curl http://localhost:3000/users/local-user/events
 curl http://localhost:3000/users/local-user/events/recent
+curl "http://localhost:3000/users/local-user/events/recent?includeArchived=true"
+
+curl -X POST http://localhost:3000/users/local-user/events/undo-last \
+  -H "Content-Type: application/json" \
+  -d '{"scope":"group","reason":"undo last"}'
+
+curl -X PATCH http://localhost:3000/users/local-user/events/<eventId>/archive \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"wrongly logged"}'
+
+curl -X POST http://localhost:3000/users/local-user/events/<eventId>/correct \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"duration_minutes":30},"reason":"corrected by user"}'
+
+curl -X POST http://localhost:3000/users/local-user/events/<journalEventId>/correct \
+  -H "Content-Type: application/json" \
+  -d '{"data":{"duration_minutes":30},"reason":"wrong event id test"}'
+
+# Telegram manual test:
+# /correct_event <journalEventId> | {"duration_minutes":30}
+# should show the journal/workout-readable validation error.
+# /correct_event <eventId> | {bad json}
+# should show: Invalid JSON. Example: /correct_event EVENT_ID | {"duration_minutes":30}
+
 curl http://localhost:3000/users/local-user/goals
 curl http://localhost:3000/users/local-user/checkins/daily/prompt
 curl http://localhost:3000/users/local-user/review/daily
@@ -303,6 +331,10 @@ Expected:
 - Duplicate active goals are blocked by default when the title, template, or similar category/title already exists. Use `/goals` to review similar goals or archive the older one first.
 - `/users/:userId/checkins/daily` saves a manual check-in as reflection events and daily review includes check-in values.
 - `/users/:userId/checkins/daily/text` parses natural-language check-ins and creates the same structured events as `/checkins/daily`.
+- Event reads ignore archived/corrected events by default. Add `includeArchived=true` to inspect archived/corrected audit history.
+- Event corrections archive the original event as `corrected` and create a replacement event; undo/archive operations do not hard-delete events.
+- Correction data is validated against the event type. For example, correcting a journal event with `duration_minutes` is rejected; correct the derived workout or reading event instead.
+- Correcting a derived check-in event, such as workout duration, also updates the parent `reflection.daily_checkin_completed.data.answers` for that group.
 - Check-in fields `applications`, `workout`, `reading`, and `sleep` create structured progress events. Notes are journal context unless they contain clear numeric phrases like `sent 2 CVs`, `trained 45 minutes`, or `read 30 minutes`.
 - Telegram normal messages that look like daily check-ins are sent to `/checkins/daily/text`. Structured `/checkin key=value` still works.
 - Natural check-in warnings include high anxiety plus gambling impulse and low sleep.
@@ -325,6 +357,10 @@ Expected:
 - `POST /messages/process`
 - `GET /users/:userId/events`
 - `GET /users/:userId/events/recent`
+- `PATCH /users/:userId/events/:eventId/archive`
+- `PATCH /users/:userId/events/groups/:eventGroupId/archive`
+- `POST /users/:userId/events/:eventId/correct`
+- `POST /users/:userId/events/undo-last`
 - `GET /users/:userId/goals`
 - `GET /users/:userId/profile`
 - `PATCH /users/:userId/profile`

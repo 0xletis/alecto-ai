@@ -6,6 +6,7 @@ import {
   CreateGoalInputSchema,
   DailyCheckInInputSchema,
   DailyCheckInTextInputSchema,
+  EventTypeSchema,
   eventRegistry,
   extractEvents,
   findGoalDuplicateWarnings,
@@ -28,8 +29,11 @@ import {
 } from "@operator-agent/core";
 import { analyzeMessageWithOpenAI, type OpenAIMessageAnalysis } from "@operator-agent/llm";
 import {
+  archiveEvent,
+  archiveEventGroup,
   archiveGoal,
   archiveMemory,
+  correctEvent,
   createEvent,
   createEvents,
   createEventsFromExtracted,
@@ -40,6 +44,7 @@ import {
   expireOldPendingActions,
   getActiveGoals,
   getActiveMemories,
+  getEventById,
   getEvents,
   getEventsSince,
   getGoals,
@@ -54,6 +59,7 @@ import {
   confirmPendingAction,
   ensureUser,
   rejectPendingAction,
+  undoLastEvents,
   type PendingAction,
   type PendingActionType,
   updateNotificationSettings,
@@ -206,13 +212,115 @@ export function buildServer() {
     } satisfies ProcessMessageResult;
   });
 
-  server.get<{ Params: { userId: string } }>("/users/:userId/events", async (request) => ({
-    events: await getEvents(request.params.userId)
-  }));
+  server.get<{ Params: { userId: string }; Querystring: { includeArchived?: string } }>(
+    "/users/:userId/events",
+    async (request) => ({
+      events: await getEvents(request.params.userId, {
+        includeArchived: request.query.includeArchived === "true"
+      })
+    })
+  );
 
-  server.get<{ Params: { userId: string } }>("/users/:userId/events/recent", async (request) => ({
-    events: await getRecentEvents(request.params.userId)
-  }));
+  server.get<{ Params: { userId: string }; Querystring: { includeArchived?: string } }>(
+    "/users/:userId/events/recent",
+    async (request) => ({
+      events: await getRecentEvents(request.params.userId, 10, {
+        includeArchived: request.query.includeArchived === "true"
+      })
+    })
+  );
+
+  server.patch<{ Params: { userId: string; eventId: string } }>(
+    "/users/:userId/events/:eventId/archive",
+    async (request, reply) => {
+      const event = await archiveEvent(
+        request.params.userId,
+        request.params.eventId,
+        readReason(request.body, "archived by user")
+      );
+
+      if (!event) {
+        return reply.status(404).send({
+          error: "Active event not found"
+        });
+      }
+
+      return { event };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; eventGroupId: string } }>(
+    "/users/:userId/events/groups/:eventGroupId/archive",
+    async (request) => {
+      const events = await archiveEventGroup(
+        request.params.userId,
+        request.params.eventGroupId,
+        readReason(request.body, "archived event group")
+      );
+
+      return {
+        count: events.length,
+        events
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string; eventId: string } }>(
+    "/users/:userId/events/:eventId/correct",
+    async (request, reply) => {
+      const input = parseCorrectEventBody(request.body);
+
+      if (!input) {
+        return reply.status(400).send({
+          error: "Invalid request body"
+        });
+      }
+
+      const event = await getEventById(request.params.userId, request.params.eventId, {
+        includeArchived: true
+      });
+
+      if (!event) {
+        return reply.status(404).send({
+          error: "Event not found"
+        });
+      }
+
+      if (event.status !== "active") {
+        return reply.status(404).send({
+          error: "Active event not found"
+        });
+      }
+
+      const validationError = validateCorrectEventInput(event.type, input.data, Boolean(input.type));
+
+      if (validationError) {
+        return reply.status(400).send({
+          error: validationError
+        });
+      }
+
+      const result = await correctEvent(request.params.userId, request.params.eventId, input);
+
+      if (!result) {
+        return reply.status(404).send({
+          error: "Active event not found"
+        });
+      }
+
+      return result;
+    }
+  );
+
+  server.post<{ Params: { userId: string } }>("/users/:userId/events/undo-last", async (request) => {
+    const input = parseUndoLastBody(request.body);
+    const events = await undoLastEvents(request.params.userId, input);
+
+    return {
+      count: events.length,
+      events
+    };
+  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/goals", async (request) => ({
     ...formatGoalsResponse(await getGoals(request.params.userId))
@@ -590,6 +698,100 @@ function isRejectionMessage(message: string): boolean {
 
 function isFinancialRiskIntent(intent: MessageIntent): boolean {
   return intent === "betting_intent" || intent === "trading_intent";
+}
+
+function readReason(body: unknown, fallback: string): string {
+  return isRecord(body) && typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : fallback;
+}
+
+function parseUndoLastBody(body: unknown): { scope: "event" | "group"; reason: string } {
+  const scope = isRecord(body) && body.scope === "event" ? "event" : "group";
+  return {
+    scope,
+    reason: readReason(body, "undo last")
+  };
+}
+
+function parseCorrectEventBody(body: unknown) {
+  if (!isRecord(body) || !isRecord(body.data)) {
+    return undefined;
+  }
+
+  const type = typeof body.type === "string" ? EventTypeSchema.safeParse(body.type) : undefined;
+  const timestamp = typeof body.timestamp === "string" ? new Date(body.timestamp) : undefined;
+  const evidence =
+    typeof body.evidence === "string"
+      ? [body.evidence]
+      : Array.isArray(body.evidence)
+        ? body.evidence.filter((item): item is string => typeof item === "string")
+        : undefined;
+
+  if (type && !type.success) {
+    return undefined;
+  }
+
+  if (timestamp && Number.isNaN(timestamp.getTime())) {
+    return undefined;
+  }
+
+  return {
+    type: type?.data,
+    timestamp,
+    data: body.data,
+    evidence,
+    reason: readReason(body, "corrected by user")
+  };
+}
+
+function validateCorrectEventInput(type: string, data: Record<string, unknown>, hasTypeOverride: boolean): string | undefined {
+  if (type === "reflection.daily_checkin_completed") {
+    return "Correct the derived event instead, such as workout, sleep, energy, applications, or reading.";
+  }
+
+  if (
+    type === "reflection.journal_entry_created" &&
+    ("duration_minutes" in data || "duration_hours" in data || "count" in data || "value" in data)
+  ) {
+    return "This is a journal event. duration_minutes looks like a workout or reading correction. Pick a health.workout_completed or learning.reading_session_completed event id.";
+  }
+
+  const genericMessage = `This event is type ${type}, but the correction data does not match that type. Pick the correct event id or use a compatible field.`;
+
+  if (type === "health.workout_completed") {
+    return typeof data.duration_minutes === "number" ? undefined : genericMessage;
+  }
+
+  if (type === "learning.reading_session_completed") {
+    return typeof data.duration_minutes === "number" ? undefined : genericMessage;
+  }
+
+  if (type === "health.sleep_logged") {
+    return typeof data.duration_hours === "number" ? undefined : genericMessage;
+  }
+
+  if (type === "career.application_sent") {
+    return typeof data.count === "number" ? undefined : genericMessage;
+  }
+
+  if (type === "reflection.energy_logged" || type === "reflection.anxiety_logged" || type === "reflection.focus_logged") {
+    return isNumberInRange(data.value, 1, 10) ? undefined : genericMessage;
+  }
+
+  if (type === "reflection.impulse_logged") {
+    const hasValidKind =
+      data.kind === undefined || data.kind === "gambling" || data.kind === "trading" || data.kind === "general";
+    return isNumberInRange(data.value, 0, 10) && hasValidKind ? undefined : genericMessage;
+  }
+
+  if (type === "reflection.journal_entry_created") {
+    return typeof data.text === "string" ? undefined : genericMessage;
+  }
+
+  return hasTypeOverride ? undefined : genericMessage;
+}
+
+function isNumberInRange(value: unknown, min: number, max: number): boolean {
+  return typeof value === "number" && value >= min && value <= max;
 }
 
 function formatGoalsResponse(goals: Awaited<ReturnType<typeof getGoals>>) {
@@ -1138,6 +1340,18 @@ function detectStructuralProposal(
 ): StructuralProposal | undefined {
   const normalized = message.toLowerCase();
 
+  if (/\b(undo last event|undo last log|borra el ultimo evento|borra el último evento|deshaz el ultimo evento|deshaz el último evento)\b/i.test(message)) {
+    return {
+      type: "event_undo_last",
+      summary: "Archive the last logged event/group",
+      payload: {
+        scope: "group",
+        reason: "user requested undo"
+      },
+      reply: "Confirm undo last logged action? Reply yes to confirm or no to cancel."
+    };
+  }
+
   if (
     /\b(be stricter with me|be harder on me|don't let me justify bets|dont let me justify bets)\b/i.test(message) ||
     /(\bno me dejes justificar apuestas\b|\bs[eé] m[aá]s duro conmigo\b)/i.test(message)
@@ -1497,6 +1711,20 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
 
     return {
       reply: `Confirmed. I saved this to memory: ${memory.summary}`
+    };
+  }
+
+  if (pendingAction.type === "event_undo_last") {
+    const scope = pendingAction.payload.scope === "event" ? "event" : "group";
+    const reason =
+      typeof pendingAction.payload.reason === "string" ? pendingAction.payload.reason : "user requested undo";
+    const events = await undoLastEvents(userId, { scope, reason });
+
+    return {
+      reply:
+        events.length === 0
+          ? "Confirmed, but there was no active event to archive."
+          : `Confirmed. Archived ${events.length} event${events.length === 1 ? "" : "s"} from the last logged action.`
     };
   }
 

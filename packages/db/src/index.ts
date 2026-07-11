@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { PrismaClient, type Prisma } from "@prisma/client";
 import { findDuplicateActiveGoal, getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
 import type {
@@ -23,9 +24,22 @@ export interface CreateEventInput {
   data?: Record<string, unknown>;
   confidence: number;
   evidence?: string[];
+  eventGroupId?: string;
 }
 
-export type PendingActionType = "profile_update" | "goal_create" | "goal_archive" | "memory_create";
+export interface EventQueryOptions {
+  includeArchived?: boolean;
+}
+
+export interface CorrectEventInput {
+  type?: StoredEvent["type"];
+  timestamp?: Date;
+  data: Record<string, unknown>;
+  evidence?: string[];
+  reason?: string;
+}
+
+export type PendingActionType = "profile_update" | "goal_create" | "goal_archive" | "memory_create" | "event_undo_last";
 export type PendingActionStatus = "pending" | "confirmed" | "rejected" | "expired";
 
 export interface PendingAction {
@@ -175,7 +189,8 @@ export async function createEvent(userId: string, eventInput: CreateEventInput):
       source: eventInput.source,
       data: toJsonObject(eventInput.data ?? {}),
       confidence: eventInput.confidence,
-      evidence: eventInput.evidence ? toJsonArray(eventInput.evidence) : undefined
+      evidence: eventInput.evidence ? toJsonArray(eventInput.evidence) : undefined,
+      eventGroupId: eventInput.eventGroupId
     }
   });
 
@@ -184,9 +199,15 @@ export async function createEvent(userId: string, eventInput: CreateEventInput):
 
 export async function createEvents(userId: string, eventInputs: CreateEventInput[]): Promise<StoredEvent[]> {
   const events: StoredEvent[] = [];
+  const eventGroupId = randomUUID();
 
   for (const eventInput of eventInputs) {
-    events.push(await createEvent(userId, eventInput));
+    events.push(
+      await createEvent(userId, {
+        ...eventInput,
+        eventGroupId: eventInput.eventGroupId ?? eventGroupId
+      })
+    );
   }
 
   return events;
@@ -209,22 +230,26 @@ export async function createEventsFromExtracted(
   );
 }
 
-export async function getEvents(userId: string): Promise<StoredEvent[]> {
+export async function getEvents(userId: string, options: EventQueryOptions = {}): Promise<StoredEvent[]> {
   await ensureUser(userId);
 
   const events = await prisma.event.findMany({
-    where: { userId },
+    where: eventWhere(userId, options),
     orderBy: { timestamp: "asc" }
   });
 
   return events.map(toStoredEvent);
 }
 
-export async function getRecentEvents(userId: string, limit = 10): Promise<StoredEvent[]> {
+export async function getRecentEvents(
+  userId: string,
+  limit = 10,
+  options: EventQueryOptions = {}
+): Promise<StoredEvent[]> {
   await ensureUser(userId);
 
   const events = await prisma.event.findMany({
-    where: { userId },
+    where: eventWhere(userId, options),
     orderBy: { timestamp: "desc" },
     take: limit
   });
@@ -232,12 +257,16 @@ export async function getRecentEvents(userId: string, limit = 10): Promise<Store
   return events.map(toStoredEvent);
 }
 
-export async function getEventsSince(userId: string, sinceDate: Date): Promise<StoredEvent[]> {
+export async function getEventsSince(
+  userId: string,
+  sinceDate: Date,
+  options: EventQueryOptions = {}
+): Promise<StoredEvent[]> {
   await ensureUser(userId);
 
   const events = await prisma.event.findMany({
     where: {
-      userId,
+      ...eventWhere(userId, options),
       timestamp: {
         gte: sinceDate
       }
@@ -246,6 +275,164 @@ export async function getEventsSince(userId: string, sinceDate: Date): Promise<S
   });
 
   return events.map(toStoredEvent);
+}
+
+export async function getEventById(
+  userId: string,
+  eventId: string,
+  options: EventQueryOptions = {}
+): Promise<StoredEvent | undefined> {
+  await ensureUser(userId);
+
+  const event = await prisma.event.findFirst({
+    where: {
+      ...eventWhere(userId, options),
+      id: eventId
+    }
+  });
+
+  return event ? toStoredEvent(event) : undefined;
+}
+
+export async function archiveEvent(
+  userId: string,
+  eventId: string,
+  reason = "archived by user"
+): Promise<StoredEvent | undefined> {
+  await ensureUser(userId);
+
+  const existingEvent = await prisma.event.findFirst({
+    where: {
+      id: eventId,
+      userId,
+      status: "active"
+    }
+  });
+
+  if (!existingEvent) {
+    return undefined;
+  }
+
+  const event = await prisma.event.update({
+    where: { id: eventId },
+    data: {
+      status: "archived",
+      archivedAt: new Date(),
+      archiveReason: reason
+    }
+  });
+
+  return toStoredEvent(event);
+}
+
+export async function archiveEventGroup(
+  userId: string,
+  eventGroupId: string,
+  reason = "archived by user"
+): Promise<StoredEvent[]> {
+  await ensureUser(userId);
+
+  const events = await prisma.event.findMany({
+    where: {
+      userId,
+      eventGroupId,
+      status: "active"
+    },
+    orderBy: { timestamp: "asc" }
+  });
+
+  const archivedEvents: StoredEvent[] = [];
+
+  for (const event of events) {
+    const archivedEvent = await prisma.event.update({
+      where: { id: event.id },
+      data: {
+        status: "archived",
+        archivedAt: new Date(),
+        archiveReason: reason
+      }
+    });
+
+    archivedEvents.push(toStoredEvent(archivedEvent));
+  }
+
+  return archivedEvents;
+}
+
+export async function correctEvent(
+  userId: string,
+  eventId: string,
+  input: CorrectEventInput
+): Promise<{ original: StoredEvent; replacement: StoredEvent } | undefined> {
+  await ensureUser(userId);
+
+  const original = await prisma.event.findFirst({
+    where: {
+      id: eventId,
+      userId,
+      status: "active"
+    }
+  });
+
+  if (!original) {
+    return undefined;
+  }
+
+  const replacement = await prisma.event.create({
+    data: {
+      userId,
+      type: input.type ?? original.type,
+      timestamp: input.timestamp ?? original.timestamp,
+      source: "manual",
+      data: toJsonObject(input.data),
+      confidence: 1,
+      evidence: toJsonArray(input.evidence ?? [`Corrected from event ${eventId}`]),
+      eventGroupId: original.eventGroupId ?? randomUUID()
+    }
+  });
+
+  const correctedOriginal = await prisma.event.update({
+    where: { id: eventId },
+    data: {
+      status: "corrected",
+      correctedByEventId: replacement.id,
+      archivedAt: new Date(),
+      archiveReason: input.reason ?? "corrected by user"
+    }
+  });
+
+  await updateParentDailyCheckInForCorrection(userId, original, replacement);
+
+  return {
+    original: toStoredEvent(correctedOriginal),
+    replacement: toStoredEvent(replacement)
+  };
+}
+
+export async function undoLastEvents(
+  userId: string,
+  input: { scope?: "event" | "group"; reason?: string } = {}
+): Promise<StoredEvent[]> {
+  await ensureUser(userId);
+
+  const latestEvent = await prisma.event.findFirst({
+    where: {
+      userId,
+      status: "active"
+    },
+    orderBy: { timestamp: "desc" }
+  });
+
+  if (!latestEvent) {
+    return [];
+  }
+
+  if ((input.scope ?? "group") === "group" && latestEvent.eventGroupId) {
+    return archiveEventGroup(userId, latestEvent.eventGroupId, input.reason ?? "undo last");
+  }
+
+  const archivedEvent = await archiveEvent(userId, latestEvent.id, input.reason ?? "undo last");
+  return archivedEvent ? [archivedEvent] : [];
 }
 
 export async function getActiveGoals(userId: string): Promise<Goal[]> {
@@ -612,8 +799,118 @@ function toStoredEvent(event: Prisma.EventGetPayload<object>): StoredEvent {
     data: toRecord(event.data),
     confidence: event.confidence,
     evidence: Array.isArray(event.evidence) ? event.evidence.filter((item) => typeof item === "string") : undefined,
+    status: event.status as StoredEvent["status"],
+    eventGroupId: event.eventGroupId ?? undefined,
+    archivedAt: event.archivedAt ?? undefined,
+    archiveReason: event.archiveReason ?? undefined,
+    correctedByEventId: event.correctedByEventId ?? undefined,
     createdAt: event.createdAt
   };
+}
+
+async function updateParentDailyCheckInForCorrection(
+  userId: string,
+  original: Prisma.EventGetPayload<object>,
+  replacement: Prisma.EventGetPayload<object>
+): Promise<void> {
+  if (!original.eventGroupId) {
+    return;
+  }
+
+  const mappedCorrection = mapCorrectionToCheckInField(replacement.type, toRecord(replacement.data));
+
+  if (!mappedCorrection) {
+    return;
+  }
+
+  const parent = await prisma.event.findFirst({
+    where: {
+      userId,
+      eventGroupId: original.eventGroupId,
+      type: "reflection.daily_checkin_completed",
+      status: "active"
+    }
+  });
+
+  if (!parent) {
+    return;
+  }
+
+  const parentData = toRecord(parent.data);
+  const answers = toRecord(parentData.answers as Prisma.JsonValue);
+  const oldValue = answers[mappedCorrection.field];
+  const correctedAt = new Date().toISOString();
+  const corrections = Array.isArray(parentData.corrections) ? parentData.corrections : [];
+
+  await prisma.event.update({
+    where: { id: parent.id },
+    data: {
+      data: toJsonObject({
+        ...parentData,
+        answers: {
+          ...answers,
+          [mappedCorrection.field]: mappedCorrection.value
+        },
+        corrected: true,
+        corrections: [
+          ...corrections,
+          {
+            eventId: original.id,
+            replacementEventId: replacement.id,
+            field: mappedCorrection.field,
+            oldValue,
+            newValue: mappedCorrection.value,
+            correctedAt
+          }
+        ]
+      })
+    }
+  });
+}
+
+function mapCorrectionToCheckInField(
+  type: string,
+  data: Record<string, unknown>
+): { field: string; value: unknown } | undefined {
+  if (type === "health.workout_completed" && typeof data.duration_minutes === "number") {
+    return { field: "workout", value: data.duration_minutes };
+  }
+
+  if (type === "learning.reading_session_completed" && typeof data.duration_minutes === "number") {
+    return { field: "reading", value: data.duration_minutes };
+  }
+
+  if (type === "health.sleep_logged" && typeof data.duration_hours === "number") {
+    return { field: "sleep", value: data.duration_hours };
+  }
+
+  if (type === "career.application_sent" && typeof data.count === "number") {
+    return { field: "applications", value: data.count };
+  }
+
+  if (type === "reflection.energy_logged" && typeof data.value === "number") {
+    return { field: "energy", value: data.value };
+  }
+
+  if (type === "reflection.anxiety_logged" && typeof data.value === "number") {
+    return { field: "anxiety", value: data.value };
+  }
+
+  if (type === "reflection.focus_logged" && typeof data.value === "number") {
+    return { field: "focus", value: data.value };
+  }
+
+  if (type === "reflection.impulse_logged" && typeof data.value === "number") {
+    if (data.kind === "gambling") {
+      return { field: "gambling_impulse", value: data.value };
+    }
+
+    if (data.kind === "trading") {
+      return { field: "trading_impulse", value: data.value };
+    }
+  }
+
+  return undefined;
 }
 
 function toMemoryEntry(memory: Prisma.MemoryEntryGetPayload<object>): MemoryEntry {
@@ -700,6 +997,13 @@ function isPrismaUniqueConstraintError(error: unknown): boolean {
   }
 
   return (error as { code?: string }).code === "P2002";
+}
+
+function eventWhere(userId: string, options: EventQueryOptions = {}): Prisma.EventWhereInput {
+  return {
+    userId,
+    ...(options.includeArchived ? {} : { status: "active" })
+  };
 }
 
 function toUserOperatingProfileUpdateData(input: UpdateUserOperatingProfileInput) {

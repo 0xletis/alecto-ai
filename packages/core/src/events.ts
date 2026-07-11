@@ -3,6 +3,7 @@ import { EventTypeSchema } from "./event-registry.js";
 
 export const EventSourceSchema = z.enum(["chat", "connector", "llm_inferred", "system"]);
 export const StoredEventSourceSchema = z.enum(["manual", "telegram"]);
+export const StoredEventStatusSchema = z.enum(["active", "archived", "corrected"]);
 
 export const EventSchema = z.object({
   id: z.string(),
@@ -24,10 +25,16 @@ export const StoredEventSchema = z.object({
   data: z.record(z.unknown()).default({}),
   confidence: z.number().min(0).max(1),
   evidence: z.array(z.string()).optional(),
+  status: StoredEventStatusSchema.default("active"),
+  eventGroupId: z.string().optional(),
+  archivedAt: z.coerce.date().optional(),
+  archiveReason: z.string().optional(),
+  correctedByEventId: z.string().optional(),
   createdAt: z.coerce.date()
 });
 
 export type EventSource = z.infer<typeof EventSourceSchema>;
 export type Event = z.infer<typeof EventSchema>;
 export type StoredEventSource = z.infer<typeof StoredEventSourceSchema>;
+export type StoredEventStatus = z.infer<typeof StoredEventStatusSchema>;
 export type StoredEvent = z.infer<typeof StoredEventSchema>;
