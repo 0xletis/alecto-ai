@@ -35,7 +35,8 @@ export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
   const progressSummaries = summarizeProgressEvents(input.todayEvents);
   const checkInSummaries = summarizeCheckIn(input.todayEvents);
   const combinedSummaries = [...progressSummaries, ...checkInSummaries];
-  const wins = progressSummaries.length > 0 ? progressSummaries : ["No logged wins yet today"];
+  const winSummaries = summarizeWinEvents(input.todayEvents);
+  const wins = winSummaries.length > 0 ? winSummaries : ["No logged wins yet today"];
   const uniqueActiveGoals = dedupeActiveGoalsForReview(input.activeGoals);
   const gaps = buildGaps(uniqueActiveGoals, input.todayEvents);
   const suggestedFocus = buildSuggestedFocus(uniqueActiveGoals, gaps);
@@ -66,12 +67,74 @@ export function summarizeEvents(events: StoredEvent[]): string[] {
 
 function summarizeProgressEvents(events: StoredEvent[]): string[] {
   const applications = sumNumber(events, "career.application_sent", "count");
+  const confirmations = countEvents(events, "career.application_confirmation_received");
+  const replies = countEvents(events, "career.recruiter_reply_received");
+  const interviews = countEvents(events, "career.interview_scheduled");
+  const offers = countEvents(events, "career.offer_received");
   const trainingMinutes = sumNumber(events, "health.workout_completed", "duration_minutes");
   const readingMinutes = sumNumber(events, "learning.reading_session_completed", "duration_minutes");
   const summaries: string[] = [];
 
   if (applications > 0) {
     summaries.push(`${applications} job application${applications === 1 ? "" : "s"} sent`);
+  }
+
+  if (confirmations > 0) {
+    summaries.push(`${confirmations} application confirmation${confirmations === 1 ? "" : "s"}`);
+  }
+
+  if (replies > 0) {
+    summaries.push(`${replies} recruiter repl${replies === 1 ? "y" : "ies"}`);
+  }
+
+  if (interviews > 0) {
+    summaries.push(`${interviews} interview${interviews === 1 ? "" : "s"} scheduled`);
+  }
+
+  if (offers > 0) {
+    summaries.push(`${offers} offer${offers === 1 ? "" : "s"} received`);
+  }
+
+  const rejections = countEvents(events, "career.rejection_received");
+
+  if (rejections > 0) {
+    summaries.push(`${rejections} rejection${rejections === 1 ? "" : "s"} received`);
+  }
+
+  if (trainingMinutes > 0) {
+    summaries.push(`${trainingMinutes} minutes of training`);
+  }
+
+  if (readingMinutes > 0) {
+    summaries.push(`${readingMinutes} minutes of reading`);
+  }
+
+  return summaries;
+}
+
+function summarizeWinEvents(events: StoredEvent[]): string[] {
+  const applications = sumNumber(events, "career.application_sent", "count");
+  const replies = countEvents(events, "career.recruiter_reply_received");
+  const interviews = countEvents(events, "career.interview_scheduled");
+  const offers = countEvents(events, "career.offer_received");
+  const trainingMinutes = sumNumber(events, "health.workout_completed", "duration_minutes");
+  const readingMinutes = sumNumber(events, "learning.reading_session_completed", "duration_minutes");
+  const summaries: string[] = [];
+
+  if (applications > 0) {
+    summaries.push(`${applications} job application${applications === 1 ? "" : "s"} sent`);
+  }
+
+  if (replies > 0) {
+    summaries.push(`${replies} recruiter repl${replies === 1 ? "y" : "ies"}`);
+  }
+
+  if (interviews > 0) {
+    summaries.push(`${interviews} interview${interviews === 1 ? "" : "s"} scheduled`);
+  }
+
+  if (offers > 0) {
+    summaries.push(`${offers} offer${offers === 1 ? "" : "s"} received`);
   }
 
   if (trainingMinutes > 0) {
@@ -149,9 +212,12 @@ function goalStatusForTemplate(templateId: string, events: StoredEvent[], todayE
   if (templateId === "career.job_search") {
     return hasAny(todayEventTypes, [
       "career.application_sent",
+      "career.application_confirmation_received",
       "career.recruiter_reply_received",
       "career.interview_scheduled",
       "career.interview_completed",
+      "career.rejection_received",
+      "career.offer_received",
       "career.cv_updated",
       "career.portfolio_updated"
     ])
@@ -306,6 +372,10 @@ function sumNumber(events: StoredEvent[], type: StoredEvent["type"], key: string
       const value = event.data[key];
       return total + (typeof value === "number" ? value : 0);
     }, 0);
+}
+
+function countEvents(events: StoredEvent[], type: StoredEvent["type"]): number {
+  return events.filter((event) => event.type === type).length;
 }
 
 function joinReadableList(items: string[]): string {

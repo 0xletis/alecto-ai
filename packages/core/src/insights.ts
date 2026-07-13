@@ -121,8 +121,11 @@ export function buildWeeklyInsight(input: BuildInsightInput): InsightReport {
 function summarizeMetrics(events: StoredEvent[]) {
   return {
     applications: sum(events, "career.application_sent", "count"),
+    applicationConfirmations: count(events, "career.application_confirmation_received"),
     recruiterReplies: count(events, "career.recruiter_reply_received"),
     interviews: countAny(events, ["career.interview_scheduled", "career.interview_completed"]),
+    rejections: count(events, "career.rejection_received"),
+    offers: count(events, "career.offer_received"),
     cvUpdates: countAny(events, ["career.cv_updated", "career.portfolio_updated"]),
     workoutSessions: count(events, "health.workout_completed"),
     workoutMinutes: sum(events, "health.workout_completed", "duration_minutes"),
@@ -147,6 +150,11 @@ function summarizeMetrics(events: StoredEvent[]) {
       events.filter((event) =>
         [
           "career.application_sent",
+          "career.application_confirmation_received",
+          "career.recruiter_reply_received",
+          "career.interview_scheduled",
+          "career.rejection_received",
+          "career.offer_received",
           "health.workout_completed",
           "learning.reading_session_completed",
           "work.deep_work_session_completed",
@@ -165,6 +173,18 @@ function dailyWins(metrics: ReturnType<typeof summarizeMetrics>): string[] {
     wins.push(`${metrics.applications} job application${metrics.applications === 1 ? "" : "s"} sent`);
   }
 
+  if (metrics.recruiterReplies > 0) {
+    wins.push(`${metrics.recruiterReplies} recruiter repl${metrics.recruiterReplies === 1 ? "y" : "ies"}`);
+  }
+
+  if (metrics.interviews > 0) {
+    wins.push(`${metrics.interviews} interview signal${metrics.interviews === 1 ? "" : "s"}`);
+  }
+
+  if (metrics.offers > 0) {
+    wins.push(`${metrics.offers} offer${metrics.offers === 1 ? "" : "s"} received`);
+  }
+
   if (metrics.workoutMinutes > 0) {
     wins.push(`${metrics.workoutMinutes} minutes of training`);
   }
@@ -178,14 +198,6 @@ function dailyWins(metrics: ReturnType<typeof summarizeMetrics>): string[] {
 
 function weeklyWins(metrics: ReturnType<typeof summarizeMetrics>): string[] {
   const wins = dailyWins(metrics);
-
-  if (metrics.recruiterReplies > 0) {
-    wins.push(`${metrics.recruiterReplies} recruiter repl${metrics.recruiterReplies === 1 ? "y" : "ies"}`);
-  }
-
-  if (metrics.interviews > 0) {
-    wins.push(`${metrics.interviews} interview signal${metrics.interviews === 1 ? "" : "s"}`);
-  }
 
   if (metrics.checkIns > 0) {
     wins.push(`${metrics.checkIns} check-in${metrics.checkIns === 1 ? "" : "s"}`);
@@ -301,13 +313,20 @@ function buildGoalProgress(
 
   return activeGoals.map((goal) => {
     if (matchesGoal(goal, "career.job_search", "career")) {
-      const signals = metrics.applications + metrics.recruiterReplies + metrics.interviews + metrics.cvUpdates;
+      const signals =
+        metrics.applications +
+        metrics.applicationConfirmations +
+        metrics.recruiterReplies +
+        metrics.interviews +
+        metrics.rejections +
+        metrics.offers +
+        metrics.cvUpdates;
       return {
         goalId: goal.id,
         title: goal.title,
         status: signals > 0 ? "progress" : "no_progress",
         note: signals > 0
-          ? `${metrics.applications} applications, ${metrics.recruiterReplies} replies, ${metrics.interviews} interview signals`
+          ? `${metrics.applications} applications, ${metrics.applicationConfirmations} confirmations, ${metrics.recruiterReplies} replies, ${metrics.interviews} interviews, ${metrics.rejections} rejections, ${metrics.offers} offers`
           : `No job-search evidence logged ${period === "daily" ? "today" : "this week"}`
       };
     }
@@ -584,6 +603,11 @@ function buildDailySummary(wins: string[], risks: string[], directProfile: boole
 function buildWeeklySummary(metrics: ReturnType<typeof summarizeMetrics>): string {
   const parts = [
     metrics.applications > 0 ? `${metrics.applications} applications sent` : undefined,
+    metrics.applicationConfirmations > 0 ? `${metrics.applicationConfirmations} confirmations` : undefined,
+    metrics.recruiterReplies > 0 ? `${metrics.recruiterReplies} recruiter replies` : undefined,
+    metrics.interviews > 0 ? `${metrics.interviews} interview signals` : undefined,
+    metrics.rejections > 0 ? `${metrics.rejections} rejections` : undefined,
+    metrics.offers > 0 ? `${metrics.offers} offers` : undefined,
     metrics.workoutMinutes > 0 ? `${metrics.workoutSessions} workouts / ${metrics.workoutMinutes} minutes` : undefined,
     metrics.readingMinutes > 0 ? `${metrics.readingMinutes} minutes of reading` : undefined,
     metrics.sleepAverage !== undefined ? `avg sleep ${round(metrics.sleepAverage)}h` : undefined,

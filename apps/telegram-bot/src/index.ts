@@ -488,8 +488,15 @@ bot.command("events", async (ctx) => {
   }
 
   try {
-    const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events/recent`);
-    await ctx.reply(formatEvents(response.events));
+    const limit = parseEventLimit(getCommandText(ctx));
+    const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events`);
+    const events = response.events.slice(-limit).reverse();
+    await replyWithEventList(
+      ctx,
+      formatEvents(events, {
+        intro: formatEventsIntro("events", events.length, response.events.length, limit)
+      })
+    );
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not fetch your recent events right now.");
   }
@@ -501,8 +508,16 @@ bot.command("events_archived", async (ctx) => {
   }
 
   try {
-    const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events/recent?includeArchived=true`);
-    await ctx.reply(formatEvents(response.events.slice(0, 10), { alwaysShowStatus: true }));
+    const limit = parseEventLimit(getCommandText(ctx));
+    const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events?includeArchived=true`);
+    const events = response.events.slice(-limit).reverse();
+    await replyWithEventList(
+      ctx,
+      formatEvents(events, {
+        alwaysShowStatus: true,
+        intro: formatEventsIntro("events_archived", events.length, response.events.length, limit, " including archived/corrected")
+      })
+    );
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not fetch archived events right now.");
   }
@@ -594,6 +609,53 @@ bot.command("correct_event", async (ctx) => {
   } catch (error) {
     console.error("Telegram correct_event failed", error);
     await replyWithApiError(ctx, error, "I could not correct that event. Check the ID and data format.");
+  }
+});
+
+bot.command("ingest", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply("Usage: /ingest pasted recruiter or job-search text");
+    return;
+  }
+
+  try {
+    const response = await apiPost<IngestionResponse>(`/users/${getTelegramUserId(ctx)}/ingest/text`, {
+      text,
+      source: "telegram"
+    });
+    await ctx.reply(response.reply);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not ingest that text right now.");
+  }
+});
+
+bot.command("ingest_job", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply("Usage: /ingest_job pasted recruiter or job-search text");
+    return;
+  }
+
+  try {
+    const response = await apiPost<IngestionResponse>(`/users/${getTelegramUserId(ctx)}/ingest/text`, {
+      text,
+      source: "telegram",
+      domainHint: "career"
+    });
+    await ctx.reply(response.reply);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not ingest that job-search text right now.");
   }
 });
 
@@ -708,9 +770,32 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    const message = ctx.message.text;
+
+    if (isExplicitMemoryRequest(message) || isDirectBettingTradingIntent(message)) {
+      const response = await apiPost<ProcessMessageResponse>("/messages/process", {
+        userId: getTelegramUserId(ctx),
+        message
+      });
+
+      await ctx.reply(response.reply);
+      return;
+    }
+
     if (await shouldTreatAsNaturalCheckIn(ctx)) {
       const response = await apiPost<NaturalCheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/text`, {
-        text: ctx.message.text
+        text: message
+      });
+
+      await ctx.reply(response.reply);
+      return;
+    }
+
+    if (looksLikeJobSearchPaste(message)) {
+      const response = await apiPost<IngestionResponse>(`/users/${getTelegramUserId(ctx)}/ingest/text`, {
+        text: message,
+        source: "telegram",
+        domainHint: "career"
       });
 
       await ctx.reply(response.reply);
@@ -719,7 +804,7 @@ bot.on("message:text", async (ctx) => {
 
     const response = await apiPost<ProcessMessageResponse>("/messages/process", {
       userId: getTelegramUserId(ctx),
-      message: ctx.message.text
+      message
     });
 
     await ctx.reply(response.reply);
@@ -824,6 +909,27 @@ function parseWeeklyInsightCommand(text: string): { day: string; time: string } 
   return { day, time };
 }
 
+function parseEventLimit(text: string): number {
+  const limit = Number(text.trim() || "5");
+
+  if (!Number.isFinite(limit)) {
+    return 5;
+  }
+
+  return Math.min(20, Math.max(1, Math.floor(limit)));
+}
+
+function formatEventsIntro(command: string, shownCount: number, totalCount: number, limit: number, suffix = ""): string {
+  const base = `Showing ${shownCount} most recent events${suffix}.`;
+  const nextLimit = limit < 10 ? 10 : 20;
+
+  if (limit >= 20 || totalCount <= limit) {
+    return base;
+  }
+
+  return `${base} Use /${command} ${nextLimit} for more.`;
+}
+
 function parseCheckIn(text: string) {
   if (!text) {
     return undefined;
@@ -919,6 +1025,43 @@ function isDirectBettingTradingIntent(message: string): boolean {
   return /\b(quiero apostar|voy a apostar|i want to bet|i'?m going to bet|quiero tradear|voy a tradear|i want to trade|long|short|leverage)\b/i.test(
     message
   );
+}
+
+function looksLikeJobSearchPaste(message: string): boolean {
+  const normalized = normalizeSignalText(message);
+  const jobPastePatterns = [
+    /\bunfortunately\b/,
+    /\bnot selected\b/,
+    /\bmove forward with other candidates\b/,
+    /\bnot be proceeding\b/,
+    /\bno longer under consideration\b/,
+    /\bhemos decidido continuar con otros candidatos\b/,
+    /\bthanks for applying\b/,
+    /\bwe received your application\b/,
+    /\bapplication received\b/,
+    /\bgracias por aplicar\b/,
+    /\bhemos recibido tu solicitud\b/,
+    /\bwe'?d like to schedule an interview\b/,
+    /\bwould like to schedule an interview\b/,
+    /\bschedule an interview\b/,
+    /\bschedule a call\b/,
+    /\bare you available\b/,
+    /\bavailable next\b/,
+    /\bavailable times\b/,
+    /\bcalendly\b/,
+    /\bentrevista\b/,
+    /\bagendar\b/,
+    /\bprogramar una llamada\b/,
+    /\bwe would like to offer\b/,
+    /\bemployment agreement\b/,
+    /\boffer\b/,
+    /\brecruiter\b/,
+    /\btalent acquisition\b/,
+    /\bwe'?d like to discuss\b/,
+    /\bwe would like to discuss\b/
+  ];
+
+  return jobPastePatterns.some((pattern) => pattern.test(normalized));
 }
 
 function countNaturalCheckInSignals(message: string): { state: number; progress: number; reminderOnlyImpulse: number } {
@@ -1272,12 +1415,21 @@ function formatGoal(goal: Goal, duplicateWarnings: GoalDuplicateWarning[] = []) 
     .join("\n");
 }
 
-function formatEvents(events: Event[], options: { alwaysShowStatus?: boolean } = {}) {
+function formatEvents(events: Event[], options: { alwaysShowStatus?: boolean; intro?: string } = {}) {
   if (events.length === 0) {
     return "No recent events yet.";
   }
 
-  return events.map((event) => formatEvent(event, options)).join("\n\n");
+  return [options.intro, ...events.map((event) => formatEvent(event, options))].filter(Boolean).join("\n\n");
+}
+
+async function replyWithEventList(ctx: Context, message: string) {
+  try {
+    await ctx.reply(truncateText(message, 3900));
+  } catch (error) {
+    console.error("Telegram event list reply failed", error);
+    await ctx.reply("Too many events to display. Try /events 5.");
+  }
 }
 
 async function getLatestPendingAction(ctx: Context) {
@@ -1315,9 +1467,11 @@ function formatEvent(event: Event, options: { alwaysShowStatus?: boolean } = {})
     status === "archived" && event.archiveReason ? `archiveReason: ${event.archiveReason}` : undefined,
     `type: ${event.type}`,
     `time: ${new Date(event.timestamp).toLocaleString()}`,
-    `data: ${formatEventData(event)}`,
+    `data: ${truncateText(formatEventData(event), 300)}`,
     correctionHint(event),
-    event.evidence && event.evidence.length > 0 ? `evidence: ${event.evidence.slice(0, 2).join("; ")}` : undefined
+    event.evidence && event.evidence.length > 0
+      ? `evidence: ${truncateText(event.evidence.slice(0, 2).join("; "), 300)}`
+      : undefined
   ]
     .filter(Boolean)
     .join("\n");
@@ -1407,14 +1561,18 @@ function formatEventData(event: Event) {
   }
 
   if (event.type === "reflection.journal_entry_created" && typeof event.data.text === "string") {
-    return event.data.text;
+    return truncateText(event.data.text, 300);
   }
 
   if (event.type === "learning.reading_session_completed" && typeof event.data.duration_minutes === "number") {
     return `${event.data.duration_minutes} minutes of reading`;
   }
 
-  return JSON.stringify(event.data);
+  return truncateText(JSON.stringify(event.data), 300);
+}
+
+function truncateText(text: string, maxLength: number): string {
+  return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 3))}...` : text;
 }
 
 function hardGuardianProfile() {
@@ -1504,6 +1662,10 @@ interface CheckInResponse {
 }
 
 interface NaturalCheckInResponse {
+  reply: string;
+}
+
+interface IngestionResponse {
   reply: string;
 }
 

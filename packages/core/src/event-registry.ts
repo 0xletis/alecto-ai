@@ -16,9 +16,11 @@ export const eventDomains = [
 
 export const eventRegistry = [
   { type: "career.application_sent", domain: "career" },
+  { type: "career.application_confirmation_received", domain: "career" },
   { type: "career.recruiter_reply_received", domain: "career" },
   { type: "career.interview_scheduled", domain: "career" },
   { type: "career.interview_completed", domain: "career" },
+  { type: "career.rejection_received", domain: "career" },
   { type: "career.offer_received", domain: "career" },
   { type: "career.cv_updated", domain: "career" },
   { type: "career.portfolio_updated", domain: "career" },

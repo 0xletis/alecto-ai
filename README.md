@@ -124,11 +124,13 @@ Telegram commands:
 - `/weekly`: weekly interpretive coaching insight
 - `/weekly_insight`: alias of `/weekly`
 - `/goals`: active goals
-- `/events`: recent active events with ids
-- `/events_archived`: recent events including archived/corrected status
+- `/events [limit]`: recent active events with ids, defaults to 5 and caps at 20
+- `/events_archived [limit]`: recent events including archived/corrected status, defaults to 5 and caps at 20
 - `/undo_last_event`: archive the latest logged event group
 - `/delete_event <eventId>`: archive one event
 - `/correct_event EVENT_ID | {"duration_minutes":30}`: correct one event while preserving history
+- `/ingest <text>`: route pasted text through the generic ingestion framework
+- `/ingest_job <text>`: ingest pasted job-search/recruiter text with a career domain hint
 - `/pending`: show pending profile/goal changes
 - `/confirm`: confirm the latest pending change
 - `/cancel`: cancel the latest pending change
@@ -281,6 +283,14 @@ curl -X POST http://localhost:3000/users/local-user/checkins/daily/text \
   -H "Content-Type: application/json" \
   -d '{"text":"hoy fatal, dormí 5h, ansiedad 8, ganas de apostar 7"}'
 
+curl -X POST http://localhost:3000/users/local-user/ingest/text \
+  -H "Content-Type: application/json" \
+  -d '{"source":"manual_paste","domainHint":"career","text":"Hi Miquel, we would like to schedule an interview for the Backend Engineer role at Example Labs. Are you available this week?"}'
+
+curl -X POST http://localhost:3000/users/local-user/ingest/text \
+  -H "Content-Type: application/json" \
+  -d '{"source":"manual_paste","domainHint":"career","text":"Unfortunately, we decided to move forward with other candidates for the Product Engineer role."}'
+
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"quiero apostar, no tengo gambling impulse"}'
@@ -351,6 +361,10 @@ Expected:
 - Correcting a derived check-in event, such as workout duration, also updates the parent `reflection.daily_checkin_completed.data.answers` for that group.
 - Check-in fields `applications`, `workout`, `reading`, and `sleep` create structured progress events. Notes are journal context unless they contain clear numeric phrases like `sent 2 CVs`, `trained 45 minutes`, or `read 30 minutes`.
 - Telegram normal messages that look like daily check-ins are sent to `/checkins/daily/text`. Structured `/checkin key=value` still works.
+- Generic ingestion uses the flow raw input -> ingestion router -> adapter registry -> adapter parse result -> normalized events. Future adapters should register with the ingestion registry instead of adding one-off pipelines.
+- `job_search_text` is the first ingestion adapter. It classifies pasted recruiter/job-search text as application confirmation, recruiter reply, interview scheduled, rejection, offer, or unknown.
+- `/ingest` and `/ingest_job` call `POST /users/:userId/ingest/text`. Telegram also routes obvious pasted job-search emails, such as recruiter interview scheduling or rejection emails, to ingestion. Casual logs like `i sent 2 cvs today` stay on the normal message/check-in path.
+- `/events` and `/events_archived` truncate long data/evidence fields to avoid Telegram message length failures. Use `/events 10` or `/events_archived 10` for more, up to 20.
 - Natural check-in warnings include high anxiety plus gambling impulse and low sleep.
 - Daily check-in reminders, daily insights, and weekly insights are sent by `pnpm dev:worker`.
 - Daily reminders send once per user per day because of `NotificationLog`. Daily insights use `daily_insight` logs, and weekly insights use `weekly_insight` logs.
@@ -407,6 +421,8 @@ Manual insight tests:
 - `POST /users/:userId/checkins/daily`
 - `POST /users/:userId/checkins/daily/text`
 - `GET /users/:userId/checkins/daily/prompt`
+- `POST /users/:userId/ingest/text`
+- `POST /users/:userId/ingest/job-search-text`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/insights/daily`
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`
@@ -415,7 +431,7 @@ Manual insight tests:
 
 ## Packages
 
-- `packages/core`: shared domain types, Zod schemas, risk states, user operating profile, and the initial event registry.
+- `packages/core`: shared domain types, Zod schemas, risk states, user operating profile, ingestion registry/adapters, and the initial event registry.
 - `packages/llm`: optional OpenAI structured message analyzer plus analysis result schemas.
 - `packages/db`: Prisma schema, client export, and repository functions for users, goals, and events.
 - `apps/api`: Fastify API exposing health, event type, message processing, persisted event, and persisted goal routes.

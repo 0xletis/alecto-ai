@@ -15,9 +15,11 @@ Rules:
 ### Career
 
 - career.application_sent
+- career.application_confirmation_received
 - career.recruiter_reply_received
 - career.interview_scheduled
 - career.interview_completed
+- career.rejection_received
 - career.offer_received
 - career.cv_updated
 - career.portfolio_updated
