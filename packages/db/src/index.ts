@@ -629,6 +629,23 @@ export async function getUsersWithDailyCheckinEnabled(): Promise<NotificationSet
   return settings.map(toNotificationSettings);
 }
 
+export async function getUsersWithEnabledNotifications(): Promise<NotificationSettings[]> {
+  const settings = await prisma.notificationSettings.findMany({
+    where: {
+      OR: [
+        { dailyCheckinEnabled: true },
+        { dailyInsightEnabled: true },
+        { weeklyInsightEnabled: true }
+      ]
+    },
+    orderBy: {
+      updatedAt: "desc"
+    }
+  });
+
+  return settings.map(toNotificationSettings);
+}
+
 export async function createNotificationLog(input: NotificationLogInput): Promise<boolean> {
   try {
     await prisma.notificationLog.create({
@@ -1001,6 +1018,11 @@ function toNotificationSettings(
     telegramUserId: settings.telegramUserId ?? undefined,
     dailyCheckinEnabled: settings.dailyCheckinEnabled,
     dailyCheckinTime: settings.dailyCheckinTime ?? undefined,
+    dailyInsightEnabled: settings.dailyInsightEnabled,
+    dailyInsightTime: settings.dailyInsightTime ?? undefined,
+    weeklyInsightEnabled: settings.weeklyInsightEnabled,
+    weeklyInsightDay: (settings.weeklyInsightDay as NotificationSettings["weeklyInsightDay"]) ?? undefined,
+    weeklyInsightTime: settings.weeklyInsightTime ?? undefined,
     timezone: settings.timezone,
     createdAt: settings.createdAt,
     updatedAt: settings.updatedAt

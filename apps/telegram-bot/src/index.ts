@@ -188,6 +188,97 @@ bot.command("disable_checkin", async (ctx) => {
   }
 });
 
+bot.command("enable_daily_insight", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const time = getCommandText(ctx);
+
+  if (!/^\d{2}:\d{2}$/.test(time)) {
+    await ctx.reply("Usage: /enable_daily_insight 21:30");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`,
+      {
+        telegramUserId: getRawTelegramUserId(ctx),
+        dailyInsightEnabled: true,
+        dailyInsightTime: time,
+        timezone: "Europe/Madrid"
+      }
+    );
+    await ctx.reply(
+      `Daily insight enabled at ${response.notificationSettings.dailyInsightTime} ${response.notificationSettings.timezone}.`
+    );
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not enable daily insight right now.");
+  }
+});
+
+bot.command("disable_daily_insight", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    await apiPatch<NotificationSettingsResponse>(`/users/${getTelegramUserId(ctx)}/notification-settings`, {
+      dailyInsightEnabled: false
+    });
+    await ctx.reply("Daily insight disabled.");
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not disable daily insight right now.");
+  }
+});
+
+bot.command("enable_weekly_insight", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseWeeklyInsightCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /enable_weekly_insight sunday 20:00");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`,
+      {
+        telegramUserId: getRawTelegramUserId(ctx),
+        weeklyInsightEnabled: true,
+        weeklyInsightDay: parsed.day,
+        weeklyInsightTime: parsed.time,
+        timezone: "Europe/Madrid"
+      }
+    );
+    await ctx.reply(
+      `Weekly insight enabled on ${response.notificationSettings.weeklyInsightDay} at ${response.notificationSettings.weeklyInsightTime} ${response.notificationSettings.timezone}.`
+    );
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not enable weekly insight right now.");
+  }
+});
+
+bot.command("disable_weekly_insight", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    await apiPatch<NotificationSettingsResponse>(`/users/${getTelegramUserId(ctx)}/notification-settings`, {
+      weeklyInsightEnabled: false
+    });
+    await ctx.reply("Weekly insight disabled.");
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not disable weekly insight right now.");
+  }
+});
+
 bot.command("send_checkin_now", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -199,6 +290,14 @@ bot.command("send_checkin_now", async (ctx) => {
   } catch (error) {
     await replyWithApiError(ctx, error, "I could not build your check-in prompt right now.");
   }
+});
+
+bot.command("send_daily_insight_now", async (ctx) => {
+  await sendInsight(ctx, "daily");
+});
+
+bot.command("send_weekly_insight_now", async (ctx) => {
+  await sendInsight(ctx, "weekly");
 });
 
 bot.command("set_style", async (ctx) => {
@@ -714,6 +813,17 @@ function parseCreateGoalFromTemplate(text: string) {
   };
 }
 
+function parseWeeklyInsightCommand(text: string): { day: string; time: string } | undefined {
+  const [day, time] = text.toLowerCase().split(/\s+/).filter(Boolean);
+  const validDays = new Set(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]);
+
+  if (!validDays.has(day) || !/^\d{2}:\d{2}$/.test(time ?? "")) {
+    return undefined;
+  }
+
+  return { day, time };
+}
+
 function parseCheckIn(text: string) {
   if (!text) {
     return undefined;
@@ -1101,6 +1211,11 @@ function formatNotificationSettings(settings: NotificationSettings) {
     "Notification settings:",
     `dailyCheckinEnabled: ${settings.dailyCheckinEnabled}`,
     `dailyCheckinTime: ${settings.dailyCheckinTime ?? "not set"}`,
+    `dailyInsightEnabled: ${settings.dailyInsightEnabled}`,
+    `dailyInsightTime: ${settings.dailyInsightTime ?? "not set"}`,
+    `weeklyInsightEnabled: ${settings.weeklyInsightEnabled}`,
+    `weeklyInsightDay: ${settings.weeklyInsightDay ?? "not set"}`,
+    `weeklyInsightTime: ${settings.weeklyInsightTime ?? "not set"}`,
     `timezone: ${settings.timezone}`,
     `telegramUserId: ${settings.telegramUserId ?? "not set"}`
   ].join("\n");
@@ -1531,6 +1646,11 @@ interface NotificationSettings {
   telegramUserId?: string;
   dailyCheckinEnabled: boolean;
   dailyCheckinTime?: string;
+  dailyInsightEnabled: boolean;
+  dailyInsightTime?: string;
+  weeklyInsightEnabled: boolean;
+  weeklyInsightDay?: string;
+  weeklyInsightTime?: string;
   timezone: string;
 }
 

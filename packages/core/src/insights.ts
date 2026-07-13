@@ -226,22 +226,26 @@ function riskSignals(metrics: ReturnType<typeof summarizeMetrics>): string[] {
 }
 
 function weeklyRisks(metrics: ReturnType<typeof summarizeMetrics>): string[] {
-  const risks = riskSignals(metrics);
+  const risks: string[] = [];
 
-  if (metrics.cooldowns >= 2) {
-    risks.push(`${metrics.cooldowns} betting/trading cooldowns this week`);
+  if (metrics.cooldowns > 0) {
+    risks.push(`${metrics.cooldowns} betting/trading cooldown${metrics.cooldowns === 1 ? "" : "s"} this week`);
   }
 
-  if (metrics.highAnxietyDays >= 2) {
-    risks.push(`high anxiety logged on ${metrics.highAnxietyDays} days`);
+  if (metrics.highImpulseEvents > 0) {
+    risks.push(`${metrics.highImpulseEvents} high impulse log${metrics.highImpulseEvents === 1 ? "" : "s"} this week`);
   }
 
-  if (metrics.lowSleepDays >= 2) {
-    risks.push(`low sleep logged on ${metrics.lowSleepDays} days`);
+  if (metrics.highAnxietyDays > 0) {
+    risks.push(`high anxiety appeared on ${metrics.highAnxietyDays} day${metrics.highAnxietyDays === 1 ? "" : "s"} this week`);
   }
 
-  if (metrics.highImpulseEvents >= 2) {
-    risks.push(`${metrics.highImpulseEvents} high impulse logs`);
+  if (metrics.lowSleepDays > 0) {
+    risks.push(`low sleep appeared on ${metrics.lowSleepDays} day${metrics.lowSleepDays === 1 ? "" : "s"} this week`);
+  }
+
+  if (metrics.lowSleepDays > 0 && metrics.highImpulseEvents > 0) {
+    risks.push("low sleep and high financial impulse both appeared this week");
   }
 
   return unique(risks);

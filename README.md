@@ -104,6 +104,12 @@ Telegram commands:
 - `/enable_checkin 09:00`: enable daily check-in reminders at local time
 - `/disable_checkin`: disable daily check-in reminders
 - `/send_checkin_now`: preview the same goal-aware daily check-in prompt the worker sends
+- `/enable_daily_insight 21:30`: enable scheduled daily insight delivery
+- `/disable_daily_insight`: disable scheduled daily insight delivery
+- `/enable_weekly_insight sunday 20:00`: enable scheduled weekly insight delivery
+- `/disable_weekly_insight`: disable scheduled weekly insight delivery
+- `/send_daily_insight_now`: send the current daily insight immediately without creating a notification log
+- `/send_weekly_insight_now`: send the current weekly insight immediately without creating a notification log
 - `/set_style hard_guardian`: apply hard guardian profile defaults
 - `/set_style balanced`: apply balanced profile defaults
 - `/templates`: show available goal templates
@@ -346,9 +352,13 @@ Expected:
 - Check-in fields `applications`, `workout`, `reading`, and `sleep` create structured progress events. Notes are journal context unless they contain clear numeric phrases like `sent 2 CVs`, `trained 45 minutes`, or `read 30 minutes`.
 - Telegram normal messages that look like daily check-ins are sent to `/checkins/daily/text`. Structured `/checkin key=value` still works.
 - Natural check-in warnings include high anxiety plus gambling impulse and low sleep.
-- Daily reminders send once per user per day because of `NotificationLog`. Use `/send_checkin_now` to test the reminder text repeatedly without creating a log.
+- Daily check-in reminders, daily insights, and weekly insights are sent by `pnpm dev:worker`.
+- Daily reminders send once per user per day because of `NotificationLog`. Daily insights use `daily_insight` logs, and weekly insights use `weekly_insight` logs.
+- Use `/send_checkin_now`, `/send_daily_insight_now`, and `/send_weekly_insight_now` to test message text repeatedly without creating notification logs.
 - Daily check-in prompts are goal-aware. Active goal templates influence the prompt, for example career goals ask about applications and interviews, health goals ask about workout/sleep, finance goals ask about impulse and thesis-before-risk.
 - `/send_checkin_now` previews the same goal-aware prompt the worker sends.
+- `/enable_daily_insight 21:30` sends `/insight` output once per day at the configured local time.
+- `/enable_weekly_insight sunday 20:00` sends `/weekly` output once for that week at the configured local weekday/time.
 - Daily review sums progress metrics like applications, workout minutes, and reading minutes, but uses the latest state metrics for sleep, energy, anxiety, focus, and impulse.
 - `/review` is factual. `/insight` and `/weekly` are interpretive coaching reports built from active events, goals, memories, profile, and risk signals.
 - Daily insight identifies meaningful progress, gaps, risk state, relevant memory signals, and 1-3 recommended next actions.

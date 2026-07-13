@@ -136,6 +136,11 @@ model NotificationSettings {
   telegramUserId       String?
   dailyCheckinEnabled  Boolean  @default(false)
   dailyCheckinTime     String?
+  dailyInsightEnabled  Boolean  @default(false)
+  dailyInsightTime     String?
+  weeklyInsightEnabled Boolean  @default(false)
+  weeklyInsightDay     String?
+  weeklyInsightTime    String?
   timezone             String   @default("Europe/Madrid")
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
