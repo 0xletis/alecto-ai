@@ -33,6 +33,7 @@ import {
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
   type IngestTextBody,
+  type GithubPublicConnectionInput,
   type MessageIntent,
   type InsightReport,
   type AgentResponse,
@@ -52,6 +53,7 @@ import {
   archiveEvent,
   archiveEventGroup,
   archiveGoal,
+  archiveIntegrationConnection,
   archiveMemory,
   correctEvent,
   createEvent,
@@ -651,8 +653,23 @@ export function buildServer() {
         }
       }
 
+      const input = normalizeGithubPublicConnectionInput(parsed.data);
+      const existingConnection = findDuplicateGithubConnection(
+        await getIntegrationConnections(request.params.userId),
+        input
+      );
+
+      if (existingConnection) {
+        return {
+          duplicate: true,
+          message: `GitHub integration already exists: ${existingConnection.id}`,
+          connection: existingConnection
+        };
+      }
+
       return {
-        connection: await createGithubPublicConnection(request.params.userId, parsed.data)
+        duplicate: false,
+        connection: await createGithubPublicConnection(request.params.userId, input)
       };
     }
   );
@@ -685,6 +702,24 @@ export function buildServer() {
     }
   );
 
+  server.delete<{ Params: { userId: string; connectionId: string } }>(
+    "/users/:userId/integrations/:connectionId",
+    async (request, reply) => {
+      const connection = await archiveIntegrationConnection(request.params.userId, request.params.connectionId);
+
+      if (!connection) {
+        return reply.status(404).send({
+          error: "Integration connection not found"
+        });
+      }
+
+      return {
+        connection,
+        message: "Integration archived. Historical events were kept."
+      };
+    }
+  );
+
   server.post<{ Params: { userId: string; connectionId: string } }>(
     "/users/:userId/integrations/:connectionId/sync",
     async (request, reply) => {
@@ -696,9 +731,15 @@ export function buildServer() {
         });
       }
 
-      if (connection.status === "paused") {
+      if (connection.status === "paused" || connection.status === "archived") {
         return reply.status(400).send({
-          error: "Integration connection is paused"
+          error: `Integration connection is ${connection.status}`
+        });
+      }
+
+      if (connection.status === "error") {
+        return reply.status(400).send({
+          error: "Integration connection is in error status. Resume it before syncing again."
         });
       }
 
@@ -1001,6 +1042,7 @@ async function syncGithubPublicConnection(connection: IntegrationConnection) {
     let eventsCreated = 0;
     let personalCommitEvents = 0;
     let repoActivityEvents = 0;
+    const repoSummaries = new Map<string, { repo: string; personalCommitEvents: number; repoActivityEvents: number }>();
 
     for (const repo of config.repos) {
       const commits = await fetchGithubCommits(repo.owner, repo.repo);
@@ -1033,11 +1075,22 @@ async function syncGithubPublicConnection(connection: IntegrationConnection) {
 
         if (created.created) {
           eventsCreated += 1;
+          const repoName = `${repo.owner}/${repo.repo}`;
+          const repoSummary = repoSummaries.get(repoName) ?? {
+            repo: repoName,
+            personalCommitEvents: 0,
+            repoActivityEvents: 0
+          };
+
           if (eventType === "coding.commit_created") {
             personalCommitEvents += 1;
+            repoSummary.personalCommitEvents += 1;
           } else {
             repoActivityEvents += 1;
+            repoSummary.repoActivityEvents += 1;
           }
+
+          repoSummaries.set(repoName, repoSummary);
         }
       }
     }
@@ -1065,6 +1118,7 @@ async function syncGithubPublicConnection(connection: IntegrationConnection) {
       eventsCreated,
       personalCommitEvents,
       repoActivityEvents,
+      repoSummaries: [...repoSummaries.values()],
       syncLog
     };
   } catch (error) {
@@ -1093,10 +1147,45 @@ async function syncGithubPublicConnection(connection: IntegrationConnection) {
       eventsCreated: 0,
       personalCommitEvents: 0,
       repoActivityEvents: 0,
+      repoSummaries: [],
       error: reason.includes(":") ? `GitHub sync failed for ${reason}` : `GitHub sync failed: ${reason}`,
       syncLog
     };
   }
+}
+
+function normalizeGithubPublicConnectionInput(input: GithubPublicConnectionInput): GithubPublicConnectionInput {
+  return {
+    ...input,
+    repos: input.repos
+      .map((repo) => ({
+        owner: repo.owner.trim().toLowerCase(),
+        repo: repo.repo.trim().toLowerCase()
+      }))
+      .sort((left, right) => `${left.owner}/${left.repo}`.localeCompare(`${right.owner}/${right.repo}`)),
+    authorLogin: input.authorLogin?.trim().toLowerCase(),
+    includeRepoActivity: input.includeRepoActivity ?? !input.authorLogin
+  };
+}
+
+function findDuplicateGithubConnection(
+  connections: Awaited<ReturnType<typeof getIntegrationConnections>>,
+  input: GithubPublicConnectionInput
+) {
+  const expectedKey = githubConnectionDedupeKey(input);
+
+  return connections.find(
+    (connection) =>
+      connection.integrationId === "github_public" &&
+      (connection.status === "active" || connection.status === "paused") &&
+      githubConnectionDedupeKey(parseGithubConnectionConfig(connection.config)) === expectedKey
+  );
+}
+
+function githubConnectionDedupeKey(input: GithubPublicConnectionInput): string {
+  const normalized = normalizeGithubPublicConnectionInput(input);
+  const repos = normalized.repos.map((repo) => `${repo.owner}/${repo.repo}`).join(",");
+  return `${repos}|author=${normalized.authorLogin ?? ""}`;
 }
 
 async function validateGithubPublicRepo(

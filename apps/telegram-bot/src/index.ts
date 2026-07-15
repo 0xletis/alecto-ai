@@ -423,7 +423,42 @@ bot.command("connect_github", async (ctx) => {
       `/users/${getTelegramUserId(ctx)}/integrations/github-public`,
       parsed
     );
+    if (response.duplicate) {
+      await ctx.reply(response.message ?? `GitHub integration already exists: ${response.connection.id}`);
+      return;
+    }
+
     await ctx.reply(`GitHub connected:\n${formatIntegrationConnection(response.connection)}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("pause_integration", async (ctx) => {
+  await updateIntegrationStatusCommand(ctx, "paused");
+});
+
+bot.command("resume_integration", async (ctx) => {
+  await updateIntegrationStatusCommand(ctx, "active");
+});
+
+bot.command("delete_integration", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const connectionId = getCommandText(ctx);
+
+  if (!connectionId) {
+    await ctx.reply("Usage: /delete_integration CONNECTION_ID");
+    return;
+  }
+
+  try {
+    const response = await apiDelete<IntegrationConnectionMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/integrations/${connectionId}`
+    );
+    await ctx.reply(response.message ?? "Integration archived. Historical events were kept.");
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
   }
@@ -1399,6 +1434,29 @@ async function syncIntegration(ctx: Context, connectionId: string): Promise<stri
   return `Synced ${response.integrationId}: ${response.eventsCreated} new event${response.eventsCreated === 1 ? "" : "s"}.`;
 }
 
+async function updateIntegrationStatusCommand(ctx: Context, status: "active" | "paused") {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const connectionId = getCommandText(ctx);
+
+  if (!connectionId) {
+    await ctx.reply(`Usage: /${status === "active" ? "resume" : "pause"}_integration CONNECTION_ID`);
+    return;
+  }
+
+  try {
+    const response = await apiPatch<IntegrationConnectionResponse>(
+      `/users/${getTelegramUserId(ctx)}/integrations/${connectionId}`,
+      { status }
+    );
+    await ctx.reply(`Integration ${status}:\n${formatIntegrationConnection(response.connection)}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+}
+
 function formatIntegrationSyncFailure(connection: IntegrationConnection, error: unknown): string {
   const reason = safeIntegrationErrorMessage(error);
 
@@ -1496,6 +1554,18 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
 
   if (!response.ok) {
     throw await errorFromResponse(response, `API PATCH ${path} failed with ${response.status}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+async function apiDelete<T>(path: string): Promise<T> {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    method: "DELETE"
+  });
+
+  if (!response.ok) {
+    throw await errorFromResponse(response, `API DELETE ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
@@ -2123,6 +2193,13 @@ interface IntegrationConnectionsResponse {
 
 interface IntegrationConnectionResponse {
   connection: IntegrationConnection;
+  duplicate?: boolean;
+  message?: string;
+}
+
+interface IntegrationConnectionMutationResponse {
+  connection: IntegrationConnection;
+  message?: string;
 }
 
 interface IntegrationSyncResponse {
@@ -2132,6 +2209,13 @@ interface IntegrationSyncResponse {
   eventsCreated: number;
   personalCommitEvents?: number;
   repoActivityEvents?: number;
+  repoSummaries?: IntegrationRepoSyncSummary[];
+}
+
+interface IntegrationRepoSyncSummary {
+  repo: string;
+  personalCommitEvents: number;
+  repoActivityEvents: number;
 }
 
 interface CheckInResponse {
@@ -2279,7 +2363,7 @@ interface IntegrationConnection {
   id: string;
   userId: string;
   integrationId: string;
-  status: "active" | "paused" | "error";
+  status: "active" | "paused" | "error" | "archived";
   config: Record<string, unknown>;
   lastSyncedAt?: string;
   lastError?: string;

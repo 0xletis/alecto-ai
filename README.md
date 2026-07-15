@@ -120,6 +120,9 @@ Telegram commands:
 - `/my_integrations`: show your connected integrations
 - `/connect_github OWNER/REPO`: watch public repo activity as external context
 - `/connect_github OWNER/REPO author=LOGIN`: connect a public repo and only log matching commits
+- `/pause_integration CONNECTION_ID`: pause an integration
+- `/resume_integration CONNECTION_ID`: resume a paused integration
+- `/delete_integration CONNECTION_ID`: archive an integration while keeping historical events
 - `/sync_integrations`: sync all active integrations
 - `/sync_integration CONNECTION_ID`: sync one integration
 - `/create_goal category | title | why`: create a goal
@@ -431,6 +434,12 @@ Expected:
 - The public GitHub integration does not support private repos. A private or nonexistent repo returns a clean sync error and updates the connection `lastError`.
 - Older GitHub `coding.commit_created` events without `data.isPersonal=true` are treated as unverified activity, not personal progress.
 - GitHub events use `source=github`, provider metadata, and external IDs for dedupe. Running the same sync twice should not create duplicate events.
+- Duplicate GitHub connections are prevented for the same normalized repo list and same `author=LOGIN`. Same repo with a different author is allowed.
+- Manual sync uses `/sync_integrations` or `/sync_integration CONNECTION_ID`.
+- Automatic integration sync is disabled by default. Set `INTEGRATION_SYNC_ENABLED=true` on the worker to sync active integrations in the background.
+- Automatic sync interval defaults to 15 minutes. Override with `INTEGRATION_SYNC_INTERVAL_MINUTES=15`.
+- Scheduled sync skips paused, archived, and error integrations, and skips active integrations synced less than the configured interval ago.
+- Scheduled sync sends Telegram only when new events are created or when a connection first enters an error state.
 
 Integration Registry v1 manual test:
 
@@ -455,6 +464,9 @@ Telegram integration commands:
 /my_integrations
 /connect_github vercel/next.js
 /connect_github letisfarre/alecto-ai author=letisfarre
+/pause_integration CONNECTION_ID
+/resume_integration CONNECTION_ID
+/delete_integration CONNECTION_ID
 /sync_integrations
 /sync_integration CONNECTION_ID
 ```
@@ -504,6 +516,7 @@ Manual insight tests:
 - `GET /users/:userId/integrations`
 - `POST /users/:userId/integrations/github-public`
 - `PATCH /users/:userId/integrations/:connectionId`
+- `DELETE /users/:userId/integrations/:connectionId`
 - `POST /users/:userId/integrations/:connectionId/sync`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/insights/daily`

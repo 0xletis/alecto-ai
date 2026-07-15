@@ -86,7 +86,7 @@ export interface IntegrationConnection {
   id: string;
   userId: string;
   integrationId: string;
-  status: "active" | "paused" | "error";
+  status: "active" | "paused" | "error" | "archived";
   config: Record<string, unknown>;
   lastSyncedAt?: Date;
   lastError?: string;
@@ -299,12 +299,50 @@ export async function createGithubPublicConnection(
   return toIntegrationConnection(connection);
 }
 
+export async function archiveIntegrationConnection(
+  userId: string,
+  connectionId: string
+): Promise<IntegrationConnection | undefined> {
+  await ensureUser(userId);
+
+  const existingConnection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: connectionId,
+      userId
+    }
+  });
+
+  if (!existingConnection) {
+    return undefined;
+  }
+
+  const connection = await prisma.integrationConnection.update({
+    where: { id: connectionId },
+    data: {
+      status: "archived"
+    }
+  });
+
+  return toIntegrationConnection(connection);
+}
+
 export async function getIntegrationConnections(userId: string): Promise<IntegrationConnection[]> {
   await ensureUser(userId);
 
   const connections = await prisma.integrationConnection.findMany({
     where: { userId },
     orderBy: { createdAt: "desc" }
+  });
+
+  return connections.map(toIntegrationConnection);
+}
+
+export async function getActiveIntegrationConnectionsForSync(): Promise<IntegrationConnection[]> {
+  const connections = await prisma.integrationConnection.findMany({
+    where: {
+      status: "active"
+    },
+    orderBy: { updatedAt: "asc" }
   });
 
   return connections.map(toIntegrationConnection);

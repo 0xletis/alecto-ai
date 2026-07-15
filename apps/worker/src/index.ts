@@ -2,6 +2,8 @@ import { config } from "dotenv";
 import {
   createNotificationLog,
   getActiveGoals,
+  getActiveIntegrationConnectionsForSync,
+  getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
   getUsersWithEnabledNotifications,
@@ -16,6 +18,8 @@ config({
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
 const apiBaseUrl = process.env.API_BASE_URL ?? "http://localhost:3000";
 const tickMs = 60_000;
+const integrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED === "true";
+const integrationSyncIntervalMinutes = Number(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15");
 
 if (!telegramBotToken) {
   throw new Error("TELEGRAM_BOT_TOKEN is required.");
@@ -56,6 +60,57 @@ async function runTick() {
     ) {
       await maybeSendWeeklyInsight(item, now);
     }
+  }
+
+  if (integrationSyncEnabled) {
+    await runIntegrationSync(now);
+  }
+}
+
+async function runIntegrationSync(now: Date) {
+  const intervalMs = Math.max(1, integrationSyncIntervalMinutes) * 60_000;
+  const connections = await getActiveIntegrationConnectionsForSync();
+  const notificationsByUser = new Map<string, string[]>();
+
+  for (const connection of connections) {
+    if (connection.lastSyncedAt && now.getTime() - connection.lastSyncedAt.getTime() < intervalMs) {
+      continue;
+    }
+
+    try {
+      const response = await apiPost<IntegrationSyncResponse>(
+        `/users/${connection.userId}/integrations/${connection.id}/sync`,
+        {}
+      );
+      const messages = formatIntegrationSyncNotifications(response);
+
+      if (messages.length > 0) {
+        notificationsByUser.set(connection.userId, [
+          ...(notificationsByUser.get(connection.userId) ?? []),
+          ...messages
+        ]);
+      }
+    } catch (error) {
+      console.error(`Integration sync failed for ${connection.id}`, error);
+
+      if (!connection.lastError) {
+        const reason = safeErrorMessage(error);
+        notificationsByUser.set(connection.userId, [
+          ...(notificationsByUser.get(connection.userId) ?? []),
+          reason.startsWith("GitHub sync failed") ? reason : `GitHub sync failed: ${reason}`
+        ]);
+      }
+    }
+  }
+
+  for (const [userId, messages] of notificationsByUser) {
+    const settings = await getOrCreateNotificationSettings(userId);
+
+    if (!settings.telegramUserId || messages.length === 0) {
+      continue;
+    }
+
+    await sendTelegramMessage(settings.telegramUserId, messages.slice(0, 5).join("\n"));
   }
 }
 
@@ -148,6 +203,74 @@ async function apiGet<T>(path: string): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+async function apiPost<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${apiBaseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(parseApiError(text) ?? `API POST ${path} failed with ${response.status}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+function parseApiError(text: string): string | undefined {
+  if (!text.trim()) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(text) as { error?: unknown };
+    return typeof parsed.error === "string" && parsed.error.trim() ? parsed.error : undefined;
+  } catch {
+    return text.trim();
+  }
+}
+
+function safeErrorMessage(error: unknown): string {
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    return error.message;
+  }
+
+  return "Integration sync failed.";
+}
+
+function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): string[] {
+  if (response.eventsCreated <= 0) {
+    return [];
+  }
+
+  const summaries = response.repoSummaries ?? [];
+
+  if (summaries.length === 0) {
+    return [`GitHub: ${response.eventsCreated} new event${response.eventsCreated === 1 ? "" : "s"} detected.`];
+  }
+
+  return summaries.flatMap((summary) => {
+    const messages: string[] = [];
+
+    if (summary.personalCommitEvents > 0) {
+      messages.push(
+        `GitHub: ${summary.personalCommitEvents} personal commit${summary.personalCommitEvents === 1 ? "" : "s"} detected in ${summary.repo}.`
+      );
+    }
+
+    if (summary.repoActivityEvents > 0) {
+      messages.push(
+        `GitHub: ${summary.repoActivityEvents} repo activity signal${summary.repoActivityEvents === 1 ? "" : "s"} detected in ${summary.repo}.`
+      );
+    }
+
+    return messages;
+  });
 }
 
 async function sendTelegramMessage(chatId: string, text: string) {
@@ -258,6 +381,22 @@ interface NotificationSettings {
 
 interface InsightResponse {
   insight: InsightReport;
+}
+
+interface IntegrationSyncResponse {
+  status: "success";
+  connectionId: string;
+  integrationId: string;
+  eventsCreated: number;
+  personalCommitEvents?: number;
+  repoActivityEvents?: number;
+  repoSummaries?: IntegrationRepoSyncSummary[];
+}
+
+interface IntegrationRepoSyncSummary {
+  repo: string;
+  personalCommitEvents: number;
+  repoActivityEvents: number;
 }
 
 interface InsightReport {
