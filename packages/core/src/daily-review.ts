@@ -32,10 +32,10 @@ export interface BuildDailyReviewInput {
 export type DailyReview = z.infer<typeof DailyReviewSchema>;
 
 export function buildDailyReview(input: BuildDailyReviewInput): DailyReview {
-  const progressSummaries = summarizeProgressEvents(input.todayEvents);
+  const progressSummaries = summarizeProgressEvents(input.todayEvents, input.activeGoals);
   const checkInSummaries = summarizeCheckIn(input.todayEvents);
   const combinedSummaries = [...progressSummaries, ...checkInSummaries];
-  const winSummaries = summarizeWinEvents(input.todayEvents);
+  const winSummaries = summarizeWinEvents(input.todayEvents, input.activeGoals);
   const wins = winSummaries.length > 0 ? winSummaries : ["No logged wins yet today"];
   const uniqueActiveGoals = dedupeActiveGoalsForReview(input.activeGoals);
   const gaps = buildGaps(uniqueActiveGoals, input.todayEvents);
@@ -65,7 +65,7 @@ export function summarizeEvents(events: StoredEvent[]): string[] {
   return [...summarizeProgressEvents(events), ...summarizeCheckIn(events)];
 }
 
-function summarizeProgressEvents(events: StoredEvent[]): string[] {
+function summarizeProgressEvents(events: StoredEvent[], activeGoals: Goal[] = []): string[] {
   const applications = sumNumber(events, "career.application_sent", "count");
   const confirmations = countEvents(events, "career.application_confirmation_received");
   const replies = countEvents(events, "career.recruiter_reply_received");
@@ -109,10 +109,12 @@ function summarizeProgressEvents(events: StoredEvent[]): string[] {
     summaries.push(`${readingMinutes} minutes of reading`);
   }
 
+  summaries.push(...summarizeCustomProgress(events, activeGoals));
+
   return summaries;
 }
 
-function summarizeWinEvents(events: StoredEvent[]): string[] {
+function summarizeWinEvents(events: StoredEvent[], activeGoals: Goal[] = []): string[] {
   const applications = sumNumber(events, "career.application_sent", "count");
   const replies = countEvents(events, "career.recruiter_reply_received");
   const interviews = countEvents(events, "career.interview_scheduled");
@@ -145,7 +147,43 @@ function summarizeWinEvents(events: StoredEvent[]): string[] {
     summaries.push(`${readingMinutes} minutes of reading`);
   }
 
+  summaries.push(...summarizeCustomProgress(events, activeGoals));
+
   return summaries;
+}
+
+function summarizeCustomProgress(events: StoredEvent[], activeGoals: Goal[]): string[] {
+  const summaries: string[] = [];
+
+  for (const goal of activeGoals.filter((item) => !item.templateId)) {
+    const progress = customProgressForGoal(goal, events);
+
+    if (progress.logs === 0) {
+      continue;
+    }
+
+    summaries.push(
+      progress.minutes > 0
+        ? `${goal.title}: ${progress.minutes} focused minutes`
+        : `${goal.title}: ${progress.logs} progress log${progress.logs === 1 ? "" : "s"}`
+    );
+  }
+
+  return summaries;
+}
+
+function customProgressForGoal(goal: Goal, events: StoredEvent[]): { logs: number; minutes: number } {
+  const progressEvents = events.filter(
+    (event) => event.type === "custom.goal_progress_logged" && event.data.goalId === goal.id
+  );
+
+  return {
+    logs: progressEvents.length,
+    minutes: progressEvents.reduce((total, event) => {
+      const value = event.data.value;
+      return event.data.unit === "minutes" && typeof value === "number" ? total + value : total;
+    }, 0)
+  };
 }
 
 function buildGaps(activeGoals: Goal[], todayEvents: StoredEvent[]): string[] {
@@ -202,10 +240,22 @@ function buildActiveGoalStatuses(activeGoals: Goal[], todayEvents: StoredEvent[]
 
     return {
       title: goal.title,
-      status: "custom goal, no template metrics configured",
+      status: customProgressStatus(goal, todayEvents),
       templateId: goal.templateId
     };
   });
+}
+
+function customProgressStatus(goal: Goal, events: StoredEvent[]): string {
+  const progress = customProgressForGoal(goal, events);
+
+  if (progress.logs === 0) {
+    return "No custom progress logged";
+  }
+
+  return progress.minutes > 0
+    ? `${progress.logs} progress log${progress.logs === 1 ? "" : "s"}, ${progress.minutes} focused minutes`
+    : `${progress.logs} progress log${progress.logs === 1 ? "" : "s"}`;
 }
 
 function goalStatusForTemplate(templateId: string, events: StoredEvent[], todayEventTypes: Set<string>): string {

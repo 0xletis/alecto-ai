@@ -333,6 +333,14 @@ curl 'http://localhost:3000/users/local-user/insights/daily?date=2026-07-11'
 curl http://localhost:3000/users/local-user/insights/weekly
 curl 'http://localhost:3000/users/local-user/insights/weekly?weekStart=2026-07-05'
 
+curl -X POST http://localhost:3000/users/local-user/goals/custom-config \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Build a YouTube channel","category":"creative"}'
+
+curl -X POST http://localhost:3000/users/local-user/goals/<goalId>/progress \
+  -H "Content-Type: application/json" \
+  -d '{"metricKey":"focused_minutes","value":45,"unit":"minutes","note":"script draft"}'
+
 curl -X PATCH http://localhost:3000/users/local-user/memory/<memoryId>/archive \
   -H "Content-Type: application/json" \
   -d '{}'
@@ -352,6 +360,12 @@ Expected:
 - Inferred risk memories, such as repeated betting cooldowns or repeated low sleep plus high gambling impulse, are stored as `memory_create` pending actions. Reply `yes` to save the memory or `no` to ignore it.
 - Repeated guardian messages should not spam duplicate `memory_create` suggestions when a similar active memory or pending memory already exists.
 - Natural-language goal creation uses a matching template when obvious, but still asks for confirmation before creating the goal.
+- Natural-language custom goal creation generates target metrics and check-in questions before confirmation.
+- Custom goals can log progress with `custom.goal_progress_logged`, either through `POST /users/:userId/goals/:goalId/progress` or Telegram `/log_progress`.
+- Telegram `/goal_plan <goalId>` shows the saved template/custom metrics, check-in questions, and progress logging examples.
+- Telegram `/log_progress <goalId> | metric=focused_minutes value=45 unit=minutes note=focused block` logs structured custom progress immediately.
+- Telegram `/log_progress <goalId> | worked for 45 minutes on the first draft` parses free text into a simple custom progress event.
+- Natural messages like `log progress for Build a YouTube channel: worked for 45 minutes` create a pending confirmation before writing the progress event.
 - Duplicate active goals are blocked by default when the title, template, or similar category/title already exists. Use `/goals` to review similar goals or archive the older one first.
 - `/users/:userId/checkins/daily` saves a manual check-in as reflection events and daily review includes check-in values.
 - `/users/:userId/checkins/daily/text` parses natural-language check-ins and creates the same structured events as `/checkins/daily`.
@@ -370,6 +384,7 @@ Expected:
 - Daily reminders send once per user per day because of `NotificationLog`. Daily insights use `daily_insight` logs, and weekly insights use `weekly_insight` logs.
 - Use `/send_checkin_now`, `/send_daily_insight_now`, and `/send_weekly_insight_now` to test message text repeatedly without creating notification logs.
 - Daily check-in prompts are goal-aware. Active goal templates influence the prompt, for example career goals ask about applications and interviews, health goals ask about workout/sleep, finance goals ask about impulse and thesis-before-risk.
+- Custom goals with check-in config add up to two goal-specific lines to the daily check-in prompt.
 - `/send_checkin_now` previews the same goal-aware prompt the worker sends.
 - `/enable_daily_insight 21:30` sends `/insight` output once per day at the configured local time.
 - `/enable_weekly_insight sunday 20:00` sends `/weekly` output once for that week at the configured local weekday/time.
@@ -383,6 +398,7 @@ Expected:
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
 - `/users/:userId/review/daily` summarizes today's stored events against active goals.
 - Daily review includes a concise `Memory signals` section when active risk-pattern memories are relevant to today's events.
+- Daily review and insights treat `custom.goal_progress_logged` as real progress for custom goals, including summed minutes when the unit is `minutes`.
 
 Manual insight tests:
 
@@ -417,6 +433,8 @@ Manual insight tests:
 - `POST /users/:userId/pending-actions/:pendingActionId/reject`
 - `POST /users/:userId/goals`
 - `POST /users/:userId/goals/from-template`
+- `POST /users/:userId/goals/custom-config`
+- `POST /users/:userId/goals/:goalId/progress`
 - `PATCH /users/:userId/goals/:goalId/archive`
 - `POST /users/:userId/checkins/daily`
 - `POST /users/:userId/checkins/daily/text`

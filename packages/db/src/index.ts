@@ -39,7 +39,13 @@ export interface CorrectEventInput {
   reason?: string;
 }
 
-export type PendingActionType = "profile_update" | "goal_create" | "goal_archive" | "memory_create" | "event_undo_last";
+export type PendingActionType =
+  | "profile_update"
+  | "goal_create"
+  | "goal_archive"
+  | "goal_progress_log"
+  | "memory_create"
+  | "event_undo_last";
 export type PendingActionStatus = "pending" | "confirmed" | "rejected" | "expired";
 
 export interface PendingAction {

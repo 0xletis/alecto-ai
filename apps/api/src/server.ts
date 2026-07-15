@@ -3,9 +3,12 @@ import {
   buildDailyReview,
   buildDailyInsight,
   buildDailyCheckinPrompt,
+  buildCustomGoalConfig,
   buildWeeklyInsight,
   CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
+  CustomGoalConfigInputSchema,
+  CustomGoalProgressInputSchema,
   DailyCheckInInputSchema,
   DailyCheckInTextInputSchema,
   EventTypeSchema,
@@ -617,6 +620,53 @@ export function buildServer() {
     );
   });
 
+  server.post<{ Params: { userId: string } }>("/users/:userId/goals/custom-config", async (request, reply) => {
+    const parsed = CustomGoalConfigInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    return {
+      config: buildCustomGoalConfig({
+        ...parsed.data,
+        userProfile: await getOrCreateUserOperatingProfile(request.params.userId)
+      })
+    };
+  });
+
+  server.post<{ Params: { userId: string; goalId: string } }>(
+    "/users/:userId/goals/:goalId/progress",
+    async (request, reply) => {
+      const parsed = CustomGoalProgressInputSchema.safeParse(request.body);
+
+      if (!parsed.success) {
+        return reply.status(400).send({
+          error: "Invalid request body",
+          issues: parsed.error.issues
+        });
+      }
+
+      const goal = (await getGoals(request.params.userId)).find((item) => item.id === request.params.goalId);
+
+      if (!goal) {
+        return reply.status(404).send({
+          error: "Goal not found"
+        });
+      }
+
+      const event = await createCustomGoalProgressEvent(request.params.userId, goal, parsed.data);
+
+      return {
+        event,
+        reply: composeCustomGoalProgressReply(goal.title, parsed.data)
+      };
+    }
+  );
+
   server.post<{ Params: { userId: string } }>("/users/:userId/checkins/daily", async (request, reply) => {
     const parsed = DailyCheckInInputSchema.safeParse(request.body);
 
@@ -1024,6 +1074,40 @@ function formatCreateGoalResult(result: Awaited<ReturnType<typeof createGoal>>) 
     duplicate: false,
     goal: result.goal
   };
+}
+
+async function createCustomGoalProgressEvent(
+  userId: string,
+  goal: Awaited<ReturnType<typeof getGoals>>[number],
+  input: { metricKey?: string; value?: string | number | boolean; unit?: string; note?: string }
+) {
+  const events = await createEvents(userId, [
+    {
+      type: "custom.goal_progress_logged",
+      source: "manual",
+      data: {
+        goalId: goal.id,
+        ...(input.metricKey ? { metricKey: input.metricKey } : {}),
+        ...(input.value !== undefined ? { value: input.value } : {}),
+        ...(input.unit ? { unit: input.unit } : {}),
+        ...(input.note ? { note: input.note } : {})
+      },
+      confidence: 1,
+      evidence: [input.note ?? input.metricKey ?? goal.title]
+    }
+  ]);
+
+  return events[0];
+}
+
+function composeCustomGoalProgressReply(
+  goalTitle: string,
+  input: { metricKey?: string; value?: string | number | boolean; unit?: string; note?: string }
+): string {
+  const metric = input.metricKey ? `${input.metricKey}${input.value !== undefined ? `=${input.value}` : ""}` : "progress";
+  const unit = input.unit ? ` ${input.unit}` : "";
+  const note = input.note ? ` (${input.note})` : "";
+  return `Logged progress for ${goalTitle}: ${metric}${unit}${note}.`;
 }
 
 async function createDailyCheckInEvents(
@@ -1577,29 +1661,159 @@ function detectStructuralProposal(
     return archiveProposal;
   }
 
+  const progressProposal = detectCustomProgressProposal(message, activeGoals);
+
+  if (progressProposal) {
+    return progressProposal;
+  }
+
   if (
-    /\b(i want to focus on|create a goal to|my new focus is|i want to find|i want to get|i want to read|i want to stop|i want to build|quiero centrarme en|quiero mejorar|quiero buscar|quiero dormir)\b/i.test(
+    /\b(i want to focus on|create a goal to|my new focus is|i want to find|i want to get|i want to read|i want to stop|i want to build|i want to write|i want to create|i want to|quiero centrarme en|quiero mejorar|quiero buscar|quiero dormir|quiero|me gustar[ií]a)\b/i.test(
       message
     )
   ) {
-    const templateId = inferGoalTemplateId(normalized);
+    if (/\b(i want to bet|i want to trade|quiero apostar|quiero tradear)\b/i.test(message)) {
+      return undefined;
+    }
+
+    const goalIntent = parseGoalCreationIntent(message);
+    const classificationText = goalIntent?.goalText.toLowerCase() ?? normalized;
+    const templateId = inferGoalTemplateId(classificationText);
     const template = templateId ? getGoalTemplate(templateId) : undefined;
-    const category = template?.category ?? inferGoalCategory(normalized);
-    const title = inferGoalTitle(message, category, templateId);
+    const category = template?.category ?? inferGoalCategory(classificationText);
+    const title = templateId
+      ? inferGoalTitle(goalIntent?.goalText ?? message, category, templateId)
+      : goalIntent?.goalText ?? inferGoalTitle(message, category, templateId);
+    const why = goalIntent?.why;
+    const customConfig = templateId ? undefined : buildCustomGoalConfig({ title, category, why });
 
     return {
       type: "goal_create",
       summary: `Create goal: ${title}`,
       payload: {
         title,
-        category,
+        category: customConfig?.category ?? category,
+        ...(why ? { why } : {}),
+        ...(customConfig
+          ? {
+              targetMetrics: customConfig.targetMetrics,
+              checkInConfig: customConfig.checkInConfig
+            }
+          : {}),
         ...(templateId ? { templateId } : {})
       },
-      reply: `I can create this goal: ${title} (${category}). Reply yes to confirm or no to cancel.`
+      reply: customConfig
+        ? formatCustomGoalCreateProposal(title, customConfig)
+        : `I can create this goal: ${title} (${category}). Reply yes to confirm or no to cancel.`
     };
   }
 
   return undefined;
+}
+
+function parseGoalCreationIntent(message: string): { goalText: string; why?: string } | undefined {
+  const withoutBoilerplate = message
+    .replace(
+      /^\s*(i want to focus on|create a goal to|my new focus is|i want to|i want|quiero centrarme en|quiero mejorar|quiero buscar|quiero|me gustar[ií]a)\s+/i,
+      ""
+    )
+    .trim()
+    .replace(/[.!?]+$/g, "");
+
+  if (!withoutBoilerplate) {
+    return undefined;
+  }
+
+  const whyMatch = withoutBoilerplate.match(
+    /^(.+?)\s+(?:to create career leverage|to build discipline|for better mood|to feel better|to make more money|for more money|para crear palanca profesional|para tener m[aá]s disciplina)$/i
+  );
+
+  if (whyMatch?.[1]) {
+    return {
+      goalText: titleCaseGoal(whyMatch[1].trim()),
+      why: withoutBoilerplate.slice(whyMatch[1].length).trim()
+    };
+  }
+
+  return {
+    goalText: titleCaseGoal(withoutBoilerplate)
+  };
+}
+
+function detectCustomProgressProposal(
+  message: string,
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>
+): StructuralProposal | undefined {
+  const match = message.match(
+    /\b(?:log progress for|i made progress on|avance en)\s+(.+?)\s*:\s*(.+)$/i
+  );
+
+  if (!match) {
+    return undefined;
+  }
+
+  const goalText = match[1]?.trim();
+  const progressText = match[2]?.trim();
+
+  if (!goalText || !progressText) {
+    return undefined;
+  }
+
+  const goal = findGoalByTitleFragment(activeGoals, goalText);
+
+  if (!goal) {
+    return {
+      type: "goal_progress_log",
+      summary: "Goal progress needs a matching goal",
+      payload: {},
+      reply: "I am not sure which goal this belongs to. Run /goals, then use /log_progress <goalId> | <progress>.",
+      createPending: false
+    };
+  }
+
+  const progress = inferProgressInputFromText(progressText);
+
+  return {
+    type: "goal_progress_log",
+    summary: `Log progress for ${goal.title}`,
+    payload: {
+      goalId: goal.id,
+      ...progress
+    },
+    reply: `I can log progress for ${goal.title}: ${progress.note ?? progressText}. Reply yes to confirm or no to cancel.`
+  };
+}
+
+function findGoalByTitleFragment(
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>,
+  goalText: string
+) {
+  const normalizedGoalText = normalizeComparableText(goalText);
+  const matches = activeGoals.filter((goal) => {
+    const normalizedTitle = normalizeComparableText(goal.title);
+    return normalizedTitle === normalizedGoalText || normalizedTitle.includes(normalizedGoalText) || normalizedGoalText.includes(normalizedTitle);
+  });
+
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function inferProgressInputFromText(text: string) {
+  const minutesMatch = text.match(/\b(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|minutos?)\b/i);
+
+  if (minutesMatch) {
+    return {
+      metricKey: "focused_minutes",
+      value: Number(minutesMatch[1]),
+      unit: "minutes",
+      note: text
+    };
+  }
+
+  return {
+    metricKey: "progress_actions",
+    value: 1,
+    note: text
+  };
 }
 
 function detectGoalArchiveProposal(
@@ -1766,7 +1980,7 @@ function inferGoalTitle(message: string, category: string, templateId?: string):
     return "Improve finance discipline";
   }
 
-  return "Clarify new focus";
+  return inferGenericGoalTitle(message) ?? "Clarify new focus";
 }
 
 function inferSpecificGoalTitle(message: string): string | undefined {
@@ -1795,6 +2009,27 @@ function titleCaseGoal(title: string): string {
   return trimmed ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : title;
 }
 
+function inferGenericGoalTitle(message: string): string | undefined {
+  const cleaned = message
+    .replace(/^\s*(i want to focus on|create a goal to|my new focus is|i want to|quiero centrarme en|quiero mejorar|quiero buscar|quiero)\s+/i, "")
+    .trim()
+    .replace(/[.!?]+$/g, "");
+
+  return cleaned.length >= 8 && cleaned.length <= 90 ? titleCaseGoal(cleaned) : undefined;
+}
+
+function formatCustomGoalCreateProposal(title: string, config: ReturnType<typeof buildCustomGoalConfig>): string {
+  const metrics = config.targetMetrics.map((metric) => metric.key).join(", ");
+  const questions = config.checkInConfig.map((question) => question.question).slice(0, 3).join(" / ");
+
+  return [
+    `I can create this custom goal: ${title}.`,
+    `Metrics: ${metrics}.`,
+    `Check-ins: ${questions}.`,
+    "Reply yes to confirm or no to cancel."
+  ].join(" ");
+}
+
 function detectOpenAIStructuralProposal(analysis: OpenAIMessageAnalysis | undefined): StructuralProposal | undefined {
   const proposedAction = analysis?.proposedAction;
 
@@ -1816,15 +2051,23 @@ function detectOpenAIStructuralProposal(analysis: OpenAIMessageAnalysis | undefi
     typeof proposedAction.payload.title === "string" &&
     typeof proposedAction.payload.category === "string"
   ) {
+    const customConfig = buildCustomGoalConfig({
+      title: proposedAction.payload.title,
+      category: proposedAction.payload.category,
+      why: typeof proposedAction.payload.why === "string" ? proposedAction.payload.why : undefined
+    });
+
     return {
       type: "goal_create",
       summary: proposedAction.summary,
       payload: {
         title: proposedAction.payload.title,
         category: proposedAction.payload.category,
-        why: typeof proposedAction.payload.why === "string" ? proposedAction.payload.why : undefined
+        why: typeof proposedAction.payload.why === "string" ? proposedAction.payload.why : undefined,
+        targetMetrics: customConfig.targetMetrics,
+        checkInConfig: customConfig.checkInConfig
       },
-      reply: `I can create this goal: ${proposedAction.payload.title} (${proposedAction.payload.category}). Reply yes to confirm or no to cancel.`
+      reply: formatCustomGoalCreateProposal(proposedAction.payload.title, customConfig)
     };
   }
 
@@ -1858,7 +2101,7 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
   }
 
   if (pendingAction.type === "goal_create") {
-    const { title, category, why, templateId, targetMetrics } = pendingAction.payload;
+    const { title, category, why, templateId, targetMetrics, checkInConfig } = pendingAction.payload;
 
     if (typeof title !== "string" || typeof category !== "string") {
       throw new Error("Invalid goal_create payload.");
@@ -1869,7 +2112,8 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
       category,
       why: typeof why === "string" ? why : undefined,
       templateId: typeof templateId === "string" ? templateId : undefined,
-      targetMetrics: Array.isArray(targetMetrics) ? targetMetrics : undefined
+      targetMetrics: Array.isArray(targetMetrics) ? targetMetrics : undefined,
+      checkInConfig: Array.isArray(checkInConfig) ? checkInConfig : undefined
     }));
 
     if (result.duplicate) {
@@ -1880,6 +2124,31 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
 
     return {
       reply: `Confirmed. I created the goal: ${title}.`
+    };
+  }
+
+  if (pendingAction.type === "goal_progress_log") {
+    const goalId = pendingAction.payload.goalId;
+
+    if (typeof goalId !== "string") {
+      throw new Error("Invalid goal_progress_log payload.");
+    }
+
+    const goal = (await getGoals(userId)).find((item) => item.id === goalId);
+
+    if (!goal) {
+      throw new Error("Goal not found.");
+    }
+
+    await createCustomGoalProgressEvent(userId, goal, CustomGoalProgressInputSchema.parse({
+      metricKey: typeof pendingAction.payload.metricKey === "string" ? pendingAction.payload.metricKey : undefined,
+      value: pendingAction.payload.value,
+      unit: typeof pendingAction.payload.unit === "string" ? pendingAction.payload.unit : undefined,
+      note: typeof pendingAction.payload.note === "string" ? pendingAction.payload.note : undefined
+    }));
+
+    return {
+      reply: `Confirmed. Logged progress for ${goal.title}.`
     };
   }
 

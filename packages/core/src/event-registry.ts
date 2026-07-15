@@ -11,7 +11,8 @@ export const eventDomains = [
   "learning",
   "reflection",
   "social",
-  "system"
+  "system",
+  "custom"
 ] as const;
 
 export const eventRegistry = [
@@ -102,7 +103,9 @@ export const eventRegistry = [
   { type: "system.review_generated", domain: "system" },
   { type: "system.alert_sent", domain: "system" },
   { type: "system.user_confirmed_change", domain: "system" },
-  { type: "system.user_rejected_change", domain: "system" }
+  { type: "system.user_rejected_change", domain: "system" },
+
+  { type: "custom.goal_progress_logged", domain: "custom" }
 ] as const;
 
 export const EventDomainSchema = z.enum(eventDomains);

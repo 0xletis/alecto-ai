@@ -10,7 +10,8 @@ export const GoalMetricSchema = z.object({
   label: z.string().min(1),
   eventType: z.string().optional(),
   aggregation: MetricAggregationSchema,
-  window: MetricWindowSchema
+  window: MetricWindowSchema,
+  unit: z.string().optional()
 });
 
 export const GoalCheckInQuestionSchema = z.object({

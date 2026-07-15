@@ -46,15 +46,15 @@ export function buildDailyInsight(input: BuildInsightInput): InsightReport {
   const activeGoals = dedupeGoalsForInsight(input.activeGoals);
   const hasDuplicateGoals = activeGoals.length < input.activeGoals.length;
   const metrics = summarizeMetrics(input.events);
-  const wins = dailyWins(metrics);
+  const wins = dailyWins(metrics, activeGoals, input.events);
   const risks = riskSignals(metrics);
   const goalProgress = buildGoalProgress(activeGoals, input.events, metrics, "daily");
   const gaps = buildGoalGaps(goalProgress);
   const patterns = withDuplicateGoalPattern(dailyPatterns(metrics), hasDuplicateGoals);
   const memorySignals = relevantMemorySignals(input.activeMemories, risks);
-  const recommendedActions = recommendDailyActions(activeGoals, metrics);
+  const recommendedActions = recommendDailyActions(activeGoals, metrics, input.events);
   const directProfile = isDirectProfile(input.userOperatingProfile);
-  const headline = dailyHeadline(wins, risks, directProfile);
+  const headline = dailyHeadline(wins, risks, directProfile, metrics.customProgressLogs > 0);
   const summary = buildDailySummary(wins, risks, directProfile);
   const hardTruth =
     directProfile && risks.length > 0
@@ -84,7 +84,7 @@ export function buildWeeklyInsight(input: BuildInsightInput): InsightReport {
   const activeGoals = dedupeGoalsForInsight(input.activeGoals);
   const hasDuplicateGoals = activeGoals.length < input.activeGoals.length;
   const metrics = summarizeMetrics(input.events);
-  const wins = weeklyWins(metrics);
+  const wins = weeklyWins(metrics, activeGoals, input.events);
   const risks = weeklyRisks(metrics);
   const goalProgress = buildGoalProgress(activeGoals, input.events, metrics, "weekly");
   const gaps = buildGoalGaps(goalProgress);
@@ -131,6 +131,8 @@ function summarizeMetrics(events: StoredEvent[]) {
     workoutMinutes: sum(events, "health.workout_completed", "duration_minutes"),
     readingSessions: count(events, "learning.reading_session_completed"),
     readingMinutes: sum(events, "learning.reading_session_completed", "duration_minutes"),
+    customProgressLogs: count(events, "custom.goal_progress_logged"),
+    customProgressMinutes: sumCustomMinutes(events),
     checkIns: count(events, "reflection.daily_checkin_completed"),
     cooldowns: count(events, "finance.betting.cooldown_triggered"),
     thesisLogs: countAny(events, ["finance.betting.bet_thesis_logged", "finance.trading.thesis_logged"]),
@@ -157,6 +159,7 @@ function summarizeMetrics(events: StoredEvent[]) {
           "career.offer_received",
           "health.workout_completed",
           "learning.reading_session_completed",
+          "custom.goal_progress_logged",
           "work.deep_work_session_completed",
           "work.task_completed"
         ].includes(event.type)
@@ -166,7 +169,7 @@ function summarizeMetrics(events: StoredEvent[]) {
   };
 }
 
-function dailyWins(metrics: ReturnType<typeof summarizeMetrics>): string[] {
+function dailyWins(metrics: ReturnType<typeof summarizeMetrics>, activeGoals: Goal[] = [], events: StoredEvent[] = []): string[] {
   const wins: string[] = [];
 
   if (metrics.applications > 0) {
@@ -193,11 +196,13 @@ function dailyWins(metrics: ReturnType<typeof summarizeMetrics>): string[] {
     wins.push(`${metrics.readingMinutes} minutes of reading`);
   }
 
+  wins.push(...customProgressWins(activeGoals, events));
+
   return wins;
 }
 
-function weeklyWins(metrics: ReturnType<typeof summarizeMetrics>): string[] {
-  const wins = dailyWins(metrics);
+function weeklyWins(metrics: ReturnType<typeof summarizeMetrics>, activeGoals: Goal[] = [], events: StoredEvent[] = []): string[] {
+  const wins = dailyWins(metrics, activeGoals, events);
 
   if (metrics.checkIns > 0) {
     wins.push(`${metrics.checkIns} check-in${metrics.checkIns === 1 ? "" : "s"}`);
@@ -312,6 +317,19 @@ function buildGoalProgress(
   const eventTypes = new Set(events.map((event) => event.type));
 
   return activeGoals.map((goal) => {
+    if (!goal.templateId && (hasCustomGoalConfig(goal) || customProgressForGoal(goal, events).logs > 0)) {
+      const progress = customProgressForGoal(goal, events);
+
+      return {
+        goalId: goal.id,
+        title: goal.title,
+        status: progress.logs > 0 ? "progress" : "no_progress",
+        note: progress.logs > 0
+          ? formatCustomProgressNote(progress)
+          : "No custom progress logged"
+      };
+    }
+
     if (matchesGoal(goal, "career.job_search", "career")) {
       const signals =
         metrics.applications +
@@ -399,9 +417,52 @@ function buildGoalProgress(
       goalId: goal.id,
       title: goal.title,
       status: hasProgress ? "progress" : "custom",
-      note: hasProgress ? "Relevant event logged" : "Custom goal: no deterministic metric configured"
+      note: hasProgress ? "Relevant event logged" : "No custom progress logged"
     };
   });
+}
+
+function hasCustomGoalConfig(goal: Goal): boolean {
+  return Boolean(goal.targetMetrics?.length || goal.checkInConfig?.length);
+}
+
+function customProgressForGoal(goal: Goal, events: StoredEvent[]): { logs: number; minutes: number; notes: number } {
+  const progressEvents = events.filter(
+    (event) => event.type === "custom.goal_progress_logged" && event.data.goalId === goal.id
+  );
+
+  return {
+    logs: progressEvents.length,
+    minutes: progressEvents.reduce((total, event) => {
+      const value = event.data.value;
+      return event.data.unit === "minutes" && typeof value === "number" ? total + value : total;
+    }, 0),
+    notes: progressEvents.filter((event) => typeof event.data.note === "string" && event.data.note.trim()).length
+  };
+}
+
+function formatCustomProgressNote(progress: { logs: number; minutes: number; notes: number }): string {
+  const parts = [`${progress.logs} progress log${progress.logs === 1 ? "" : "s"}`];
+
+  if (progress.minutes > 0) {
+    parts.push(`${progress.minutes} focused minutes`);
+  }
+
+  if (progress.notes > 0) {
+    parts.push(`${progress.notes} note${progress.notes === 1 ? "" : "s"}`);
+  }
+
+  return parts.join(", ");
+}
+
+function customProgressWins(activeGoals: Goal[], events: StoredEvent[]): string[] {
+  return activeGoals
+    .filter((goal) => !goal.templateId)
+    .map((goal) => {
+      const progress = customProgressForGoal(goal, events);
+      return progress.logs > 0 ? `${goal.title}: ${formatCustomProgressNote(progress)}` : undefined;
+    })
+    .filter((item): item is string => Boolean(item));
 }
 
 function buildGoalGaps(goalProgress: InsightGoalProgress[]): string[] {
@@ -475,7 +536,7 @@ function relevantMemorySignals(memories: MemoryEntry[], risks: string[]): string
     .map((memory) => memory.summary);
 }
 
-function recommendDailyActions(activeGoals: Goal[], metrics: ReturnType<typeof summarizeMetrics>): string[] {
+function recommendDailyActions(activeGoals: Goal[], metrics: ReturnType<typeof summarizeMetrics>, events: StoredEvent[]): string[] {
   const actions: string[] = [];
   const hasElevatedRisk =
     metrics.cooldowns > 0 ||
@@ -485,6 +546,17 @@ function recommendDailyActions(activeGoals: Goal[], metrics: ReturnType<typeof s
 
   if (hasElevatedRisk) {
     actions.push("No betting/trading decisions while anxiety is 7 or higher, impulse is 6 or higher, or sleep is below 6h.");
+  }
+
+  const customGoal = preferredCustomGoalForRecommendation(activeGoals, events);
+
+  if (customGoal) {
+    const progress = customProgressForGoal(customGoal, events);
+    actions.push(
+      progress.logs > 0
+        ? `Do one more concrete action for ${customGoal.title} or deliberately stop for today.`
+        : `Log one concrete action for ${customGoal.title}.`
+    );
   }
 
   if (hasGoal(activeGoals, "career.job_search", "career")) {
@@ -508,6 +580,17 @@ function recommendDailyActions(activeGoals: Goal[], metrics: ReturnType<typeof s
   }
 
   return unique(actions).slice(0, 4);
+}
+
+function preferredCustomGoalForRecommendation(activeGoals: Goal[], events: StoredEvent[]): Goal | undefined {
+  const customGoals = activeGoals.filter((goal) => !goal.templateId);
+
+  return (
+    [...customGoals]
+      .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())
+      .find((goal) => customProgressForGoal(goal, events).logs > 0) ??
+    customGoals.sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0]
+  );
 }
 
 function recommendWeeklyActions(activeGoals: Goal[], metrics: ReturnType<typeof summarizeMetrics>, risks: string[]): string[] {
@@ -545,9 +628,13 @@ function recommendWeeklyActions(activeGoals: Goal[], metrics: ReturnType<typeof 
   return unique(actions).slice(0, 4);
 }
 
-function dailyHeadline(wins: string[], risks: string[], directProfile: boolean): string {
+function dailyHeadline(wins: string[], risks: string[], directProfile: boolean, hasCustomProgress: boolean): string {
   if (wins.length > 0 && risks.length > 0) {
     return directProfile ? "Good output. Risk state is the main issue." : "Good output, but risk state is elevated.";
+  }
+
+  if (hasCustomProgress) {
+    return "Custom goal progress logged.";
   }
 
   if (wins.length > 0) {
@@ -610,6 +697,9 @@ function buildWeeklySummary(metrics: ReturnType<typeof summarizeMetrics>): strin
     metrics.offers > 0 ? `${metrics.offers} offers` : undefined,
     metrics.workoutMinutes > 0 ? `${metrics.workoutSessions} workouts / ${metrics.workoutMinutes} minutes` : undefined,
     metrics.readingMinutes > 0 ? `${metrics.readingMinutes} minutes of reading` : undefined,
+    metrics.customProgressLogs > 0
+      ? `${metrics.customProgressLogs} custom progress log${metrics.customProgressLogs === 1 ? "" : "s"}${metrics.customProgressMinutes > 0 ? ` / ${metrics.customProgressMinutes} focused minutes` : ""}`
+      : undefined,
     metrics.sleepAverage !== undefined ? `avg sleep ${round(metrics.sleepAverage)}h` : undefined,
     metrics.energyAverage !== undefined ? `avg energy ${round(metrics.energyAverage)}/10` : undefined,
     metrics.anxietyAverage !== undefined ? `avg anxiety ${round(metrics.anxietyAverage)}/10` : undefined,
@@ -645,6 +735,15 @@ function sum(events: StoredEvent[], type: string, key: string): number {
   return events
     .filter((event) => event.type === type)
     .reduce((total, event) => total + numberValue(event, key), 0);
+}
+
+function sumCustomMinutes(events: StoredEvent[]): number {
+  return events
+    .filter((event) => event.type === "custom.goal_progress_logged")
+    .reduce((total, event) => {
+      const value = event.data.value;
+      return event.data.unit === "minutes" && typeof value === "number" ? total + value : total;
+    }, 0);
 }
 
 function latest(events: StoredEvent[], type: string, key: string): number | undefined {

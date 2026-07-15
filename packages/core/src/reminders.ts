@@ -10,14 +10,20 @@ export interface BuildDailyCheckinPromptInput {
 
 export function buildDailyCheckinPrompt(input: BuildDailyCheckinPromptInput): string {
   const sections = new Set<string>();
+  const customSections: string[] = [];
 
   for (const goal of input.activeGoals) {
+    if (!goal.templateId && goal.checkInConfig?.[0]) {
+      customSections.push(`${goal.title}: ${goal.checkInConfig[0].question}`);
+      continue;
+    }
+
     for (const section of sectionsForGoal(goal)) {
       sections.add(section);
     }
   }
 
-  const goalLines = [...sections].map((section) => `- ${section}`);
+  const goalLines = [...sections, ...customSections.slice(0, 2)].map((section) => `- ${section}`);
 
   if (goalLines.length === 0) {
     goalLines.push("- Custom goals: did you make any concrete progress?");

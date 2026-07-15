@@ -415,6 +415,83 @@ bot.command("create_goal_from_template", async (ctx) => {
   }
 });
 
+bot.command("goal_plan", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const goalId = getCommandText(ctx);
+
+  if (!goalId) {
+    await ctx.reply("Usage: /goal_plan <goalId>");
+    return;
+  }
+
+  try {
+    const goalsResponse = await apiGet<GoalsResponse>(`/users/${getTelegramUserId(ctx)}/goals`);
+    const goal = goalsResponse.goals.find((item) => item.id === goalId);
+
+    if (!goal) {
+      await ctx.reply("I could not find that goal. Run /goals and copy the id.");
+      return;
+    }
+
+    if (goal.targetMetrics?.length || goal.checkInConfig?.length) {
+      await ctx.reply(formatGoalPlan(goal));
+      return;
+    }
+
+    const configResponse = await apiPost<CustomGoalConfigResponse>(`/users/${getTelegramUserId(ctx)}/goals/custom-config`, {
+      title: goal.title,
+      why: goal.why,
+      category: goal.category
+    });
+
+    await ctx.reply(
+      [
+        formatGoalPlan({
+          ...goal,
+          targetMetrics: configResponse.config.targetMetrics,
+          checkInConfig: configResponse.config.checkInConfig
+        }),
+        "",
+        "This goal has no saved custom config yet. Use these as a suggested plan for now."
+      ].join("\n")
+    );
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not build that goal plan right now.");
+  }
+});
+
+bot.command("log_progress", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseLogProgressCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply(
+      [
+        "Usage:",
+        "/log_progress <goalId> | metric=focused_minutes value=45 unit=minutes note=focused block",
+        "/log_progress <goalId> | worked for 45 minutes on the first draft"
+      ].join("\n")
+    );
+    return;
+  }
+
+  try {
+    const response = await apiPost<GoalProgressResponse>(
+      `/users/${getTelegramUserId(ctx)}/goals/${parsed.goalId}/progress`,
+      parsed.progress
+    );
+    await ctx.reply(response.reply);
+  } catch (error) {
+    await replyWithApiError(ctx, error, "I could not log that goal progress right now.");
+  }
+});
+
 bot.command("archive_goal", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -896,6 +973,71 @@ function parseCreateGoalFromTemplate(text: string) {
     title,
     why: why || undefined
   };
+}
+
+function parseLogProgressCommand(text: string): { goalId: string; progress: CustomGoalProgressInput } | undefined {
+  const [goalId, progressText] = text.split("|").map((part) => part.trim());
+
+  if (!goalId || !progressText) {
+    return undefined;
+  }
+
+  if (/\bmetric=/i.test(progressText)) {
+    return {
+      goalId,
+      progress: parseStructuredProgress(progressText)
+    };
+  }
+
+  const minutes = progressText.match(/\b(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|minutos?)\b/i);
+
+  return {
+    goalId,
+    progress: minutes
+      ? {
+          metricKey: "focused_minutes",
+          value: Number(minutes[1]),
+          unit: "minutes",
+          note: progressText
+        }
+      : {
+          metricKey: "progress_actions",
+          value: 1,
+          note: progressText
+        }
+  };
+}
+
+function parseStructuredProgress(text: string): CustomGoalProgressInput {
+  const noteMatch = text.match(/\bnote=(.+)$/i);
+  const withoutNote = noteMatch ? text.slice(0, noteMatch.index).trim() : text;
+  const pairs = Object.fromEntries(
+    withoutNote
+      .split(/\s+/)
+      .map((part) => part.split("="))
+      .filter(([key, value]) => key && value)
+      .map(([key, value]) => [key.toLowerCase(), value])
+  );
+
+  return {
+    metricKey: pairs.metric,
+    value: pairs.value !== undefined ? parseProgressValue(pairs.value) : undefined,
+    unit: pairs.unit,
+    note: noteMatch?.[1]?.trim()
+  };
+}
+
+function parseProgressValue(value: string): string | number | boolean {
+  if (/^(true|yes)$/i.test(value)) {
+    return true;
+  }
+
+  if (/^(false|no)$/i.test(value)) {
+    return false;
+  }
+
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : value;
 }
 
 function parseWeeklyInsightCommand(text: string): { day: string; time: string } | undefined {
@@ -1415,6 +1557,24 @@ function formatGoal(goal: Goal, duplicateWarnings: GoalDuplicateWarning[] = []) 
     .join("\n");
 }
 
+function formatGoalPlan(goal: Goal) {
+  return [
+    `Goal plan: ${goal.title}`,
+    `id: ${goal.id}`,
+    `category: ${goal.category}`,
+    `template: ${goal.templateId ?? "custom"}`,
+    goal.targetMetrics?.length
+      ? `Metrics:\n${goal.targetMetrics.map((metric) => `- ${metric.key}: ${metric.label}${metric.unit ? ` (${metric.unit})` : ""}`).join("\n")}`
+      : "Metrics: none configured",
+    goal.checkInConfig?.length
+      ? `Check-ins:\n${goal.checkInConfig.map((question) => `- ${question.question}`).join("\n")}`
+      : "Check-ins: none configured",
+    "Examples:",
+    `/log_progress ${goal.id} | metric=focused_minutes value=45 unit=minutes note=focused block`,
+    `/log_progress ${goal.id} | worked for 45 minutes on it`
+  ].join("\n");
+}
+
 function formatEvents(events: Event[], options: { alwaysShowStatus?: boolean; intro?: string } = {}) {
   if (events.length === 0) {
     return "No recent events yet.";
@@ -1568,6 +1728,14 @@ function formatEventData(event: Event) {
     return `${event.data.duration_minutes} minutes of reading`;
   }
 
+  if (event.type === "custom.goal_progress_logged") {
+    const metric = typeof event.data.metricKey === "string" ? event.data.metricKey : "progress";
+    const value = event.data.value !== undefined ? `=${String(event.data.value)}` : "";
+    const unit = typeof event.data.unit === "string" ? ` ${event.data.unit}` : "";
+    const note = typeof event.data.note === "string" ? ` (${truncateText(event.data.note, 120)})` : "";
+    return `${metric}${value}${unit}${note}`;
+  }
+
   return truncateText(JSON.stringify(event.data), 300);
 }
 
@@ -1633,6 +1801,19 @@ interface GoalResponse {
   goal?: Goal;
   existingGoal?: Goal;
   message?: string;
+}
+
+interface CustomGoalConfigResponse {
+  config: {
+    category: string;
+    targetMetrics: GoalMetric[];
+    checkInConfig: GoalCheckInQuestion[];
+    suggestedLogExamples: string[];
+  };
+}
+
+interface GoalProgressResponse {
+  reply: string;
 }
 
 interface EventsResponse {
@@ -1751,6 +1932,30 @@ interface Goal {
   status: string;
   why?: string;
   templateId?: string;
+  targetMetrics?: GoalMetric[];
+  checkInConfig?: GoalCheckInQuestion[];
+}
+
+interface GoalMetric {
+  key: string;
+  label: string;
+  eventType?: string;
+  aggregation: string;
+  window: string;
+  unit?: string;
+}
+
+interface GoalCheckInQuestion {
+  key: string;
+  question: string;
+  answerType: string;
+}
+
+interface CustomGoalProgressInput {
+  metricKey?: string;
+  value?: string | number | boolean;
+  unit?: string;
+  note?: string;
 }
 
 interface GoalDuplicateWarning {

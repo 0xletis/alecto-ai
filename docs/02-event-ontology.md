@@ -119,3 +119,9 @@ Rules:
 - system.alert_sent
 - system.user_confirmed_change
 - system.user_rejected_change
+
+### Custom
+
+- custom.goal_progress_logged
+  - Generic progress event for non-template goals.
+  - Data: goalId, metricKey optional, value optional, unit optional, note optional.
