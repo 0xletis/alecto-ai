@@ -68,7 +68,7 @@ bot.command("profile", async (ctx) => {
     const response = await apiGet<ProfileResponse>(`/users/${getTelegramUserId(ctx)}/profile`);
     await ctx.reply(formatProfile(response.profile));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch your profile right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch your profile right now.");
   }
 });
 
@@ -81,7 +81,7 @@ bot.command("memory", async (ctx) => {
     const response = await apiGet<MemoriesResponse>(`/users/${getTelegramUserId(ctx)}/memory`);
     await ctx.reply(formatMemories(response.memories));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch your memories right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch your memories right now.");
   }
 });
 
@@ -104,7 +104,7 @@ bot.command("remember", async (ctx) => {
     });
     await ctx.reply("Saved to memory.");
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not save that memory right now.");
+    await replyWithApiFailure(ctx, error, "I could not save that memory right now.");
   }
 });
 
@@ -124,7 +124,7 @@ bot.command("forget_memory", async (ctx) => {
     await apiPatch<MemoryResponse>(`/users/${getTelegramUserId(ctx)}/memory/${memoryId}/archive`, {});
     await ctx.reply("Archived memory.");
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not archive that memory. Check the ID and try again.");
+    await replyWithApiFailure(ctx, error, "I could not archive that memory. Check the ID and try again.");
   }
 });
 
@@ -139,7 +139,7 @@ bot.command("notifications", async (ctx) => {
     );
     await ctx.reply(formatNotificationSettings(response.notificationSettings));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch notification settings right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch notification settings right now.");
   }
 });
 
@@ -169,7 +169,7 @@ bot.command("enable_checkin", async (ctx) => {
       `Daily check-in enabled at ${response.notificationSettings.dailyCheckinTime} ${response.notificationSettings.timezone}.`
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not enable daily check-ins right now.");
+    await replyWithApiFailure(ctx, error, "I could not enable daily check-ins right now.");
   }
 });
 
@@ -184,7 +184,7 @@ bot.command("disable_checkin", async (ctx) => {
     });
     await ctx.reply("Daily check-in disabled.");
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not disable daily check-ins right now.");
+    await replyWithApiFailure(ctx, error, "I could not disable daily check-ins right now.");
   }
 });
 
@@ -214,7 +214,7 @@ bot.command("enable_daily_insight", async (ctx) => {
       `Daily insight enabled at ${response.notificationSettings.dailyInsightTime} ${response.notificationSettings.timezone}.`
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not enable daily insight right now.");
+    await replyWithApiFailure(ctx, error, "I could not enable daily insight right now.");
   }
 });
 
@@ -229,7 +229,7 @@ bot.command("disable_daily_insight", async (ctx) => {
     });
     await ctx.reply("Daily insight disabled.");
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not disable daily insight right now.");
+    await replyWithApiFailure(ctx, error, "I could not disable daily insight right now.");
   }
 });
 
@@ -260,7 +260,7 @@ bot.command("enable_weekly_insight", async (ctx) => {
       `Weekly insight enabled on ${response.notificationSettings.weeklyInsightDay} at ${response.notificationSettings.weeklyInsightTime} ${response.notificationSettings.timezone}.`
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not enable weekly insight right now.");
+    await replyWithApiFailure(ctx, error, "I could not enable weekly insight right now.");
   }
 });
 
@@ -275,7 +275,7 @@ bot.command("disable_weekly_insight", async (ctx) => {
     });
     await ctx.reply("Weekly insight disabled.");
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not disable weekly insight right now.");
+    await replyWithApiFailure(ctx, error, "I could not disable weekly insight right now.");
   }
 });
 
@@ -288,7 +288,7 @@ bot.command("send_checkin_now", async (ctx) => {
     const response = await apiGet<DailyCheckInPromptResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/prompt`);
     await ctx.reply(response.prompt);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not build your check-in prompt right now.");
+    await replyWithApiFailure(ctx, error, "I could not build your check-in prompt right now.");
   }
 });
 
@@ -327,7 +327,7 @@ bot.command("set_style", async (ctx) => {
       ].join("\n")
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not update your style right now.");
+    await replyWithApiFailure(ctx, error, "I could not update your style right now.");
   }
 });
 
@@ -363,7 +363,7 @@ bot.command("create_goal", async (ctx) => {
 
     await ctx.reply(`Goal created:\n${formatGoal(response.goal)}`);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not create that goal right now.");
+    await replyWithApiFailure(ctx, error, "I could not create that goal right now.");
   }
 });
 
@@ -376,7 +376,105 @@ bot.command("templates", async (ctx) => {
     const response = await apiGet<GoalTemplatesResponse>("/goal-templates");
     await ctx.reply(formatGoalTemplates(response.goalTemplates));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch goal templates right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch goal templates right now.");
+  }
+});
+
+bot.command("integrations", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<IntegrationsResponse>("/integrations");
+    await ctx.reply(formatIntegrationDefinitions(response.integrations));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not fetch integrations right now.");
+  }
+});
+
+bot.command("my_integrations", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
+    await ctx.reply(formatIntegrationConnections(response.connections));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not fetch your integrations right now.");
+  }
+});
+
+bot.command("connect_github", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseConnectGithubCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /connect_github OWNER/REPO or /connect_github OWNER/REPO author=LOGIN");
+    return;
+  }
+
+  try {
+    const response = await apiPost<IntegrationConnectionResponse>(
+      `/users/${getTelegramUserId(ctx)}/integrations/github-public`,
+      parsed
+    );
+    await ctx.reply(`GitHub connected:\n${formatIntegrationConnection(response.connection)}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("sync_integrations", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
+    const activeConnections = response.connections.filter((connection) => connection.status === "active");
+
+    if (activeConnections.length === 0) {
+      await ctx.reply("No active integrations to sync.");
+      return;
+    }
+
+    const results: string[] = [];
+
+    for (const connection of activeConnections) {
+      try {
+        results.push(await syncIntegration(ctx, connection.id));
+      } catch (error) {
+        results.push(formatIntegrationSyncFailure(connection, error));
+      }
+    }
+
+    await replyWithIntegrationMessage(ctx, results.join("\n"));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, `Integration sync failed: ${safeIntegrationErrorMessage(error)}`);
+  }
+});
+
+bot.command("sync_integration", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const connectionId = getCommandText(ctx);
+
+  if (!connectionId) {
+    await ctx.reply("Usage: /sync_integration CONNECTION_ID");
+    return;
+  }
+
+  try {
+    await replyWithIntegrationMessage(ctx, await syncIntegration(ctx, connectionId));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, `Integration sync failed: ${safeIntegrationErrorMessage(error)}`);
   }
 });
 
@@ -411,7 +509,7 @@ bot.command("create_goal_from_template", async (ctx) => {
 
     await ctx.reply(`Goal created:\n${formatGoal(response.goal)}`);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not create that template goal right now.");
+    await replyWithApiFailure(ctx, error, "I could not create that template goal right now.");
   }
 });
 
@@ -459,7 +557,7 @@ bot.command("goal_plan", async (ctx) => {
       ].join("\n")
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not build that goal plan right now.");
+    await replyWithApiFailure(ctx, error, "I could not build that goal plan right now.");
   }
 });
 
@@ -488,7 +586,7 @@ bot.command("log_progress", async (ctx) => {
     );
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not log that goal progress right now.");
+    await replyWithApiFailure(ctx, error, "I could not log that goal progress right now.");
   }
 });
 
@@ -513,7 +611,7 @@ bot.command("archive_goal", async (ctx) => {
 
     await ctx.reply(`Goal archived:\n${formatGoal(response.goal)}`);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not archive that goal. Check the goal ID and try again.");
+    await replyWithApiFailure(ctx, error, "I could not archive that goal. Check the goal ID and try again.");
   }
 });
 
@@ -526,7 +624,7 @@ bot.command("review", async (ctx) => {
     const review = await apiGet<DailyReviewResponse>(`/users/${getTelegramUserId(ctx)}/review/daily`);
     await ctx.reply(formatDailyReview(review.review));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch your daily review right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch your daily review right now.");
   }
 });
 
@@ -555,7 +653,7 @@ bot.command("goals", async (ctx) => {
     const response = await apiGet<GoalsResponse>(`/users/${getTelegramUserId(ctx)}/goals`);
     await ctx.reply(formatGoals(response.goals, response.duplicateWarnings ?? []));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch your goals right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch your goals right now.");
   }
 });
 
@@ -575,7 +673,7 @@ bot.command("events", async (ctx) => {
       })
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch your recent events right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch your recent events right now.");
   }
 });
 
@@ -596,7 +694,7 @@ bot.command("events_archived", async (ctx) => {
       })
     );
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch archived events right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch archived events right now.");
   }
 });
 
@@ -612,7 +710,7 @@ bot.command("undo_last_event", async (ctx) => {
     });
     await ctx.reply(formatArchiveResult(response));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not undo the last event right now.");
+    await replyWithApiFailure(ctx, error, "I could not undo the last event right now.");
   }
 });
 
@@ -635,7 +733,7 @@ bot.command("delete_event", async (ctx) => {
     await ctx.reply(`Archived event ${eventId}.`);
   } catch (error) {
     if (isFetchError(error)) {
-      await replyWithApiError(ctx, error, "I could not archive that event. Check the ID and try again.");
+      await replyWithApiFailure(ctx, error, "I could not archive that event. Check the ID and try again.");
       return;
     }
 
@@ -685,7 +783,7 @@ bot.command("correct_event", async (ctx) => {
     await ctx.reply(`Corrected event. Old event archived, replacement created: ${response.replacement.id}.`);
   } catch (error) {
     console.error("Telegram correct_event failed", error);
-    await replyWithApiError(ctx, error, "I could not correct that event. Check the ID and data format.");
+    await replyWithApiFailure(ctx, error, "I could not correct that event. Check the ID and data format.");
   }
 });
 
@@ -708,7 +806,7 @@ bot.command("ingest", async (ctx) => {
     });
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not ingest that text right now.");
+    await replyWithApiFailure(ctx, error, "I could not ingest that text right now.");
   }
 });
 
@@ -732,7 +830,7 @@ bot.command("ingest_job", async (ctx) => {
     });
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not ingest that job-search text right now.");
+    await replyWithApiFailure(ctx, error, "I could not ingest that job-search text right now.");
   }
 });
 
@@ -759,7 +857,7 @@ bot.command("checkin", async (ctx) => {
     const response = await apiPost<CheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily`, parsed);
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not save that check-in right now.");
+    await replyWithApiFailure(ctx, error, "I could not save that check-in right now.");
   }
 });
 
@@ -787,7 +885,7 @@ bot.command("pending", async (ctx) => {
     const response = await apiGet<PendingActionsResponse>(`/users/${getTelegramUserId(ctx)}/pending-actions`);
     await ctx.reply(formatPendingActions(response.pendingActions));
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not fetch pending actions right now.");
+    await replyWithApiFailure(ctx, error, "I could not fetch pending actions right now.");
   }
 });
 
@@ -810,7 +908,7 @@ bot.command("confirm", async (ctx) => {
     );
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not confirm that pending action right now.");
+    await replyWithApiFailure(ctx, error, "I could not confirm that pending action right now.");
   }
 });
 
@@ -833,7 +931,7 @@ bot.command("cancel", async (ctx) => {
     );
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not cancel that pending action right now.");
+    await replyWithApiFailure(ctx, error, "I could not cancel that pending action right now.");
   }
 });
 
@@ -886,7 +984,7 @@ bot.on("message:text", async (ctx) => {
 
     await ctx.reply(response.reply);
   } catch (error) {
-    await replyWithApiError(ctx, error, "I could not process that message right now.");
+    await replyWithApiFailure(ctx, error, "I could not process that message right now.");
   }
 });
 
@@ -1049,6 +1147,23 @@ function parseWeeklyInsightCommand(text: string): { day: string; time: string } 
   }
 
   return { day, time };
+}
+
+function parseConnectGithubCommand(text: string) {
+  const [repoText, ...rest] = text.split(/\s+/).filter(Boolean);
+  const [owner, repo] = (repoText ?? "").split("/");
+
+  if (!owner || !repo) {
+    return undefined;
+  }
+
+  const authorArg = rest.find((part) => part.startsWith("author="));
+  const authorLogin = authorArg?.replace(/^author=/, "").trim();
+
+  return {
+    repos: [{ owner, repo }],
+    ...(authorLogin ? { authorLogin } : {})
+  };
 }
 
 function parseEventLimit(text: string): number {
@@ -1251,7 +1366,7 @@ async function sendInsight(ctx: Context, periodType: "daily" | "weekly") {
     const response = await apiGet<InsightResponse>(`/users/${getTelegramUserId(ctx)}${path}`);
     await ctx.reply(formatInsight(response.insight));
   } catch (error) {
-    await replyWithApiError(
+    await replyWithApiFailure(
       ctx,
       error,
       periodType === "daily"
@@ -1261,11 +1376,94 @@ async function sendInsight(ctx: Context, periodType: "daily" | "weekly") {
   }
 }
 
+async function syncIntegration(ctx: Context, connectionId: string): Promise<string> {
+  const response = await apiPost<IntegrationSyncResponse>(
+    `/users/${getTelegramUserId(ctx)}/integrations/${connectionId}/sync`,
+    {}
+  );
+  const personalCommits = response.personalCommitEvents ?? 0;
+  const repoActivity = response.repoActivityEvents ?? 0;
+
+  if (personalCommits === 0 && repoActivity > 0) {
+    return `Synced ${response.integrationId}: ${repoActivity} repo activity event${repoActivity === 1 ? "" : "s"}.`;
+  }
+
+  if (personalCommits > 0 && repoActivity === 0) {
+    return `Synced ${response.integrationId}: ${personalCommits} personal commit${personalCommits === 1 ? "" : "s"}.`;
+  }
+
+  if (personalCommits > 0 && repoActivity > 0) {
+    return `Synced ${response.integrationId}: ${personalCommits} personal commit${personalCommits === 1 ? "" : "s"} and ${repoActivity} repo activity event${repoActivity === 1 ? "" : "s"}.`;
+  }
+
+  return `Synced ${response.integrationId}: ${response.eventsCreated} new event${response.eventsCreated === 1 ? "" : "s"}.`;
+}
+
+function formatIntegrationSyncFailure(connection: IntegrationConnection, error: unknown): string {
+  const reason = safeIntegrationErrorMessage(error);
+
+  return `Integration sync failed for ${connection.integrationId} ${connection.id}: ${reason}`;
+}
+
+function safeIntegrationErrorMessage(error: unknown): string {
+  const fallback = "Integration request failed.";
+
+  if (!error || typeof error !== "object") {
+    return fallback;
+  }
+
+  const err = error as Record<string, unknown>;
+  const message =
+    typeof err.message === "string"
+      ? err.message
+      : typeof err.description === "string"
+        ? err.description
+        : "";
+
+  if (!message) {
+    return fallback;
+  }
+
+  if (message.includes("Cannot access") && message.includes("before initialization")) {
+    return fallback;
+  }
+
+  if (
+    message.includes("repo not found or private") ||
+    message.includes("Public GitHub integration only supports public repos")
+  ) {
+    return message;
+  }
+
+  if (message.includes("404") || message.toLowerCase().includes("not found")) {
+    return "repo not found or private. Public GitHub integration only supports public repos.";
+  }
+
+  if (message.includes("403") || message.toLowerCase().includes("rate limit")) {
+    return "GitHub rate limit reached. Try again later.";
+  }
+
+  return message;
+}
+
+async function replyWithIntegrationMessage(ctx: Context, message: string) {
+  try {
+    await ctx.reply(truncateText(message, 3900));
+  } catch (error) {
+    console.error("Telegram integration reply failed", error);
+    try {
+      await ctx.reply("Integration sync failed. Check /my_integrations for connection status.");
+    } catch (replyError) {
+      console.error("Telegram integration fallback reply failed", replyError);
+    }
+  }
+}
+
 async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`);
 
   if (!response.ok) {
-    throw await ApiError.fromResponse(response, `API GET ${path} failed with ${response.status}`);
+    throw await errorFromResponse(response, `API GET ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
@@ -1281,7 +1479,7 @@ async function apiPost<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    throw await ApiError.fromResponse(response, `API POST ${path} failed with ${response.status}`);
+    throw await errorFromResponse(response, `API POST ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
@@ -1297,7 +1495,7 @@ async function apiPatch<T>(path: string, body: unknown): Promise<T> {
   });
 
   if (!response.ok) {
-    throw await ApiError.fromResponse(response, `API PATCH ${path} failed with ${response.status}`);
+    throw await errorFromResponse(response, `API PATCH ${path} failed with ${response.status}`);
   }
 
   return (await response.json()) as T;
@@ -1330,7 +1528,7 @@ async function postCorrectEvent(
   }
 
   const responseText = await response.text();
-  const parsedError = parseApiErrorText(responseText);
+  const parsedError = parseApiFailureText(responseText);
 
   return {
     ok: false,
@@ -1338,7 +1536,7 @@ async function postCorrectEvent(
   };
 }
 
-function parseApiErrorText(responseText: string): string | undefined {
+function parseApiFailureText(responseText: string): string | undefined {
   if (!responseText.trim()) {
     return undefined;
   }
@@ -1351,11 +1549,18 @@ function parseApiErrorText(responseText: string): string | undefined {
   }
 }
 
-async function replyWithApiError(ctx: Context, error: unknown, fallbackMessage: string) {
+async function replyWithApiFailure(ctx: Context, error: unknown, fallbackMessage: string) {
   console.error("Telegram API call failed", error);
 
   if (isFetchError(error)) {
     await ctx.reply("I cannot reach the agent API right now. Make sure the API server is running.");
+    return;
+  }
+
+  const message = safeErrorMessage(error);
+
+  if (message) {
+    await ctx.reply(message);
     return;
   }
 
@@ -1366,22 +1571,31 @@ function isFetchError(error: unknown) {
   return error instanceof TypeError;
 }
 
-class ApiError extends Error {
-  constructor(
-    message: string,
-    readonly status: number
-  ) {
-    super(message);
+async function errorFromResponse(response: Response, fallbackMessage: string): Promise<Error> {
+  try {
+    const body = (await response.json()) as { error?: unknown };
+    return new Error(typeof body.error === "string" && body.error.trim() ? body.error : fallbackMessage);
+  } catch {
+    return new Error(fallbackMessage);
+  }
+}
+
+function safeErrorMessage(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") {
+    return undefined;
   }
 
-  static async fromResponse(response: Response, fallbackMessage: string): Promise<ApiError> {
-    try {
-      const body = (await response.json()) as { error?: unknown };
-      return new ApiError(typeof body.error === "string" ? body.error : fallbackMessage, response.status);
-    } catch {
-      return new ApiError(fallbackMessage, response.status);
-    }
+  const candidate = error as { message?: unknown; description?: unknown };
+
+  if (typeof candidate.message === "string" && candidate.message.trim()) {
+    return candidate.message;
   }
+
+  if (typeof candidate.description === "string" && candidate.description.trim()) {
+    return candidate.description;
+  }
+
+  return undefined;
 }
 
 async function findEventIncludingArchived(ctx: Context, eventId: string): Promise<Event | undefined> {
@@ -1524,6 +1738,60 @@ function formatGoalTemplates(goalTemplates: GoalTemplate[]) {
   }
 
   return goalTemplates.map((template) => `${template.id}: ${template.title}`).join("\n");
+}
+
+function formatIntegrationDefinitions(integrations: IntegrationDefinition[]) {
+  if (integrations.length === 0) {
+    return "No integrations registered.";
+  }
+
+  return integrations
+    .map(
+      (integration) =>
+        [
+          `${integration.id}: ${integration.name}`,
+          `status: ${integration.status}`,
+          `auth: ${integration.authType}`,
+          `events: ${integration.producesEventTypes.join(", ")}`
+        ].join("\n")
+    )
+    .join("\n\n");
+}
+
+function formatIntegrationConnections(connections: IntegrationConnection[]) {
+  if (connections.length === 0) {
+    return "No integrations connected. Use /connect_github OWNER/REPO.";
+  }
+
+  return connections.map(formatIntegrationConnection).join("\n\n");
+}
+
+function formatIntegrationConnection(connection: IntegrationConnection) {
+  const repos = Array.isArray(connection.config.repos)
+    ? connection.config.repos
+        .map((item) => {
+          if (!item || typeof item !== "object") {
+            return undefined;
+          }
+
+          const repo = item as { owner?: unknown; repo?: unknown };
+          return typeof repo.owner === "string" && typeof repo.repo === "string" ? `${repo.owner}/${repo.repo}` : undefined;
+        })
+        .filter(Boolean)
+        .join(", ")
+    : "not set";
+
+  return [
+    `id: ${connection.id}`,
+    `integration: ${connection.integrationId}`,
+    `status: ${connection.status}`,
+    `repos: ${repos}`,
+    typeof connection.config.authorLogin === "string" ? `author: ${connection.config.authorLogin}` : undefined,
+    connection.lastSyncedAt ? `lastSyncedAt: ${new Date(connection.lastSyncedAt).toLocaleString()}` : undefined,
+    connection.lastError ? `lastError: ${connection.lastError}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function formatReviewGoal(goal: DailyReviewGoal) {
@@ -1736,6 +2004,13 @@ function formatEventData(event: Event) {
     return `${metric}${value}${unit}${note}`;
   }
 
+  if (event.type === "coding.commit_created" || event.type === "coding.repo_activity_detected") {
+    const repo = typeof event.data.repo === "string" ? event.data.repo : "repo";
+    const sha = typeof event.data.sha === "string" ? event.data.sha.slice(0, 7) : "";
+    const message = typeof event.data.message === "string" ? truncateText(event.data.message.split("\n")[0] ?? "", 120) : "";
+    return [repo, sha, message].filter(Boolean).join(" ");
+  }
+
   return truncateText(JSON.stringify(event.data), 300);
 }
 
@@ -1836,6 +2111,27 @@ interface EventCorrectionResponse {
 
 interface GoalTemplatesResponse {
   goalTemplates: GoalTemplate[];
+}
+
+interface IntegrationsResponse {
+  integrations: IntegrationDefinition[];
+}
+
+interface IntegrationConnectionsResponse {
+  connections: IntegrationConnection[];
+}
+
+interface IntegrationConnectionResponse {
+  connection: IntegrationConnection;
+}
+
+interface IntegrationSyncResponse {
+  status: "success";
+  connectionId: string;
+  integrationId: string;
+  eventsCreated: number;
+  personalCommitEvents?: number;
+  repoActivityEvents?: number;
 }
 
 interface CheckInResponse {
@@ -1968,6 +2264,25 @@ interface GoalTemplate {
   id: string;
   title: string;
   category: string;
+}
+
+interface IntegrationDefinition {
+  id: string;
+  name: string;
+  description: string;
+  status: "available" | "planned";
+  authType: "none" | "api_key" | "oauth" | "manual";
+  producesEventTypes: string[];
+}
+
+interface IntegrationConnection {
+  id: string;
+  userId: string;
+  integrationId: string;
+  status: "active" | "paused" | "error";
+  config: Record<string, unknown>;
+  lastSyncedAt?: string;
+  lastError?: string;
 }
 
 interface Event {

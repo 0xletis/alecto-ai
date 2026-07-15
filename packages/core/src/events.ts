@@ -2,7 +2,7 @@ import { z } from "zod";
 import { EventTypeSchema } from "./event-registry.js";
 
 export const EventSourceSchema = z.enum(["chat", "connector", "llm_inferred", "system"]);
-export const StoredEventSourceSchema = z.enum(["manual", "telegram"]);
+export const StoredEventSourceSchema = z.enum(["manual", "telegram", "github"]);
 export const StoredEventStatusSchema = z.enum(["active", "archived", "corrected"]);
 
 export const EventSchema = z.object({
@@ -27,6 +27,8 @@ export const StoredEventSchema = z.object({
   evidence: z.array(z.string()).optional(),
   status: StoredEventStatusSchema.default("active"),
   eventGroupId: z.string().optional(),
+  externalId: z.string().optional(),
+  provider: z.string().optional(),
   archivedAt: z.coerce.date().optional(),
   archiveReason: z.string().optional(),
   correctedByEventId: z.string().optional(),

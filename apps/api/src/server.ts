@@ -19,6 +19,8 @@ import {
   getGoalTemplate,
   goalTemplates,
   IngestTextBodySchema,
+  GithubPublicConnectionInputSchema,
+  integrationRegistry,
   CreateMemoryInputSchema,
   PendingMemoryCreatePayloadSchema,
   processMessage,
@@ -27,6 +29,7 @@ import {
   parsedDailyCheckInToAnswers,
   parseDailyCheckinText,
   routeIngestion,
+  UpdateIntegrationConnectionInputSchema,
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
   type IngestTextBody,
@@ -74,11 +77,19 @@ import {
   getRelevantMemories,
   hasRecentNotificationLog,
   confirmPendingAction,
+  createExternalEventIfNotExists,
+  createGithubPublicConnection,
+  createIntegrationSyncLog,
   ensureUser,
+  getIntegrationConnection,
+  getIntegrationConnections,
   rejectPendingAction,
   undoLastEvents,
   type PendingAction,
   type PendingActionType,
+  type IntegrationConnection,
+  updateIntegrationConnection,
+  updateIntegrationConnectionSyncState,
   updateNotificationSettings,
   updateUserOperatingProfile
 } from "@operator-agent/db";
@@ -95,6 +106,10 @@ export function buildServer() {
 
   server.get("/events/types", async () => ({
     eventTypes: eventRegistry
+  }));
+
+  server.get("/integrations", async () => ({
+    integrations: integrationRegistry
   }));
 
   server.get("/goal-templates", async () => ({
@@ -610,6 +625,102 @@ export function buildServer() {
     return ingestText(request.params.userId, parsed.data);
   });
 
+  server.get<{ Params: { userId: string } }>("/users/:userId/integrations", async (request) => ({
+    connections: await getIntegrationConnections(request.params.userId)
+  }));
+
+  server.post<{ Params: { userId: string } }>(
+    "/users/:userId/integrations/github-public",
+    async (request, reply) => {
+      const parsed = GithubPublicConnectionInputSchema.safeParse(request.body);
+
+      if (!parsed.success) {
+        return reply.status(400).send({
+          error: "Invalid request body",
+          issues: parsed.error.issues
+        });
+      }
+
+      for (const repo of parsed.data.repos) {
+        const validationError = await validateGithubPublicRepo(repo.owner, repo.repo, "connection");
+
+        if (validationError) {
+          return reply.status(validationError.httpStatus).send({
+            error: validationError.message
+          });
+        }
+      }
+
+      return {
+        connection: await createGithubPublicConnection(request.params.userId, parsed.data)
+      };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; connectionId: string } }>(
+    "/users/:userId/integrations/:connectionId",
+    async (request, reply) => {
+      const parsed = UpdateIntegrationConnectionInputSchema.safeParse(request.body);
+
+      if (!parsed.success) {
+        return reply.status(400).send({
+          error: "Invalid request body",
+          issues: parsed.error.issues
+        });
+      }
+
+      const connection = await updateIntegrationConnection(
+        request.params.userId,
+        request.params.connectionId,
+        parsed.data
+      );
+
+      if (!connection) {
+        return reply.status(404).send({
+          error: "Integration connection not found"
+        });
+      }
+
+      return { connection };
+    }
+  );
+
+  server.post<{ Params: { userId: string; connectionId: string } }>(
+    "/users/:userId/integrations/:connectionId/sync",
+    async (request, reply) => {
+      const connection = await getIntegrationConnection(request.params.userId, request.params.connectionId);
+
+      if (!connection) {
+        return reply.status(404).send({
+          error: "Integration connection not found"
+        });
+      }
+
+      if (connection.status === "paused") {
+        return reply.status(400).send({
+          error: "Integration connection is paused"
+        });
+      }
+
+      if (connection.integrationId !== "github_public") {
+        return reply.status(400).send({
+          error: "Unsupported integration sync"
+        });
+      }
+
+      const result = await syncGithubPublicConnection(connection);
+
+      if (result.status === "error") {
+        return reply.status(502).send({
+          error: result.error,
+          syncLog: result.syncLog
+        });
+      }
+
+      return result;
+    }
+  );
+
   server.post<{ Params: { userId: string } }>("/users/:userId/goals", async (request, reply) => {
     const parsed = CreateGoalInputSchema.safeParse(request.body);
 
@@ -880,6 +991,248 @@ async function ingestText(userId: string, input: IngestTextBody) {
     events,
     reply: composeIngestionReply(result.classification, events.length)
   };
+}
+
+async function syncGithubPublicConnection(connection: IntegrationConnection) {
+  const startedAt = new Date();
+
+  try {
+    const config = parseGithubConnectionConfig(connection.config);
+    let eventsCreated = 0;
+    let personalCommitEvents = 0;
+    let repoActivityEvents = 0;
+
+    for (const repo of config.repos) {
+      const commits = await fetchGithubCommits(repo.owner, repo.repo);
+
+      for (const commit of commits) {
+        const externalId = `github:${repo.owner}/${repo.repo}:commit:${commit.sha}`;
+        const matchesAuthor = matchesGithubAuthor(commit, config.authorLogin);
+        const shouldCreateCommit = Boolean(config.authorLogin && matchesAuthor);
+        const shouldCreateRepoActivity = !shouldCreateCommit && config.includeRepoActivity;
+
+        if (!shouldCreateCommit && !shouldCreateRepoActivity) {
+          continue;
+        }
+
+        const eventType = shouldCreateCommit ? "coding.commit_created" : "coding.repo_activity_detected";
+        const created = await createExternalEventIfNotExists(connection.userId, {
+          type: eventType,
+          timestamp: parseGithubCommitDate(commit) ?? new Date(),
+          source: "github",
+          provider: "github",
+          externalId,
+          data: githubCommitEventData(repo.owner, repo.repo, commit, externalId, shouldCreateCommit),
+          confidence: shouldCreateCommit ? 0.95 : 0.8,
+          evidence: [
+            commit.commit.message.split("\n")[0] ?? "GitHub commit",
+            `${repo.owner}/${repo.repo}`,
+            commit.sha.slice(0, 7)
+          ]
+        });
+
+        if (created.created) {
+          eventsCreated += 1;
+          if (eventType === "coding.commit_created") {
+            personalCommitEvents += 1;
+          } else {
+            repoActivityEvents += 1;
+          }
+        }
+      }
+    }
+
+    await updateIntegrationConnectionSyncState(connection.userId, connection.id, {
+      status: "active",
+      lastSyncedAt: new Date(),
+      lastError: null
+    });
+
+    const syncLog = await createIntegrationSyncLog({
+      userId: connection.userId,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      status: "success",
+      startedAt,
+      finishedAt: new Date(),
+      eventsCreated
+    });
+
+    return {
+      status: "success" as const,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      eventsCreated,
+      personalCommitEvents,
+      repoActivityEvents,
+      syncLog
+    };
+  } catch (error) {
+    const reason = shortErrorMessage(error);
+
+    await updateIntegrationConnectionSyncState(connection.userId, connection.id, {
+      status: "error",
+      lastError: reason
+    });
+
+    const syncLog = await createIntegrationSyncLog({
+      userId: connection.userId,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      status: "error",
+      startedAt,
+      finishedAt: new Date(),
+      eventsCreated: 0,
+      error: reason
+    });
+
+    return {
+      status: "error" as const,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      eventsCreated: 0,
+      personalCommitEvents: 0,
+      repoActivityEvents: 0,
+      error: reason.includes(":") ? `GitHub sync failed for ${reason}` : `GitHub sync failed: ${reason}`,
+      syncLog
+    };
+  }
+}
+
+async function validateGithubPublicRepo(
+  owner: string,
+  repo: string,
+  action: "connection" | "sync"
+): Promise<{ httpStatus: number; message: string } | undefined> {
+  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      "user-agent": "alecto-ai"
+    }
+  });
+
+  if (response.ok) {
+    return undefined;
+  }
+
+  if (response.status === 404) {
+    return {
+      httpStatus: 400,
+      message: `GitHub ${action} failed for ${owner}/${repo}: repo not found or private. Public GitHub integration only supports public repos.`
+    };
+  }
+
+  if (response.status === 403) {
+    return {
+      httpStatus: 429,
+      message: `GitHub ${action} failed: GitHub rate limit reached. Try again later.`
+    };
+  }
+
+  const body = await response.text();
+  return {
+    httpStatus: 502,
+    message: `GitHub ${action} failed for ${owner}/${repo}: ${truncatePlainText(body || response.statusText, 160)}`
+  };
+}
+
+function parseGithubConnectionConfig(config: Record<string, unknown>) {
+  const parsed = GithubPublicConnectionInputSchema.safeParse(config);
+
+  if (!parsed.success) {
+    throw new Error("Invalid GitHub connection config");
+  }
+
+  return {
+    ...parsed.data,
+    includeRepoActivity: parsed.data.includeRepoActivity ?? !parsed.data.authorLogin
+  };
+}
+
+async function fetchGithubCommits(owner: string, repo: string): Promise<GithubCommit[]> {
+  const response = await fetch(`https://api.github.com/repos/${owner}/${repo}/commits?per_page=10`, {
+    headers: {
+      accept: "application/vnd.github+json",
+      "user-agent": "alecto-ai"
+    }
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw githubFetchError(owner, repo, response.status, body || response.statusText);
+  }
+
+  return (await response.json()) as GithubCommit[];
+}
+
+function githubFetchError(owner: string, repo: string, status: number, body: string): GithubFetchError {
+  if (status === 404) {
+    return new GithubFetchError(
+      "GITHUB_REPO_NOT_FOUND_OR_PRIVATE",
+      `${owner}/${repo}: repo not found or private. Public GitHub integration only supports public repos.`
+    );
+  }
+
+  if (status === 403) {
+    return new GithubFetchError("GITHUB_RATE_LIMITED", `${owner}/${repo}: GitHub rate limit reached. Try again later.`);
+  }
+
+  return new GithubFetchError("GITHUB_FETCH_FAILED", `${owner}/${repo}: ${truncatePlainText(body, 160)}`);
+}
+
+function matchesGithubAuthor(commit: GithubCommit, authorLogin?: string): boolean {
+  if (!authorLogin) {
+    return true;
+  }
+
+  const expected = authorLogin.toLowerCase();
+  const candidates = [
+    commit.author?.login,
+    commit.committer?.login,
+    commit.commit.author?.name,
+    commit.commit.author?.email,
+    commit.commit.committer?.name,
+    commit.commit.committer?.email
+  ];
+
+  return candidates.some((candidate) => candidate?.toLowerCase().includes(expected));
+}
+
+function parseGithubCommitDate(commit: GithubCommit): Date | undefined {
+  const value = commit.commit.author?.date ?? commit.commit.committer?.date;
+  const date = value ? new Date(value) : undefined;
+
+  return date && !Number.isNaN(date.getTime()) ? date : undefined;
+}
+
+function githubCommitEventData(
+  owner: string,
+  repo: string,
+  commit: GithubCommit,
+  externalId: string,
+  isPersonal: boolean
+) {
+  return {
+    provider: "github",
+    isPersonal,
+    activityKind: isPersonal ? "personal_commit" : "repo_activity",
+    repo: `${owner}/${repo}`,
+    sha: commit.sha,
+    message: commit.commit.message,
+    authorName: commit.commit.author?.name ?? commit.commit.committer?.name,
+    authorLogin: commit.author?.login ?? commit.committer?.login,
+    url: commit.html_url,
+    externalId
+  };
+}
+
+function shortErrorMessage(error: unknown): string {
+  return truncatePlainText(error instanceof Error ? error.message : String(error), 200);
+}
+
+function truncatePlainText(text: string, maxLength: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > maxLength ? `${clean.slice(0, maxLength - 3)}...` : clean;
 }
 
 function composeIngestionReply(classification: string, eventCount: number): string {
@@ -2366,6 +2719,39 @@ function tomorrow(): Date {
   const date = new Date();
   date.setDate(date.getDate() + 1);
   return date;
+}
+
+interface GithubCommit {
+  sha: string;
+  html_url?: string;
+  author?: {
+    login?: string;
+  } | null;
+  committer?: {
+    login?: string;
+  } | null;
+  commit: {
+    message: string;
+    author?: {
+      name?: string;
+      email?: string;
+      date?: string;
+    } | null;
+    committer?: {
+      name?: string;
+      email?: string;
+      date?: string;
+    } | null;
+  };
+}
+
+class GithubFetchError extends Error {
+  constructor(
+    readonly code: "GITHUB_REPO_NOT_FOUND_OR_PRIVATE" | "GITHUB_RATE_LIMITED" | "GITHUB_FETCH_FAILED",
+    message: string
+  ) {
+    super(message);
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -116,6 +116,12 @@ Telegram commands:
 - `/set_style hard_guardian`: apply hard guardian profile defaults
 - `/set_style balanced`: apply balanced profile defaults
 - `/templates`: show available goal templates
+- `/integrations`: show available and planned integrations
+- `/my_integrations`: show your connected integrations
+- `/connect_github OWNER/REPO`: watch public repo activity as external context
+- `/connect_github OWNER/REPO author=LOGIN`: connect a public repo and only log matching commits
+- `/sync_integrations`: sync all active integrations
+- `/sync_integration CONNECTION_ID`: sync one integration
 - `/create_goal category | title | why`: create a goal
 - `/create_goal_from_template templateId | title | why`: create a structured goal from a template
 - `/archive_goal <goalId>`: archive a goal
@@ -148,6 +154,7 @@ Verify the routes from another terminal:
 curl http://localhost:3000/health
 curl http://localhost:3000/events/types
 curl http://localhost:3000/goal-templates
+curl http://localhost:3000/integrations
 curl http://localhost:3000/goal-templates/career.job_search
 
 curl -X POST http://localhost:3000/users/local-user/goals \
@@ -366,6 +373,7 @@ Expected:
 - `/health` returns `{ "ok": true, "service": "operator-agent-api" }`
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
 - `/goal-templates` returns structured goal templates such as `career.job_search`, `health.strength_energy`, `health.sleep_better`, `learning.reading_more`, and `finance.control_betting_trading`.
+- `/integrations` returns Integration Registry v1. `github_public` is available; `gmail` and `wallet_public` are planned.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Explicit memory phrases like `remember that`, `recuerda que`, or `guarda que` create visible memories immediately and reply `Saved to memory.`
 - `/users/:userId/memory` returns active memories by default. Use `?includeArchived=true` to include archived/rejected memories.
@@ -418,6 +426,38 @@ Expected:
 - `/users/:userId/review/daily` summarizes today's stored events against active goals.
 - Daily review includes a concise `Memory signals` section when active risk-pattern memories are relevant to today's events.
 - Daily review and insights treat `custom.goal_progress_logged` as real progress for custom goals, including summed minutes when the unit is `minutes`.
+- GitHub public repo sync creates `coding.repo_activity_detected` when no `author=LOGIN` filter is set. That is external context, not personal progress.
+- GitHub public repo sync creates `coding.commit_created` only when `author=LOGIN` is configured and the commit matches that user. Those personal commits can count as wins/progress.
+- The public GitHub integration does not support private repos. A private or nonexistent repo returns a clean sync error and updates the connection `lastError`.
+- Older GitHub `coding.commit_created` events without `data.isPersonal=true` are treated as unverified activity, not personal progress.
+- GitHub events use `source=github`, provider metadata, and external IDs for dedupe. Running the same sync twice should not create duplicate events.
+
+Integration Registry v1 manual test:
+
+```bash
+curl http://localhost:3000/integrations
+
+curl -X POST http://localhost:3000/users/dev-user/integrations/github-public \
+  -H "Content-Type: application/json" \
+  -d '{"repos":[{"owner":"vercel","repo":"next.js"}]}'
+
+curl http://localhost:3000/users/dev-user/integrations
+
+curl -X POST http://localhost:3000/users/dev-user/integrations/CONNECTION_ID/sync \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Telegram integration commands:
+
+```text
+/integrations
+/my_integrations
+/connect_github vercel/next.js
+/connect_github letisfarre/alecto-ai author=letisfarre
+/sync_integrations
+/sync_integration CONNECTION_ID
+```
 
 Manual insight tests:
 
@@ -430,6 +470,7 @@ Manual insight tests:
 
 - `GET /health`
 - `GET /events/types`
+- `GET /integrations`
 - `GET /goal-templates`
 - `GET /goal-templates/:templateId`
 - `POST /messages/process`
@@ -460,6 +501,10 @@ Manual insight tests:
 - `GET /users/:userId/checkins/daily/prompt`
 - `POST /users/:userId/ingest/text`
 - `POST /users/:userId/ingest/job-search-text`
+- `GET /users/:userId/integrations`
+- `POST /users/:userId/integrations/github-public`
+- `PATCH /users/:userId/integrations/:connectionId`
+- `POST /users/:userId/integrations/:connectionId/sync`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/insights/daily`
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`

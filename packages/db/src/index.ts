@@ -5,11 +5,13 @@ import type {
   CreateMemoryInput,
   CreateGoalInput,
   ExtractedEvent,
+  GithubPublicConnectionInput,
   Goal,
   MemoryEntry,
   NotificationSettings,
   PendingMemoryCreatePayload,
   StoredEvent,
+  UpdateIntegrationConnectionInput,
   UpdateNotificationSettingsInput,
   UpdateUserOperatingProfileInput,
   UserOperatingProfile
@@ -25,6 +27,8 @@ export interface CreateEventInput {
   confidence: number;
   evidence?: string[];
   eventGroupId?: string;
+  externalId?: string;
+  provider?: string;
 }
 
 export interface EventQueryOptions {
@@ -76,6 +80,30 @@ export interface NotificationLogInput {
   userId: string;
   type: string;
   sentForDate: string;
+}
+
+export interface IntegrationConnection {
+  id: string;
+  userId: string;
+  integrationId: string;
+  status: "active" | "paused" | "error";
+  config: Record<string, unknown>;
+  lastSyncedAt?: Date;
+  lastError?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface IntegrationSyncLog {
+  id: string;
+  userId: string;
+  connectionId: string;
+  integrationId: string;
+  status: "success" | "error";
+  startedAt: Date;
+  finishedAt?: Date;
+  eventsCreated: number;
+  error?: string;
 }
 
 export type CreateGoalResult =
@@ -196,7 +224,9 @@ export async function createEvent(userId: string, eventInput: CreateEventInput):
       data: toJsonObject(eventInput.data ?? {}),
       confidence: eventInput.confidence,
       evidence: eventInput.evidence ? toJsonArray(eventInput.evidence) : undefined,
-      eventGroupId: eventInput.eventGroupId
+      eventGroupId: eventInput.eventGroupId,
+      externalId: eventInput.externalId,
+      provider: eventInput.provider
     }
   });
 
@@ -217,6 +247,170 @@ export async function createEvents(userId: string, eventInputs: CreateEventInput
   }
 
   return events;
+}
+
+export async function createExternalEventIfNotExists(
+  userId: string,
+  eventInput: CreateEventInput & { externalId: string; source: "github" }
+): Promise<{ created: boolean; event: StoredEvent }> {
+  await ensureUser(userId);
+
+  const existingEvent = await prisma.event.findUnique({
+    where: {
+      userId_source_externalId: {
+        userId,
+        source: eventInput.source,
+        externalId: eventInput.externalId
+      }
+    }
+  });
+
+  if (existingEvent) {
+    return {
+      created: false,
+      event: toStoredEvent(existingEvent)
+    };
+  }
+
+  return {
+    created: true,
+    event: await createEvent(userId, eventInput)
+  };
+}
+
+export async function createGithubPublicConnection(
+  userId: string,
+  input: GithubPublicConnectionInput
+): Promise<IntegrationConnection> {
+  await ensureUser(userId);
+
+  const connection = await prisma.integrationConnection.create({
+    data: {
+      userId,
+      integrationId: "github_public",
+      status: "active",
+      config: toJsonObject({
+        ...input,
+        includeRepoActivity: input.includeRepoActivity ?? !input.authorLogin
+      })
+    }
+  });
+
+  return toIntegrationConnection(connection);
+}
+
+export async function getIntegrationConnections(userId: string): Promise<IntegrationConnection[]> {
+  await ensureUser(userId);
+
+  const connections = await prisma.integrationConnection.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return connections.map(toIntegrationConnection);
+}
+
+export async function getIntegrationConnection(
+  userId: string,
+  connectionId: string
+): Promise<IntegrationConnection | undefined> {
+  await ensureUser(userId);
+
+  const connection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: connectionId,
+      userId
+    }
+  });
+
+  return connection ? toIntegrationConnection(connection) : undefined;
+}
+
+export async function updateIntegrationConnection(
+  userId: string,
+  connectionId: string,
+  input: UpdateIntegrationConnectionInput
+): Promise<IntegrationConnection | undefined> {
+  await ensureUser(userId);
+
+  const existingConnection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: connectionId,
+      userId
+    }
+  });
+
+  if (!existingConnection) {
+    return undefined;
+  }
+
+  const connection = await prisma.integrationConnection.update({
+    where: { id: connectionId },
+    data: {
+      status: input.status,
+      lastError: input.status === "active" ? null : existingConnection.lastError
+    }
+  });
+
+  return toIntegrationConnection(connection);
+}
+
+export async function updateIntegrationConnectionSyncState(
+  userId: string,
+  connectionId: string,
+  input: { status?: "active" | "error"; lastSyncedAt?: Date; lastError?: string | null }
+): Promise<IntegrationConnection | undefined> {
+  await ensureUser(userId);
+
+  const existingConnection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: connectionId,
+      userId
+    }
+  });
+
+  if (!existingConnection) {
+    return undefined;
+  }
+
+  const connection = await prisma.integrationConnection.update({
+    where: { id: connectionId },
+    data: {
+      status: input.status,
+      lastSyncedAt: input.lastSyncedAt,
+      lastError: input.lastError
+    }
+  });
+
+  return toIntegrationConnection(connection);
+}
+
+export async function createIntegrationSyncLog(input: {
+  userId: string;
+  connectionId: string;
+  integrationId: string;
+  status: "success" | "error";
+  startedAt?: Date;
+  finishedAt?: Date;
+  eventsCreated?: number;
+  error?: string;
+}): Promise<IntegrationSyncLog> {
+  await ensureUser(input.userId);
+
+  const log = await prisma.integrationSyncLog.create({
+    data: {
+      userId: input.userId,
+      connectionId: input.connectionId,
+      integrationId: input.integrationId,
+      status: input.status,
+      startedAt: input.startedAt ?? new Date(),
+      finishedAt: input.finishedAt,
+      eventsCreated: input.eventsCreated ?? 0,
+      error: input.error
+    }
+  });
+
+  return toIntegrationSyncLog(log);
 }
 
 export async function createEventsFromExtracted(
@@ -840,6 +1034,8 @@ function toStoredEvent(event: Prisma.EventGetPayload<object>): StoredEvent {
     evidence: Array.isArray(event.evidence) ? event.evidence.filter((item) => typeof item === "string") : undefined,
     status: event.status as StoredEvent["status"],
     eventGroupId: event.eventGroupId ?? undefined,
+    externalId: event.externalId ?? undefined,
+    provider: event.provider ?? undefined,
     archivedAt: event.archivedAt ?? undefined,
     archiveReason: event.archiveReason ?? undefined,
     correctedByEventId: event.correctedByEventId ?? undefined,
@@ -1012,6 +1208,36 @@ function toPendingAction(pendingAction: Prisma.PendingActionGetPayload<object>):
     expiresAt: pendingAction.expiresAt ?? undefined,
     createdAt: pendingAction.createdAt,
     updatedAt: pendingAction.updatedAt
+  };
+}
+
+function toIntegrationConnection(
+  connection: Prisma.IntegrationConnectionGetPayload<object>
+): IntegrationConnection {
+  return {
+    id: connection.id,
+    userId: connection.userId,
+    integrationId: connection.integrationId,
+    status: connection.status as IntegrationConnection["status"],
+    config: toRecord(connection.config),
+    lastSyncedAt: connection.lastSyncedAt ?? undefined,
+    lastError: connection.lastError ?? undefined,
+    createdAt: connection.createdAt,
+    updatedAt: connection.updatedAt
+  };
+}
+
+function toIntegrationSyncLog(log: Prisma.IntegrationSyncLogGetPayload<object>): IntegrationSyncLog {
+  return {
+    id: log.id,
+    userId: log.userId,
+    connectionId: log.connectionId,
+    integrationId: log.integrationId,
+    status: log.status as IntegrationSyncLog["status"],
+    startedAt: log.startedAt,
+    finishedAt: log.finishedAt ?? undefined,
+    eventsCreated: log.eventsCreated,
+    error: log.error ?? undefined
   };
 }
 

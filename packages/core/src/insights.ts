@@ -55,7 +55,7 @@ export function buildDailyInsight(input: BuildInsightInput): InsightReport {
   const recommendedActions = recommendDailyActions(activeGoals, metrics, input.events);
   const directProfile = isDirectProfile(input.userOperatingProfile);
   const headline = dailyHeadline(wins, risks, directProfile, metrics.customProgressLogs > 0);
-  const summary = buildDailySummary(wins, risks, directProfile);
+  const summary = buildDailySummary(wins, risks, directProfile, metrics);
   const hardTruth =
     directProfile && risks.length > 0
       ? "You do not need more analysis tonight. You need to protect the system from your impulsive state."
@@ -131,6 +131,15 @@ function summarizeMetrics(events: StoredEvent[]) {
     workoutMinutes: sum(events, "health.workout_completed", "duration_minutes"),
     readingSessions: count(events, "learning.reading_session_completed"),
     readingMinutes: sum(events, "learning.reading_session_completed", "duration_minutes"),
+    commits: countPersonalCommitEvents(events),
+    unverifiedGithubCommits: countUnverifiedGithubCommitEvents(events),
+    repoActivity: count(events, "coding.repo_activity_detected"),
+    activeRepos: unique(
+      events
+        .filter((event) => event.type === "coding.commit_created" || event.type === "coding.repo_activity_detected")
+        .map((event) => (typeof event.data.repo === "string" ? event.data.repo : undefined))
+        .filter((repo): repo is string => Boolean(repo))
+    ),
     customProgressLogs: count(events, "custom.goal_progress_logged"),
     customProgressMinutes: sumCustomMinutes(events),
     checkIns: count(events, "reflection.daily_checkin_completed"),
@@ -149,21 +158,7 @@ function summarizeMetrics(events: StoredEvent[]) {
     impulseLatest: latestImpulse(events),
     highImpulseEvents: events.filter((event) => event.type === "reflection.impulse_logged" && numberValue(event, "value") >= 6).length,
     progressDays: distinctDays(
-      events.filter((event) =>
-        [
-          "career.application_sent",
-          "career.application_confirmation_received",
-          "career.recruiter_reply_received",
-          "career.interview_scheduled",
-          "career.rejection_received",
-          "career.offer_received",
-          "health.workout_completed",
-          "learning.reading_session_completed",
-          "custom.goal_progress_logged",
-          "work.deep_work_session_completed",
-          "work.task_completed"
-        ].includes(event.type)
-      )
+      events.filter((event) => isPersonalProgressEvent(event))
     ),
     totalDays: Math.max(1, distinctDays(events))
   };
@@ -194,6 +189,10 @@ function dailyWins(metrics: ReturnType<typeof summarizeMetrics>, activeGoals: Go
 
   if (metrics.readingMinutes > 0) {
     wins.push(`${metrics.readingMinutes} minutes of reading`);
+  }
+
+  if (metrics.commits > 0) {
+    wins.push(`${metrics.commits} personal commit${metrics.commits === 1 ? "" : "s"} detected`);
   }
 
   wins.push(...customProgressWins(activeGoals, events));
@@ -279,6 +278,14 @@ function dailyPatterns(metrics: ReturnType<typeof summarizeMetrics>): string[] {
     patterns.push("low sleep and high anxiety are stacked");
   }
 
+  if (metrics.repoActivity > 0 && metrics.commits === 0) {
+    patterns.push(`${metrics.repoActivity} repo activity signal${metrics.repoActivity === 1 ? "" : "s"} detected as external context, not personal output`);
+  }
+
+  if (metrics.unverifiedGithubCommits > 0) {
+    patterns.push(`${metrics.unverifiedGithubCommits} unverified GitHub commit event${metrics.unverifiedGithubCommits === 1 ? "" : "s"} ignored for personal progress`);
+  }
+
   return patterns;
 }
 
@@ -303,6 +310,14 @@ function weeklyPatterns(events: StoredEvent[], metrics: ReturnType<typeof summar
 
   if (metrics.checkIns > 0 && metrics.checkIns < Math.min(4, distinctDays(events))) {
     patterns.push("check-ins were inconsistent");
+  }
+
+  if (metrics.repoActivity > 0 && metrics.commits === 0) {
+    patterns.push(`${metrics.repoActivity} repo activity signal${metrics.repoActivity === 1 ? "" : "s"} detected without personal commits`);
+  }
+
+  if (metrics.unverifiedGithubCommits > 0) {
+    patterns.push(`${metrics.unverifiedGithubCommits} unverified GitHub commit event${metrics.unverifiedGithubCommits === 1 ? "" : "s"} ignored for personal progress`);
   }
 
   return patterns;
@@ -338,13 +353,14 @@ function buildGoalProgress(
         metrics.interviews +
         metrics.rejections +
         metrics.offers +
-        metrics.cvUpdates;
+        metrics.cvUpdates +
+        metrics.commits;
       return {
         goalId: goal.id,
         title: goal.title,
         status: signals > 0 ? "progress" : "no_progress",
         note: signals > 0
-          ? `${metrics.applications} applications, ${metrics.applicationConfirmations} confirmations, ${metrics.recruiterReplies} replies, ${metrics.interviews} interviews, ${metrics.rejections} rejections, ${metrics.offers} offers`
+          ? `${metrics.applications} applications, ${metrics.applicationConfirmations} confirmations, ${metrics.recruiterReplies} replies, ${metrics.interviews} interviews, ${metrics.rejections} rejections, ${metrics.offers} offers, ${metrics.commits} personal commits`
           : `No job-search evidence logged ${period === "daily" ? "today" : "this week"}`
       };
     }
@@ -368,6 +384,17 @@ function buildGoalProgress(
         note: metrics.readingMinutes > 0
           ? `${metrics.readingSessions} reading session${metrics.readingSessions === 1 ? "" : "s"}, ${metrics.readingMinutes} minutes`
           : `No reading evidence logged ${period === "daily" ? "today" : "this week"}`
+      };
+    }
+
+    if (matchesGoal(goal, "creative.build_project", "creative") || goal.category === "coding" || goal.category === "project") {
+      return {
+        goalId: goal.id,
+        title: goal.title,
+        status: metrics.commits > 0 ? "progress" : "no_progress",
+        note: metrics.commits > 0
+          ? `${metrics.commits} personal commit${metrics.commits === 1 ? "" : "s"} detected`
+          : `No personal coding evidence logged ${period === "daily" ? "today" : "this week"}`
       };
     }
 
@@ -664,7 +691,12 @@ function weeklyHeadline(wins: string[], risks: string[], directProfile: boolean)
   return "Low signal week. The system needs more evidence.";
 }
 
-function buildDailySummary(wins: string[], risks: string[], directProfile: boolean): string {
+function buildDailySummary(
+  wins: string[],
+  risks: string[],
+  directProfile: boolean,
+  metrics: ReturnType<typeof summarizeMetrics>
+): string {
   if (wins.length > 0 && risks.length > 0) {
     const riskText = joinReadableList(risks);
     return directProfile
@@ -684,6 +716,14 @@ function buildDailySummary(wins: string[], risks: string[], directProfile: boole
       : `The main signal today is risk: ${joinReadableList(risks)}. Stabilize before making decisions.`;
   }
 
+  if (metrics.repoActivity > 0) {
+    return "GitHub repo activity was detected, but no personal commits were identified.";
+  }
+
+  if (metrics.unverifiedGithubCommits > 0) {
+    return "GitHub commit activity exists, but it is unverified. No personal commits were identified.";
+  }
+
   return "There is not enough logged evidence today. One honest check-in or concrete action would improve the signal.";
 }
 
@@ -697,6 +737,8 @@ function buildWeeklySummary(metrics: ReturnType<typeof summarizeMetrics>): strin
     metrics.offers > 0 ? `${metrics.offers} offers` : undefined,
     metrics.workoutMinutes > 0 ? `${metrics.workoutSessions} workouts / ${metrics.workoutMinutes} minutes` : undefined,
     metrics.readingMinutes > 0 ? `${metrics.readingMinutes} minutes of reading` : undefined,
+    metrics.commits > 0 ? `${metrics.commits} personal commit${metrics.commits === 1 ? "" : "s"}` : undefined,
+    metrics.repoActivity > 0 ? `${metrics.repoActivity} repo activity signal${metrics.repoActivity === 1 ? "" : "s"} detected` : undefined,
     metrics.customProgressLogs > 0
       ? `${metrics.customProgressLogs} custom progress log${metrics.customProgressLogs === 1 ? "" : "s"}${metrics.customProgressMinutes > 0 ? ` / ${metrics.customProgressMinutes} focused minutes` : ""}`
       : undefined,
@@ -729,6 +771,49 @@ function count(events: StoredEvent[], type: string): number {
 
 function countAny(events: StoredEvent[], types: string[]): number {
   return events.filter((event) => types.includes(event.type)).length;
+}
+
+function countPersonalCommitEvents(events: StoredEvent[]): number {
+  return events.filter(isPersonalCommitEvent).length;
+}
+
+function countUnverifiedGithubCommitEvents(events: StoredEvent[]): number {
+  return events.filter(
+    (event) =>
+      event.type === "coding.commit_created" &&
+      event.source === "github" &&
+      event.data.isPersonal !== true
+  ).length;
+}
+
+function isPersonalCommitEvent(event: StoredEvent): boolean {
+  if (event.type !== "coding.commit_created") {
+    return false;
+  }
+
+  if (event.source === "github") {
+    return event.data.isPersonal === true;
+  }
+
+  return true;
+}
+
+function isPersonalProgressEvent(event: StoredEvent): boolean {
+  return (
+    [
+      "career.application_sent",
+      "career.application_confirmation_received",
+      "career.recruiter_reply_received",
+      "career.interview_scheduled",
+      "career.rejection_received",
+      "career.offer_received",
+      "health.workout_completed",
+      "learning.reading_session_completed",
+      "custom.goal_progress_logged",
+      "work.deep_work_session_completed",
+      "work.task_completed"
+    ].includes(event.type) || isPersonalCommitEvent(event)
+  );
 }
 
 function sum(events: StoredEvent[], type: string, key: string): number {
