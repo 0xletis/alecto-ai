@@ -4,6 +4,7 @@ import {
   buildDailyInsight,
   buildDailyCheckinPrompt,
   buildCustomGoalConfig,
+  composeAgentResponse,
   buildWeeklyInsight,
   CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
@@ -31,12 +32,19 @@ import {
   type IngestTextBody,
   type MessageIntent,
   type InsightReport,
+  type AgentResponse,
+  type AgentResponseComposerInput,
   type MemoryEntry,
   type ProcessMessageResult,
   type StoredEvent,
   type UpdateUserOperatingProfileInput
 } from "@operator-agent/core";
-import { analyzeMessageWithOpenAI, polishInsightWithOpenAI, type OpenAIMessageAnalysis } from "@operator-agent/llm";
+import {
+  analyzeMessageWithOpenAI,
+  composeResponseWithOpenAI,
+  polishInsightWithOpenAI,
+  type OpenAIMessageAnalysis
+} from "@operator-agent/llm";
 import {
   archiveEvent,
   archiveEventGroup,
@@ -155,6 +163,28 @@ export function buildServer() {
       recentEvents,
       userOperatingProfile
     };
+
+    const naturalCustomProgress = detectNaturalCustomProgress(parsed.data.message, activeGoals);
+
+    if (naturalCustomProgress) {
+      const event = await createCustomGoalProgressEvent(parsed.data.userId, naturalCustomProgress.goal, {
+        metricKey: "focused_minutes",
+        value: naturalCustomProgress.minutes,
+        unit: "minutes",
+        note: parsed.data.message
+      });
+
+      return {
+        userId: parsed.data.userId,
+        message: parsed.data.message,
+        intent: "event_logging",
+        mode: "fiscal",
+        riskState: "GREEN",
+        extractedEvents: [],
+        reply: `Logged for ${naturalCustomProgress.goal.title}: ${naturalCustomProgress.minutes} focused minutes.`
+      } satisfies ProcessMessageResult;
+    }
+
     const ruleBasedStructuralProposal = detectStructuralProposal(parsed.data.message, activeGoals);
 
     if (ruleBasedStructuralProposal) {
@@ -203,21 +233,24 @@ export function buildServer() {
         evidence: [result.message]
       });
 
-      const pendingMemoryReply = await maybeCreateRepeatedCooldownPendingMemory(result.userId, cooldownEvent);
+      await maybeCreateRepeatedCooldownPendingMemory(result.userId, cooldownEvent);
+      const composed = await composeFinalAgentResponse(result, {
+        extractedEvents: [cooldownEvent]
+      });
 
       return {
         ...result,
-        reply: pendingMemoryReply ? `${result.reply} ${pendingMemoryReply}` : result.reply
+        reply: composed.reply
       };
     }
 
-    if (savedEvents.length === 0) {
-      return result;
-    }
+    const composed = await composeFinalAgentResponse(result, {
+      extractedEvents: savedEvents.length > 0 ? savedEvents : undefined
+    });
 
     return {
       ...result,
-      reply: composeSavedEventsReply(savedEvents)
+      reply: composed.reply
     } satisfies ProcessMessageResult;
   });
 
@@ -758,6 +791,60 @@ function analyzeMessage(
   });
 }
 
+async function buildAgentContext(userId: string) {
+  const activeGoals = await getActiveGoals(userId);
+  const recentEvents = await getRecentEvents(userId, 10);
+  const memories = await getRelevantMemories(userId, { limit: 5 });
+  const profile = await getOrCreateUserOperatingProfile(userId);
+  const todayEvents = await getEventsSince(userId, startOfToday());
+  const todaySummary = buildDailyReview({
+    userId,
+    activeGoals,
+    todayEvents,
+    activeMemories: memories
+  }).summary;
+
+  return {
+    activeGoals,
+    recentEvents,
+    memories,
+    profile,
+    todaySummary
+  };
+}
+
+async function composeFinalAgentResponse(
+  result: ProcessMessageResult,
+  options: { extractedEvents?: StoredEvent[] } = {}
+): Promise<AgentResponse> {
+  const context = await buildAgentContext(result.userId);
+  const input: AgentResponseComposerInput = {
+    userId: result.userId,
+    message: result.message,
+    intent: result.intent,
+    mode: result.mode,
+    riskState: result.riskState,
+    extractedEvents: options.extractedEvents,
+    activeGoals: context.activeGoals,
+    recentEvents: context.recentEvents,
+    memories: context.memories,
+    profile: context.profile,
+    todaySummary: context.todaySummary
+  };
+  const fallback = composeAgentResponse(input);
+
+  if (!shouldUseOpenAIAnalysis() || result.riskState === "RED" || fallback.mode === "support") {
+    return fallback;
+  }
+
+  try {
+    return await composeResponseWithOpenAI(input, fallback);
+  } catch (error) {
+    console.warn("OpenAI response composer failed; using deterministic reply.", error);
+    return fallback;
+  }
+}
+
 async function ingestText(userId: string, input: IngestTextBody) {
   const result = routeIngestion({
     userId,
@@ -1087,6 +1174,7 @@ async function createCustomGoalProgressEvent(
       source: "manual",
       data: {
         goalId: goal.id,
+        goalTitle: goal.title,
         ...(input.metricKey ? { metricKey: input.metricKey } : {}),
         ...(input.value !== undefined ? { value: input.value } : {}),
         ...(input.unit ? { unit: input.unit } : {}),
@@ -1782,6 +1870,67 @@ function detectCustomProgressProposal(
     },
     reply: `I can log progress for ${goal.title}: ${progress.note ?? progressText}. Reply yes to confirm or no to cancel.`
   };
+}
+
+function detectNaturalCustomProgress(
+  message: string,
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>
+): { goal: Awaited<ReturnType<typeof getActiveGoals>>[number]; minutes: number } | undefined {
+  const match = message.match(
+    /\b(?:worked|spent|hice)\s+(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|minutos?)\s+(?:on|en)\s+(?:my\s+)?(.+)$/i
+  );
+
+  if (!match?.[1] || !match[2]) {
+    return undefined;
+  }
+
+  const minutes = Number(match[1]);
+
+  if (!Number.isFinite(minutes)) {
+    return undefined;
+  }
+
+  const goal = findMatchingCustomGoal(activeGoals, match[2]);
+
+  return goal ? { goal, minutes } : undefined;
+}
+
+function findMatchingCustomGoal(
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>,
+  text: string
+) {
+  const customGoals = activeGoals.filter((goal) => !goal.templateId && goal.status === "active");
+  const normalizedText = normalizeComparableText(text);
+
+  return customGoals.find((goal) => customGoalMatchesText(goal, normalizedText));
+}
+
+function customGoalMatchesText(goal: Awaited<ReturnType<typeof getActiveGoals>>[number], normalizedText: string): boolean {
+  const goalTitle = normalizeComparableText(goal.title);
+
+  if (goalTitle.includes(normalizedText) || normalizedText.includes(goalTitle)) {
+    return true;
+  }
+
+  const goalWords = goalTitle.split(" ").filter((word) => word.length > 3);
+  const hasSharedGoalWord = goalWords.some((word) => normalizedText.includes(word));
+
+  if (hasSharedGoalWord) {
+    return true;
+  }
+
+  if (
+    /youtube|channel|script|video|content/.test(normalizedText) &&
+    /youtube|channel|content|video/.test(goalTitle)
+  ) {
+    return true;
+  }
+
+  if (/car|dealership|seller|coche|carro/.test(normalizedText) && /car|coche|buy|cheap/.test(goalTitle)) {
+    return true;
+  }
+
+  return false;
 }
 
 function findGoalByTitleFragment(

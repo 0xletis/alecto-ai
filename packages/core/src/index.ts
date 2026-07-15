@@ -11,5 +11,6 @@ export * from "./message-processing.js";
 export * from "./memory.js";
 export * from "./notifications.js";
 export * from "./reminders.js";
+export * from "./response-composer.js";
 export * from "./risk.js";
 export * from "./user-operating-profile.js";

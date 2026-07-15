@@ -43,6 +43,9 @@ OPENAI_API_KEY=sk-...
 
 When OpenAI analysis is disabled, missing, or fails validation, the API falls back to the rule-based pipeline.
 The deterministic risk engine always runs after analysis and has final authority over RED betting/trading behavior.
+After intent, event extraction, and risk are finalized, `/messages/process` runs ResponseComposer v1.
+The composer uses mode, risk state, profile, active goals, recent events, memories, and today's summary to produce the final reply.
+If OpenAI is enabled, it may rewrite the deterministic fallback for tone, but it cannot create DB changes, invent facts, or override RED risk policy.
 
 Start with your current environment:
 
@@ -223,6 +226,18 @@ curl -X POST http://localhost:3000/messages/process \
 
 curl -X POST http://localhost:3000/messages/process \
   -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"I feel stuck"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"I feel like shit today"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"local-user","message":"what next on the repo?"}'
+
+curl -X POST http://localhost:3000/messages/process \
+  -H "Content-Type: application/json" \
   -d '{"userId":"local-user","message":"quiero apostar 1000 porque esto es seguro"}'
 
 curl -X POST http://localhost:3000/messages/process \
@@ -393,6 +408,10 @@ Expected:
 - Daily insight identifies meaningful progress, gaps, risk state, relevant memory signals, and 1-3 recommended next actions.
 - Weekly insight aggregates the last 7 days by default and looks for repeated patterns such as cooldowns, low sleep, high anxiety, and clustered progress.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
+- ResponseComposer v1 is the final normal-chat reply layer. It supports `fiscal`, `guardian`, `support`, `mirror`, `builder`, and `review` style replies from the same structured context pack.
+- Composer context includes active goals, last 10 active events, up to 5 relevant memories, the user operating profile, and today's factual summary.
+- Deterministic composer fallback always works without OpenAI. If OpenAI composition fails, the fallback reply is returned.
+- Guardian RED replies remain deterministic and do not validate betting/trading behavior.
 - When OpenAI is enabled, insight wording may be lightly polished from the deterministic report. The LLM should not invent facts, metrics, risks, memories, or actions; if polish fails, the deterministic insight is returned.
 - `/messages/process` fetches the user's operating profile and adapts guardian/vulnerable reply tone without overriding deterministic risk policy.
 - RED betting/trading messages save a `finance.betting.cooldown_triggered` event and use recent stored events as risk context.
