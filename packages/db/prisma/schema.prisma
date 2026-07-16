@@ -21,6 +21,7 @@ model User {
   memories             MemoryEntry[]
   integrationConnections IntegrationConnection[]
   integrationSyncLogs    IntegrationSyncLog[]
+  emailSignalRules       EmailSignalRule[]
 }
 
 model Goal {
@@ -179,6 +180,7 @@ model IntegrationConnection {
 
   user     User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
   syncLogs IntegrationSyncLog[]
+  emailSignalRules EmailSignalRule[]
 
   @@index([userId])
   @@index([userId, integrationId])
@@ -200,6 +202,30 @@ model IntegrationSyncLog {
 
   @@index([userId])
   @@index([connectionId])
+}
+
+model EmailSignalRule {
+  id                  String    @id @default(uuid())
+  userId              String
+  connectionId        String
+  goalId              String?
+  adapterId           String
+  name                String
+  query               String
+  status              String    @default("active")
+  reviewBeforeLogging Boolean   @default(false)
+  createdBy           String
+  lastSyncedAt        DateTime?
+  lastError           String?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  user       User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connection IntegrationConnection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([connectionId])
+  @@index([userId, status])
 }
 
 enum GoalStatus {

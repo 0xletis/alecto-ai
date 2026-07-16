@@ -125,6 +125,16 @@ Telegram commands:
 - `/delete_integration CONNECTION_ID`: archive an integration while keeping historical events
 - `/sync_integrations`: sync all active integrations
 - `/sync_integration CONNECTION_ID`: sync one integration
+- `/connect_gmail`: get the Gmail readonly OAuth URL
+- `/my_email_rules`: show Gmail email signal rules
+- `/enable_email_rule job_search`: enable job-search email scanning after Gmail is connected
+- `/enable_email_rule job_search goal=GOAL_ID`: attach the job-search email rule to a goal
+- `/pause_email_rule RULE_ID`: pause an email rule
+- `/resume_email_rule RULE_ID`: resume a paused email rule
+- `/delete_email_rule RULE_ID`: archive an email rule
+- `/cleanup_gmail_rule_events RULE_ID`: archive active Gmail events created by one email rule
+- `/sync_gmail`: manually sync active Gmail rules
+- `/sync_gmail_debug`: manually sync Gmail and show safe per-rule counters
 - `/create_goal category | title | why`: create a goal
 - `/create_goal_from_template templateId | title | why`: create a structured goal from a template
 - `/archive_goal <goalId>`: archive a goal
@@ -376,7 +386,17 @@ Expected:
 - `/health` returns `{ "ok": true, "service": "operator-agent-api" }`
 - `/events/types` returns the initial core event registry from `docs/02-event-ontology.md`
 - `/goal-templates` returns structured goal templates such as `career.job_search`, `health.strength_energy`, `health.sleep_better`, `learning.reading_more`, and `finance.control_betting_trading`.
-- `/integrations` returns Integration Registry v1. `github_public` is available; `gmail` and `wallet_public` are planned.
+- `/integrations` returns Integration Registry v1. `github_public` and `gmail` are available; `wallet_public` is planned.
+- Gmail is a generic readonly email source. It does not scan anything until the user connects Gmail and explicitly enables an email rule.
+- `job_search_email` is the first email adapter. It searches user-approved Gmail results for recruiter replies, interview scheduling, application confirmations, rejections, and offers, then feeds the existing `job_search_text` ingestion adapter.
+- Planned email adapters include work/client action emails, finance receipts, learning deadlines, and custom goal email signals.
+- Gmail OAuth tokens are stored in local Postgres JSON config for the MVP. They are never returned by the OAuth callback, `/my_integrations`, sync responses, or Telegram replies. Encrypt tokens before production.
+- Never commit `.env`. If OAuth tokens are leaked during local testing, revoke the Google app/session and reconnect Gmail.
+- `/sync_gmail` reports safe counters: messages found, processed, ignored, deduped, and events created. `/sync_gmail_debug` adds per-rule IDs and last errors without email bodies or tokens.
+- Gmail dedupe skips active duplicates. Events archived by `/cleanup_gmail_rule_events` can be reprocessed after classifier fixes; normal manual archives still block recreation.
+- Gmail `job_search_email` is conservative. It requires strong recruiting/job context, ignores obvious marketing/newsletter/promotional emails, and never treats the word `offer` alone as a career offer.
+- Gmail emails below auto-log confidence are not logged automatically. Uncertain messages count as `needs review`; weak matches count as low-confidence ignored or unknown.
+- Use `/cleanup_gmail_rule_events RULE_ID` to archive test Gmail events from one rule without deleting historical data.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Explicit memory phrases like `remember that`, `recuerda que`, or `guarda que` create visible memories immediately and reply `Saved to memory.`
 - `/users/:userId/memory` returns active memories by default. Use `?includeArchived=true` to include archived/rejected memories.
@@ -439,12 +459,24 @@ Expected:
 - Automatic integration sync is disabled by default. Set `INTEGRATION_SYNC_ENABLED=true` on the worker to sync active integrations in the background.
 - Automatic sync interval defaults to 15 minutes. Override with `INTEGRATION_SYNC_INTERVAL_MINUTES=15`.
 - Scheduled sync skips paused, archived, and error integrations, and skips active integrations synced less than the configured interval ago.
+- Scheduled sync supports active GitHub and Gmail integrations. Gmail sync skips connections with no active email rules.
 - Scheduled sync sends Telegram only when new events are created or when a connection first enters an error state.
+
+Gmail OAuth setup:
+
+```bash
+GOOGLE_CLIENT_ID=your-google-client-id
+GOOGLE_CLIENT_SECRET=your-google-client-secret
+GMAIL_REDIRECT_URI=http://localhost:3000/oauth/gmail/callback
+```
+
+Create a Google OAuth client with the redirect URI above and the readonly Gmail scope. Then run `/connect_gmail`, open the returned URL, complete consent, and enable scanning with `/enable_email_rule job_search`. The OAuth callback only displays `Gmail connected. You can return to Telegram.`
 
 Integration Registry v1 manual test:
 
 ```bash
 curl http://localhost:3000/integrations
+curl http://localhost:3000/email-adapters
 
 curl -X POST http://localhost:3000/users/dev-user/integrations/github-public \
   -H "Content-Type: application/json" \
@@ -455,6 +487,12 @@ curl http://localhost:3000/users/dev-user/integrations
 curl -X POST http://localhost:3000/users/dev-user/integrations/CONNECTION_ID/sync \
   -H "Content-Type: application/json" \
   -d '{}'
+
+curl http://localhost:3000/users/dev-user/integrations/gmail/oauth-url
+
+curl -X POST http://localhost:3000/users/dev-user/email-rules \
+  -H "Content-Type: application/json" \
+  -d '{"connectionId":"GMAIL_CONNECTION_ID","adapterId":"job_search_email","name":"Job search emails"}'
 ```
 
 Telegram integration commands:
@@ -464,11 +502,21 @@ Telegram integration commands:
 /my_integrations
 /connect_github vercel/next.js
 /connect_github letisfarre/alecto-ai author=letisfarre
+/connect_gmail
+/my_email_rules
+/enable_email_rule job_search
+/enable_email_rule job_search goal=GOAL_ID
+/pause_email_rule RULE_ID
+/resume_email_rule RULE_ID
+/delete_email_rule RULE_ID
+/cleanup_gmail_rule_events RULE_ID
 /pause_integration CONNECTION_ID
 /resume_integration CONNECTION_ID
 /delete_integration CONNECTION_ID
 /sync_integrations
 /sync_integration CONNECTION_ID
+/sync_gmail
+/sync_gmail_debug
 ```
 
 Manual insight tests:
@@ -483,6 +531,7 @@ Manual insight tests:
 - `GET /health`
 - `GET /events/types`
 - `GET /integrations`
+- `GET /email-adapters`
 - `GET /goal-templates`
 - `GET /goal-templates/:templateId`
 - `POST /messages/process`
@@ -514,10 +563,17 @@ Manual insight tests:
 - `POST /users/:userId/ingest/text`
 - `POST /users/:userId/ingest/job-search-text`
 - `GET /users/:userId/integrations`
+- `GET /users/:userId/integrations/gmail/oauth-url`
+- `GET /oauth/gmail/callback`
 - `POST /users/:userId/integrations/github-public`
 - `PATCH /users/:userId/integrations/:connectionId`
 - `DELETE /users/:userId/integrations/:connectionId`
 - `POST /users/:userId/integrations/:connectionId/sync`
+- `GET /users/:userId/email-rules`
+- `POST /users/:userId/email-rules`
+- `PATCH /users/:userId/email-rules/:ruleId`
+- `DELETE /users/:userId/email-rules/:ruleId`
+- `POST /users/:userId/email-rules/:ruleId/cleanup-events`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/insights/daily`
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`
@@ -534,4 +590,4 @@ Manual insight tests:
 
 ## Current Scope
 
-This skeleton intentionally does not include UI, OpenClaw integration, OAuth/auth, WhatsApp, or wallet/private-key functionality.
+This skeleton intentionally does not include UI, OpenClaw integration, WhatsApp, wallet/private-key functionality, or general app auth. Gmail has a minimal readonly OAuth flow for local MVP email ingestion.

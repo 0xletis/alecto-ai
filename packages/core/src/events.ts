@@ -2,7 +2,7 @@ import { z } from "zod";
 import { EventTypeSchema } from "./event-registry.js";
 
 export const EventSourceSchema = z.enum(["chat", "connector", "llm_inferred", "system"]);
-export const StoredEventSourceSchema = z.enum(["manual", "telegram", "github"]);
+export const StoredEventSourceSchema = z.enum(["manual", "telegram", "github", "gmail"]);
 export const StoredEventStatusSchema = z.enum(["active", "archived", "corrected"]);
 
 export const EventSchema = z.object({

@@ -95,9 +95,10 @@ async function runIntegrationSync(now: Date) {
 
       if (!connection.lastError) {
         const reason = safeErrorMessage(error);
+        const prefix = connection.integrationId === "gmail" ? "Gmail sync failed" : "GitHub sync failed";
         notificationsByUser.set(connection.userId, [
           ...(notificationsByUser.get(connection.userId) ?? []),
-          reason.startsWith("GitHub sync failed") ? reason : `GitHub sync failed: ${reason}`
+          reason.startsWith(prefix) ? reason : `${prefix}: ${reason}`
         ]);
       }
     }
@@ -248,6 +249,11 @@ function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): 
     return [];
   }
 
+  if (response.integrationId === "gmail" && response.emailSummaries?.length) {
+    const total = response.emailSummaries.reduce((sum, summary) => sum + summary.eventsCreated, 0);
+    return total > 0 ? [`Gmail: ${total} job-search email event${total === 1 ? "" : "s"} logged.`] : [];
+  }
+
   const summaries = response.repoSummaries ?? [];
 
   if (summaries.length === 0) {
@@ -384,19 +390,36 @@ interface InsightResponse {
 }
 
 interface IntegrationSyncResponse {
-  status: "success";
+  status: "success" | "error";
   connectionId: string;
   integrationId: string;
   eventsCreated: number;
   personalCommitEvents?: number;
   repoActivityEvents?: number;
   repoSummaries?: IntegrationRepoSyncSummary[];
+  emailSummaries?: EmailSyncSummary[];
 }
 
 interface IntegrationRepoSyncSummary {
   repo: string;
   personalCommitEvents: number;
   repoActivityEvents: number;
+}
+
+interface EmailSyncSummary {
+  ruleId: string;
+  adapterId: string;
+  query: string;
+  messagesFound: number;
+  processed: number;
+  ignoredUnknown: number;
+  filteredMarketing: number;
+  needsReview: number;
+  lowConfidenceIgnored: number;
+  deduped: number;
+  archivedCleanupReprocessed: number;
+  eventsCreated: number;
+  lastError?: string;
 }
 
 interface InsightReport {

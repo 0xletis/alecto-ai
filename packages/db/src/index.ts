@@ -3,6 +3,7 @@ import { PrismaClient, type Prisma } from "@prisma/client";
 import { findDuplicateActiveGoal, getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
 import type {
   CreateMemoryInput,
+  CreateEmailSignalRuleInput,
   CreateGoalInput,
   ExtractedEvent,
   GithubPublicConnectionInput,
@@ -12,6 +13,7 @@ import type {
   PendingMemoryCreatePayload,
   StoredEvent,
   UpdateIntegrationConnectionInput,
+  UpdateEmailSignalRuleInput,
   UpdateNotificationSettingsInput,
   UpdateUserOperatingProfileInput,
   UserOperatingProfile
@@ -29,6 +31,10 @@ export interface CreateEventInput {
   eventGroupId?: string;
   externalId?: string;
   provider?: string;
+}
+
+export interface ExternalEventDedupeOptions {
+  ignoreArchivedCleanup?: boolean;
 }
 
 export interface EventQueryOptions {
@@ -104,6 +110,23 @@ export interface IntegrationSyncLog {
   finishedAt?: Date;
   eventsCreated: number;
   error?: string;
+}
+
+export interface EmailSignalRule {
+  id: string;
+  userId: string;
+  connectionId: string;
+  goalId?: string;
+  adapterId: string;
+  name: string;
+  query: string;
+  status: "active" | "paused" | "archived";
+  reviewBeforeLogging: boolean;
+  createdBy: "system" | "user";
+  lastSyncedAt?: Date;
+  lastError?: string;
+  createdAt: Date;
+  updatedAt: Date;
 }
 
 export type CreateGoalResult =
@@ -251,8 +274,9 @@ export async function createEvents(userId: string, eventInputs: CreateEventInput
 
 export async function createExternalEventIfNotExists(
   userId: string,
-  eventInput: CreateEventInput & { externalId: string; source: "github" }
-): Promise<{ created: boolean; event: StoredEvent }> {
+  eventInput: CreateEventInput & { externalId: string },
+  options: ExternalEventDedupeOptions = {}
+): Promise<{ created: boolean; event: StoredEvent; ignoredArchivedCleanup?: boolean }> {
   await ensureUser(userId);
 
   const existingEvent = await prisma.event.findUnique({
@@ -266,6 +290,21 @@ export async function createExternalEventIfNotExists(
   });
 
   if (existingEvent) {
+    if (shouldIgnoreArchivedCleanupEvent(existingEvent, eventInput, options)) {
+      await prisma.event.update({
+        where: { id: existingEvent.id },
+        data: {
+          externalId: `${existingEvent.externalId}:cleanup:${existingEvent.id}`
+        }
+      });
+
+      return {
+        created: true,
+        event: await createEvent(userId, eventInput),
+        ignoredArchivedCleanup: true
+      };
+    }
+
     return {
       created: false,
       event: toStoredEvent(existingEvent)
@@ -276,6 +315,28 @@ export async function createExternalEventIfNotExists(
     created: true,
     event: await createEvent(userId, eventInput)
   };
+}
+
+function shouldIgnoreArchivedCleanupEvent(
+  existingEvent: Prisma.EventGetPayload<object>,
+  eventInput: CreateEventInput & { externalId: string },
+  options: ExternalEventDedupeOptions
+): boolean {
+  if (!options.ignoreArchivedCleanup || eventInput.source !== "gmail") {
+    return false;
+  }
+
+  const existingData = toRecord(existingEvent.data);
+  const nextData = eventInput.data ?? {};
+
+  return (
+    existingEvent.source === "gmail" &&
+    existingEvent.status === "archived" &&
+    existingEvent.archiveReason === "cleanup gmail rule test events" &&
+    typeof existingData.ruleId === "string" &&
+    typeof nextData.ruleId === "string" &&
+    existingData.ruleId === nextData.ruleId
+  );
 }
 
 export async function createGithubPublicConnection(
@@ -293,6 +354,24 @@ export async function createGithubPublicConnection(
         ...input,
         includeRepoActivity: input.includeRepoActivity ?? !input.authorLogin
       })
+    }
+  });
+
+  return toIntegrationConnection(connection);
+}
+
+export async function createGmailConnection(
+  userId: string,
+  config: Record<string, unknown>
+): Promise<IntegrationConnection> {
+  await ensureUser(userId);
+
+  const connection = await prisma.integrationConnection.create({
+    data: {
+      userId,
+      integrationId: "gmail",
+      status: "active",
+      config: toJsonObject(config)
     }
   });
 
@@ -346,6 +425,34 @@ export async function getActiveIntegrationConnectionsForSync(): Promise<Integrat
   });
 
   return connections.map(toIntegrationConnection);
+}
+
+export async function updateIntegrationConnectionConfig(
+  userId: string,
+  connectionId: string,
+  config: Record<string, unknown>
+): Promise<IntegrationConnection | undefined> {
+  await ensureUser(userId);
+
+  const existingConnection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: connectionId,
+      userId
+    }
+  });
+
+  if (!existingConnection) {
+    return undefined;
+  }
+
+  const connection = await prisma.integrationConnection.update({
+    where: { id: connectionId },
+    data: {
+      config: toJsonObject(config)
+    }
+  });
+
+  return toIntegrationConnection(connection);
 }
 
 export async function getIntegrationConnection(
@@ -449,6 +556,134 @@ export async function createIntegrationSyncLog(input: {
   });
 
   return toIntegrationSyncLog(log);
+}
+
+export async function createEmailSignalRule(
+  userId: string,
+  input: CreateEmailSignalRuleInput & { query: string; createdBy?: "system" | "user" }
+): Promise<EmailSignalRule> {
+  await ensureUser(userId);
+
+  const rule = await prisma.emailSignalRule.create({
+    data: {
+      userId,
+      connectionId: input.connectionId,
+      goalId: input.goalId,
+      adapterId: input.adapterId,
+      name: input.name,
+      query: input.query,
+      reviewBeforeLogging: input.reviewBeforeLogging,
+      createdBy: input.createdBy ?? "user"
+    }
+  });
+
+  return toEmailSignalRule(rule);
+}
+
+export async function getEmailSignalRules(userId: string): Promise<EmailSignalRule[]> {
+  await ensureUser(userId);
+
+  const rules = await prisma.emailSignalRule.findMany({
+    where: { userId },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return rules.map(toEmailSignalRule);
+}
+
+export async function getActiveEmailSignalRulesForConnection(
+  userId: string,
+  connectionId: string
+): Promise<EmailSignalRule[]> {
+  await ensureUser(userId);
+
+  const rules = await prisma.emailSignalRule.findMany({
+    where: {
+      userId,
+      connectionId,
+      status: "active"
+    },
+    orderBy: { updatedAt: "asc" }
+  });
+
+  return rules.map(toEmailSignalRule);
+}
+
+export async function updateEmailSignalRule(
+  userId: string,
+  ruleId: string,
+  input: UpdateEmailSignalRuleInput
+): Promise<EmailSignalRule | undefined> {
+  await ensureUser(userId);
+
+  const existingRule = await prisma.emailSignalRule.findFirst({
+    where: {
+      id: ruleId,
+      userId
+    }
+  });
+
+  if (!existingRule) {
+    return undefined;
+  }
+
+  const rule = await prisma.emailSignalRule.update({
+    where: { id: ruleId },
+    data: {
+      status: input.status,
+      lastError: input.status === "active" ? null : existingRule.lastError
+    }
+  });
+
+  return toEmailSignalRule(rule);
+}
+
+export async function archiveEmailSignalRule(userId: string, ruleId: string): Promise<EmailSignalRule | undefined> {
+  await ensureUser(userId);
+
+  const existingRule = await prisma.emailSignalRule.findFirst({
+    where: {
+      id: ruleId,
+      userId
+    }
+  });
+
+  if (!existingRule) {
+    return undefined;
+  }
+
+  const rule = await prisma.emailSignalRule.update({
+    where: { id: ruleId },
+    data: { status: "archived" }
+  });
+
+  return toEmailSignalRule(rule);
+}
+
+export async function updateEmailSignalRuleSyncState(
+  userId: string,
+  ruleId: string,
+  input: { lastSyncedAt?: Date; lastError?: string | null }
+): Promise<EmailSignalRule | undefined> {
+  await ensureUser(userId);
+
+  const existingRule = await prisma.emailSignalRule.findFirst({
+    where: {
+      id: ruleId,
+      userId
+    }
+  });
+
+  if (!existingRule) {
+    return undefined;
+  }
+
+  const rule = await prisma.emailSignalRule.update({
+    where: { id: ruleId },
+    data: input
+  });
+
+  return toEmailSignalRule(rule);
 }
 
 export async function createEventsFromExtracted(
@@ -561,6 +796,44 @@ export async function archiveEvent(
   });
 
   return toStoredEvent(event);
+}
+
+export async function archiveGmailRuleEvents(
+  userId: string,
+  ruleId: string,
+  reason = "cleanup gmail rule test events"
+): Promise<StoredEvent[]> {
+  await ensureUser(userId);
+
+  const events = await prisma.event.findMany({
+    where: {
+      userId,
+      source: "gmail",
+      status: "active",
+      data: {
+        path: ["ruleId"],
+        equals: ruleId
+      }
+    },
+    orderBy: { createdAt: "asc" }
+  });
+
+  const archivedEvents: StoredEvent[] = [];
+
+  for (const event of events) {
+    const archivedEvent = await prisma.event.update({
+      where: { id: event.id },
+      data: {
+        status: "archived",
+        archivedAt: new Date(),
+        archiveReason: reason
+      }
+    });
+
+    archivedEvents.push(toStoredEvent(archivedEvent));
+  }
+
+  return archivedEvents;
 }
 
 export async function archiveEventGroup(
@@ -1276,6 +1549,25 @@ function toIntegrationSyncLog(log: Prisma.IntegrationSyncLogGetPayload<object>):
     finishedAt: log.finishedAt ?? undefined,
     eventsCreated: log.eventsCreated,
     error: log.error ?? undefined
+  };
+}
+
+function toEmailSignalRule(rule: Prisma.EmailSignalRuleGetPayload<object>): EmailSignalRule {
+  return {
+    id: rule.id,
+    userId: rule.userId,
+    connectionId: rule.connectionId,
+    goalId: rule.goalId ?? undefined,
+    adapterId: rule.adapterId,
+    name: rule.name,
+    query: rule.query,
+    status: rule.status as EmailSignalRule["status"],
+    reviewBeforeLogging: rule.reviewBeforeLogging,
+    createdBy: rule.createdBy as EmailSignalRule["createdBy"],
+    lastSyncedAt: rule.lastSyncedAt ?? undefined,
+    lastError: rule.lastError ?? undefined,
+    createdAt: rule.createdAt,
+    updatedAt: rule.updatedAt
   };
 }
 

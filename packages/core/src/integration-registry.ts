@@ -23,13 +23,77 @@ export const GithubPublicConnectionInputSchema = z.object({
   includeRepoActivity: z.boolean().optional()
 });
 
+export const CreateEmailSignalRuleInputSchema = z.object({
+  connectionId: z.string().min(1),
+  goalId: z.string().min(1).optional(),
+  adapterId: z.string().min(1),
+  name: z.string().min(1),
+  query: z.string().min(1).optional(),
+  reviewBeforeLogging: z.boolean().default(false)
+});
+
+export const UpdateEmailSignalRuleInputSchema = z.object({
+  status: z.enum(["active", "paused"])
+});
+
 export const UpdateIntegrationConnectionInputSchema = z.object({
   status: z.enum(["active", "paused"])
 });
 
 export type IntegrationDefinition = z.infer<typeof IntegrationDefinitionSchema>;
 export type GithubPublicConnectionInput = z.infer<typeof GithubPublicConnectionInputSchema>;
+export type CreateEmailSignalRuleInput = z.infer<typeof CreateEmailSignalRuleInputSchema>;
+export type UpdateEmailSignalRuleInput = z.infer<typeof UpdateEmailSignalRuleInputSchema>;
 export type UpdateIntegrationConnectionInput = z.infer<typeof UpdateIntegrationConnectionInputSchema>;
+
+export interface EmailAdapterDefinition {
+  id: string;
+  domain: string;
+  description: string;
+  status: "available" | "planned";
+  defaultQuery?: string;
+  targetAdapterId?: string;
+}
+
+export const emailAdapterRegistry: EmailAdapterDefinition[] = [
+  {
+    id: "job_search_email",
+    domain: "career",
+    description: "Detects recruiter replies, interviews, application confirmations, rejections, and offers.",
+    status: "available",
+    defaultQuery:
+      'newer_than:30d interview OR "schedule an interview" OR "thanks for applying" OR recruiter OR "talent acquisition" OR unfortunately OR "job offer" OR "offer letter" OR "offer of employment" OR "employment agreement" OR application OR applying OR "security code" OR "verification code" OR "resubmit your application"',
+    targetAdapterId: "job_search_text"
+  },
+  {
+    id: "work_action_email",
+    domain: "work",
+    description: "Planned adapter for work/client action emails.",
+    status: "planned"
+  },
+  {
+    id: "finance_receipt_email",
+    domain: "finance",
+    description: "Planned adapter for finance and receipt emails.",
+    status: "planned"
+  },
+  {
+    id: "learning_deadline_email",
+    domain: "learning",
+    description: "Planned adapter for course and learning deadline emails.",
+    status: "planned"
+  },
+  {
+    id: "custom_goal_email",
+    domain: "custom",
+    description: "Planned adapter for custom goal email signals.",
+    status: "planned"
+  }
+];
+
+export function getEmailAdapterDefinition(adapterId: string): EmailAdapterDefinition | undefined {
+  return emailAdapterRegistry.find((adapter) => adapter.id === adapterId);
+}
 
 export const integrationRegistry: IntegrationDefinition[] = [
   {
@@ -43,8 +107,8 @@ export const integrationRegistry: IntegrationDefinition[] = [
   {
     id: "gmail",
     name: "Gmail",
-    description: "Planned OAuth integration for job-search email signals.",
-    status: "planned",
+    description: "Generic Gmail email source for user-approved email signal rules.",
+    status: "available",
     authType: "oauth",
     producesEventTypes: [
       "career.application_confirmation_received",

@@ -19,7 +19,11 @@ import {
   getGoalTemplate,
   goalTemplates,
   IngestTextBodySchema,
+  CreateEmailSignalRuleInputSchema,
+  UpdateEmailSignalRuleInputSchema,
   GithubPublicConnectionInputSchema,
+  emailAdapterRegistry,
+  getEmailAdapterDefinition,
   integrationRegistry,
   CreateMemoryInputSchema,
   PendingMemoryCreatePayloadSchema,
@@ -52,6 +56,7 @@ import {
 import {
   archiveEvent,
   archiveEventGroup,
+  archiveGmailRuleEvents,
   archiveGoal,
   archiveIntegrationConnection,
   archiveMemory,
@@ -60,6 +65,8 @@ import {
   createEvents,
   createEventsFromExtracted,
   createGoal,
+  createGmailConnection,
+  createEmailSignalRule,
   createMemory,
   createMemoryFromPendingPayload,
   createPendingAction,
@@ -83,15 +90,22 @@ import {
   createGithubPublicConnection,
   createIntegrationSyncLog,
   ensureUser,
+  getActiveEmailSignalRulesForConnection,
+  getEmailSignalRules,
   getIntegrationConnection,
   getIntegrationConnections,
   rejectPendingAction,
   undoLastEvents,
+  archiveEmailSignalRule,
   type PendingAction,
   type PendingActionType,
   type IntegrationConnection,
+  type EmailSignalRule,
   updateIntegrationConnection,
+  updateIntegrationConnectionConfig,
   updateIntegrationConnectionSyncState,
+  updateEmailSignalRule,
+  updateEmailSignalRuleSyncState,
   updateNotificationSettings,
   updateUserOperatingProfile
 } from "@operator-agent/db";
@@ -112,6 +126,10 @@ export function buildServer() {
 
   server.get("/integrations", async () => ({
     integrations: integrationRegistry
+  }));
+
+  server.get("/email-adapters", async () => ({
+    emailAdapters: emailAdapterRegistry
   }));
 
   server.get("/goal-templates", async () => ({
@@ -628,8 +646,64 @@ export function buildServer() {
   });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/integrations", async (request) => ({
-    connections: await getIntegrationConnections(request.params.userId)
+    connections: (await getIntegrationConnections(request.params.userId)).map(sanitizeIntegrationConnection)
   }));
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/integrations/gmail/oauth-url", async (request, reply) => {
+    const config = gmailOAuthConfig();
+
+    if (!config) {
+      return reply.status(400).send({
+        error: "Gmail OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GMAIL_REDIRECT_URI."
+      });
+    }
+
+    return {
+      url: buildGmailOAuthUrl(request.params.userId, config)
+    };
+  });
+
+  server.get<{ Querystring: { code?: string; state?: string; error?: string } }>(
+    "/oauth/gmail/callback",
+    async (request, reply) => {
+      if (request.query.error) {
+        return reply.status(400).send({
+          error: `Gmail OAuth failed: ${request.query.error}`
+        });
+      }
+
+      if (!request.query.code || !request.query.state) {
+        return reply.status(400).send({
+          error: "Missing Gmail OAuth code or state."
+        });
+      }
+
+      const config = gmailOAuthConfig();
+      const userId = decodeGmailOAuthState(request.query.state);
+
+      if (!config || !userId) {
+        return reply.status(400).send({
+          error: "Invalid Gmail OAuth configuration or state."
+        });
+      }
+
+      try {
+        const token = await exchangeGmailOAuthCode(request.query.code, config);
+        const email = await getGmailProfileEmail(token.accessToken);
+
+        await createGmailConnection(userId, {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email,
+          token
+        });
+      } catch {
+        return reply.status(400).type("text/plain").send("Gmail connection failed. Try again from Telegram.");
+      }
+
+      return reply.type("text/plain").send("Gmail connected. You can return to Telegram.");
+    }
+  );
 
   server.post<{ Params: { userId: string } }>(
     "/users/:userId/integrations/github-public",
@@ -663,13 +737,120 @@ export function buildServer() {
         return {
           duplicate: true,
           message: `GitHub integration already exists: ${existingConnection.id}`,
-          connection: existingConnection
+          connection: sanitizeIntegrationConnection(existingConnection)
         };
       }
 
       return {
         duplicate: false,
-        connection: await createGithubPublicConnection(request.params.userId, input)
+        connection: sanitizeIntegrationConnection(await createGithubPublicConnection(request.params.userId, input))
+      };
+    }
+  );
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/email-rules", async (request) => ({
+    emailRules: (await getEmailSignalRules(request.params.userId)).map(sanitizeEmailSignalRule)
+  }));
+
+  server.post<{ Params: { userId: string } }>("/users/:userId/email-rules", async (request, reply) => {
+    const parsed = CreateEmailSignalRuleInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    const connection = await getIntegrationConnection(request.params.userId, parsed.data.connectionId);
+
+    if (!connection || connection.integrationId !== "gmail" || connection.status !== "active") {
+      return reply.status(400).send({
+        error: "Active Gmail connection not found."
+      });
+    }
+
+    const adapter = getEmailAdapterDefinition(parsed.data.adapterId);
+
+    if (!adapter || adapter.status !== "available" || adapter.id !== "job_search_email") {
+      return reply.status(400).send({
+        error: "Unsupported email adapter."
+      });
+    }
+
+    await archiveStaleJobSearchEmailRules(request.params.userId, connection.id);
+
+    const existingCurrentRule = (await getEmailSignalRules(request.params.userId)).find(
+      (rule) =>
+        rule.status === "active" &&
+        rule.connectionId === connection.id &&
+        rule.adapterId === "job_search_email"
+    );
+
+    if (existingCurrentRule) {
+      return { emailRule: sanitizeEmailSignalRule(existingCurrentRule) };
+    }
+
+    const rule = await createEmailSignalRule(request.params.userId, {
+      ...parsed.data,
+      query: parsed.data.query ?? adapter.defaultQuery ?? "",
+      createdBy: "user"
+    });
+
+    return { emailRule: sanitizeEmailSignalRule(rule) };
+  });
+
+  server.patch<{ Params: { userId: string; ruleId: string } }>(
+    "/users/:userId/email-rules/:ruleId",
+    async (request, reply) => {
+      const parsed = UpdateEmailSignalRuleInputSchema.safeParse(request.body);
+
+      if (!parsed.success) {
+        return reply.status(400).send({
+          error: "Invalid request body",
+          issues: parsed.error.issues
+        });
+      }
+
+      const rule = await updateEmailSignalRule(request.params.userId, request.params.ruleId, parsed.data);
+
+      if (!rule) {
+        return reply.status(404).send({
+          error: "Email rule not found"
+        });
+      }
+
+      return { emailRule: sanitizeEmailSignalRule(rule) };
+    }
+  );
+
+  server.delete<{ Params: { userId: string; ruleId: string } }>(
+    "/users/:userId/email-rules/:ruleId",
+    async (request, reply) => {
+      const rule = await archiveEmailSignalRule(request.params.userId, request.params.ruleId);
+
+      if (!rule) {
+        return reply.status(404).send({
+          error: "Email rule not found"
+        });
+      }
+
+      return {
+        emailRule: sanitizeEmailSignalRule(rule),
+        message: `Email rule archived: ${rule.id}`
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string; ruleId: string } }>(
+    "/users/:userId/email-rules/:ruleId/cleanup-events",
+    async (request) => {
+      const events = await archiveGmailRuleEvents(request.params.userId, request.params.ruleId, "cleanup gmail rule test events");
+
+      return {
+        count: events.length,
+        events,
+        message: `Archived ${events.length} Gmail event${events.length === 1 ? "" : "s"} for rule ${request.params.ruleId}.`
       };
     }
   );
@@ -698,7 +879,7 @@ export function buildServer() {
         });
       }
 
-      return { connection };
+      return { connection: sanitizeIntegrationConnection(connection) };
     }
   );
 
@@ -714,7 +895,7 @@ export function buildServer() {
       }
 
       return {
-        connection,
+        connection: sanitizeIntegrationConnection(connection),
         message: "Integration archived. Historical events were kept."
       };
     }
@@ -743,17 +924,24 @@ export function buildServer() {
         });
       }
 
-      if (connection.integrationId !== "github_public") {
+      if (connection.integrationId !== "github_public" && connection.integrationId !== "gmail") {
         return reply.status(400).send({
           error: "Unsupported integration sync"
         });
       }
 
-      const result = await syncGithubPublicConnection(connection);
+      const result =
+        connection.integrationId === "github_public"
+          ? await syncGithubPublicConnection(connection)
+          : await syncGmailConnection(connection);
 
       if (result.status === "error") {
         return reply.status(502).send({
           error: result.error,
+          connectionId: result.connectionId,
+          integrationId: result.integrationId,
+          eventsCreated: result.eventsCreated,
+          emailSummaries: "emailSummaries" in result ? result.emailSummaries : undefined,
           syncLog: result.syncLog
         });
       }
@@ -1154,6 +1342,315 @@ async function syncGithubPublicConnection(connection: IntegrationConnection) {
   }
 }
 
+async function syncGmailConnection(connection: IntegrationConnection) {
+  const startedAt = new Date();
+  const rules = await getActiveEmailSignalRulesForConnection(connection.userId, connection.id);
+
+  if (rules.length === 0) {
+    const syncLog = await createIntegrationSyncLog({
+      userId: connection.userId,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      status: "success",
+      startedAt,
+      finishedAt: new Date(),
+      eventsCreated: 0
+    });
+
+    return {
+      status: "success" as const,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      eventsCreated: 0,
+      personalCommitEvents: 0,
+      repoActivityEvents: 0,
+      repoSummaries: [],
+      emailSummaries: [],
+      syncLog
+    };
+  }
+
+  let eventsCreated = 0;
+  const emailSummaries: EmailRuleSyncSummary[] = [];
+
+  try {
+    const accessToken = await getValidGmailAccessToken(connection);
+
+    for (const rule of rules) {
+      const ruleSummary: EmailRuleSyncSummary = {
+        ruleId: rule.id,
+        adapterId: rule.adapterId,
+        query: rule.query,
+        messagesFound: 0,
+        processed: 0,
+        ignoredUnknown: 0,
+        filteredMarketing: 0,
+        needsReview: 0,
+        lowConfidenceIgnored: 0,
+        deduped: 0,
+        archivedCleanupReprocessed: 0,
+        eventsCreated: 0
+      };
+
+      try {
+        const messageIds = await searchGmailMessagesForRule(accessToken, rule);
+        ruleSummary.messagesFound = messageIds.length;
+
+        for (const messageId of messageIds) {
+          const message = await getGmailMessage(accessToken, messageId);
+          const text = gmailMessageToText(message);
+          const result = routeIngestion({
+            userId: connection.userId,
+            text,
+            source: "gmail",
+            metadata: {
+              domainHint: "career",
+              emailAdapterId: rule.adapterId,
+              gmailMessageId: message.id
+            }
+          });
+
+          if (result.classification === "filtered_marketing") {
+            ruleSummary.processed += 1;
+            ruleSummary.filteredMarketing += 1;
+            continue;
+          }
+
+          if (result.classification === "application_action_required") {
+            ruleSummary.processed += 1;
+            ruleSummary.needsReview += 1;
+            continue;
+          }
+
+          if (result.classification === "unknown") {
+            ruleSummary.processed += 1;
+            ruleSummary.ignoredUnknown += 1;
+            continue;
+          }
+
+          const validCandidates = result.eventCandidates.filter((candidate) => EventTypeSchema.safeParse(candidate.type).success);
+
+          if (validCandidates.length === 0 || rule.reviewBeforeLogging) {
+            ruleSummary.processed += 1;
+            ruleSummary.needsReview += rule.reviewBeforeLogging && validCandidates.length > 0 ? 1 : 0;
+            ruleSummary.ignoredUnknown += validCandidates.length === 0 ? 1 : 0;
+            continue;
+          }
+
+          const strongestConfidence = Math.max(...validCandidates.map((candidate) => candidate.confidence));
+
+          if (strongestConfidence < 0.65) {
+            ruleSummary.processed += 1;
+            ruleSummary.lowConfidenceIgnored += 1;
+            continue;
+          }
+
+          if (strongestConfidence < 0.9) {
+            ruleSummary.processed += 1;
+            ruleSummary.needsReview += 1;
+            continue;
+          }
+
+          let messageEventsCreated = 0;
+
+          for (const candidate of validCandidates) {
+            const externalId = `gmail:${rule.id}:${message.id}`;
+            const created = await createExternalEventIfNotExists(connection.userId, {
+              type: EventTypeSchema.parse(candidate.type),
+              timestamp: new Date(),
+              source: "gmail",
+              provider: "gmail",
+              externalId,
+              data: {
+                ...candidate.data,
+                provider: "gmail",
+                emailAdapterId: rule.adapterId,
+                adapterId: result.adapterId,
+                classification: result.classification,
+                ruleId: rule.id,
+                gmailMessageId: message.id,
+                threadId: message.threadId,
+                subject: getGmailHeader(message, "subject"),
+                from: getGmailHeader(message, "from"),
+                snippet: message.snippet,
+                confidence: candidate.confidence,
+                externalId
+              },
+              confidence: candidate.confidence,
+              evidence: candidate.evidence
+            }, {
+              ignoreArchivedCleanup: true
+            });
+
+            if (created.created) {
+              eventsCreated += 1;
+              ruleSummary.eventsCreated += 1;
+              messageEventsCreated += 1;
+              if (created.ignoredArchivedCleanup) {
+                ruleSummary.archivedCleanupReprocessed += 1;
+              }
+            }
+          }
+
+          if (messageEventsCreated > 0) {
+            ruleSummary.processed += 1;
+          } else {
+            ruleSummary.deduped += 1;
+          }
+        }
+
+        await updateEmailSignalRuleSyncState(connection.userId, rule.id, {
+          lastSyncedAt: new Date(),
+          lastError: null
+        });
+
+        emailSummaries.push(ruleSummary);
+      } catch (error) {
+        ruleSummary.lastError = safeGmailErrorMessage(error);
+        emailSummaries.push(ruleSummary);
+        await updateEmailSignalRuleSyncState(connection.userId, rule.id, {
+          lastError: safeGmailErrorMessage(error)
+        });
+        throw error;
+      }
+    }
+
+    await updateIntegrationConnectionSyncState(connection.userId, connection.id, {
+      status: "active",
+      lastSyncedAt: new Date(),
+      lastError: null
+    });
+
+    const syncLog = await createIntegrationSyncLog({
+      userId: connection.userId,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      status: "success",
+      startedAt,
+      finishedAt: new Date(),
+      eventsCreated
+    });
+
+    return {
+      status: "success" as const,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      eventsCreated,
+      personalCommitEvents: 0,
+      repoActivityEvents: 0,
+      repoSummaries: [],
+      emailSummaries,
+      syncLog
+    };
+  } catch (error) {
+    const reason = safeGmailErrorMessage(error);
+    const shouldMarkConnectionError = isGmailConnectionError(error);
+
+    await updateIntegrationConnectionSyncState(connection.userId, connection.id, {
+      status: shouldMarkConnectionError ? "error" : undefined,
+      lastError: reason
+    });
+
+    const syncLog = await createIntegrationSyncLog({
+      userId: connection.userId,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      status: "error",
+      startedAt,
+      finishedAt: new Date(),
+      eventsCreated,
+      error: reason
+    });
+
+    return {
+      status: "error" as const,
+      connectionId: connection.id,
+      integrationId: connection.integrationId,
+      eventsCreated,
+      personalCommitEvents: 0,
+      repoActivityEvents: 0,
+      repoSummaries: [],
+      emailSummaries,
+      error: reason,
+      syncLog
+    };
+  }
+}
+
+function sanitizeIntegrationConnection(connection: IntegrationConnection) {
+  return {
+    id: connection.id,
+    userId: connection.userId,
+    integrationId: connection.integrationId,
+    status: connection.status,
+    config: sanitizeIntegrationConfig(connection),
+    lastSyncedAt: connection.lastSyncedAt,
+    lastError: sanitizeIntegrationLastError(connection.integrationId, connection.lastError),
+    createdAt: connection.createdAt,
+    updatedAt: connection.updatedAt
+  };
+}
+
+function sanitizeEmailSignalRule(rule: EmailSignalRule) {
+  return {
+    ...rule,
+    lastError: sanitizeIntegrationLastError("gmail", rule.lastError)
+  };
+}
+
+async function archiveStaleJobSearchEmailRules(userId: string, currentConnectionId: string): Promise<void> {
+  const [rules, connections] = await Promise.all([getEmailSignalRules(userId), getIntegrationConnections(userId)]);
+  const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
+
+  for (const rule of rules) {
+    if (rule.status !== "active" || rule.adapterId !== "job_search_email" || rule.connectionId === currentConnectionId) {
+      continue;
+    }
+
+    const connection = connectionById.get(rule.connectionId);
+
+    if (!connection || connection.integrationId !== "gmail" || connection.status === "error" || connection.status === "archived") {
+      await archiveEmailSignalRule(userId, rule.id);
+    }
+  }
+}
+
+function sanitizeIntegrationLastError(integrationId: string, error?: string): string | undefined {
+  if (!error) {
+    return undefined;
+  }
+
+  if (integrationId === "gmail") {
+    return safeGmailErrorMessage(error);
+  }
+
+  return truncatePlainText(error, 200);
+}
+
+function sanitizeIntegrationConfig(connection: IntegrationConnection): Record<string, unknown> {
+  if (connection.integrationId === "github_public") {
+    return {
+      repos: connection.config.repos,
+      authorLogin: connection.config.authorLogin,
+      includeRepoActivity: connection.config.includeRepoActivity
+    };
+  }
+
+  if (connection.integrationId === "gmail") {
+    const token = readGmailToken(connection);
+
+    return {
+      provider: "gmail",
+      scope: typeof connection.config.scope === "string" ? connection.config.scope : "gmail.readonly",
+      email: typeof connection.config.email === "string" ? connection.config.email : undefined,
+      hasRefreshToken: Boolean(token.refreshToken),
+      expiresAt: token.expiresAt || undefined
+    };
+  }
+
+  return {};
+}
+
 function normalizeGithubPublicConnectionInput(input: GithubPublicConnectionInput): GithubPublicConnectionInput {
   return {
     ...input,
@@ -1267,6 +1764,320 @@ function githubFetchError(owner: string, repo: string, status: number, body: str
   }
 
   return new GithubFetchError("GITHUB_FETCH_FAILED", `${owner}/${repo}: ${truncatePlainText(body, 160)}`);
+}
+
+function gmailOAuthConfig() {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = process.env.GMAIL_REDIRECT_URI ?? "http://localhost:3000/oauth/gmail/callback";
+
+  return clientId && clientSecret ? { clientId, clientSecret, redirectUri } : undefined;
+}
+
+function buildGmailOAuthUrl(userId: string, config: { clientId: string; redirectUri: string }): string {
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    response_type: "code",
+    scope: "https://www.googleapis.com/auth/gmail.readonly",
+    access_type: "offline",
+    prompt: "consent",
+    state: Buffer.from(JSON.stringify({ userId }), "utf8").toString("base64url")
+  });
+
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+function decodeGmailOAuthState(state: string): string | undefined {
+  try {
+    const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8")) as { userId?: unknown };
+    return typeof parsed.userId === "string" ? parsed.userId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function exchangeGmailOAuthCode(
+  code: string,
+  config: { clientId: string; clientSecret: string; redirectUri: string }
+) {
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      code,
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      redirect_uri: config.redirectUri,
+      grant_type: "authorization_code"
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gmail OAuth token exchange failed: ${truncatePlainText(await response.text(), 200)}`);
+  }
+
+  const token = (await response.json()) as GmailTokenResponse;
+  return {
+    accessToken: token.access_token,
+    refreshToken: token.refresh_token,
+    expiresAt: Date.now() + (token.expires_in ?? 3600) * 1000,
+    tokenType: token.token_type,
+    scope: token.scope
+  };
+}
+
+async function getGmailProfileEmail(accessToken: string): Promise<string | undefined> {
+  const response = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
+
+  if (!response.ok) {
+    return undefined;
+  }
+
+  const profile = (await response.json()) as { emailAddress?: unknown };
+  return typeof profile.emailAddress === "string" ? profile.emailAddress : undefined;
+}
+
+async function getValidGmailAccessToken(connection: IntegrationConnection): Promise<string> {
+  const token = readGmailToken(connection);
+
+  if (token.accessToken && token.expiresAt > Date.now() + 60_000) {
+    return token.accessToken;
+  }
+
+  if (!token.refreshToken) {
+    throw new GmailSyncError("GMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.");
+  }
+
+  const config = gmailOAuthConfig();
+
+  if (!config) {
+    throw new GmailSyncError("GMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.");
+  }
+
+  const response = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      refresh_token: token.refreshToken,
+      grant_type: "refresh_token"
+    })
+  });
+
+  if (!response.ok) {
+    throw gmailApiError("token refresh", response.status, await response.text());
+  }
+
+  const refreshed = (await response.json()) as GmailTokenResponse;
+  const nextToken = {
+    ...token,
+    accessToken: refreshed.access_token,
+    expiresAt: Date.now() + (refreshed.expires_in ?? 3600) * 1000,
+    tokenType: refreshed.token_type ?? token.tokenType,
+    scope: refreshed.scope ?? token.scope
+  };
+
+  await updateIntegrationConnectionConfig(connection.userId, connection.id, {
+    ...connection.config,
+    token: nextToken
+  });
+
+  return nextToken.accessToken;
+}
+
+function readGmailToken(connection: IntegrationConnection) {
+  const token = isRecord(connection.config.token) ? connection.config.token : {};
+  return {
+    accessToken: typeof token.accessToken === "string" ? token.accessToken : "",
+    refreshToken: typeof token.refreshToken === "string" ? token.refreshToken : "",
+    expiresAt: typeof token.expiresAt === "number" ? token.expiresAt : 0,
+    tokenType: typeof token.tokenType === "string" ? token.tokenType : "Bearer",
+    scope: typeof token.scope === "string" ? token.scope : ""
+  };
+}
+
+async function searchGmailMessagesForRule(accessToken: string, rule: EmailSignalRule): Promise<string[]> {
+  const queries = expandGmailQueriesForRule(rule);
+  const messageIds = new Set<string>();
+
+  for (const query of queries) {
+    for (const messageId of await searchGmailMessages(accessToken, query)) {
+      messageIds.add(messageId);
+    }
+  }
+
+  return Array.from(messageIds);
+}
+
+function expandGmailQueriesForRule(rule: EmailSignalRule): string[] {
+  if (rule.adapterId !== "job_search_email") {
+    return [rule.query];
+  }
+
+  return [
+    "newer_than:30d interview",
+    'newer_than:30d "schedule an interview"',
+    'newer_than:30d "thanks for applying"',
+    "newer_than:30d recruiter",
+    'newer_than:30d "talent acquisition"',
+    "newer_than:30d unfortunately",
+    'newer_than:30d "job offer"',
+    'newer_than:30d "offer letter"',
+    'newer_than:30d "offer of employment"',
+    'newer_than:30d "employment agreement"',
+    "newer_than:30d application",
+    "newer_than:30d applying",
+    'newer_than:30d "security code" application',
+    'newer_than:30d "verification code" application',
+    'newer_than:30d "resubmit your application"',
+    'newer_than:30d "complete your application"'
+  ];
+}
+
+async function searchGmailMessages(accessToken: string, query: string): Promise<string[]> {
+  const params = new URLSearchParams({
+    q: query,
+    maxResults: "10"
+  });
+  const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?${params.toString()}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
+
+  if (!response.ok) {
+    throw gmailApiError("search", response.status, await response.text());
+  }
+
+  const result = (await response.json()) as { messages?: Array<{ id?: string }> };
+  return (result.messages ?? []).map((message) => message.id).filter((id): id is string => Boolean(id));
+}
+
+async function getGmailMessage(accessToken: string, messageId: string): Promise<GmailMessage> {
+  const response = await fetch(
+    `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?format=full`,
+    {
+      headers: {
+        authorization: `Bearer ${accessToken}`
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw gmailApiError("message fetch", response.status, await response.text());
+  }
+
+  return (await response.json()) as GmailMessage;
+}
+
+function gmailApiError(action: "token refresh" | "search" | "message fetch", status: number, body: string): GmailSyncError {
+  const text = body.toLowerCase();
+
+  if (status === 400 && action === "search") {
+    return new GmailSyncError("GMAIL_QUERY_INVALID", "Gmail search query failed. Check the email rule query.");
+  }
+
+  if (status === 401) {
+    return new GmailSyncError("GMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.");
+  }
+
+  if (status === 403 && (text.includes("rate") || text.includes("quota"))) {
+    return new GmailSyncError("GMAIL_RATE_LIMITED", "Gmail rate limit reached. Try again later.");
+  }
+
+  if (status === 403) {
+    return new GmailSyncError(
+      "GMAIL_PERMISSION",
+      "Gmail permission error. Reconnect Gmail and approve Gmail readonly access."
+    );
+  }
+
+  if (status === 429) {
+    return new GmailSyncError("GMAIL_RATE_LIMITED", "Gmail rate limit reached. Try again later.");
+  }
+
+  return new GmailSyncError("GMAIL_SYNC_FAILED", "Gmail sync failed.");
+}
+
+function safeGmailErrorMessage(error: unknown): string {
+  if (error instanceof GmailSyncError) {
+    return error.message;
+  }
+
+  const message = error instanceof Error ? error.message : String(error);
+  const lower = message.toLowerCase();
+
+  if (lower.includes("gmail api has not been used") || lower.includes("disabled")) {
+    return "Gmail API is disabled in Google Cloud project. Enable Gmail API and retry.";
+  }
+
+  if (lower.includes("refresh token") || lower.includes("invalid_grant") || lower.includes("unauthorized")) {
+    return "Gmail authorization expired. Reconnect Gmail.";
+  }
+
+  if (lower.includes("permission") || lower.includes("scope") || lower.includes("insufficient")) {
+    return "Gmail permission error. Reconnect Gmail and approve Gmail readonly access.";
+  }
+
+  if (lower.includes("rate") || lower.includes("quota") || lower.includes("429")) {
+    return "Gmail rate limit reached. Try again later.";
+  }
+
+  if (lower.includes("query") || lower.includes("search")) {
+    return "Gmail search query failed. Check the email rule query.";
+  }
+
+  return "Gmail sync failed.";
+}
+
+function isGmailConnectionError(error: unknown): boolean {
+  return (
+    error instanceof GmailSyncError &&
+    (error.code === "GMAIL_AUTH_EXPIRED" || error.code === "GMAIL_PERMISSION")
+  );
+}
+
+function gmailMessageToText(message: GmailMessage): string {
+  const subject = getGmailHeader(message, "subject");
+  const from = getGmailHeader(message, "from");
+  const snippet = message.snippet ?? "";
+  const body = decodeGmailBody(message.payload) || snippet;
+
+  return [`Subject: ${subject}`, `From: ${from}`, `Snippet: ${snippet}`, `Body: ${body}`].filter(Boolean).join("\n");
+}
+
+function getGmailHeader(message: GmailMessage, name: string): string {
+  return message.payload?.headers?.find((header) => header.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+}
+
+function decodeGmailBody(part?: GmailMessagePart): string {
+  if (!part) {
+    return "";
+  }
+
+  if (part.body?.data && (!part.mimeType || part.mimeType.startsWith("text/"))) {
+    return decodeBase64Url(part.body.data);
+  }
+
+  return (part.parts ?? []).map(decodeGmailBody).filter(Boolean).join("\n").slice(0, 5000);
+}
+
+function decodeBase64Url(value: string): string {
+  try {
+    return Buffer.from(value.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+  } catch {
+    return "";
+  }
 }
 
 function matchesGithubAuthor(commit: GithubCommit, authorLogin?: string): boolean {
@@ -2834,9 +3645,66 @@ interface GithubCommit {
   };
 }
 
+interface GmailTokenResponse {
+  access_token: string;
+  refresh_token?: string;
+  expires_in?: number;
+  token_type?: string;
+  scope?: string;
+}
+
+interface GmailMessage {
+  id: string;
+  threadId?: string;
+  snippet?: string;
+  payload?: GmailMessagePart;
+}
+
+interface EmailRuleSyncSummary {
+  ruleId: string;
+  adapterId: string;
+  query: string;
+  messagesFound: number;
+  processed: number;
+  ignoredUnknown: number;
+  filteredMarketing: number;
+  needsReview: number;
+  lowConfidenceIgnored: number;
+  deduped: number;
+  archivedCleanupReprocessed: number;
+  eventsCreated: number;
+  lastError?: string;
+}
+
+interface GmailMessagePart {
+  mimeType?: string;
+  headers?: Array<{
+    name: string;
+    value: string;
+  }>;
+  body?: {
+    data?: string;
+  };
+  parts?: GmailMessagePart[];
+}
+
 class GithubFetchError extends Error {
   constructor(
     readonly code: "GITHUB_REPO_NOT_FOUND_OR_PRIVATE" | "GITHUB_RATE_LIMITED" | "GITHUB_FETCH_FAILED",
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+class GmailSyncError extends Error {
+  constructor(
+    readonly code:
+      | "GMAIL_AUTH_EXPIRED"
+      | "GMAIL_PERMISSION"
+      | "GMAIL_RATE_LIMITED"
+      | "GMAIL_QUERY_INVALID"
+      | "GMAIL_SYNC_FAILED",
     message: string
   ) {
     super(message);

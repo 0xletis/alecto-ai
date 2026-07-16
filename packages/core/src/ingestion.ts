@@ -14,6 +14,7 @@ export const IngestionDomainSchema = z.enum([
 export const IngestionSourceSchema = z.enum([
   "manual_paste",
   "telegram",
+  "gmail",
   "future_gmail",
   "future_github",
   "future_wallet",
@@ -118,7 +119,9 @@ export const jobSearchTextAdapter: IngestionAdapter = {
         "agendar",
         "programar una llamada",
         "thanks for applying",
+        "thank you for your application",
         "we received your application",
+        "your application to",
         "application received",
         "gracias por aplicar",
         "hemos recibido tu solicitud",
@@ -133,9 +136,9 @@ export const jobSearchTextAdapter: IngestionAdapter = {
   parse(input) {
     const text = normalizeText(input.text);
     const extracted = extractJobSearchFields(input.text);
-    const classification = classifyJobSearchText(text);
+    const classification = classifyJobSearchText(text, input.source);
     const eventType = eventTypeForJobClassification(classification);
-    const confidence = confidenceForJobClassification(classification);
+    const confidence = confidenceForJobClassification(classification, input.source);
 
     return IngestionResultSchema.parse({
       adapterId: "job_search_text",
@@ -161,65 +164,38 @@ export const jobSearchTextAdapter: IngestionAdapter = {
 
 registerIngestionAdapter(jobSearchTextAdapter);
 
-function classifyJobSearchText(text: string): string {
-  if (
-    hasAny(text, [
-      "unfortunately",
-      "not selected",
-      "move forward with other candidates",
-      "not be proceeding",
-      "no longer under consideration",
-      "hemos decidido continuar con otros candidatos"
-    ])
-  ) {
-    return "rejection";
+function classifyJobSearchText(text: string, source: IngestionSource): string {
+  const gmail = source === "gmail";
+
+  if (gmail && hasMarketingContext(text) && !hasStrongJobContext(text)) {
+    return "filtered_marketing";
   }
 
-  if (hasAny(text, ["we would like to offer", "offer", "compensation", "contract", "employment agreement", "oferta"])) {
-    return "offer";
+  if (gmail && !hasStrongJobContext(text)) {
+    return "unknown";
   }
 
-  if (
-    hasAny(text, [
-      "interview",
-      "schedule an interview",
-      "schedule a call",
-      "calendly",
-      "meet",
-      "available next",
-      "available times",
-      "entrevista",
-      "agendar",
-      "programar una llamada"
-    ])
-  ) {
+  if (gmail && isApplicationActionRequired(text)) {
+    return "application_action_required";
+  }
+
+  if (isInterviewScheduled(text)) {
     return "interview_scheduled";
   }
 
-  if (
-    hasAny(text, [
-      "application received",
-      "thanks for applying",
-      "we received your application",
-      "gracias por aplicar",
-      "hemos recibido tu solicitud"
-    ])
-  ) {
+  if (isJobOffer(text)) {
+    return "offer";
+  }
+
+  if (isRejection(text)) {
+    return "rejection";
+  }
+
+  if (isApplicationConfirmation(text)) {
     return "application_confirmation";
   }
 
-  if (
-    hasAny(text, [
-      "thanks for reaching out",
-      "your profile",
-      "we'd like to discuss",
-      "we would like to discuss",
-      "are you available",
-      "available next",
-      "recruiter",
-      "talent acquisition"
-    ])
-  ) {
+  if (isRecruiterReply(text)) {
     return "recruiter_reply";
   }
 
@@ -238,8 +214,216 @@ function eventTypeForJobClassification(classification: string): string | undefin
   return eventTypes[classification];
 }
 
-function confidenceForJobClassification(classification: string): number {
-  return classification === "unknown" ? 0.25 : 0.85;
+function confidenceForJobClassification(classification: string, source: IngestionSource): number {
+  if (classification === "filtered_marketing") {
+    return 0.1;
+  }
+
+  if (classification === "application_action_required") {
+    return 0.8;
+  }
+
+  if (classification === "unknown") {
+    return 0.25;
+  }
+
+  if (source === "gmail") {
+    return classification === "recruiter_reply" ? 0.9 : 0.95;
+  }
+
+  return 0.85;
+}
+
+function hasStrongJobContext(text: string): boolean {
+  const hasApplicationWithHiringContext =
+    hasAny(text, ["applying", "apply", "application"]) &&
+    hasAny(text, ["role", "position", "job", "candidate", "recruitment", "careers", "career"]);
+
+  return (
+    hasApplicationWithHiringContext ||
+    (text.includes("interview") && hasAny(text, ["schedule", "availability", "available", "call", "recruiter", "hiring", "team"])) ||
+    hasAny(text, ["recruiter", "talent acquisition", "hiring team"]) ||
+    hasAny(text, ["greenhouse", "lever", "workday", "ashby", "personio", "smartrecruiters", "comeet", "workable", "recruitee"]) ||
+    hasAny(text, [
+      "thank you for your application",
+      "thanks for your application",
+      "thank you for applying",
+      "thanks for applying",
+      "we received your application",
+      "we've received your application",
+      "we have received your application",
+      "we are reviewing your application",
+      "we are currently reviewing your application",
+      "currently reviewing your application",
+      "our team will review your application",
+      "your application to",
+      "your application has been received",
+      "application received",
+      "not moving forward",
+      "move forward with other candidates"
+    ]) ||
+    (text.includes("unfortunately") && hasAny(text, ["application", "candidate", "position", "role", "job"])) ||
+    isJobOffer(text)
+  );
+}
+
+function isApplicationActionRequired(text: string): boolean {
+  return hasAny(text, [
+    "security code",
+    "verification code",
+    "verify your email",
+    "confirm your email",
+    "copy and paste this code",
+    "enter the code",
+    "resubmit your application",
+    "complete your application",
+    "finish your application",
+    "action required",
+    "required to submit"
+  ]);
+}
+
+function hasMarketingContext(text: string): boolean {
+  return hasAny(text, [
+    "newsletter",
+    "limited offer",
+    "special offer",
+    "shopping offer",
+    "discount",
+    "sale",
+    "buy",
+    "points",
+    "revpoints",
+    "glovo",
+    "cashback",
+    "reward",
+    "rewards",
+    "sports card",
+    "collectible",
+    "collectibles",
+    "promo",
+    "promotion"
+  ]);
+}
+
+function isJobOffer(text: string): boolean {
+  return (
+    hasAny(text, [
+      "job offer",
+      "offer of employment",
+      "employment offer",
+      "offer letter",
+      "we would like to offer you the role",
+      "compensation package",
+      "employment agreement",
+      "contract for the role"
+    ]) ||
+    (hasAny(text, ["offer", "compensation", "contract"]) &&
+      hasAny(text, ["role", "position", "job", "employment", "hiring", "recruiter"]))
+  );
+}
+
+function isInterviewScheduled(text: string): boolean {
+  return (
+    hasAny(text, [
+      "schedule an interview",
+      "schedule a call",
+      "calendly",
+      "available next",
+      "available times",
+      "next step is a call",
+      "next step is an interview",
+      "phone screen",
+      "technical screen",
+      "entrevista",
+      "agendar",
+      "programar una llamada"
+    ]) ||
+    (text.includes("interview") && hasAny(text, ["schedule", "availability", "available", "call", "recruiter", "hiring", "team"]))
+  );
+}
+
+function isRejection(text: string): boolean {
+  return (
+    (text.includes("unfortunately") &&
+      hasAny(text, [
+        "we will not be moving forward",
+        "we are not moving forward",
+        "not moving forward",
+        "other candidates",
+        "not selected",
+        "not been selected",
+        "will not be proceeding",
+        "won't be progressing",
+        "will not progress your application"
+      ])) ||
+    hasAny(text, [
+      "we decided not to proceed",
+      "we have decided not to proceed",
+      "no longer under consideration",
+      "you have not been selected",
+      "you were not selected",
+      "move forward with other candidates",
+      "proceed with other candidates",
+      "moving forward with other candidates",
+      "unable to offer you",
+      "not be proceeding",
+      "will not be proceeding",
+      "we won't be progressing",
+      "we will not progress your application",
+      "hemos decidido continuar con otros candidatos"
+    ])
+  );
+}
+
+function isApplicationConfirmation(text: string): boolean {
+  return hasAny(text, [
+    "application received",
+    "we received your application",
+    "we've received your application",
+    "we have received your application",
+    "your application was received",
+    "your application has been received",
+    "application submitted successfully",
+    "application submitted",
+    "application confirmed",
+    "thanks for applying",
+    "thank you for applying",
+    "thank you for your application",
+    "thank you for your interest",
+    "our team will review your application",
+    "we are reviewing your application",
+    "we are currently reviewing your application",
+    "currently reviewing your application",
+    "we will be in touch if your qualifications match",
+    "gracias por aplicar",
+    "hemos recibido tu solicitud"
+  ]);
+}
+
+function isRecruiterReply(text: string): boolean {
+  return (
+    hasAny(text, [
+      "can you share availability",
+      "share your availability",
+      "are you available",
+      "available next",
+      "schedule a call",
+      "schedule an interview",
+      "asks for more information",
+      "could you send",
+      "can you send",
+      "we'd like to discuss",
+      "we would like to discuss",
+      "would like to speak",
+      "wants to speak",
+      "next step is a call",
+      "next step is a screen",
+      "next step is an interview"
+    ]) ||
+    (hasAny(text, ["recruiter", "hiring team", "talent acquisition"]) &&
+      hasAny(text, ["speak", "call", "availability", "available", "more information", "next step", "screen", "interview"]))
+  );
 }
 
 function extractJobSearchFields(text: string): Record<string, unknown> {

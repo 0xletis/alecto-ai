@@ -399,8 +399,20 @@ bot.command("my_integrations", async (ctx) => {
   }
 
   try {
+    const includeArchived = getCommandText(ctx).trim().toLowerCase() === "all";
     const response = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
-    await ctx.reply(formatIntegrationConnections(response.connections));
+    const [goals, rules] = await Promise.all([
+      apiGet<GoalsResponse>(`/users/${getTelegramUserId(ctx)}/goals`),
+      apiGet<EmailRulesResponse>(`/users/${getTelegramUserId(ctx)}/email-rules`)
+    ]);
+    await ctx.reply(
+      [
+        formatIntegrationConnections(response.connections, includeArchived),
+        gmailRuleSuggestion(response.connections, goals.goals, rules.emailRules)
+      ]
+        .filter(Boolean)
+        .join("\n\n")
+    );
   } catch (error) {
     await replyWithApiFailure(ctx, error, "I could not fetch your integrations right now.");
   }
@@ -431,6 +443,186 @@ bot.command("connect_github", async (ctx) => {
     await ctx.reply(`GitHub connected:\n${formatIntegrationConnection(response.connection)}`);
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("connect_gmail", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<GmailOAuthUrlResponse>(
+      `/users/${getTelegramUserId(ctx)}/integrations/gmail/oauth-url`
+    );
+    await ctx.reply(`Connect Gmail:\n${response.url}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("my_email_rules", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const [rules, integrations] = await Promise.all([
+      apiGet<EmailRulesResponse>(`/users/${getTelegramUserId(ctx)}/email-rules`),
+      apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`)
+    ]);
+    await ctx.reply(formatEmailRules(rules.emailRules, integrations.connections));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("enable_email_rule", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseEnableEmailRuleCommand(getCommandText(ctx));
+
+  if (!parsed || parsed.kind !== "job_search") {
+    await ctx.reply("Usage: /enable_email_rule job_search or /enable_email_rule job_search goal=GOAL_ID");
+    return;
+  }
+
+  try {
+    const integrations = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
+    const gmailConnection = integrations.connections.find(
+      (connection) => connection.integrationId === "gmail" && connection.status === "active"
+    );
+
+    if (!gmailConnection) {
+      await ctx.reply("Connect Gmail first with /connect_gmail.");
+      return;
+    }
+
+    const response = await apiPost<EmailRuleResponse>(`/users/${getTelegramUserId(ctx)}/email-rules`, {
+      connectionId: gmailConnection.id,
+      goalId: parsed.goalId,
+      adapterId: "job_search_email",
+      name: "Job search emails",
+      reviewBeforeLogging: false
+    });
+
+    await ctx.reply(`Email rule enabled:\n${formatEmailRule(response.emailRule, gmailConnection)}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("pause_email_rule", async (ctx) => {
+  await updateEmailRuleStatusCommand(ctx, "paused");
+});
+
+bot.command("resume_email_rule", async (ctx) => {
+  await updateEmailRuleStatusCommand(ctx, "active");
+});
+
+bot.command("delete_email_rule", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const ruleId = getCommandText(ctx);
+
+  if (!ruleId) {
+    await ctx.reply("Usage: /delete_email_rule RULE_ID");
+    return;
+  }
+
+  try {
+    const response = await apiDelete<EmailRuleMutationResponse>(`/users/${getTelegramUserId(ctx)}/email-rules/${ruleId}`);
+    await ctx.reply(response.message ?? `Email rule archived: ${ruleId}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("cleanup_gmail_rule_events", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const ruleId = getCommandText(ctx);
+
+  if (!ruleId) {
+    await ctx.reply("Usage: /cleanup_gmail_rule_events RULE_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPost<GmailRuleCleanupResponse>(
+      `/users/${getTelegramUserId(ctx)}/email-rules/${ruleId}/cleanup-events`,
+      {}
+    );
+    await ctx.reply(response.message ?? `Archived ${response.count} Gmail events for rule ${ruleId}.`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("sync_gmail", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const integrations = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
+    const gmailConnections = integrations.connections.filter(
+      (connection) => connection.integrationId === "gmail" && connection.status === "active"
+    );
+
+    if (gmailConnections.length === 0) {
+      await ctx.reply("No active Gmail integration. Connect Gmail with /connect_gmail.");
+      return;
+    }
+
+    const results = [];
+
+    for (const connection of gmailConnections) {
+      try {
+        results.push(await syncIntegration(ctx, connection.id));
+      } catch (error) {
+        results.push(formatIntegrationSyncFailure(connection, error));
+      }
+    }
+
+    await replyWithIntegrationMessage(ctx, results.join("\n"));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, `Integration sync failed: ${safeIntegrationErrorMessage(error)}`);
+  }
+});
+
+bot.command("sync_gmail_debug", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const integrations = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
+    const gmailConnections = integrations.connections.filter(
+      (connection) => connection.integrationId === "gmail" && connection.status === "active"
+    );
+
+    if (gmailConnections.length === 0) {
+      await ctx.reply("No active Gmail integration. Connect Gmail with /connect_gmail.");
+      return;
+    }
+
+    const results = [];
+
+    for (const connection of gmailConnections) {
+      const response = await postIntegrationSyncForDebug(ctx, connection.id);
+      results.push(formatGmailSyncDebug(connection, response));
+    }
+
+    await replyWithIntegrationMessage(ctx, results.join("\n\n"));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, `Gmail sync failed: ${safeGmailIntegrationErrorMessage(error)}`);
   }
 });
 
@@ -1201,6 +1393,22 @@ function parseConnectGithubCommand(text: string) {
   };
 }
 
+function parseEnableEmailRuleCommand(text: string): { kind: string; goalId?: string } | undefined {
+  const [kind, ...rest] = text.split(/\s+/).filter(Boolean);
+
+  if (!kind) {
+    return undefined;
+  }
+
+  const goalArg = rest.find((part) => part.startsWith("goal="));
+  const goalId = goalArg?.replace(/^goal=/, "").trim();
+
+  return {
+    kind,
+    ...(goalId ? { goalId } : {})
+  };
+}
+
 function parseEventLimit(text: string): number {
   const limit = Number(text.trim() || "5");
 
@@ -1419,6 +1627,10 @@ async function syncIntegration(ctx: Context, connectionId: string): Promise<stri
   const personalCommits = response.personalCommitEvents ?? 0;
   const repoActivity = response.repoActivityEvents ?? 0;
 
+  if (response.integrationId === "gmail") {
+    return formatGmailSyncSummary(response);
+  }
+
   if (personalCommits === 0 && repoActivity > 0) {
     return `Synced ${response.integrationId}: ${repoActivity} repo activity event${repoActivity === 1 ? "" : "s"}.`;
   }
@@ -1432,6 +1644,83 @@ async function syncIntegration(ctx: Context, connectionId: string): Promise<stri
   }
 
   return `Synced ${response.integrationId}: ${response.eventsCreated} new event${response.eventsCreated === 1 ? "" : "s"}.`;
+}
+
+async function postIntegrationSyncForDebug(ctx: Context, connectionId: string): Promise<IntegrationSyncResponse> {
+  const response = await fetch(`${apiBaseUrl}/users/${getTelegramUserId(ctx)}/integrations/${connectionId}/sync`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({})
+  });
+
+  const body = (await response.json()) as IntegrationSyncResponse & { error?: string };
+
+  if (!response.ok && !body.integrationId) {
+    throw new Error(body.error ?? `API POST sync failed with ${response.status}`);
+  }
+
+  return body;
+}
+
+function formatGmailSyncSummary(response: IntegrationSyncResponse): string {
+  const totals = gmailSyncTotals(response.emailSummaries ?? []);
+  return `Gmail sync: ${totals.messagesFound} messages found, ${totals.processed} processed, ${totals.ignoredUnknown} ignored, ${totals.deduped} active deduped, ${totals.eventsCreated} events created.`;
+}
+
+function formatGmailSyncDebug(connection: IntegrationConnection, response: IntegrationSyncResponse): string {
+  const totals = gmailSyncTotals(response.emailSummaries ?? []);
+  const ruleLines =
+    response.emailSummaries?.map(
+      (summary) =>
+        `- rule ${summary.ruleId} (${summary.adapterId}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
+    ) ?? [];
+
+  return [
+    `Gmail connection: ${connection.id}`,
+    `active rules: ${response.emailSummaries?.length ?? 0}`,
+    `messages found: ${totals.messagesFound}`,
+    `processed: ${totals.processed}`,
+    `events created: ${totals.eventsCreated}`,
+    `active deduped: ${totals.deduped}`,
+    `archived cleanup reprocessed: ${totals.archivedCleanupReprocessed}`,
+    `needs review: ${totals.needsReview}`,
+    `filtered marketing: ${totals.filteredMarketing}`,
+    `low confidence ignored: ${totals.lowConfidenceIgnored}`,
+    `ignored unknown: ${totals.ignoredUnknown}`,
+    response.error ? `lastError: ${safeGmailIntegrationMessageFromText(response.error)}` : undefined,
+    ...ruleLines
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function gmailSyncTotals(summaries: EmailSyncSummary[]) {
+  return summaries.reduce(
+    (totals, summary) => ({
+      messagesFound: totals.messagesFound + summary.messagesFound,
+      processed: totals.processed + summary.processed,
+      ignoredUnknown: totals.ignoredUnknown + summary.ignoredUnknown,
+      filteredMarketing: totals.filteredMarketing + summary.filteredMarketing,
+      needsReview: totals.needsReview + summary.needsReview,
+      lowConfidenceIgnored: totals.lowConfidenceIgnored + summary.lowConfidenceIgnored,
+      deduped: totals.deduped + summary.deduped,
+      archivedCleanupReprocessed: totals.archivedCleanupReprocessed + summary.archivedCleanupReprocessed,
+      eventsCreated: totals.eventsCreated + summary.eventsCreated
+    }),
+    {
+      messagesFound: 0,
+      processed: 0,
+      ignoredUnknown: 0,
+      filteredMarketing: 0,
+      needsReview: 0,
+      lowConfidenceIgnored: 0,
+      deduped: 0,
+      archivedCleanupReprocessed: 0,
+      eventsCreated: 0
+    }
+  );
 }
 
 async function updateIntegrationStatusCommand(ctx: Context, status: "active" | "paused") {
@@ -1457,8 +1746,35 @@ async function updateIntegrationStatusCommand(ctx: Context, status: "active" | "
   }
 }
 
+async function updateEmailRuleStatusCommand(ctx: Context, status: "active" | "paused") {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const ruleId = getCommandText(ctx);
+
+  if (!ruleId) {
+    await ctx.reply(`Usage: /${status === "active" ? "resume" : "pause"}_email_rule RULE_ID`);
+    return;
+  }
+
+  try {
+    const [response, integrations] = await Promise.all([
+      apiPatch<EmailRuleResponse>(`/users/${getTelegramUserId(ctx)}/email-rules/${ruleId}`, {
+        status
+      }),
+      apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`)
+    ]);
+    const connection = integrations.connections.find((item) => item.id === response.emailRule.connectionId);
+    await ctx.reply(`Email rule ${status}:\n${formatEmailRule(response.emailRule, connection)}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+}
+
 function formatIntegrationSyncFailure(connection: IntegrationConnection, error: unknown): string {
-  const reason = safeIntegrationErrorMessage(error);
+  const reason =
+    connection.integrationId === "gmail" ? safeGmailIntegrationErrorMessage(error) : safeIntegrationErrorMessage(error);
 
   return `Integration sync failed for ${connection.integrationId} ${connection.id}: ${reason}`;
 }
@@ -1486,6 +1802,10 @@ function safeIntegrationErrorMessage(error: unknown): string {
     return fallback;
   }
 
+  if (message.toLowerCase().includes("gmail")) {
+    return safeGmailIntegrationMessageFromText(message);
+  }
+
   if (
     message.includes("repo not found or private") ||
     message.includes("Public GitHub integration only supports public repos")
@@ -1502,6 +1822,48 @@ function safeIntegrationErrorMessage(error: unknown): string {
   }
 
   return message;
+}
+
+function safeGmailIntegrationErrorMessage(error: unknown): string {
+  if (!error || typeof error !== "object") {
+    return "Gmail sync failed.";
+  }
+
+  const err = error as Record<string, unknown>;
+  const message =
+    typeof err.message === "string"
+      ? err.message
+      : typeof err.description === "string"
+        ? err.description
+        : "";
+
+  return safeGmailIntegrationMessageFromText(message);
+}
+
+function safeGmailIntegrationMessageFromText(message: string): string {
+  const lower = message.toLowerCase();
+
+  if (lower.includes("gmail api has not been used") || lower.includes("disabled")) {
+    return "Gmail API is disabled in Google Cloud project. Enable Gmail API and retry.";
+  }
+
+  if (lower.includes("authorization") || lower.includes("refresh") || lower.includes("invalid_grant")) {
+    return "Gmail authorization expired. Reconnect Gmail.";
+  }
+
+  if (lower.includes("permission") || lower.includes("scope") || lower.includes("insufficient")) {
+    return "Gmail permission error. Reconnect Gmail and approve Gmail readonly access.";
+  }
+
+  if (lower.includes("rate") || lower.includes("quota") || lower.includes("429")) {
+    return "Gmail rate limit reached. Try again later.";
+  }
+
+  if (lower.includes("query") || lower.includes("search")) {
+    return "Gmail search query failed. Check the email rule query.";
+  }
+
+  return "Gmail sync failed.";
 }
 
 async function replyWithIntegrationMessage(ctx: Context, message: string) {
@@ -1828,15 +2190,92 @@ function formatIntegrationDefinitions(integrations: IntegrationDefinition[]) {
     .join("\n\n");
 }
 
-function formatIntegrationConnections(connections: IntegrationConnection[]) {
-  if (connections.length === 0) {
+function formatIntegrationConnections(connections: IntegrationConnection[], includeArchived = false) {
+  const visibleConnections = includeArchived
+    ? connections
+    : connections.filter((connection) => connection.status !== "archived");
+
+  if (visibleConnections.length === 0) {
     return "No integrations connected. Use /connect_github OWNER/REPO.";
   }
 
-  return connections.map(formatIntegrationConnection).join("\n\n");
+  return [
+    ...visibleConnections.map(formatIntegrationConnection),
+    !includeArchived && connections.some((connection) => connection.status === "archived")
+      ? "Use /my_integrations all to include archived."
+      : undefined
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function formatEmailRules(rules: EmailSignalRule[], connections: IntegrationConnection[] = []) {
+  if (rules.length === 0) {
+    return "No email rules yet. Use /enable_email_rule job_search after connecting Gmail.";
+  }
+
+  const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
+  return rules.map((rule) => formatEmailRule(rule, connectionById.get(rule.connectionId))).join("\n\n");
+}
+
+function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnection) {
+  const connectionStatus = connection?.status ?? "missing";
+  const staleWarning =
+    rule.status === "active" && connectionStatus !== "active"
+      ? "warning: rule is attached to inactive Gmail connection"
+      : undefined;
+
+  return [
+    `id: ${rule.id}`,
+    `adapter: ${rule.adapterId}`,
+    `name: ${rule.name}`,
+    `status: ${rule.status}`,
+    `connectionId: ${rule.connectionId}`,
+    `connectionStatus: ${connectionStatus}`,
+    staleWarning,
+    rule.goalId ? `goalId: ${rule.goalId}` : undefined,
+    `query: ${truncateText(rule.query, 140)}`,
+    `reviewBeforeLogging: ${rule.reviewBeforeLogging}`,
+    rule.lastSyncedAt ? `lastSyncedAt: ${new Date(rule.lastSyncedAt).toLocaleString()}` : undefined,
+    rule.lastError ? `lastError: ${safeGmailIntegrationMessageFromText(rule.lastError)}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function gmailRuleSuggestion(connections: IntegrationConnection[], goals: Goal[], rules: EmailSignalRule[]): string | undefined {
+  const hasGmail = connections.some((connection) => connection.integrationId === "gmail" && connection.status === "active");
+  const hasCareerGoal = goals.some((goal) => goal.status === "active" && (goal.category === "career" || goal.templateId === "career.job_search"));
+  const hasJobSearchRule = rules.some((rule) => rule.status === "active" && rule.adapterId === "job_search_email");
+
+  if (!hasGmail || !hasCareerGoal || hasJobSearchRule) {
+    return undefined;
+  }
+
+  return "Gmail can track recruiter replies, interviews, rejections, and offers for your job-search goal. Enable with /enable_email_rule job_search.";
 }
 
 function formatIntegrationConnection(connection: IntegrationConnection) {
+  if (connection.integrationId === "gmail") {
+    return [
+      `id: ${connection.id}`,
+      "integration: gmail",
+      `status: ${connection.status}`,
+      typeof connection.config.email === "string" ? `email: ${connection.config.email}` : undefined,
+      typeof connection.config.scope === "string" ? `scope: ${connection.config.scope}` : undefined,
+      typeof connection.config.hasRefreshToken === "boolean"
+        ? `hasRefreshToken: ${connection.config.hasRefreshToken}`
+        : undefined,
+      typeof connection.config.expiresAt === "number"
+        ? `expiresAt: ${new Date(connection.config.expiresAt).toLocaleString()}`
+        : undefined,
+      connection.lastSyncedAt ? `lastSyncedAt: ${new Date(connection.lastSyncedAt).toLocaleString()}` : undefined,
+      connection.lastError ? `lastError: ${safeGmailIntegrationMessageFromText(connection.lastError)}` : undefined
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
   const repos = Array.isArray(connection.config.repos)
     ? connection.config.repos
         .map((item) => {
@@ -1858,7 +2297,7 @@ function formatIntegrationConnection(connection: IntegrationConnection) {
     `repos: ${repos}`,
     typeof connection.config.authorLogin === "string" ? `author: ${connection.config.authorLogin}` : undefined,
     connection.lastSyncedAt ? `lastSyncedAt: ${new Date(connection.lastSyncedAt).toLocaleString()}` : undefined,
-    connection.lastError ? `lastError: ${connection.lastError}` : undefined
+    connection.lastError ? `lastError: ${safeIntegrationErrorMessage({ message: connection.lastError })}` : undefined
   ]
     .filter(Boolean)
     .join("\n");
@@ -2191,6 +2630,28 @@ interface IntegrationConnectionsResponse {
   connections: IntegrationConnection[];
 }
 
+interface GmailOAuthUrlResponse {
+  url: string;
+}
+
+interface EmailRulesResponse {
+  emailRules: EmailSignalRule[];
+}
+
+interface EmailRuleResponse {
+  emailRule: EmailSignalRule;
+}
+
+interface EmailRuleMutationResponse {
+  emailRule: EmailSignalRule;
+  message?: string;
+}
+
+interface GmailRuleCleanupResponse {
+  count: number;
+  message?: string;
+}
+
 interface IntegrationConnectionResponse {
   connection: IntegrationConnection;
   duplicate?: boolean;
@@ -2203,19 +2664,37 @@ interface IntegrationConnectionMutationResponse {
 }
 
 interface IntegrationSyncResponse {
-  status: "success";
+  status: "success" | "error";
   connectionId: string;
   integrationId: string;
   eventsCreated: number;
   personalCommitEvents?: number;
   repoActivityEvents?: number;
   repoSummaries?: IntegrationRepoSyncSummary[];
+  emailSummaries?: EmailSyncSummary[];
+  error?: string;
 }
 
 interface IntegrationRepoSyncSummary {
   repo: string;
   personalCommitEvents: number;
   repoActivityEvents: number;
+}
+
+interface EmailSyncSummary {
+  ruleId: string;
+  adapterId: string;
+  query: string;
+  messagesFound: number;
+  processed: number;
+  ignoredUnknown: number;
+  filteredMarketing: number;
+  needsReview: number;
+  lowConfidenceIgnored: number;
+  deduped: number;
+  archivedCleanupReprocessed: number;
+  eventsCreated: number;
+  lastError?: string;
 }
 
 interface CheckInResponse {
@@ -2365,6 +2844,21 @@ interface IntegrationConnection {
   integrationId: string;
   status: "active" | "paused" | "error" | "archived";
   config: Record<string, unknown>;
+  lastSyncedAt?: string;
+  lastError?: string;
+}
+
+interface EmailSignalRule {
+  id: string;
+  userId: string;
+  connectionId: string;
+  goalId?: string;
+  adapterId: string;
+  name: string;
+  query: string;
+  status: "active" | "paused" | "archived";
+  reviewBeforeLogging: boolean;
+  createdBy: "system" | "user";
   lastSyncedAt?: string;
   lastError?: string;
 }
