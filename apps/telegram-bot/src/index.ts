@@ -508,7 +508,7 @@ bot.command("enable_email_rule", async (ctx) => {
       reviewBeforeLogging: false
     });
 
-    await ctx.reply(`Email rule enabled:\n${formatEmailRule(response.emailRule, gmailConnection)}`);
+    await ctx.reply(`${response.message ?? `Email rule enabled: ${response.emailRule.id}`}\n${formatEmailRule(response.emailRule, gmailConnection)}`);
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
   }
@@ -520,6 +520,30 @@ bot.command("pause_email_rule", async (ctx) => {
 
 bot.command("resume_email_rule", async (ctx) => {
   await updateEmailRuleStatusCommand(ctx, "active");
+});
+
+bot.command("set_email_rule_config", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseSetEmailRuleConfigCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /set_email_rule_config RULE_ID maxMessagesPerSync=10 maxEventsPerSync=3 classifierMode=rules");
+    return;
+  }
+
+  try {
+    const [response, integrations] = await Promise.all([
+      apiPatch<EmailRuleResponse>(`/users/${getTelegramUserId(ctx)}/email-rules/${parsed.ruleId}`, parsed.input),
+      apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`)
+    ]);
+    const connection = integrations.connections.find((item) => item.id === response.emailRule.connectionId);
+    await ctx.reply(`Email rule updated:\n${formatEmailRule(response.emailRule, connection)}`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
 });
 
 bot.command("delete_email_rule", async (ctx) => {
@@ -573,7 +597,7 @@ bot.command("sync_gmail", async (ctx) => {
   try {
     const integrations = await apiGet<IntegrationConnectionsResponse>(`/users/${getTelegramUserId(ctx)}/integrations`);
     const gmailConnections = integrations.connections.filter(
-      (connection) => connection.integrationId === "gmail" && connection.status === "active"
+      (connection) => connection.integrationId === "gmail" && (connection.status === "active" || connection.status === "error")
     );
 
     if (gmailConnections.length === 0) {
@@ -616,6 +640,11 @@ bot.command("sync_gmail_debug", async (ctx) => {
     const results = [];
 
     for (const connection of gmailConnections) {
+      if (connection.status === "error") {
+        results.push(formatGmailConnectionErrorDebug(connection));
+        continue;
+      }
+
       const response = await postIntegrationSyncForDebug(ctx, connection.id);
       results.push(formatGmailSyncDebug(connection, response));
     }
@@ -1409,6 +1438,75 @@ function parseEnableEmailRuleCommand(text: string): { kind: string; goalId?: str
   };
 }
 
+function parseSetEmailRuleConfigCommand(
+  text: string
+): { ruleId: string; input: Record<string, string | number | boolean | null> } | undefined {
+  const [ruleId, ...parts] = text.split(/\s+/).filter(Boolean);
+
+  if (!ruleId || parts.length === 0) {
+    return undefined;
+  }
+
+  const numberKeys = new Set([
+    "lookbackDays",
+    "maxMessagesPerSync",
+    "maxEventsPerSync",
+    "minAutoLogConfidence",
+    "minReviewConfidence"
+  ]);
+  const allowedKeys = new Set([
+    ...numberKeys,
+    "fetchStrategy",
+    "classifierMode",
+    "query",
+    "reviewBeforeLogging"
+  ]);
+  const validFetchStrategies = new Set(["query", "all_recent", "sender_allowlist", "label"]);
+  const validClassifierModes = new Set(["rules", "llm", "hybrid"]);
+  const input: Record<string, string | number | boolean | null> = {};
+
+  for (const part of parts) {
+    const [key, ...valueParts] = part.split("=");
+    const value = valueParts.join("=");
+
+    if (!key || !allowedKeys.has(key) || value === "") {
+      return undefined;
+    }
+
+    if (numberKeys.has(key)) {
+      const numberValue = Number(value);
+
+      if (!Number.isFinite(numberValue)) {
+        return undefined;
+      }
+
+      input[key] = numberValue;
+      continue;
+    }
+
+    if (key === "reviewBeforeLogging") {
+      if (!/^(true|false)$/i.test(value)) {
+        return undefined;
+      }
+
+      input[key] = value.toLowerCase() === "true";
+      continue;
+    }
+
+    if (key === "fetchStrategy" && !validFetchStrategies.has(value)) {
+      return undefined;
+    }
+
+    if (key === "classifierMode" && !validClassifierModes.has(value)) {
+      return undefined;
+    }
+
+    input[key] = key === "query" && value === "null" ? null : value;
+  }
+
+  return { ruleId, input };
+}
+
 function parseEventLimit(text: string): number {
   const limit = Number(text.trim() || "5");
 
@@ -1665,31 +1763,65 @@ async function postIntegrationSyncForDebug(ctx: Context, connectionId: string): 
 }
 
 function formatGmailSyncSummary(response: IntegrationSyncResponse): string {
+  if ((response.emailSummaries?.length ?? 0) === 0 && response.emailRuleDiagnostics?.activeRulesForConnection === 0) {
+    return "No active email rules for current Gmail connection. Enable with /enable_email_rule job_search.";
+  }
+
   const totals = gmailSyncTotals(response.emailSummaries ?? []);
-  return `Gmail sync: ${totals.messagesFound} messages found, ${totals.processed} processed, ${totals.ignoredUnknown} ignored, ${totals.deduped} active deduped, ${totals.eventsCreated} events created.`;
+  return `Gmail sync: ${totals.messagesFound} messages found, ${totals.processed} processed, ${totals.ignoredUnknown} ignored, ${totals.deduped} active deduped, ${totals.semanticDeduped} semantic deduped, ${totals.eventsCreated} events created.`;
+}
+
+function formatGmailConnectionErrorDebug(connection: IntegrationConnection): string {
+  return [
+    `Gmail connection: ${connection.id}`,
+    `status: ${connection.status}`,
+    connection.lastError ? `lastError: ${safeGmailIntegrationMessageFromText(connection.lastError)}` : "lastError: Gmail sync failed.",
+    "Reconnect Gmail with /connect_gmail."
+  ].join("\n");
 }
 
 function formatGmailSyncDebug(connection: IntegrationConnection, response: IntegrationSyncResponse): string {
   const totals = gmailSyncTotals(response.emailSummaries ?? []);
+  const activeRuleCount = response.emailRuleDiagnostics?.activeRulesForConnection ?? response.emailSummaries?.length ?? 0;
   const ruleLines =
     response.emailSummaries?.map(
       (summary) =>
-        `- rule ${summary.ruleId} (${summary.adapterId}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
+        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
     ) ?? [];
 
   return [
     `Gmail connection: ${connection.id}`,
-    `active rules: ${response.emailSummaries?.length ?? 0}`,
+    response.emailRuleDiagnostics ? `total email rules: ${response.emailRuleDiagnostics.totalEmailRules}` : undefined,
+    response.emailRuleDiagnostics ? `rules for connection: ${response.emailRuleDiagnostics.rulesForConnection}` : undefined,
+    response.emailRuleDiagnostics
+      ? `active rules for connection: ${response.emailRuleDiagnostics.activeRulesForConnection}`
+      : undefined,
+    response.emailRuleDiagnostics ? `stale/archived rules: ${response.emailRuleDiagnostics.staleOrArchivedRules}` : undefined,
+    `active rules: ${activeRuleCount}`,
+    response.emailRuleDiagnostics?.activeRulesForConnection === 0
+      ? "No active email rules for current Gmail connection. Enable with /enable_email_rule job_search."
+      : undefined,
+    response.emailSummaries?.[0]?.fetchStrategy ? `fetchStrategy: ${response.emailSummaries[0].fetchStrategy}` : undefined,
+    response.emailSummaries?.[0]?.classifierMode ? `classifierMode: ${response.emailSummaries[0].classifierMode}` : undefined,
+    response.emailSummaries?.[0] ? `lookbackDays: ${response.emailSummaries[0].lookbackDays}` : undefined,
+    response.emailSummaries?.[0] ? `maxMessagesPerSync: ${response.emailSummaries[0].maxMessagesPerSync}` : undefined,
+    response.emailSummaries?.[0] ? `maxEventsPerSync: ${response.emailSummaries[0].maxEventsPerSync}` : undefined,
     `messages found: ${totals.messagesFound}`,
     `processed: ${totals.processed}`,
     `events created: ${totals.eventsCreated}`,
     `active deduped: ${totals.deduped}`,
+    `semantic deduped: ${totals.semanticDeduped}`,
     `archived cleanup reprocessed: ${totals.archivedCleanupReprocessed}`,
     `needs review: ${totals.needsReview}`,
     `filtered marketing: ${totals.filteredMarketing}`,
     `low confidence ignored: ${totals.lowConfidenceIgnored}`,
     `ignored unknown: ${totals.ignoredUnknown}`,
+    `skipped due maxEventsPerSync: ${totals.skippedDueMaxEventsPerSync}`,
+    response.errorStage ? `lastErrorStage: ${response.errorStage}` : undefined,
     response.error ? `lastError: ${safeGmailIntegrationMessageFromText(response.error)}` : undefined,
+    ...(response.emailRuleDiagnostics?.rejectedRuleReasons.length
+      ? response.emailRuleDiagnostics.rejectedRuleReasons.map((reason) => `rule not loaded: ${reason}`)
+      : []),
     ...ruleLines
   ]
     .filter(Boolean)
@@ -1706,7 +1838,9 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       needsReview: totals.needsReview + summary.needsReview,
       lowConfidenceIgnored: totals.lowConfidenceIgnored + summary.lowConfidenceIgnored,
       deduped: totals.deduped + summary.deduped,
+      semanticDeduped: totals.semanticDeduped + summary.semanticDeduped,
       archivedCleanupReprocessed: totals.archivedCleanupReprocessed + summary.archivedCleanupReprocessed,
+      skippedDueMaxEventsPerSync: totals.skippedDueMaxEventsPerSync + summary.skippedDueMaxEventsPerSync,
       eventsCreated: totals.eventsCreated + summary.eventsCreated
     }),
     {
@@ -1717,7 +1851,9 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       needsReview: 0,
       lowConfidenceIgnored: 0,
       deduped: 0,
+      semanticDeduped: 0,
       archivedCleanupReprocessed: 0,
+      skippedDueMaxEventsPerSync: 0,
       eventsCreated: 0
     }
   );
@@ -1843,6 +1979,10 @@ function safeGmailIntegrationErrorMessage(error: unknown): string {
 function safeGmailIntegrationMessageFromText(message: string): string {
   const lower = message.toLowerCase();
 
+  if (lower.startsWith("gmail sync failed:")) {
+    return truncateText(message, 220);
+  }
+
   if (lower.includes("gmail api has not been used") || lower.includes("disabled")) {
     return "Gmail API is disabled in Google Cloud project. Enable Gmail API and retry.";
   }
@@ -1861,6 +2001,10 @@ function safeGmailIntegrationMessageFromText(message: string): string {
 
   if (lower.includes("query") || lower.includes("search")) {
     return "Gmail search query failed. Check the email rule query.";
+  }
+
+  if (lower.includes("fetch strategy not implemented")) {
+    return "Fetch strategy not implemented yet.";
   }
 
   return "Gmail sync failed.";
@@ -2234,7 +2378,14 @@ function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnecti
     `connectionStatus: ${connectionStatus}`,
     staleWarning,
     rule.goalId ? `goalId: ${rule.goalId}` : undefined,
-    `query: ${truncateText(rule.query, 140)}`,
+    `fetchStrategy: ${rule.fetchStrategy}`,
+    `classifierMode: ${rule.classifierMode}`,
+    `lookbackDays: ${rule.lookbackDays}`,
+    `maxMessagesPerSync: ${rule.maxMessagesPerSync}`,
+    `maxEventsPerSync: ${rule.maxEventsPerSync}`,
+    `minAutoLogConfidence: ${rule.minAutoLogConfidence}`,
+    `minReviewConfidence: ${rule.minReviewConfidence}`,
+    rule.query ? `query: ${truncateText(rule.query, 140)}` : undefined,
     `reviewBeforeLogging: ${rule.reviewBeforeLogging}`,
     rule.lastSyncedAt ? `lastSyncedAt: ${new Date(rule.lastSyncedAt).toLocaleString()}` : undefined,
     rule.lastError ? `lastError: ${safeGmailIntegrationMessageFromText(rule.lastError)}` : undefined
@@ -2640,6 +2791,7 @@ interface EmailRulesResponse {
 
 interface EmailRuleResponse {
   emailRule: EmailSignalRule;
+  message?: string;
 }
 
 interface EmailRuleMutationResponse {
@@ -2672,7 +2824,9 @@ interface IntegrationSyncResponse {
   repoActivityEvents?: number;
   repoSummaries?: IntegrationRepoSyncSummary[];
   emailSummaries?: EmailSyncSummary[];
+  emailRuleDiagnostics?: EmailRuleDiagnostics;
   error?: string;
+  errorStage?: GmailErrorStage;
 }
 
 interface IntegrationRepoSyncSummary {
@@ -2684,7 +2838,12 @@ interface IntegrationRepoSyncSummary {
 interface EmailSyncSummary {
   ruleId: string;
   adapterId: string;
-  query: string;
+  query?: string;
+  fetchStrategy: string;
+  classifierMode: string;
+  lookbackDays: number;
+  maxMessagesPerSync: number;
+  maxEventsPerSync: number;
   messagesFound: number;
   processed: number;
   ignoredUnknown: number;
@@ -2692,10 +2851,29 @@ interface EmailSyncSummary {
   needsReview: number;
   lowConfidenceIgnored: number;
   deduped: number;
+  semanticDeduped: number;
   archivedCleanupReprocessed: number;
+  skippedDueMaxEventsPerSync: number;
   eventsCreated: number;
   lastError?: string;
+  lastErrorStage?: GmailErrorStage;
 }
+
+interface EmailRuleDiagnostics {
+  totalEmailRules: number;
+  rulesForConnection: number;
+  activeRulesForConnection: number;
+  staleOrArchivedRules: number;
+  rejectedRuleReasons: string[];
+}
+
+type GmailErrorStage =
+  | "rule_loading"
+  | "token_refresh"
+  | "gmail_search"
+  | "gmail_message_fetch"
+  | "classification"
+  | "event_creation";
 
 interface CheckInResponse {
   reply: string;
@@ -2855,8 +3033,15 @@ interface EmailSignalRule {
   goalId?: string;
   adapterId: string;
   name: string;
-  query: string;
-  status: "active" | "paused" | "archived";
+  query?: string;
+  status: "active" | "paused" | "archived" | "error";
+  fetchStrategy: "query" | "all_recent" | "sender_allowlist" | "label";
+  lookbackDays: number;
+  maxMessagesPerSync: number;
+  maxEventsPerSync: number;
+  classifierMode: "rules" | "llm" | "hybrid";
+  minAutoLogConfidence: number;
+  minReviewConfidence: number;
   reviewBeforeLogging: boolean;
   createdBy: "system" | "user";
   lastSyncedAt?: string;

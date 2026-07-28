@@ -211,8 +211,15 @@ model EmailSignalRule {
   goalId              String?
   adapterId           String
   name                String
-  query               String
+  query               String?
   status              String    @default("active")
+  fetchStrategy       String    @default("query")
+  lookbackDays        Int       @default(30)
+  maxMessagesPerSync  Int       @default(25)
+  maxEventsPerSync    Int       @default(10)
+  classifierMode      String    @default("rules")
+  minAutoLogConfidence Float    @default(0.9)
+  minReviewConfidence Float     @default(0.65)
   reviewBeforeLogging Boolean   @default(false)
   createdBy           String
   lastSyncedAt        DateTime?

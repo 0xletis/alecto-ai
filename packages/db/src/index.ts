@@ -37,6 +37,17 @@ export interface ExternalEventDedupeOptions {
   ignoreArchivedCleanup?: boolean;
 }
 
+export interface GmailSemanticEventDedupeInput {
+  userId: string;
+  ruleId: string;
+  eventType: StoredEvent["type"];
+  subject?: string;
+  from?: string;
+  company?: string;
+  role?: string;
+  since?: Date;
+}
+
 export interface EventQueryOptions {
   includeArchived?: boolean;
 }
@@ -119,8 +130,15 @@ export interface EmailSignalRule {
   goalId?: string;
   adapterId: string;
   name: string;
-  query: string;
-  status: "active" | "paused" | "archived";
+  query?: string;
+  status: "active" | "paused" | "archived" | "error";
+  fetchStrategy: "query" | "all_recent" | "sender_allowlist" | "label";
+  lookbackDays: number;
+  maxMessagesPerSync: number;
+  maxEventsPerSync: number;
+  classifierMode: "rules" | "llm" | "hybrid";
+  minAutoLogConfidence: number;
+  minReviewConfidence: number;
   reviewBeforeLogging: boolean;
   createdBy: "system" | "user";
   lastSyncedAt?: Date;
@@ -315,6 +333,89 @@ export async function createExternalEventIfNotExists(
     created: true,
     event: await createEvent(userId, eventInput)
   };
+}
+
+export async function findGmailSemanticDuplicateEvent(
+  input: GmailSemanticEventDedupeInput
+): Promise<StoredEvent | undefined> {
+  await ensureUser(input.userId);
+
+  const subject = normalizeSemanticText(input.subject);
+  const from = normalizeEmailAddress(input.from);
+  const company = normalizeSemanticText(input.company);
+  const role = normalizeSemanticText(input.role);
+
+  if (!subject || !from) {
+    return undefined;
+  }
+
+  const events = await prisma.event.findMany({
+    where: {
+      userId: input.userId,
+      type: input.eventType,
+      source: "gmail",
+      provider: "gmail",
+      status: "active",
+      timestamp: {
+        gte: input.since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      }
+    },
+    orderBy: { timestamp: "desc" }
+  });
+
+  const duplicate = events.find((event) => {
+    const data = toRecord(event.data);
+
+    return (
+      data.ruleId === input.ruleId &&
+      normalizeSemanticText(readString(data.subject)) === subject &&
+      normalizeEmailAddress(readString(data.from)) === from &&
+      normalizeSemanticText(readString(data.company)) === company &&
+      normalizeSemanticText(readString(data.role)) === role
+    );
+  });
+
+  return duplicate ? toStoredEvent(duplicate) : undefined;
+}
+
+export async function findExternalEvent(
+  userId: string,
+  source: CreateEventInput["source"],
+  externalId: string
+): Promise<StoredEvent | undefined> {
+  await ensureUser(userId);
+
+  const event = await prisma.event.findUnique({
+    where: {
+      userId_source_externalId: {
+        userId,
+        source,
+        externalId
+      }
+    }
+  });
+
+  return event ? toStoredEvent(event) : undefined;
+}
+
+function normalizeSemanticText(value?: string): string {
+  return (value ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s@.+-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeEmailAddress(value?: string): string {
+  const normalized = normalizeSemanticText(value);
+  const match = normalized.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/);
+  return match?.[0] ?? normalized;
+}
+
+function readString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
 }
 
 function shouldIgnoreArchivedCleanupEvent(
@@ -560,7 +661,7 @@ export async function createIntegrationSyncLog(input: {
 
 export async function createEmailSignalRule(
   userId: string,
-  input: CreateEmailSignalRuleInput & { query: string; createdBy?: "system" | "user" }
+  input: CreateEmailSignalRuleInput & { createdBy?: "system" | "user" }
 ): Promise<EmailSignalRule> {
   await ensureUser(userId);
 
@@ -572,6 +673,13 @@ export async function createEmailSignalRule(
       adapterId: input.adapterId,
       name: input.name,
       query: input.query,
+      fetchStrategy: input.fetchStrategy,
+      lookbackDays: input.lookbackDays,
+      maxMessagesPerSync: input.maxMessagesPerSync,
+      maxEventsPerSync: input.maxEventsPerSync,
+      classifierMode: input.classifierMode,
+      minAutoLogConfidence: input.minAutoLogConfidence,
+      minReviewConfidence: input.minReviewConfidence,
       reviewBeforeLogging: input.reviewBeforeLogging,
       createdBy: input.createdBy ?? "user"
     }
@@ -597,16 +705,30 @@ export async function getActiveEmailSignalRulesForConnection(
 ): Promise<EmailSignalRule[]> {
   await ensureUser(userId);
 
+  const connection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: connectionId,
+      userId
+    }
+  });
+
+  if (
+    !connection ||
+    connection.integrationId !== "gmail" ||
+    normalizeStatus(connection.status) !== "active"
+  ) {
+    return [];
+  }
+
   const rules = await prisma.emailSignalRule.findMany({
     where: {
       userId,
-      connectionId,
-      status: "active"
+      connectionId
     },
     orderBy: { updatedAt: "asc" }
   });
 
-  return rules.map(toEmailSignalRule);
+  return rules.map(toEmailSignalRule).filter((rule) => rule.status === "active");
 }
 
 export async function updateEmailSignalRule(
@@ -631,6 +753,15 @@ export async function updateEmailSignalRule(
     where: { id: ruleId },
     data: {
       status: input.status,
+      fetchStrategy: input.fetchStrategy,
+      query: input.query,
+      lookbackDays: input.lookbackDays,
+      maxMessagesPerSync: input.maxMessagesPerSync,
+      maxEventsPerSync: input.maxEventsPerSync,
+      classifierMode: input.classifierMode,
+      minAutoLogConfidence: input.minAutoLogConfidence,
+      minReviewConfidence: input.minReviewConfidence,
+      reviewBeforeLogging: input.reviewBeforeLogging,
       lastError: input.status === "active" ? null : existingRule.lastError
     }
   });
@@ -1529,7 +1660,7 @@ function toIntegrationConnection(
     id: connection.id,
     userId: connection.userId,
     integrationId: connection.integrationId,
-    status: connection.status as IntegrationConnection["status"],
+    status: normalizeIntegrationStatus(connection.status),
     config: toRecord(connection.config),
     lastSyncedAt: connection.lastSyncedAt ?? undefined,
     lastError: connection.lastError ?? undefined,
@@ -1560,15 +1691,58 @@ function toEmailSignalRule(rule: Prisma.EmailSignalRuleGetPayload<object>): Emai
     goalId: rule.goalId ?? undefined,
     adapterId: rule.adapterId,
     name: rule.name,
-    query: rule.query,
-    status: rule.status as EmailSignalRule["status"],
-    reviewBeforeLogging: rule.reviewBeforeLogging,
+    query: rule.query ?? undefined,
+    status: normalizeEmailRuleStatus(rule.status),
+    fetchStrategy: normalizeEmailFetchStrategy(rule.fetchStrategy),
+    lookbackDays: positiveIntOrDefault(rule.lookbackDays, 30),
+    maxMessagesPerSync: positiveIntOrDefault(rule.maxMessagesPerSync, 25),
+    maxEventsPerSync: positiveIntOrDefault(rule.maxEventsPerSync, 10),
+    classifierMode: normalizeEmailClassifierMode(rule.classifierMode),
+    minAutoLogConfidence: confidenceOrDefault(rule.minAutoLogConfidence, 0.9),
+    minReviewConfidence: confidenceOrDefault(rule.minReviewConfidence, 0.65),
+    reviewBeforeLogging: rule.reviewBeforeLogging ?? false,
     createdBy: rule.createdBy as EmailSignalRule["createdBy"],
     lastSyncedAt: rule.lastSyncedAt ?? undefined,
     lastError: rule.lastError ?? undefined,
     createdAt: rule.createdAt,
     updatedAt: rule.updatedAt
   };
+}
+
+function normalizeStatus(status: string | null | undefined): string {
+  return (status ?? "").trim().toLowerCase();
+}
+
+function normalizeIntegrationStatus(status: string | null | undefined): IntegrationConnection["status"] {
+  const normalized = normalizeStatus(status);
+  return normalized === "paused" || normalized === "error" || normalized === "archived" ? normalized : "active";
+}
+
+function normalizeEmailRuleStatus(status: string | null | undefined): EmailSignalRule["status"] {
+  const normalized = normalizeStatus(status);
+  if (!normalized || normalized === "active") {
+    return "active";
+  }
+
+  return normalized === "paused" || normalized === "error" ? normalized : "archived";
+}
+
+function normalizeEmailFetchStrategy(strategy: string | null | undefined): EmailSignalRule["fetchStrategy"] {
+  const normalized = normalizeStatus(strategy);
+  return normalized === "all_recent" || normalized === "sender_allowlist" || normalized === "label" ? normalized : "query";
+}
+
+function normalizeEmailClassifierMode(mode: string | null | undefined): EmailSignalRule["classifierMode"] {
+  const normalized = normalizeStatus(mode);
+  return normalized === "llm" || normalized === "hybrid" ? normalized : "rules";
+}
+
+function positiveIntOrDefault(value: number | null | undefined, defaultValue: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : defaultValue;
+}
+
+function confidenceOrDefault(value: number | null | undefined, defaultValue: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : defaultValue;
 }
 
 function toNotificationSettings(

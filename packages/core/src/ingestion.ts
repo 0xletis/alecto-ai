@@ -171,12 +171,12 @@ function classifyJobSearchText(text: string, source: IngestionSource): string {
     return "filtered_marketing";
   }
 
-  if (gmail && !hasStrongJobContext(text)) {
-    return "unknown";
-  }
-
   if (gmail && isApplicationActionRequired(text)) {
     return "application_action_required";
+  }
+
+  if (gmail && !hasStrongJobContext(text)) {
+    return "unknown";
   }
 
   if (isInterviewScheduled(text)) {

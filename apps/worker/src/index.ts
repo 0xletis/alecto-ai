@@ -398,6 +398,7 @@ interface IntegrationSyncResponse {
   repoActivityEvents?: number;
   repoSummaries?: IntegrationRepoSyncSummary[];
   emailSummaries?: EmailSyncSummary[];
+  errorStage?: GmailErrorStage;
 }
 
 interface IntegrationRepoSyncSummary {
@@ -409,7 +410,12 @@ interface IntegrationRepoSyncSummary {
 interface EmailSyncSummary {
   ruleId: string;
   adapterId: string;
-  query: string;
+  query?: string;
+  fetchStrategy: string;
+  classifierMode: string;
+  lookbackDays: number;
+  maxMessagesPerSync: number;
+  maxEventsPerSync: number;
   messagesFound: number;
   processed: number;
   ignoredUnknown: number;
@@ -417,10 +423,21 @@ interface EmailSyncSummary {
   needsReview: number;
   lowConfidenceIgnored: number;
   deduped: number;
+  semanticDeduped: number;
   archivedCleanupReprocessed: number;
+  skippedDueMaxEventsPerSync: number;
   eventsCreated: number;
   lastError?: string;
+  lastErrorStage?: GmailErrorStage;
 }
+
+type GmailErrorStage =
+  | "rule_loading"
+  | "token_refresh"
+  | "gmail_search"
+  | "gmail_message_fetch"
+  | "classification"
+  | "event_creation";
 
 interface InsightReport {
   headline: string;

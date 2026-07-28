@@ -131,6 +131,7 @@ Telegram commands:
 - `/enable_email_rule job_search goal=GOAL_ID`: attach the job-search email rule to a goal
 - `/pause_email_rule RULE_ID`: pause an email rule
 - `/resume_email_rule RULE_ID`: resume a paused email rule
+- `/set_email_rule_config RULE_ID key=value`: tune a rule, for example `maxMessagesPerSync=10 maxEventsPerSync=3 classifierMode=rules`
 - `/delete_email_rule RULE_ID`: archive an email rule
 - `/cleanup_gmail_rule_events RULE_ID`: archive active Gmail events created by one email rule
 - `/sync_gmail`: manually sync active Gmail rules
@@ -390,6 +391,9 @@ Expected:
 - Gmail is a generic readonly email source. It does not scan anything until the user connects Gmail and explicitly enables an email rule.
 - `job_search_email` is the first email adapter. It searches user-approved Gmail results for recruiter replies, interview scheduling, application confirmations, rejections, and offers, then feeds the existing `job_search_text` ingestion adapter.
 - Planned email adapters include work/client action emails, finance receipts, learning deadlines, and custom goal email signals.
+- Email rules control the fetch strategy, lookback window, classifier mode, message cap, event cap, and confidence thresholds. Supported fetch strategies are `query` and `all_recent`; `sender_allowlist` and `label` are reserved for later and fail safely.
+- Classifier modes are `rules`, `hybrid`, and `llm`. `rules` uses the deterministic classifier. `hybrid` currently falls back to rules when no LLM is available. `llm` does not crash without OpenAI; it marks the email for review instead of auto-logging.
+- Rule sync is capped by `maxMessagesPerSync` and `maxEventsPerSync`, creates at most one event per email, and only logs approved event types from the ontology.
 - Gmail OAuth tokens are stored in local Postgres JSON config for the MVP. They are never returned by the OAuth callback, `/my_integrations`, sync responses, or Telegram replies. Encrypt tokens before production.
 - Never commit `.env`. If OAuth tokens are leaked during local testing, revoke the Google app/session and reconnect Gmail.
 - `/sync_gmail` reports safe counters: messages found, processed, ignored, deduped, and events created. `/sync_gmail_debug` adds per-rule IDs and last errors without email bodies or tokens.
@@ -508,6 +512,8 @@ Telegram integration commands:
 /enable_email_rule job_search goal=GOAL_ID
 /pause_email_rule RULE_ID
 /resume_email_rule RULE_ID
+/set_email_rule_config RULE_ID maxMessagesPerSync=10 maxEventsPerSync=3 classifierMode=rules
+/set_email_rule_config RULE_ID fetchStrategy=all_recent lookbackDays=7
 /delete_email_rule RULE_ID
 /cleanup_gmail_rule_events RULE_ID
 /pause_integration CONNECTION_ID

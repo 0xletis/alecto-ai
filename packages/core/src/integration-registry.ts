@@ -23,17 +23,36 @@ export const GithubPublicConnectionInputSchema = z.object({
   includeRepoActivity: z.boolean().optional()
 });
 
+export const EmailFetchStrategySchema = z.enum(["query", "all_recent", "sender_allowlist", "label"]);
+export const EmailClassifierModeSchema = z.enum(["rules", "llm", "hybrid"]);
+
 export const CreateEmailSignalRuleInputSchema = z.object({
   connectionId: z.string().min(1),
   goalId: z.string().min(1).optional(),
   adapterId: z.string().min(1),
   name: z.string().min(1),
-  query: z.string().min(1).optional(),
+  query: z.string().min(1).nullable().optional(),
+  fetchStrategy: EmailFetchStrategySchema.default("query"),
+  lookbackDays: z.number().int().positive().default(30),
+  maxMessagesPerSync: z.number().int().positive().default(25),
+  maxEventsPerSync: z.number().int().positive().default(10),
+  classifierMode: EmailClassifierModeSchema.default("rules"),
+  minAutoLogConfidence: z.number().min(0).max(1).default(0.9),
+  minReviewConfidence: z.number().min(0).max(1).default(0.65),
   reviewBeforeLogging: z.boolean().default(false)
 });
 
 export const UpdateEmailSignalRuleInputSchema = z.object({
-  status: z.enum(["active", "paused"])
+  status: z.enum(["active", "paused"]).optional(),
+  fetchStrategy: EmailFetchStrategySchema.optional(),
+  query: z.string().min(1).nullable().optional(),
+  lookbackDays: z.number().int().positive().optional(),
+  maxMessagesPerSync: z.number().int().positive().optional(),
+  maxEventsPerSync: z.number().int().positive().optional(),
+  classifierMode: EmailClassifierModeSchema.optional(),
+  minAutoLogConfidence: z.number().min(0).max(1).optional(),
+  minReviewConfidence: z.number().min(0).max(1).optional(),
+  reviewBeforeLogging: z.boolean().optional()
 });
 
 export const UpdateIntegrationConnectionInputSchema = z.object({
@@ -42,6 +61,8 @@ export const UpdateIntegrationConnectionInputSchema = z.object({
 
 export type IntegrationDefinition = z.infer<typeof IntegrationDefinitionSchema>;
 export type GithubPublicConnectionInput = z.infer<typeof GithubPublicConnectionInputSchema>;
+export type EmailFetchStrategy = z.infer<typeof EmailFetchStrategySchema>;
+export type EmailClassifierMode = z.infer<typeof EmailClassifierModeSchema>;
 export type CreateEmailSignalRuleInput = z.infer<typeof CreateEmailSignalRuleInputSchema>;
 export type UpdateEmailSignalRuleInput = z.infer<typeof UpdateEmailSignalRuleInputSchema>;
 export type UpdateIntegrationConnectionInput = z.infer<typeof UpdateIntegrationConnectionInputSchema>;
