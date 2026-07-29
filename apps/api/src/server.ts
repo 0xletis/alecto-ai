@@ -50,7 +50,9 @@ import {
 } from "@operator-agent/core";
 import {
   analyzeMessageWithOpenAI,
+  classifyEmailWithLLM,
   composeResponseWithOpenAI,
+  JobSearchEmailAllowedEventTypes,
   polishInsightWithOpenAI,
   type OpenAIMessageAnalysis
 } from "@operator-agent/llm";
@@ -1669,6 +1671,11 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     ignoredUnknown: 0,
     filteredMarketing: 0,
     needsReview: 0,
+    llmClassified: 0,
+    llmUnavailable: 0,
+    llmErrors: 0,
+    llmNeedsReview: 0,
+    llmIgnored: 0,
     reviewItemsCreated: 0,
     reviewItemsAlreadyPending: 0,
     reviewItemsRejectedDeduped: 0,
@@ -1678,7 +1685,8 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     semanticDeduped: 0,
     archivedCleanupReprocessed: 0,
     skippedDueMaxEventsPerSync: 0,
-    eventsCreated: 0
+    eventsCreated: 0,
+    reviewCandidateDebug: []
   };
 }
 
@@ -1699,7 +1707,21 @@ async function syncEmailSignalRule(input: {
 
     const message = await withGmailStage("gmail_message_fetch", () => getGmailMessage(input.accessToken, messageId));
     const text = gmailMessageToText(message);
-    const classification = await withGmailStage("classification", () => classifyEmailForRule(input.rule, text));
+    const classificationResult = await withGmailStage("classification", () => classifyEmailForRule(input.rule, message, text));
+    const classification = classificationResult.classification;
+    if (classificationResult.llmStatus === "classified") {
+      summary.llmClassified += 1;
+      if (classification.decision === "needs_review") {
+        summary.llmNeedsReview += 1;
+      }
+      if (classification.decision === "ignore") {
+        summary.llmIgnored += 1;
+      }
+    } else if (classificationResult.llmStatus === "unavailable") {
+      summary.llmUnavailable += 1;
+    } else if (classificationResult.llmStatus === "error") {
+      summary.llmErrors += 1;
+    }
     summary.processed += 1;
 
     if (classification.reason === "filtered_marketing") {
@@ -1736,6 +1758,7 @@ async function syncEmailSignalRule(input: {
           classification
         })
       );
+      summary.reviewCandidateDebug.push(reviewResult.debug as EmailReviewCandidateDebug);
 
       if (reviewResult.status === "created") {
         summary.reviewItemsCreated += 1;
@@ -1751,12 +1774,12 @@ async function syncEmailSignalRule(input: {
         summary.reviewItemsRejectedDeduped += 1;
       } else if (
         reviewResult.status === "semantic_approved" ||
-        reviewResult.status === "semantic_archived" ||
         reviewResult.status === "approved_deduped" ||
-        reviewResult.status === "archived_deduped" ||
-        reviewResult.status === "active_event_deduped"
+        reviewResult.status === "archived_deduped"
       ) {
         summary.reviewItemsSemanticDeduped += 1;
+      } else if (reviewResult.status === "active_event_deduped") {
+        summary.semanticDeduped += 1;
       }
 
       continue;
@@ -1868,24 +1891,90 @@ async function fetchEmailMessageIds(accessToken: string, rule: EmailSignalRule):
   throw new GmailSyncError("GMAIL_SYNC_FAILED", "Fetch strategy not implemented yet.", "gmail_search");
 }
 
-async function classifyEmailForRule(rule: EmailSignalRule, text: string) {
-  if (rule.adapterId !== "job_search_email") {
-    return classifyJobSearchEmail({
-      text,
-      classifierMode: rule.classifierMode,
-      llmAvailable: Boolean(process.env.OPENAI_API_KEY)
-    });
-  }
-
-  if (rule.classifierMode === "llm" && !process.env.OPENAI_API_KEY) {
-    return classifyJobSearchEmail({ text, classifierMode: "llm", llmAvailable: false });
-  }
-
-  return classifyJobSearchEmail({
+async function classifyEmailForRule(
+  rule: EmailSignalRule,
+  message: GmailMessage,
+  text: string
+): Promise<{ classification: ReturnType<typeof classifyJobSearchEmail>; llmStatus?: "classified" | "unavailable" | "error" }> {
+  const rulesClassification = classifyJobSearchEmail({
     text,
-    classifierMode: rule.classifierMode,
-    llmAvailable: Boolean(process.env.OPENAI_API_KEY)
+    classifierMode: "rules",
+    llmAvailable: false
   });
+
+  if (rule.adapterId !== "job_search_email") {
+    return { classification: rulesClassification };
+  }
+
+  if (isHardEmailClassification(rulesClassification)) {
+    return { classification: rulesClassification };
+  }
+
+  if (rule.classifierMode === "rules") {
+    return { classification: rulesClassification };
+  }
+
+  if (rule.classifierMode === "hybrid" && rulesClassification.decision === "log_event" && rulesClassification.confidence >= rule.minAutoLogConfidence) {
+    return { classification: rulesClassification };
+  }
+
+  if (
+    rule.classifierMode === "hybrid" &&
+    rulesClassification.reason !== "unknown" &&
+    !(rulesClassification.decision === "log_event" && rulesClassification.confidence < rule.minAutoLogConfidence)
+  ) {
+    return { classification: rulesClassification };
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    if (rule.classifierMode === "llm") {
+      return {
+        classification: classifyJobSearchEmail({ text, classifierMode: "llm", llmAvailable: false }),
+        llmStatus: "unavailable"
+      };
+    }
+
+    return { classification: rulesClassification, llmStatus: "unavailable" };
+  }
+
+  try {
+    const llmClassification = await classifyEmailWithLLM({
+      adapterId: "job_search_email",
+      source: "gmail",
+      subject: getGmailHeader(message, "subject"),
+      from: getGmailHeader(message, "from"),
+      snippet: message.snippet,
+      bodyText: text,
+      allowedEventTypes: JobSearchEmailAllowedEventTypes,
+      classifierMode: rule.classifierMode === "llm" ? "llm" : "hybrid",
+      minAutoLogConfidence: rule.minAutoLogConfidence,
+      minReviewConfidence: rule.minReviewConfidence
+    });
+
+    return { classification: llmClassification, llmStatus: "classified" };
+  } catch {
+    return {
+      classification: {
+        decision: rule.classifierMode === "llm" ? "needs_review" : rulesClassification.decision,
+        eventType: undefined,
+        confidence: rule.classifierMode === "llm" ? rule.minReviewConfidence : rulesClassification.confidence,
+        reason: "LLM classifier failed.",
+        evidence: text.slice(0, 300),
+        extracted: {},
+        metadata: {
+          classifierMode: rule.classifierMode,
+          adapterId: "job_search_email",
+          source: "gmail",
+          classifier: "llm"
+        }
+      },
+      llmStatus: "error"
+    };
+  }
+}
+
+function isHardEmailClassification(classification: ReturnType<typeof classifyJobSearchEmail>): boolean {
+  return classification.reason === "filtered_marketing" || classification.reason === "application_action_required";
 }
 
 async function createEmailReviewItemForClassification(input: {
@@ -1898,9 +1987,27 @@ async function createEmailReviewItemForClassification(input: {
   const subject = getGmailHeader(input.message, "subject");
   const from = getGmailHeader(input.message, "from");
   const reviewExternalId = `gmail-review:${input.rule.id}:${input.message.id}`;
-  const proposedEventType = input.classification.eventType ?? input.classification.reason;
+  const proposedEventType = input.classification.eventType ?? safeEmailReviewProposedType(input.classification.reason);
   const company = typeof input.classification.extracted.company === "string" ? input.classification.extracted.company : undefined;
   const role = typeof input.classification.extracted.role === "string" ? input.classification.extracted.role : undefined;
+  const semanticKey = buildEmailReviewSemanticKey({
+    userId: input.userId,
+    ruleId: input.rule.id,
+    provider: "gmail",
+    proposedEventType,
+    subject,
+    from,
+    company,
+    role
+  });
+  const baseDebug = {
+    subject: truncatePlainText(subject ?? "", 120),
+    from: truncatePlainText(from ?? "", 120),
+    proposedEventType,
+    company,
+    role,
+    semanticKey
+  };
 
   if (EventTypeSchema.safeParse(proposedEventType).success) {
     const activeEvent = await findGmailSemanticDuplicateEvent({
@@ -1914,7 +2021,15 @@ async function createEmailReviewItemForClassification(input: {
     });
 
     if (activeEvent) {
-      return { status: "active_event_deduped" as const, event: activeEvent };
+      return {
+        status: "active_event_deduped" as const,
+        event: activeEvent,
+        debug: {
+          ...baseDebug,
+          decision: "active_event_exists",
+          matchedEventId: activeEvent.id
+        }
+      };
     }
   }
 
@@ -1932,18 +2047,45 @@ async function createEmailReviewItemForClassification(input: {
 
   if (semanticReview) {
     if (semanticReview.status === "pending") {
-      return { status: "semantic_pending" as const, item: semanticReview };
+      return {
+        status: "semantic_pending" as const,
+        item: semanticReview,
+        debug: {
+          ...baseDebug,
+          decision: "existing_pending",
+          matchedReviewId: semanticReview.id,
+          matchedReviewStatus: semanticReview.status
+        }
+      };
     }
 
     if (semanticReview.status === "rejected") {
-      return { status: "semantic_rejected" as const, item: semanticReview };
+      return {
+        status: "semantic_rejected" as const,
+        item: semanticReview,
+        debug: {
+          ...baseDebug,
+          decision: "existing_rejected",
+          matchedReviewId: semanticReview.id,
+          matchedReviewStatus: semanticReview.status
+        }
+      };
     }
 
     if (semanticReview.status === "approved") {
-      return { status: "semantic_approved" as const, item: semanticReview };
+      return {
+        status: "semantic_approved" as const,
+        item: semanticReview,
+        debug: {
+          ...baseDebug,
+          decision: "existing_approved",
+          matchedReviewId: semanticReview.id,
+          matchedReviewStatus: semanticReview.status
+        }
+      };
     }
 
-    return upsertEmailReviewItem({
+    const created = await upsertEmailReviewItem({
       userId: input.userId,
       connectionId: input.connectionId,
       ruleId: input.rule.id,
@@ -1960,9 +2102,19 @@ async function createEmailReviewItemForClassification(input: {
       reason: input.classification.reason,
       extracted: input.classification.extracted
     });
+
+    return {
+      ...created,
+      debug: {
+        ...baseDebug,
+        decision: created.status === "created" ? "created" : "archived_ignored",
+        matchedReviewId: semanticReview.id,
+        matchedReviewStatus: semanticReview.status
+      }
+    };
   }
 
-  return upsertEmailReviewItem({
+  const created = await upsertEmailReviewItem({
     userId: input.userId,
     connectionId: input.connectionId,
     ruleId: input.rule.id,
@@ -1979,6 +2131,78 @@ async function createEmailReviewItemForClassification(input: {
     reason: input.classification.reason,
     extracted: input.classification.extracted
   });
+
+  return {
+    ...created,
+    debug: {
+      ...baseDebug,
+      decision: created.status === "created" ? "created" : dedupeDecisionForReviewStatus(created.status),
+      matchedReviewId: "item" in created ? created.item.id : undefined,
+      matchedReviewStatus: "item" in created ? created.item.status : undefined
+    }
+  };
+}
+
+function safeEmailReviewProposedType(reason: string): string | undefined {
+  return ["application_action_required", "security_code", "verify_email"].includes(reason) ? reason : undefined;
+}
+
+function dedupeDecisionForReviewStatus(status: string): EmailReviewCandidateDebug["decision"] {
+  if (status === "already_pending") {
+    return "existing_pending";
+  }
+
+  if (status === "rejected_deduped") {
+    return "existing_rejected";
+  }
+
+  if (status === "approved_deduped") {
+    return "existing_approved";
+  }
+
+  if (status === "archived_deduped") {
+    return "archived_ignored";
+  }
+
+  return "invalid_ignored";
+}
+
+function buildEmailReviewSemanticKey(input: {
+  userId: string;
+  ruleId: string;
+  provider: "gmail";
+  proposedEventType?: string;
+  subject?: string;
+  from?: string;
+  company?: string;
+  role?: string;
+}): string {
+  return [
+    input.userId,
+    input.ruleId,
+    input.provider,
+    input.proposedEventType ?? "none",
+    normalizeDebugSemanticText(input.subject),
+    normalizeDebugEmailAddress(input.from),
+    normalizeDebugSemanticText(input.company),
+    normalizeDebugSemanticText(input.role)
+  ].join("|");
+}
+
+function normalizeDebugSemanticText(value?: string): string {
+  return (value ?? "")
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s@.+-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeDebugEmailAddress(value?: string): string {
+  const normalized = normalizeDebugSemanticText(value);
+  const match = normalized.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/);
+  return match?.[0] ?? normalized;
 }
 
 function sanitizeIntegrationConnection(connection: IntegrationConnection) {
@@ -4179,6 +4403,11 @@ interface EmailRuleSyncSummary {
   ignoredUnknown: number;
   filteredMarketing: number;
   needsReview: number;
+  llmClassified: number;
+  llmUnavailable: number;
+  llmErrors: number;
+  llmNeedsReview: number;
+  llmIgnored: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsRejectedDeduped: number;
@@ -4191,6 +4420,27 @@ interface EmailRuleSyncSummary {
   eventsCreated: number;
   lastError?: string;
   lastErrorStage?: GmailErrorStage;
+  reviewCandidateDebug: EmailReviewCandidateDebug[];
+}
+
+interface EmailReviewCandidateDebug {
+  subject?: string;
+  from?: string;
+  proposedEventType?: string;
+  company?: string;
+  role?: string;
+  decision:
+    | "created"
+    | "existing_pending"
+    | "existing_rejected"
+    | "existing_approved"
+    | "active_event_exists"
+    | "archived_ignored"
+    | "invalid_ignored";
+  matchedReviewId?: string;
+  matchedReviewStatus?: string;
+  matchedEventId?: string;
+  semanticKey: string;
 }
 
 interface EmailRuleDiagnostics {

@@ -1872,7 +1872,11 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
   const ruleLines =
     response.emailSummaries?.map(
       (summary) =>
-        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, review created ${summary.reviewItemsCreated}, review pending ${summary.reviewItemsAlreadyPending}, review semantic deduped ${summary.reviewItemsSemanticDeduped}, review rejected/deduped ${summary.reviewItemsRejectedDeduped}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
+        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, llm classified ${summary.llmClassified}, llm unavailable ${summary.llmUnavailable}, llm errors ${summary.llmErrors}, llm needs review ${summary.llmNeedsReview}, llm ignored ${summary.llmIgnored}, review created ${summary.reviewItemsCreated}, review pending ${summary.reviewItemsAlreadyPending}, review semantic deduped ${summary.reviewItemsSemanticDeduped}, review rejected/deduped ${summary.reviewItemsRejectedDeduped}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
+    ) ?? [];
+  const candidateLines =
+    response.emailSummaries?.flatMap((summary) =>
+      (summary.reviewCandidateDebug ?? []).slice(0, 12).map(formatEmailReviewCandidateDebug)
     ) ?? [];
 
   return [
@@ -1899,6 +1903,11 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
     `semantic deduped: ${totals.semanticDeduped}`,
     `archived cleanup reprocessed: ${totals.archivedCleanupReprocessed}`,
     `needs review: ${totals.needsReview}`,
+    `llm classified: ${totals.llmClassified}`,
+    `llm unavailable: ${totals.llmUnavailable}`,
+    `llm errors: ${totals.llmErrors}`,
+    `llm needs review: ${totals.llmNeedsReview}`,
+    `llm ignored: ${totals.llmIgnored}`,
     `review items created: ${totals.reviewItemsCreated}`,
     `review items already pending: ${totals.reviewItemsAlreadyPending}`,
     `review semantic deduped: ${totals.reviewItemsSemanticDeduped}`,
@@ -1912,10 +1921,28 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
     ...(response.emailRuleDiagnostics?.rejectedRuleReasons.length
       ? response.emailRuleDiagnostics.rejectedRuleReasons.map((reason) => `rule not loaded: ${reason}`)
       : []),
-    ...ruleLines
+    ...ruleLines,
+    ...candidateLines
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatEmailReviewCandidateDebug(candidate: EmailReviewCandidateDebug): string {
+  return [
+    `review candidate: ${candidate.decision}`,
+    candidate.subject ? `subject=${truncateText(candidate.subject, 80)}` : undefined,
+    candidate.from ? `from=${truncateText(candidate.from, 80)}` : undefined,
+    candidate.proposedEventType ? `type=${candidate.proposedEventType}` : undefined,
+    candidate.company ? `company=${truncateText(candidate.company, 60)}` : undefined,
+    candidate.role ? `role=${truncateText(candidate.role, 60)}` : undefined,
+    candidate.matchedReviewId ? `matchedReviewId=${candidate.matchedReviewId}` : undefined,
+    candidate.matchedReviewStatus ? `matchedReviewStatus=${candidate.matchedReviewStatus}` : undefined,
+    candidate.matchedEventId ? `matchedEventId=${candidate.matchedEventId}` : undefined,
+    `semanticKey=${truncateText(candidate.semanticKey, 220)}`
+  ]
+    .filter(Boolean)
+    .join(" | ");
 }
 
 function gmailSyncTotals(summaries: EmailSyncSummary[]) {
@@ -1926,6 +1953,11 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       ignoredUnknown: totals.ignoredUnknown + summary.ignoredUnknown,
       filteredMarketing: totals.filteredMarketing + summary.filteredMarketing,
       needsReview: totals.needsReview + summary.needsReview,
+      llmClassified: totals.llmClassified + summary.llmClassified,
+      llmUnavailable: totals.llmUnavailable + summary.llmUnavailable,
+      llmErrors: totals.llmErrors + summary.llmErrors,
+      llmNeedsReview: totals.llmNeedsReview + summary.llmNeedsReview,
+      llmIgnored: totals.llmIgnored + summary.llmIgnored,
       reviewItemsCreated: totals.reviewItemsCreated + summary.reviewItemsCreated,
       reviewItemsAlreadyPending: totals.reviewItemsAlreadyPending + summary.reviewItemsAlreadyPending,
       reviewItemsSemanticDeduped: totals.reviewItemsSemanticDeduped + summary.reviewItemsSemanticDeduped,
@@ -1943,6 +1975,11 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       ignoredUnknown: 0,
       filteredMarketing: 0,
       needsReview: 0,
+      llmClassified: 0,
+      llmUnavailable: 0,
+      llmErrors: 0,
+      llmNeedsReview: 0,
+      llmIgnored: 0,
       reviewItemsCreated: 0,
       reviewItemsAlreadyPending: 0,
       reviewItemsSemanticDeduped: 0,
@@ -2989,6 +3026,11 @@ interface EmailSyncSummary {
   ignoredUnknown: number;
   filteredMarketing: number;
   needsReview: number;
+  llmClassified: number;
+  llmUnavailable: number;
+  llmErrors: number;
+  llmNeedsReview: number;
+  llmIgnored: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsSemanticDeduped: number;
@@ -3001,6 +3043,27 @@ interface EmailSyncSummary {
   eventsCreated: number;
   lastError?: string;
   lastErrorStage?: GmailErrorStage;
+  reviewCandidateDebug?: EmailReviewCandidateDebug[];
+}
+
+interface EmailReviewCandidateDebug {
+  subject?: string;
+  from?: string;
+  proposedEventType?: string;
+  company?: string;
+  role?: string;
+  decision:
+    | "created"
+    | "existing_pending"
+    | "existing_rejected"
+    | "existing_approved"
+    | "active_event_exists"
+    | "archived_ignored"
+    | "invalid_ignored";
+  matchedReviewId?: string;
+  matchedReviewStatus?: string;
+  matchedEventId?: string;
+  semanticKey: string;
 }
 
 interface EmailRuleDiagnostics {

@@ -421,6 +421,11 @@ interface EmailSyncSummary {
   ignoredUnknown: number;
   filteredMarketing: number;
   needsReview: number;
+  llmClassified: number;
+  llmUnavailable: number;
+  llmErrors: number;
+  llmNeedsReview: number;
+  llmIgnored: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsSemanticDeduped: number;
@@ -433,6 +438,7 @@ interface EmailSyncSummary {
   eventsCreated: number;
   lastError?: string;
   lastErrorStage?: GmailErrorStage;
+  reviewCandidateDebug?: unknown[];
 }
 
 type GmailErrorStage =

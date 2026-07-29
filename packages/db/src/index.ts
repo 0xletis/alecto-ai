@@ -488,8 +488,7 @@ export async function findGmailSemanticDuplicateReviewItem(
   const duplicate =
     matches.find((item) => normalizeEmailReviewStatus(item.status) === "pending") ??
     matches.find((item) => normalizeEmailReviewStatus(item.status) === "rejected") ??
-    matches.find((item) => normalizeEmailReviewStatus(item.status) === "approved") ??
-    matches.find((item) => normalizeEmailReviewStatus(item.status) === "archived");
+    matches.find((item) => normalizeEmailReviewStatus(item.status) === "approved");
 
   return duplicate ? toEmailReviewItem(duplicate) : undefined;
 }

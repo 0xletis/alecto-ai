@@ -11,7 +11,8 @@
     "dev:api": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && pnpm --filter @operator-agent/core build && pnpm --filter @operator-agent/db build && pnpm --filter @operator-agent/llm build && pnpm --filter @operator-agent/api dev",
     "dev:telegram": "pnpm --filter @operator-agent/telegram-bot dev",
     "dev:worker": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && pnpm --filter @operator-agent/core build && pnpm --filter @operator-agent/db build && pnpm --filter @operator-agent/worker dev",
-    "typecheck": "pnpm -r typecheck"
+    "typecheck": "pnpm -r typecheck",
+    "test": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && tsx --test tests/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

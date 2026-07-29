@@ -19,7 +19,8 @@ export const EmailClassificationSchema = z.object({
   metadata: z.object({
     classifierMode: z.enum(["rules", "llm", "hybrid"]),
     adapterId: z.string(),
-    source: z.literal("gmail")
+    source: z.literal("gmail"),
+    classifier: z.enum(["rules", "llm"]).optional()
   })
 });
 
@@ -44,7 +45,8 @@ export function classifyJobSearchEmail(input: ClassifyJobSearchEmailInput): Emai
       metadata: {
         classifierMode,
         adapterId: "job_search_email",
-        source: "gmail"
+        source: "gmail",
+        classifier: "llm"
       }
     });
   }
@@ -82,15 +84,8 @@ export function classifyJobSearchEmail(input: ClassifyJobSearchEmailInput): Emai
     metadata: {
       classifierMode: classifierMode === "hybrid" ? "rules" : classifierMode,
       adapterId: "job_search_email",
-      source: "gmail"
+      source: "gmail",
+      classifier: "rules"
     }
-  });
-}
-
-export async function classifyEmailWithLLM(input: ClassifyJobSearchEmailInput): Promise<EmailClassification> {
-  return classifyJobSearchEmail({
-    ...input,
-    classifierMode: "llm",
-    llmAvailable: false
   });
 }
