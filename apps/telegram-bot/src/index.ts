@@ -102,7 +102,8 @@ bot.command("remember", async (ctx) => {
       type: inferMemoryType(text),
       summary: normalizeMemorySummary(text)
     });
-    await ctx.reply("Saved to memory.");
+    const actionResponse = await tryCreateManualAction(ctx, text);
+    await ctx.reply(actionResponse ? ["Saved to memory.", actionResponse.message].join("\n") : "Saved to memory.");
   } catch (error) {
     await replyWithApiFailure(ctx, error, "I could not save that memory right now.");
   }
@@ -671,6 +672,34 @@ bot.command("cleanup_email_reviews", async (ctx) => {
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
   }
+});
+
+bot.command("action_help", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  await ctx.reply(
+    [
+      "Action examples:",
+      "- /action review homepage copy tomorrow",
+      "- /todo apply to 2 jobs tonight",
+      "- /add_action send the CV by Friday",
+      "- remind me to call Alex Friday"
+    ].join("\n")
+  );
+});
+
+bot.command("action", async (ctx) => {
+  await createManualActionFromCommand(ctx, "/action");
+});
+
+bot.command("todo", async (ctx) => {
+  await createManualActionFromCommand(ctx, "/todo");
+});
+
+bot.command("add_action", async (ctx) => {
+  await createManualActionFromCommand(ctx, "/add_action");
 });
 
 bot.command("actions", async (ctx) => {
@@ -2702,6 +2731,38 @@ function formatAction(action: ActionItem): string {
     .join("\n");
 }
 
+async function createManualActionFromCommand(ctx: Context, commandName: string) {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply(`Usage: ${commandName} review homepage copy tomorrow`);
+    return;
+  }
+
+  try {
+    const response = await apiPost<ManualActionResponse>(`/users/${getTelegramUserId(ctx)}/actions/manual`, {
+      text
+    });
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not create that action item.");
+  }
+}
+
+async function tryCreateManualAction(ctx: Context, text: string): Promise<ManualActionResponse | undefined> {
+  try {
+    return await apiPost<ManualActionResponse>(`/users/${getTelegramUserId(ctx)}/actions/manual`, {
+      text
+    });
+  } catch {
+    return undefined;
+  }
+}
+
 function parseSnoozeActionCommand(text: string): { actionId: string; snoozedUntil: Date } | undefined {
   const [actionId, value] = text.trim().split(/\s+/, 2);
 
@@ -3202,6 +3263,26 @@ interface ActionMutationResponse {
   message?: string;
 }
 
+interface ManualActionResponse {
+  action?: ActionItem;
+  duplicate: boolean;
+  extraction: {
+    shouldCreateAction: boolean;
+    confidence: number;
+    title?: string;
+    description?: string;
+    dueAt?: string;
+    dueText?: string;
+    priority: "low" | "medium" | "high";
+    project?: string;
+    actionType: "manual" | "reminder" | "follow_up" | "deadline" | "generic";
+    needsConfirmation: boolean;
+    reason: string;
+    evidence: string;
+  };
+  message: string;
+}
+
 interface EmailReviewCleanupResponse {
   count: number;
   emailReviews: EmailReviewItem[];
@@ -3557,7 +3638,16 @@ interface ActionItem {
   priority: "low" | "medium" | "high";
   dueAt?: string;
   project?: string;
-  actionType?: "work_action_required" | "work_deadline_detected" | "work_follow_up_requested" | "work_project_update_detected" | "generic";
+  actionType?:
+    | "work_action_required"
+    | "work_deadline_detected"
+    | "work_follow_up_requested"
+    | "work_project_update_detected"
+    | "manual"
+    | "reminder"
+    | "follow_up"
+    | "deadline"
+    | "generic";
   evidence?: string;
   createdAt: string;
   updatedAt: string;

@@ -205,7 +205,16 @@ export interface ActionItem {
   priority: "low" | "medium" | "high";
   dueAt?: Date;
   project?: string;
-  actionType?: "work_action_required" | "work_deadline_detected" | "work_follow_up_requested" | "work_project_update_detected" | "generic";
+  actionType?:
+    | "work_action_required"
+    | "work_deadline_detected"
+    | "work_follow_up_requested"
+    | "work_project_update_detected"
+    | "manual"
+    | "reminder"
+    | "follow_up"
+    | "deadline"
+    | "generic";
   evidence?: string;
   createdAt: Date;
   updatedAt: Date;
@@ -1251,6 +1260,29 @@ export async function createActionItemIfNotExists(
   });
 
   return { created: true, actionItem: toActionItem(actionItem) };
+}
+
+export async function createActionItem(userId: string, input: CreateActionItemInput): Promise<ActionItem> {
+  await ensureUser(userId);
+
+  const actionItem = await prisma.actionItem.create({
+    data: {
+      userId,
+      source: input.source,
+      sourceId: input.sourceId,
+      sourceProvider: input.sourceProvider,
+      sourceRuleId: input.sourceRuleId,
+      title: input.title,
+      description: input.description,
+      priority: input.priority ?? "medium",
+      dueAt: input.dueAt,
+      project: input.project,
+      actionType: input.actionType ?? "generic",
+      evidence: input.evidence
+    }
+  });
+
+  return toActionItem(actionItem);
 }
 
 export async function getActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
@@ -2419,6 +2451,10 @@ function normalizeActionItemType(actionType: string | null | undefined): ActionI
     normalized === "work_deadline_detected" ||
     normalized === "work_follow_up_requested" ||
     normalized === "work_project_update_detected" ||
+    normalized === "manual" ||
+    normalized === "reminder" ||
+    normalized === "follow_up" ||
+    normalized === "deadline" ||
     normalized === "generic"
   ) {
     return normalized;

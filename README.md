@@ -139,6 +139,10 @@ Telegram commands:
 - `/email_reviews all`: show recent pending/approved/rejected email review items
 - `/approve_email_review REVIEW_ID`: approve a pending email review item; core career reviews create events, work-action reviews create action items
 - `/reject_email_review REVIEW_ID`: reject a pending email review item
+- `/action_help`: show manual action examples
+- `/action review homepage copy tomorrow`: create a manual action item
+- `/todo apply to 2 jobs tonight`: create a manual action item
+- `/add_action send the CV by Friday`: create a manual action item
 - `/actions`: show open action items
 - `/actions all`: show recent open/completed/snoozed/archived action items
 - `/complete_action ACTION_ID`: mark an action item completed
@@ -414,7 +418,9 @@ Expected:
 - Gmail emails below auto-log confidence are not logged automatically. Uncertain messages count as `needs review`; weak matches count as low-confidence ignored or unknown.
 - Gmail `needs_review` classifications create pending email review items. Approving only creates an event when the proposed event type is already in the core ontology.
 - `work_action_email` reviews are different: approving `work_action_required`, `work_deadline_detected`, `work_follow_up_requested`, or `work_project_update_detected` creates an ActionItem, not an Event.
-- ActionItems are things to do. Events are things that happened. Use `/actions`, `/complete_action`, `/snooze_action`, and `/archive_action` to manage open work items.
+- ActionItems are things to do. Events are things that happened. Use `/action`, `/todo`, `/add_action`, `/actions`, `/complete_action`, `/snooze_action`, and `/archive_action` to manage open work items.
+- Natural concrete task messages such as `I need to review homepage copy tomorrow` or `remind me to call Alex Friday` create manual ActionItems. Vague reflections and betting/trading reminders do not create actions.
+- `/remember` still saves memory. If the remembered text clearly contains a concrete future task, Alecto also creates or reuses a manual ActionItem.
 - Use `/cleanup_gmail_rule_events RULE_ID` to archive test Gmail events from one rule without deleting historical data.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Explicit memory phrases like `remember that`, `recuerda que`, or `guarda que` create visible memories immediately and reply `Saved to memory.`
@@ -609,6 +615,7 @@ Manual insight tests:
 - `POST /users/:userId/email-reviews/:reviewId/reject`
 - `GET /users/:userId/actions`
 - `GET /users/:userId/actions?status=all`
+- `POST /users/:userId/actions/manual`
 - `PATCH /users/:userId/actions/:actionId/complete`
 - `PATCH /users/:userId/actions/:actionId/snooze`
 - `PATCH /users/:userId/actions/:actionId/archive`

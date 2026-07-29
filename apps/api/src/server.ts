@@ -16,6 +16,8 @@ import {
   DailyCheckInTextInputSchema,
   EventTypeSchema,
   eventRegistry,
+  extractManualAction,
+  normalizeManualActionTitleKey,
   extractEvents,
   findGoalDuplicateWarnings,
   getGoalTemplate,
@@ -72,6 +74,7 @@ import {
   createGoal,
   createGmailConnection,
   createEmailSignalRule,
+  createActionItem,
   createActionItemIfNotExists,
   createMemory,
   createMemoryFromPendingPayload,
@@ -211,7 +214,12 @@ export function buildServer() {
         }
       });
 
-      return replyOnly(parsed.data.userId, parsed.data.message, "Saved to memory.");
+      const actionResult = await maybeCreateManualActionFromText(parsed.data.userId, explicitMemory.summary);
+      const replyText = actionResult.extraction.shouldCreateAction
+        ? ["Saved to memory.", formatActionCreatedReply(actionResult)].join("\n")
+        : "Saved to memory.";
+
+      return replyOnly(parsed.data.userId, parsed.data.message, replyText);
     }
 
     const recentEvents = await getRecentEvents(parsed.data.userId, 50);
@@ -223,6 +231,11 @@ export function buildServer() {
       recentEvents,
       userOperatingProfile
     };
+    const manualActionResult = await maybeCreateManualActionFromText(parsed.data.userId, parsed.data.message);
+
+    if (manualActionResult.extraction.shouldCreateAction) {
+      return replyOnly(parsed.data.userId, parsed.data.message, formatActionCreatedReply(manualActionResult));
+    }
 
     const naturalCustomProgress = detectNaturalCustomProgress(parsed.data.message, activeGoals);
 
@@ -1023,6 +1036,34 @@ export function buildServer() {
     }
   );
 
+  server.post<{ Params: { userId: string } }>(
+    "/users/:userId/actions/manual",
+    async (request, reply) => {
+      const body = isRecord(request.body) ? request.body : {};
+      const text = typeof body.text === "string" ? body.text : "";
+
+      if (!text.trim()) {
+        return reply.status(400).send({ error: "Action text is required." });
+      }
+
+      const result = await maybeCreateManualActionFromText(request.params.userId, text, { forceActionIntent: true });
+
+      if (!result.extraction.shouldCreateAction) {
+        return reply.status(400).send({
+          error: "I could not turn that into a concrete action item.",
+          extraction: result.extraction
+        });
+      }
+
+      return {
+        action: result.action ? sanitizeActionItem(result.action) : undefined,
+        duplicate: result.duplicate,
+        extraction: result.extraction,
+        message: formatActionCreatedReply(result)
+      };
+    }
+  );
+
   server.patch<{ Params: { userId: string; actionId: string } }>(
     "/users/:userId/actions/:actionId/complete",
     async (request, reply) => {
@@ -1499,13 +1540,31 @@ function buildOperatorTopPriorities(input: {
   goalStatus: DailyOperatorBriefGoalStatus[];
   risks: string[];
 }): string[] {
-  const priorities = [
-    ...input.overdueActions.map((action) => `Overdue: ${action.title}`),
-    ...input.dueSoonActions.map((action) => `Due soon: ${action.title}`),
-    ...input.openActions.map((action) => action.title),
-    ...input.goalStatus.filter((goal) => goal.status === "no_progress").map((goal) => `Log progress for ${goal.title}`),
-    ...input.risks.slice(0, 1)
-  ];
+  const priorities: string[] = [];
+  const seenActionIds = new Set<string>();
+  const seenActionTitles = new Set<string>();
+
+  const addActionPriority = (action: ActionItem, label?: string) => {
+    const titleKey = normalizeManualActionTitleKey(action.title);
+
+    if (seenActionIds.has(action.id) || seenActionTitles.has(titleKey)) {
+      return;
+    }
+
+    seenActionIds.add(action.id);
+    seenActionTitles.add(titleKey);
+    priorities.push(label ? `${label}: ${action.title}` : action.title);
+  };
+
+  input.overdueActions.forEach((action) => addActionPriority(action, "Overdue"));
+  input.dueSoonActions.forEach((action) => addActionPriority(action, "Due soon"));
+  input.openActions.forEach((action) => addActionPriority(action));
+
+  for (const goal of input.goalStatus.filter((item) => item.status === "no_progress")) {
+    priorities.push(`Log progress for ${goal.title}`);
+  }
+
+  priorities.push(...input.risks.slice(0, 1));
 
   return uniqueStrings(priorities).slice(0, 3);
 }
@@ -1717,6 +1776,94 @@ function uniqueStrings(values: Array<string | undefined>): string[] {
 
 function formatLocalDate(date: Date): string {
   return date.toISOString().slice(0, 10);
+}
+
+async function maybeCreateManualActionFromText(
+  userId: string,
+  text: string,
+  options: { forceActionIntent?: boolean } = {}
+): Promise<{
+  extraction: ReturnType<typeof extractManualAction>;
+  action?: ActionItem;
+  duplicate: boolean;
+}> {
+  const extraction = extractManualAction({ text }, { forceActionIntent: options.forceActionIntent });
+
+  if (!extraction.shouldCreateAction || !extraction.title) {
+    return { extraction, duplicate: false };
+  }
+
+  const duplicate = await findDuplicateManualAction(userId, extraction.title, extraction.dueAt);
+
+  if (duplicate) {
+    return {
+      extraction,
+      action: duplicate,
+      duplicate: true
+    };
+  }
+
+  const description = [extraction.description, extraction.dueText && !extraction.dueAt ? `Due: ${extraction.dueText}.` : undefined]
+    .filter(Boolean)
+    .join(" ");
+  const action = await createActionItem(userId, {
+    source: "manual",
+    title: extraction.title,
+    description: description || undefined,
+    priority: extraction.priority,
+    dueAt: extraction.dueAt,
+    project: extraction.project,
+    actionType: extraction.actionType,
+    evidence: extraction.evidence
+  });
+
+  return {
+    extraction,
+    action,
+    duplicate: false
+  };
+}
+
+async function findDuplicateManualAction(userId: string, title: string, dueAt?: Date): Promise<ActionItem | undefined> {
+  const actions = await getRecentActionItems(userId, 100);
+  const titleKey = normalizeManualActionTitleKey(title);
+  const dueKey = dueAt ? formatLocalDate(dueAt) : "";
+
+  return actions.find((action) => {
+    if (action.source !== "manual" || (action.status !== "open" && action.status !== "snoozed")) {
+      return false;
+    }
+
+    const actionDueKey = action.dueAt ? formatLocalDate(action.dueAt) : "";
+    return normalizeManualActionTitleKey(action.title) === titleKey && actionDueKey === dueKey;
+  });
+}
+
+function formatActionCreatedReply(input: {
+  extraction: ReturnType<typeof extractManualAction>;
+  action?: ActionItem;
+  duplicate: boolean;
+}): string {
+  if (!input.action) {
+    return "I could not turn that into a concrete action item.";
+  }
+
+  const dueLine = input.action.dueAt
+    ? `due: ${input.extraction.dueText ?? formatLocalDate(input.action.dueAt)}`
+    : input.extraction.dueText
+      ? `due: ${input.extraction.dueText}`
+      : undefined;
+
+  return [
+    input.duplicate ? `Action already exists: ${input.action.title}` : "Action created:",
+    input.duplicate ? undefined : input.action.title,
+    dueLine,
+    `complete: /complete_action ${input.action.id}`,
+    `snooze: /snooze_action ${input.action.id} tomorrow`,
+    `archive: /archive_action ${input.action.id}`
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function composeFinalAgentResponse(

@@ -6,7 +6,7 @@ import {
   findGmailSemanticDuplicateReviewItem,
   prisma
 } from "../packages/db/src/index.ts";
-import { classifyJobSearchEmail, classifyWorkActionEmail } from "../packages/core/src/index.ts";
+import { classifyJobSearchEmail, classifyWorkActionEmail, normalizeManualActionTitleKey } from "../packages/core/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
 const userId = `test-user-${randomUUID()}`;
@@ -619,6 +619,299 @@ test("/today shows goal progress and betting cooldown risk", async () => {
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: briefUserId } });
+  }
+});
+
+test("manual action API creates titled action with due parsing", async () => {
+  const server = buildServer();
+  const actionUserId = `action-api-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "review homepage copy tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.action.title, "Review homepage copy");
+    assert.equal(payload.extraction.dueText, "tomorrow");
+    assert.ok(payload.action.dueAt);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("todo text creates action and strips tonight from title", async () => {
+  const server = buildServer();
+  const actionUserId = `action-todo-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "todo: apply to 2 jobs tonight" }
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.action.title, "Apply to 2 jobs");
+    assert.equal(payload.extraction.dueText, "tonight");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("natural concrete action message creates ActionItem", async () => {
+  const server = buildServer();
+  const actionUserId = `action-natural-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "I need to review homepage copy tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action created/);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].title, "Review homepage copy");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("manual action command and natural text with article dedupe to one open action", async () => {
+  const server = buildServer();
+  const actionUserId = `action-article-dedupe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const command = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "review homepage copy tomorrow" }
+    });
+    assert.equal(command.statusCode, 200);
+    assert.equal(command.json().action.title, "Review homepage copy");
+
+    const natural = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "I need to review the homepage copy tomorrow" }
+    });
+    assert.equal(natural.statusCode, 200);
+    assert.match(natural.json().reply, /Action already exists: Review homepage copy/);
+
+    const actions = await prisma.actionItem.findMany({
+      where: { userId: actionUserId, status: { in: ["open", "snoozed"] } }
+    });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].title, "Review homepage copy");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("manual action title key treats optional articles as same task", () => {
+  assert.equal(normalizeManualActionTitleKey("Review homepage copy"), normalizeManualActionTitleKey("Review the homepage copy"));
+});
+
+test("same manual task dedupes by due day even when timestamps differ", async () => {
+  const server = buildServer();
+  const actionUserId = `action-day-dedupe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Review homepage copy",
+      priority: "medium",
+      dueAt: new Date("2026-07-30T18:00:00.000Z")
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "I need to review the homepage copy 2026-07-30" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().duplicate, true);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("/today does not duplicate due-soon action in top priorities", async () => {
+  const server = buildServer();
+  const actionUserId = `today-priority-dedupe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Review homepage copy",
+      priority: "medium",
+      dueAt: new Date(Date.now() + 60 * 60 * 1000)
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today`
+    });
+    assert.equal(response.statusCode, 200);
+    const priorities = response.json().brief.topPriorities as string[];
+    assert.equal(priorities.filter((priority) => priority.includes("Review homepage copy")).length, 1);
+    assert.equal(priorities[0], "Due soon: Review homepage copy");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("explicit memory concrete task saves memory and creates ActionItem", async () => {
+  const server = buildServer();
+  const actionUserId = `action-memory-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "remember that I need to review homepage copy tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Saved to memory/);
+    assert.match(response.json().reply, /Action created/);
+
+    const [memories, actions] = await Promise.all([
+      prisma.memoryEntry.findMany({ where: { userId: actionUserId } }),
+      prisma.actionItem.findMany({ where: { userId: actionUserId } })
+    ]);
+    assert.equal(memories.length, 1);
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].title, "Review homepage copy");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("remember task uses manual action dedupe behavior", async () => {
+  const server = buildServer();
+  const actionUserId = `action-memory-dedupe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const command = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "review homepage copy tomorrow" }
+    });
+    assert.equal(command.statusCode, 200);
+
+    const memory = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "remember that I need to review the homepage copy tomorrow" }
+    });
+    assert.equal(memory.statusCode, 200);
+    assert.match(memory.json().reply, /Saved to memory/);
+    assert.match(memory.json().reply, /Action already exists: Review homepage copy/);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("vague action language and betting reminders do not create ActionItems", async () => {
+  const server = buildServer();
+  const actionUserId = `action-safe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const vague = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "I need to be better" }
+    });
+    assert.equal(vague.statusCode, 200);
+
+    const betting = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "remind me to bet tomorrow" }
+    });
+    assert.equal(betting.statusCode, 200);
+    assert.equal(betting.json().intent, "betting_intent");
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("duplicate open manual action is reused but completed old action does not block", async () => {
+  const server = buildServer();
+  const actionUserId = `action-dedupe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "remind me to call Alex Friday" }
+    });
+    assert.equal(first.statusCode, 200);
+    const firstAction = first.json().action;
+    assert.equal(firstAction.title, "Call Alex");
+
+    const duplicate = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "remind me to call Alex Friday" }
+    });
+    assert.equal(duplicate.statusCode, 200);
+    assert.equal(duplicate.json().duplicate, true);
+    assert.equal(duplicate.json().action.id, firstAction.id);
+
+    await prisma.actionItem.update({
+      where: { id: firstAction.id },
+      data: { status: "completed", completedAt: new Date() }
+    });
+
+    const newAction = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "remind me to call Alex Friday" }
+    });
+    assert.equal(newAction.statusCode, 200);
+    assert.equal(newAction.json().duplicate, false);
+    assert.notEqual(newAction.json().action.id, firstAction.id);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
   }
 });
 
