@@ -48,6 +48,19 @@ export interface GmailSemanticEventDedupeInput {
   since?: Date;
 }
 
+export interface GmailSemanticReviewDedupeInput {
+  userId: string;
+  ruleId: string;
+  adapterId: string;
+  provider: "gmail";
+  proposedEventType?: string;
+  subject?: string;
+  from?: string;
+  company?: string;
+  role?: string;
+  since?: Date;
+}
+
 export interface EventQueryOptions {
   includeArchived?: boolean;
 }
@@ -146,6 +159,61 @@ export interface EmailSignalRule {
   createdAt: Date;
   updatedAt: Date;
 }
+
+export interface EmailReviewItem {
+  id: string;
+  userId: string;
+  connectionId: string;
+  ruleId: string;
+  adapterId: string;
+  provider: "gmail";
+  providerMessageId: string;
+  externalId: string;
+  subject?: string;
+  from?: string;
+  snippet?: string;
+  evidence?: string;
+  proposedEventType?: string;
+  confidence: number;
+  reason: string;
+  extracted: Record<string, unknown>;
+  status: "pending" | "approved" | "rejected" | "archived";
+  eventId?: string;
+  archiveReason?: string;
+  reviewedAt?: Date;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface EmailReviewItemInput {
+  userId: string;
+  connectionId: string;
+  ruleId: string;
+  adapterId: string;
+  provider: "gmail";
+  providerMessageId: string;
+  externalId: string;
+  subject?: string;
+  from?: string;
+  snippet?: string;
+  evidence?: string;
+  proposedEventType?: string;
+  confidence: number;
+  reason: string;
+  extracted: Record<string, unknown>;
+}
+
+export type EmailReviewUpsertResult =
+  | { status: "created"; item: EmailReviewItem }
+  | { status: "already_pending"; item: EmailReviewItem }
+  | { status: "rejected_deduped"; item: EmailReviewItem }
+  | { status: "approved_deduped"; item: EmailReviewItem }
+  | { status: "archived_deduped"; item: EmailReviewItem }
+  | { status: "semantic_pending"; item: EmailReviewItem }
+  | { status: "semantic_rejected"; item: EmailReviewItem }
+  | { status: "semantic_approved"; item: EmailReviewItem }
+  | { status: "semantic_archived"; item: EmailReviewItem }
+  | { status: "active_event_deduped"; event: StoredEvent };
 
 export type CreateGoalResult =
   | {
@@ -376,6 +444,173 @@ export async function findGmailSemanticDuplicateEvent(
   });
 
   return duplicate ? toStoredEvent(duplicate) : undefined;
+}
+
+export async function findGmailSemanticDuplicateReviewItem(
+  input: GmailSemanticReviewDedupeInput
+): Promise<EmailReviewItem | undefined> {
+  await ensureUser(input.userId);
+
+  const subject = normalizeSemanticText(input.subject);
+  const from = normalizeEmailAddress(input.from);
+  const company = normalizeSemanticText(input.company);
+  const role = normalizeSemanticText(input.role);
+
+  if (!subject || !from || !input.proposedEventType) {
+    return undefined;
+  }
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: {
+      userId: input.userId,
+      ruleId: input.ruleId,
+      adapterId: input.adapterId,
+      provider: input.provider,
+      proposedEventType: input.proposedEventType,
+      createdAt: {
+        gte: input.since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+
+  const matches = items.filter((item) => {
+    const extracted = toRecord(item.extracted);
+
+    return (
+      normalizeSemanticText(item.subject ?? undefined) === subject &&
+      normalizeEmailAddress(item.from ?? undefined) === from &&
+      normalizeSemanticText(readString(extracted.company)) === company &&
+      normalizeSemanticText(readString(extracted.role)) === role
+    );
+  });
+
+  const duplicate =
+    matches.find((item) => normalizeEmailReviewStatus(item.status) === "pending") ??
+    matches.find((item) => normalizeEmailReviewStatus(item.status) === "rejected") ??
+    matches.find((item) => normalizeEmailReviewStatus(item.status) === "approved") ??
+    matches.find((item) => normalizeEmailReviewStatus(item.status) === "archived");
+
+  return duplicate ? toEmailReviewItem(duplicate) : undefined;
+}
+
+export async function approvePendingGmailReviewItemsForSemanticEvent(input: {
+  userId: string;
+  ruleId: string;
+  adapterId: string;
+  proposedEventType: StoredEvent["type"];
+  subject?: string;
+  from?: string;
+  company?: string;
+  role?: string;
+  eventId: string;
+  since?: Date;
+}): Promise<EmailReviewItem[]> {
+  await ensureUser(input.userId);
+
+  const subject = normalizeSemanticText(input.subject);
+  const from = normalizeEmailAddress(input.from);
+  const company = normalizeSemanticText(input.company);
+  const role = normalizeSemanticText(input.role);
+
+  if (!subject || !from) {
+    return [];
+  }
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: {
+      userId: input.userId,
+      ruleId: input.ruleId,
+      adapterId: input.adapterId,
+      provider: "gmail",
+      proposedEventType: input.proposedEventType,
+      status: "pending",
+      createdAt: {
+        gte: input.since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      }
+    }
+  });
+
+  const matchingIds = items
+    .filter((item) => {
+      const extracted = toRecord(item.extracted);
+
+      return (
+        normalizeSemanticText(item.subject ?? undefined) === subject &&
+        normalizeEmailAddress(item.from ?? undefined) === from &&
+        normalizeSemanticText(readString(extracted.company)) === company &&
+        normalizeSemanticText(readString(extracted.role)) === role
+      );
+    })
+    .map((item) => item.id);
+
+  if (matchingIds.length === 0) {
+    return [];
+  }
+
+  await prisma.emailReviewItem.updateMany({
+    where: {
+      id: {
+        in: matchingIds
+      }
+    },
+    data: {
+      status: "approved",
+      eventId: input.eventId,
+      reviewedAt: new Date()
+    }
+  });
+
+  const updated = await prisma.emailReviewItem.findMany({
+    where: {
+      id: {
+        in: matchingIds
+      }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+
+  return updated.map(toEmailReviewItem);
+}
+
+export async function archivePendingEmailReviewItemsForRule(userId: string, ruleId: string): Promise<EmailReviewItem[]> {
+  await ensureUser(userId);
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: {
+      userId,
+      ruleId,
+      status: "pending"
+    }
+  });
+
+  if (items.length === 0) {
+    return [];
+  }
+
+  await prisma.emailReviewItem.updateMany({
+    where: {
+      id: {
+        in: items.map((item) => item.id)
+      }
+    },
+    data: {
+      status: "archived",
+      archiveReason: "cleanup email reviews",
+      reviewedAt: new Date()
+    }
+  });
+
+  const archived = await prisma.emailReviewItem.findMany({
+    where: {
+      id: {
+        in: items.map((item) => item.id)
+      }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+
+  return archived.map(toEmailReviewItem);
 }
 
 export async function findExternalEvent(
@@ -815,6 +1050,157 @@ export async function updateEmailSignalRuleSyncState(
   });
 
   return toEmailSignalRule(rule);
+}
+
+export async function upsertEmailReviewItem(input: EmailReviewItemInput): Promise<EmailReviewUpsertResult> {
+  await ensureUser(input.userId);
+
+  const existing = await prisma.emailReviewItem.findUnique({
+    where: { externalId: input.externalId }
+  });
+
+  if (existing) {
+    const existingItem = toEmailReviewItem(existing);
+
+    if (existingItem.status === "rejected") {
+      return { status: "rejected_deduped", item: existingItem };
+    }
+
+    if (existingItem.status === "approved") {
+      return { status: "approved_deduped", item: existingItem };
+    }
+
+    if (existingItem.status === "archived") {
+      const item = await prisma.emailReviewItem.create({
+        data: {
+          ...emailReviewItemData(input),
+          externalId: `${input.externalId}:recreated:${randomUUID()}`
+        }
+      });
+
+      return { status: "created", item: toEmailReviewItem(item) };
+    }
+
+    const updated = await prisma.emailReviewItem.update({
+      where: { id: existing.id },
+      data: emailReviewItemData(input)
+    });
+
+    return { status: "already_pending", item: toEmailReviewItem(updated) };
+  }
+
+  const item = await prisma.emailReviewItem.create({
+    data: emailReviewItemData(input)
+  });
+
+  return { status: "created", item: toEmailReviewItem(item) };
+}
+
+export async function getEmailReviewItems(
+  userId: string,
+  options: { status?: EmailReviewItem["status"] | "all"; limit?: number } = {}
+): Promise<EmailReviewItem[]> {
+  await ensureUser(userId);
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: {
+      userId,
+      ...(options.status && options.status !== "all" ? { status: options.status } : {})
+    },
+    orderBy: { updatedAt: "desc" },
+    take: options.limit ?? 10
+  });
+
+  return items.map(toEmailReviewItem);
+}
+
+export async function getEmailReviewItem(userId: string, reviewId: string): Promise<EmailReviewItem | undefined> {
+  await ensureUser(userId);
+
+  const item = await prisma.emailReviewItem.findFirst({
+    where: {
+      id: reviewId,
+      userId
+    }
+  });
+
+  return item ? toEmailReviewItem(item) : undefined;
+}
+
+export async function approveEmailReviewItem(
+  userId: string,
+  reviewId: string,
+  eventId?: string
+): Promise<EmailReviewItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await prisma.emailReviewItem.findFirst({
+    where: {
+      id: reviewId,
+      userId
+    }
+  });
+
+  if (!existing || existing.status !== "pending") {
+    return existing ? toEmailReviewItem(existing) : undefined;
+  }
+
+  const item = await prisma.emailReviewItem.update({
+    where: { id: reviewId },
+    data: {
+      status: "approved",
+      eventId,
+      reviewedAt: new Date()
+    }
+  });
+
+  return toEmailReviewItem(item);
+}
+
+export async function rejectEmailReviewItem(userId: string, reviewId: string): Promise<EmailReviewItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await prisma.emailReviewItem.findFirst({
+    where: {
+      id: reviewId,
+      userId
+    }
+  });
+
+  if (!existing || existing.status !== "pending") {
+    return existing ? toEmailReviewItem(existing) : undefined;
+  }
+
+  const item = await prisma.emailReviewItem.update({
+    where: { id: reviewId },
+    data: {
+      status: "rejected",
+      reviewedAt: new Date()
+    }
+  });
+
+  return toEmailReviewItem(item);
+}
+
+function emailReviewItemData(input: EmailReviewItemInput): Prisma.EmailReviewItemUncheckedCreateInput {
+  return {
+    userId: input.userId,
+    connectionId: input.connectionId,
+    ruleId: input.ruleId,
+    adapterId: input.adapterId,
+    provider: input.provider,
+    providerMessageId: input.providerMessageId,
+    externalId: input.externalId,
+    subject: input.subject,
+    from: input.from,
+    snippet: input.snippet,
+    evidence: input.evidence,
+    proposedEventType: input.proposedEventType,
+    confidence: input.confidence,
+    reason: input.reason,
+    extracted: toJsonObject(input.extracted),
+    status: "pending"
+  };
 }
 
 export async function createEventsFromExtracted(
@@ -1707,6 +2093,43 @@ function toEmailSignalRule(rule: Prisma.EmailSignalRuleGetPayload<object>): Emai
     createdAt: rule.createdAt,
     updatedAt: rule.updatedAt
   };
+}
+
+function toEmailReviewItem(item: Prisma.EmailReviewItemGetPayload<object>): EmailReviewItem {
+  return {
+    id: item.id,
+    userId: item.userId,
+    connectionId: item.connectionId,
+    ruleId: item.ruleId,
+    adapterId: item.adapterId,
+    provider: "gmail",
+    providerMessageId: item.providerMessageId,
+    externalId: item.externalId,
+    subject: item.subject ?? undefined,
+    from: item.from ?? undefined,
+    snippet: item.snippet ?? undefined,
+    evidence: item.evidence ?? undefined,
+    proposedEventType: item.proposedEventType ?? undefined,
+    confidence: item.confidence,
+    reason: item.reason,
+    extracted: toRecord(item.extracted),
+    status: normalizeEmailReviewStatus(item.status),
+    eventId: item.eventId ?? undefined,
+    archiveReason: item.archiveReason ?? undefined,
+    reviewedAt: item.reviewedAt ?? undefined,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt
+  };
+}
+
+function normalizeEmailReviewStatus(status: string | null | undefined): EmailReviewItem["status"] {
+  const normalized = normalizeStatus(status);
+
+  if (normalized === "approved" || normalized === "rejected" || normalized === "archived") {
+    return normalized;
+  }
+
+  return "pending";
 }
 
 function normalizeStatus(status: string | null | undefined): string {

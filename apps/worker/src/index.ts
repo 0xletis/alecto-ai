@@ -421,6 +421,10 @@ interface EmailSyncSummary {
   ignoredUnknown: number;
   filteredMarketing: number;
   needsReview: number;
+  reviewItemsCreated: number;
+  reviewItemsAlreadyPending: number;
+  reviewItemsSemanticDeduped: number;
+  reviewItemsRejectedDeduped: number;
   lowConfidenceIgnored: number;
   deduped: number;
   semanticDeduped: number;

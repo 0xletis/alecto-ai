@@ -589,6 +589,92 @@ bot.command("cleanup_gmail_rule_events", async (ctx) => {
   }
 });
 
+bot.command("email_reviews", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const showAll = getCommandText(ctx).trim().toLowerCase() === "all";
+
+  try {
+    const response = await apiGet<EmailReviewsResponse>(
+      `/users/${getTelegramUserId(ctx)}/email-reviews${showAll ? "?status=all" : ""}`
+    );
+    await replyWithIntegrationMessage(ctx, formatEmailReviews(response.emailReviews, showAll));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("approve_email_review", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const reviewId = getCommandText(ctx);
+
+  if (!reviewId) {
+    await ctx.reply("Usage: /approve_email_review REVIEW_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPost<EmailReviewMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/email-reviews/${reviewId}/approve`,
+      {}
+    );
+    await ctx.reply(response.message ?? "Email review approved.");
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("reject_email_review", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const reviewId = getCommandText(ctx);
+
+  if (!reviewId) {
+    await ctx.reply("Usage: /reject_email_review REVIEW_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPost<EmailReviewMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/email-reviews/${reviewId}/reject`,
+      {}
+    );
+    await ctx.reply(response.message ?? "Email review rejected.");
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("cleanup_email_reviews", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const ruleId = getCommandText(ctx);
+
+  if (!ruleId) {
+    await ctx.reply("Usage: /cleanup_email_reviews RULE_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPost<EmailReviewCleanupResponse>(
+      `/users/${getTelegramUserId(ctx)}/email-rules/${ruleId}/cleanup-reviews`,
+      {}
+    );
+    await ctx.reply(response.message ?? `Archived ${response.count} pending email review items for rule ${ruleId}.`);
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
 bot.command("sync_gmail", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -1786,7 +1872,7 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
   const ruleLines =
     response.emailSummaries?.map(
       (summary) =>
-        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
+        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, review created ${summary.reviewItemsCreated}, review pending ${summary.reviewItemsAlreadyPending}, review semantic deduped ${summary.reviewItemsSemanticDeduped}, review rejected/deduped ${summary.reviewItemsRejectedDeduped}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
     ) ?? [];
 
   return [
@@ -1813,6 +1899,10 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
     `semantic deduped: ${totals.semanticDeduped}`,
     `archived cleanup reprocessed: ${totals.archivedCleanupReprocessed}`,
     `needs review: ${totals.needsReview}`,
+    `review items created: ${totals.reviewItemsCreated}`,
+    `review items already pending: ${totals.reviewItemsAlreadyPending}`,
+    `review semantic deduped: ${totals.reviewItemsSemanticDeduped}`,
+    `review items rejected/deduped: ${totals.reviewItemsRejectedDeduped}`,
     `filtered marketing: ${totals.filteredMarketing}`,
     `low confidence ignored: ${totals.lowConfidenceIgnored}`,
     `ignored unknown: ${totals.ignoredUnknown}`,
@@ -1836,6 +1926,10 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       ignoredUnknown: totals.ignoredUnknown + summary.ignoredUnknown,
       filteredMarketing: totals.filteredMarketing + summary.filteredMarketing,
       needsReview: totals.needsReview + summary.needsReview,
+      reviewItemsCreated: totals.reviewItemsCreated + summary.reviewItemsCreated,
+      reviewItemsAlreadyPending: totals.reviewItemsAlreadyPending + summary.reviewItemsAlreadyPending,
+      reviewItemsSemanticDeduped: totals.reviewItemsSemanticDeduped + summary.reviewItemsSemanticDeduped,
+      reviewItemsRejectedDeduped: totals.reviewItemsRejectedDeduped + summary.reviewItemsRejectedDeduped,
       lowConfidenceIgnored: totals.lowConfidenceIgnored + summary.lowConfidenceIgnored,
       deduped: totals.deduped + summary.deduped,
       semanticDeduped: totals.semanticDeduped + summary.semanticDeduped,
@@ -1849,6 +1943,10 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       ignoredUnknown: 0,
       filteredMarketing: 0,
       needsReview: 0,
+      reviewItemsCreated: 0,
+      reviewItemsAlreadyPending: 0,
+      reviewItemsSemanticDeduped: 0,
+      reviewItemsRejectedDeduped: 0,
       lowConfidenceIgnored: 0,
       deduped: 0,
       semanticDeduped: 0,
@@ -2362,6 +2460,32 @@ function formatEmailRules(rules: EmailSignalRule[], connections: IntegrationConn
   return rules.map((rule) => formatEmailRule(rule, connectionById.get(rule.connectionId))).join("\n\n");
 }
 
+function formatEmailReviews(reviews: EmailReviewItem[], showAll: boolean): string {
+  if (reviews.length === 0) {
+    return showAll ? "No recent email review items." : "No pending email reviews.";
+  }
+
+  return reviews.map(formatEmailReview).join("\n\n");
+}
+
+function formatEmailReview(review: EmailReviewItem): string {
+  return [
+    `id: ${review.id}`,
+    `status: ${review.status}`,
+    review.from ? `from: ${truncateText(review.from, 120)}` : undefined,
+    review.subject ? `subject: ${truncateText(review.subject, 120)}` : undefined,
+    review.proposedEventType ? `suggestion: ${review.proposedEventType}` : undefined,
+    `confidence: ${review.confidence}`,
+    `reason: ${truncateText(review.reason, 120)}`,
+    review.status === "archived" && review.archiveReason ? `archiveReason: ${review.archiveReason}` : undefined,
+    review.evidence || review.snippet ? `evidence: ${truncateText(review.evidence ?? review.snippet ?? "", 220)}` : undefined,
+    review.status === "pending" ? `approve: /approve_email_review ${review.id}` : undefined,
+    review.status === "pending" ? `reject: /reject_email_review ${review.id}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnection) {
   const connectionStatus = connection?.status ?? "missing";
   const staleWarning =
@@ -2799,6 +2923,22 @@ interface EmailRuleMutationResponse {
   message?: string;
 }
 
+interface EmailReviewsResponse {
+  emailReviews: EmailReviewItem[];
+}
+
+interface EmailReviewMutationResponse {
+  emailReview: EmailReviewItem;
+  event?: Event | null;
+  message?: string;
+}
+
+interface EmailReviewCleanupResponse {
+  count: number;
+  emailReviews: EmailReviewItem[];
+  message?: string;
+}
+
 interface GmailRuleCleanupResponse {
   count: number;
   message?: string;
@@ -2849,6 +2989,10 @@ interface EmailSyncSummary {
   ignoredUnknown: number;
   filteredMarketing: number;
   needsReview: number;
+  reviewItemsCreated: number;
+  reviewItemsAlreadyPending: number;
+  reviewItemsSemanticDeduped: number;
+  reviewItemsRejectedDeduped: number;
   lowConfidenceIgnored: number;
   deduped: number;
   semanticDeduped: number;
@@ -3046,6 +3190,31 @@ interface EmailSignalRule {
   createdBy: "system" | "user";
   lastSyncedAt?: string;
   lastError?: string;
+}
+
+interface EmailReviewItem {
+  id: string;
+  userId: string;
+  connectionId: string;
+  ruleId: string;
+  adapterId: string;
+  provider: "gmail";
+  providerMessageId: string;
+  externalId: string;
+  subject?: string;
+  from?: string;
+  snippet?: string;
+  evidence?: string;
+  proposedEventType?: string;
+  confidence: number;
+  reason: string;
+  extracted: Record<string, unknown>;
+  status: "pending" | "approved" | "rejected" | "archived";
+  eventId?: string;
+  archiveReason?: string;
+  reviewedAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface Event {

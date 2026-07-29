@@ -134,6 +134,10 @@ Telegram commands:
 - `/set_email_rule_config RULE_ID key=value`: tune a rule, for example `maxMessagesPerSync=10 maxEventsPerSync=3 classifierMode=rules`
 - `/delete_email_rule RULE_ID`: archive an email rule
 - `/cleanup_gmail_rule_events RULE_ID`: archive active Gmail events created by one email rule
+- `/email_reviews`: show pending Gmail email review items
+- `/email_reviews all`: show recent pending/approved/rejected email review items
+- `/approve_email_review REVIEW_ID`: approve a pending email review item
+- `/reject_email_review REVIEW_ID`: reject a pending email review item
 - `/sync_gmail`: manually sync active Gmail rules
 - `/sync_gmail_debug`: manually sync Gmail and show safe per-rule counters
 - `/create_goal category | title | why`: create a goal
@@ -400,6 +404,7 @@ Expected:
 - Gmail dedupe skips active duplicates. Events archived by `/cleanup_gmail_rule_events` can be reprocessed after classifier fixes; normal manual archives still block recreation.
 - Gmail `job_search_email` is conservative. It requires strong recruiting/job context, ignores obvious marketing/newsletter/promotional emails, and never treats the word `offer` alone as a career offer.
 - Gmail emails below auto-log confidence are not logged automatically. Uncertain messages count as `needs review`; weak matches count as low-confidence ignored or unknown.
+- Gmail `needs_review` classifications create pending email review items. Approving only creates an event when the proposed event type is already in the core ontology.
 - Use `/cleanup_gmail_rule_events RULE_ID` to archive test Gmail events from one rule without deleting historical data.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Explicit memory phrases like `remember that`, `recuerda que`, or `guarda que` create visible memories immediately and reply `Saved to memory.`
@@ -516,6 +521,10 @@ Telegram integration commands:
 /set_email_rule_config RULE_ID fetchStrategy=all_recent lookbackDays=7
 /delete_email_rule RULE_ID
 /cleanup_gmail_rule_events RULE_ID
+/email_reviews
+/email_reviews all
+/approve_email_review REVIEW_ID
+/reject_email_review REVIEW_ID
 /pause_integration CONNECTION_ID
 /resume_integration CONNECTION_ID
 /delete_integration CONNECTION_ID

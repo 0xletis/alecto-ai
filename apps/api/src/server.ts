@@ -87,6 +87,7 @@ import {
   getRelevantMemories,
   findExternalEvent,
   findGmailSemanticDuplicateEvent,
+  findGmailSemanticDuplicateReviewItem,
   hasRecentNotificationLog,
   confirmPendingAction,
   createExternalEventIfNotExists,
@@ -95,15 +96,23 @@ import {
   ensureUser,
   getActiveEmailSignalRulesForConnection,
   getEmailSignalRules,
+  getEmailReviewItem,
+  getEmailReviewItems,
   getIntegrationConnection,
   getIntegrationConnections,
+  approveEmailReviewItem,
+  approvePendingGmailReviewItemsForSemanticEvent,
   rejectPendingAction,
+  rejectEmailReviewItem,
   undoLastEvents,
   archiveEmailSignalRule,
+  archivePendingEmailReviewItemsForRule,
+  upsertEmailReviewItem,
   type PendingAction,
   type PendingActionType,
   type IntegrationConnection,
   type EmailSignalRule,
+  type EmailReviewItem,
   updateIntegrationConnection,
   updateIntegrationConnectionConfig,
   updateIntegrationConnectionSyncState,
@@ -878,6 +887,111 @@ export function buildServer() {
     }
   );
 
+  server.get<{ Params: { userId: string }; Querystring: { status?: string } }>(
+    "/users/:userId/email-reviews",
+    async (request) => {
+      const status = request.query.status === "all" ? "all" : "pending";
+
+      return {
+        emailReviews: (await getEmailReviewItems(request.params.userId, {
+          status,
+          limit: 10
+        })).map(sanitizeEmailReviewItem)
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string; reviewId: string } }>(
+    "/users/:userId/email-reviews/:reviewId/approve",
+    async (request, reply) => {
+      const review = await getEmailReviewItem(request.params.userId, request.params.reviewId);
+
+      if (!review) {
+        return reply.status(404).send({ error: "Email review item not found" });
+      }
+
+      if (review.status !== "pending") {
+        return reply.status(400).send({
+          error: `Email review item is already ${review.status}.`,
+          emailReview: sanitizeEmailReviewItem(review)
+        });
+      }
+
+      if (!review.proposedEventType || !EventTypeSchema.safeParse(review.proposedEventType).success) {
+        const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId);
+
+        return {
+          emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
+          event: null,
+          message: "This review item does not map to an approved event type yet. No event created."
+        };
+      }
+
+      const eventExternalId = review.externalId.replace(/^gmail-review:/, "gmail:");
+      const created = await createExternalEventIfNotExists(request.params.userId, {
+        type: EventTypeSchema.parse(review.proposedEventType),
+        timestamp: new Date(),
+        source: "gmail",
+        provider: "gmail",
+        externalId: eventExternalId,
+        data: {
+          ...review.extracted,
+          provider: "gmail",
+          emailAdapterId: review.adapterId,
+          adapterId: "job_search_text",
+          classification: review.reason,
+          ruleId: review.ruleId,
+          gmailMessageId: review.providerMessageId,
+          subject: review.subject,
+          from: review.from,
+          snippet: review.snippet,
+          confidence: review.confidence,
+          reason: review.reason,
+          reviewItemId: review.id,
+          externalId: eventExternalId
+        },
+        confidence: review.confidence,
+        evidence: review.evidence ? [review.evidence] : undefined
+      });
+      const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId, created.event.id);
+
+      return {
+        emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
+        event: created.event,
+        message: created.created ? "Email review approved and event created." : "Email review approved. Event already existed."
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string; reviewId: string } }>(
+    "/users/:userId/email-reviews/:reviewId/reject",
+    async (request, reply) => {
+      const review = await rejectEmailReviewItem(request.params.userId, request.params.reviewId);
+
+      if (!review) {
+        return reply.status(404).send({ error: "Email review item not found" });
+      }
+
+      return {
+        emailReview: sanitizeEmailReviewItem(review),
+        message: review.status === "rejected" ? "Email review rejected." : `Email review item is already ${review.status}.`
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string; ruleId: string } }>(
+    "/users/:userId/email-rules/:ruleId/cleanup-reviews",
+    async (request) => {
+      const archived = await archivePendingEmailReviewItemsForRule(request.params.userId, request.params.ruleId);
+
+      return {
+        count: archived.length,
+        emailReviews: archived.map(sanitizeEmailReviewItem),
+        message: `Archived ${archived.length} pending email review item${archived.length === 1 ? "" : "s"} for rule ${request.params.ruleId}.`
+      };
+    }
+  );
+
   server.patch<{ Params: { userId: string; connectionId: string } }>(
     "/users/:userId/integrations/:connectionId",
     async (request, reply) => {
@@ -1555,6 +1669,10 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     ignoredUnknown: 0,
     filteredMarketing: 0,
     needsReview: 0,
+    reviewItemsCreated: 0,
+    reviewItemsAlreadyPending: 0,
+    reviewItemsRejectedDeduped: 0,
+    reviewItemsSemanticDeduped: 0,
     lowConfidenceIgnored: 0,
     deduped: 0,
     semanticDeduped: 0,
@@ -1603,8 +1721,44 @@ async function syncEmailSignalRule(input: {
       input.rule.reviewBeforeLogging ||
       classification.confidence < input.rule.minAutoLogConfidence
     ) {
-      summary.needsReview += classification.confidence >= input.rule.minReviewConfidence ? 1 : 0;
-      summary.lowConfidenceIgnored += classification.confidence < input.rule.minReviewConfidence ? 1 : 0;
+      if (classification.confidence < input.rule.minReviewConfidence) {
+        summary.lowConfidenceIgnored += 1;
+        continue;
+      }
+
+      summary.needsReview += 1;
+      const reviewResult = await withGmailStage("event_creation", () =>
+        createEmailReviewItemForClassification({
+          userId: input.userId,
+          connectionId: input.rule.connectionId,
+          rule: input.rule,
+          message,
+          classification
+        })
+      );
+
+      if (reviewResult.status === "created") {
+        summary.reviewItemsCreated += 1;
+      } else if (reviewResult.status === "already_pending") {
+        summary.reviewItemsAlreadyPending += 1;
+      } else if (reviewResult.status === "rejected_deduped") {
+        summary.reviewItemsRejectedDeduped += 1;
+      } else if (reviewResult.status === "semantic_pending") {
+        summary.reviewItemsSemanticDeduped += 1;
+        summary.reviewItemsAlreadyPending += 1;
+      } else if (reviewResult.status === "semantic_rejected") {
+        summary.reviewItemsSemanticDeduped += 1;
+        summary.reviewItemsRejectedDeduped += 1;
+      } else if (
+        reviewResult.status === "semantic_approved" ||
+        reviewResult.status === "semantic_archived" ||
+        reviewResult.status === "approved_deduped" ||
+        reviewResult.status === "archived_deduped" ||
+        reviewResult.status === "active_event_deduped"
+      ) {
+        summary.reviewItemsSemanticDeduped += 1;
+      }
+
       continue;
     }
 
@@ -1678,6 +1832,19 @@ async function syncEmailSignalRule(input: {
 
     if (created.created) {
       summary.eventsCreated += 1;
+      await withGmailStage("event_creation", () =>
+        approvePendingGmailReviewItemsForSemanticEvent({
+          userId: input.userId,
+          ruleId: input.rule.id,
+          adapterId: input.rule.adapterId,
+          proposedEventType: eventType,
+          subject,
+          from,
+          company: typeof classification.extracted.company === "string" ? classification.extracted.company : undefined,
+          role: typeof classification.extracted.role === "string" ? classification.extracted.role : undefined,
+          eventId: created.event.id
+        })
+      );
       if (created.ignoredArchivedCleanup) {
         summary.archivedCleanupReprocessed += 1;
       }
@@ -1721,6 +1888,99 @@ async function classifyEmailForRule(rule: EmailSignalRule, text: string) {
   });
 }
 
+async function createEmailReviewItemForClassification(input: {
+  userId: string;
+  connectionId: string;
+  rule: EmailSignalRule;
+  message: GmailMessage;
+  classification: ReturnType<typeof classifyJobSearchEmail>;
+}) {
+  const subject = getGmailHeader(input.message, "subject");
+  const from = getGmailHeader(input.message, "from");
+  const reviewExternalId = `gmail-review:${input.rule.id}:${input.message.id}`;
+  const proposedEventType = input.classification.eventType ?? input.classification.reason;
+  const company = typeof input.classification.extracted.company === "string" ? input.classification.extracted.company : undefined;
+  const role = typeof input.classification.extracted.role === "string" ? input.classification.extracted.role : undefined;
+
+  if (EventTypeSchema.safeParse(proposedEventType).success) {
+    const activeEvent = await findGmailSemanticDuplicateEvent({
+      userId: input.userId,
+      ruleId: input.rule.id,
+      eventType: EventTypeSchema.parse(proposedEventType),
+      subject,
+      from,
+      company,
+      role
+    });
+
+    if (activeEvent) {
+      return { status: "active_event_deduped" as const, event: activeEvent };
+    }
+  }
+
+  const semanticReview = await findGmailSemanticDuplicateReviewItem({
+    userId: input.userId,
+    ruleId: input.rule.id,
+    adapterId: input.rule.adapterId,
+    provider: "gmail",
+    proposedEventType,
+    subject,
+    from,
+    company,
+    role
+  });
+
+  if (semanticReview) {
+    if (semanticReview.status === "pending") {
+      return { status: "semantic_pending" as const, item: semanticReview };
+    }
+
+    if (semanticReview.status === "rejected") {
+      return { status: "semantic_rejected" as const, item: semanticReview };
+    }
+
+    if (semanticReview.status === "approved") {
+      return { status: "semantic_approved" as const, item: semanticReview };
+    }
+
+    return upsertEmailReviewItem({
+      userId: input.userId,
+      connectionId: input.connectionId,
+      ruleId: input.rule.id,
+      adapterId: input.rule.adapterId,
+      provider: "gmail",
+      providerMessageId: input.message.id,
+      externalId: reviewExternalId,
+      subject,
+      from,
+      snippet: input.message.snippet ? truncatePlainText(input.message.snippet, 300) : undefined,
+      evidence: truncatePlainText(input.classification.evidence, 500),
+      proposedEventType,
+      confidence: input.classification.confidence,
+      reason: input.classification.reason,
+      extracted: input.classification.extracted
+    });
+  }
+
+  return upsertEmailReviewItem({
+    userId: input.userId,
+    connectionId: input.connectionId,
+    ruleId: input.rule.id,
+    adapterId: input.rule.adapterId,
+    provider: "gmail",
+    providerMessageId: input.message.id,
+    externalId: reviewExternalId,
+    subject,
+    from,
+    snippet: input.message.snippet ? truncatePlainText(input.message.snippet, 300) : undefined,
+    evidence: truncatePlainText(input.classification.evidence, 500),
+    proposedEventType,
+    confidence: input.classification.confidence,
+    reason: input.classification.reason,
+    extracted: input.classification.extracted
+  });
+}
+
 function sanitizeIntegrationConnection(connection: IntegrationConnection) {
   return {
     id: connection.id,
@@ -1739,6 +1999,14 @@ function sanitizeEmailSignalRule(rule: EmailSignalRule) {
   return {
     ...rule,
     lastError: sanitizeIntegrationLastError("gmail", rule.lastError)
+  };
+}
+
+function sanitizeEmailReviewItem(item: EmailReviewItem) {
+  return {
+    ...item,
+    evidence: item.evidence ? truncatePlainText(item.evidence, 500) : undefined,
+    snippet: item.snippet ? truncatePlainText(item.snippet, 300) : undefined
   };
 }
 
@@ -3911,6 +4179,10 @@ interface EmailRuleSyncSummary {
   ignoredUnknown: number;
   filteredMarketing: number;
   needsReview: number;
+  reviewItemsCreated: number;
+  reviewItemsAlreadyPending: number;
+  reviewItemsRejectedDeduped: number;
+  reviewItemsSemanticDeduped: number;
   lowConfidenceIgnored: number;
   deduped: number;
   semanticDeduped: number;
