@@ -89,6 +89,7 @@ import {
   getOrCreateUserOperatingProfile,
   getMemories,
   getRecentEvents,
+  getRecentActionItems,
   getRelevantMemories,
   findExternalEvent,
   findGmailSemanticDuplicateEvent,
@@ -567,6 +568,10 @@ export function buildServer() {
       })
     };
   });
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/today", async (request) => ({
+    brief: await generateDailyOperatorBrief(request.params.userId)
+  }));
 
   server.get<{ Params: { userId: string }; Querystring: { date?: string } }>(
     "/users/:userId/insights/daily",
@@ -1419,6 +1424,299 @@ async function buildAgentContext(userId: string) {
     profile,
     todaySummary
   };
+}
+
+async function generateDailyOperatorBrief(userId: string): Promise<DailyOperatorBrief> {
+  const now = new Date();
+  const todayStart = startOfToday();
+  const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const [actions, activeGoals, todayEvents, recentEvents, recentReviews] = await Promise.all([
+    getRecentActionItems(userId, 50),
+    getActiveGoals(userId),
+    getEventsSince(userId, todayStart),
+    getEventsSince(userId, last24h),
+    getEmailReviewItems(userId, { status: "all", limit: 10 })
+  ]);
+  const visibleActions = actions.filter((action) => action.status !== "archived");
+  const openActions = visibleActions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
+  const overdueActions = openActions.filter((action) => action.dueAt && action.dueAt < now);
+  const dueSoonActions = openActions.filter((action) => isActionDueSoon(action, now));
+  const completedToday = visibleActions.filter(
+    (action) => action.status === "completed" && action.completedAt && action.completedAt >= todayStart
+  );
+  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents));
+  const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews);
+  const risks = buildOperatorRisks(recentEvents);
+  const topPriorities = buildOperatorTopPriorities({
+    overdueActions,
+    dueSoonActions,
+    openActions,
+    goalStatus,
+    risks
+  });
+  const suggestedNextStep = pickOperatorNextStep({
+    overdueActions,
+    dueSoonActions,
+    openActions,
+    goalStatus
+  });
+
+  return {
+    date: formatLocalDate(now),
+    summary: buildOperatorSummary({ openActions, overdueActions, activeGoals, todayEvents, risks }),
+    topPriorities,
+    openActions: openActions.slice(0, 10).map(toBriefAction),
+    overdueActions: overdueActions.slice(0, 10).map(toBriefAction),
+    goalStatus,
+    recentWins,
+    risks,
+    suggestedNextStep
+  };
+}
+
+function buildOperatorSummary(input: {
+  openActions: ActionItem[];
+  overdueActions: ActionItem[];
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>;
+  todayEvents: StoredEvent[];
+  risks: string[];
+}): string {
+  const parts = [
+    `${input.openActions.length} open action${input.openActions.length === 1 ? "" : "s"}`,
+    input.overdueActions.length > 0 ? `${input.overdueActions.length} overdue` : undefined,
+    `${input.activeGoals.length} active goal${input.activeGoals.length === 1 ? "" : "s"}`,
+    `${input.todayEvents.length} event${input.todayEvents.length === 1 ? "" : "s"} logged today`,
+    input.risks.length > 0 ? `${input.risks.length} risk watchout${input.risks.length === 1 ? "" : "s"}` : undefined
+  ].filter(Boolean);
+
+  return parts.length > 0 ? `Today has ${parts.join(", ")}.` : "Nothing material is logged for today yet.";
+}
+
+function buildOperatorTopPriorities(input: {
+  overdueActions: ActionItem[];
+  dueSoonActions: ActionItem[];
+  openActions: ActionItem[];
+  goalStatus: DailyOperatorBriefGoalStatus[];
+  risks: string[];
+}): string[] {
+  const priorities = [
+    ...input.overdueActions.map((action) => `Overdue: ${action.title}`),
+    ...input.dueSoonActions.map((action) => `Due soon: ${action.title}`),
+    ...input.openActions.map((action) => action.title),
+    ...input.goalStatus.filter((goal) => goal.status === "no_progress").map((goal) => `Log progress for ${goal.title}`),
+    ...input.risks.slice(0, 1)
+  ];
+
+  return uniqueStrings(priorities).slice(0, 3);
+}
+
+function pickOperatorNextStep(input: {
+  overdueActions: ActionItem[];
+  dueSoonActions: ActionItem[];
+  openActions: ActionItem[];
+  goalStatus: DailyOperatorBriefGoalStatus[];
+}): string {
+  const overdue = input.overdueActions[0];
+  if (overdue) {
+    return `Handle overdue action: ${overdue.title}.`;
+  }
+
+  const due = input.dueSoonActions[0];
+  if (due) {
+    return `Handle due action: ${due.title}.`;
+  }
+
+  const open = input.openActions[0];
+  if (open) {
+    return `Do this first: ${open.title}.`;
+  }
+
+  const staleGoal = input.goalStatus.find((goal) => goal.status === "no_progress");
+  if (staleGoal) {
+    return `Log one concrete action for ${staleGoal.title}.`;
+  }
+
+  return "Log one meaningful action.";
+}
+
+function buildOperatorGoalStatus(
+  goal: Awaited<ReturnType<typeof getActiveGoals>>[number],
+  todayEvents: StoredEvent[]
+): DailyOperatorBriefGoalStatus {
+  const note = goalProgressNoteForToday(goal, todayEvents);
+
+  return {
+    goalId: goal.id,
+    title: goal.title,
+    status: note === "no progress logged today" ? "no_progress" : "progress",
+    note
+  };
+}
+
+function goalProgressNoteForToday(goal: Awaited<ReturnType<typeof getActiveGoals>>[number], events: StoredEvent[]): string {
+  const templateId = goal.templateId ?? "";
+  const category = goal.category;
+
+  if (templateId === "career.job_search" || category === "career") {
+    const applications = sumEventNumber(events, "career.application_sent", "count");
+    const interviews = countEvent(events, "career.interview_scheduled");
+    const replies = countEvent(events, "career.recruiter_reply_received");
+    const parts = [
+      applications > 0 ? `${applications} application${applications === 1 ? "" : "s"} sent today` : undefined,
+      interviews > 0 ? `${interviews} interview${interviews === 1 ? "" : "s"} scheduled today` : undefined,
+      replies > 0 ? `${replies} recruiter repl${replies === 1 ? "y" : "ies"} today` : undefined
+    ].filter(Boolean);
+
+    return parts.join(", ") || "no progress logged today";
+  }
+
+  if (templateId.includes("health") || category === "health") {
+    const workouts = countEvent(events, "health.workout_completed");
+    const steps = sumEventNumber(events, "health.steps_logged", "count");
+    const parts = [
+      workouts > 0 ? "training logged today" : undefined,
+      steps > 0 ? `${steps} steps logged today` : undefined
+    ].filter(Boolean);
+
+    return parts.join(", ") || "no progress logged today";
+  }
+
+  if (templateId.includes("reading") || category === "learning") {
+    const minutes = sumEventNumber(events, "learning.reading_session_completed", "duration_minutes");
+    return minutes > 0 ? `${minutes} minutes reading today` : "no progress logged today";
+  }
+
+  const customLogs = events.filter((event) => event.type === "custom.goal_progress_logged" && event.data.goalId === goal.id);
+  const focusedMinutes = customLogs.reduce((sum, event) => {
+    const metricKey = typeof event.data.metricKey === "string" ? event.data.metricKey : "";
+    const value = typeof event.data.value === "number" ? event.data.value : 0;
+    return metricKey === "focused_minutes" || metricKey === "minutes" ? sum + value : sum;
+  }, 0);
+
+  if (customLogs.length > 0) {
+    return focusedMinutes > 0
+      ? `${customLogs.length} progress log${customLogs.length === 1 ? "" : "s"}, ${focusedMinutes} focused minutes`
+      : `${customLogs.length} progress log${customLogs.length === 1 ? "" : "s"} today`;
+  }
+
+  return "no progress logged today";
+}
+
+function buildOperatorRecentWins(events: StoredEvent[], completedActions: ActionItem[], recentReviews: EmailReviewItem[]): string[] {
+  const wins = [
+    ...completedActions.map((action) => `Completed action: ${action.title}`),
+    sumEventNumber(events, "career.application_sent", "count") > 0
+      ? `${sumEventNumber(events, "career.application_sent", "count")} application${sumEventNumber(events, "career.application_sent", "count") === 1 ? "" : "s"} sent`
+      : undefined,
+    countEvent(events, "health.workout_completed") > 0 ? "Training logged" : undefined,
+    sumEventNumber(events, "learning.reading_session_completed", "duration_minutes") > 0
+      ? `${sumEventNumber(events, "learning.reading_session_completed", "duration_minutes")} minutes reading`
+      : undefined,
+    countEvent(events, "custom.goal_progress_logged") > 0 ? `${countEvent(events, "custom.goal_progress_logged")} custom progress log${countEvent(events, "custom.goal_progress_logged") === 1 ? "" : "s"}` : undefined,
+    recentReviews.some((review) => review.status === "approved" && review.reviewedAt && review.reviewedAt >= startOfToday())
+      ? "Email review approved today"
+      : undefined
+  ].filter(Boolean);
+
+  return uniqueStrings(wins).slice(0, 5);
+}
+
+function buildOperatorRisks(events: StoredEvent[]): string[] {
+  const risks = [];
+  const cooldowns = countEvent(events, "finance.betting.cooldown_triggered");
+
+  if (cooldowns > 0) {
+    risks.push("Betting impulse detected recently. Do not open a bet today without cooldown.");
+  }
+
+  if (countEvent(events, "finance.betting.large_bet_detected") > 0) {
+    risks.push("Large bet signal detected recently.");
+  }
+
+  if (countEvent(events, "finance.trading.large_loss_detected") > 0) {
+    risks.push("Large trading loss detected recently.");
+  }
+
+  const latestAnxiety = latestEventNumber(events, "reflection.anxiety_logged", "value");
+  const latestSleep = latestEventNumber(events, "health.sleep_logged", "duration_hours");
+  const latestImpulse = latestImpulseValue(events);
+
+  if (latestAnxiety !== undefined && latestAnxiety >= 7) {
+    risks.push(`Anxiety is ${latestAnxiety}/10. Keep decisions smaller.`);
+  }
+
+  if (latestSleep !== undefined && latestSleep < 6) {
+    risks.push(`Sleep is below 6h. No betting/trading decisions today.`);
+  }
+
+  if (latestImpulse !== undefined && latestImpulse >= 6) {
+    risks.push(`Gambling/trading impulse is ${latestImpulse}/10. Do not act on it.`);
+  }
+
+  return uniqueStrings(risks).slice(0, 5);
+}
+
+function toBriefAction(action: ActionItem): DailyOperatorBriefAction {
+  return {
+    id: action.id,
+    title: action.title,
+    status: action.status,
+    priority: action.priority,
+    dueAt: action.dueAt?.toISOString(),
+    snoozedUntil: action.snoozedUntil?.toISOString()
+  };
+}
+
+function isSnoozedDue(action: ActionItem, now: Date): boolean {
+  return action.status === "snoozed" && Boolean(action.snoozedUntil && action.snoozedUntil <= now);
+}
+
+function isActionDueSoon(action: ActionItem, now: Date): boolean {
+  if (!action.dueAt) {
+    return false;
+  }
+
+  const next24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+  return action.dueAt >= now && action.dueAt <= next24h;
+}
+
+function countEvent(events: StoredEvent[], type: string): number {
+  return events.filter((event) => event.type === type).length;
+}
+
+function sumEventNumber(events: StoredEvent[], type: string, key: string): number {
+  return events
+    .filter((event) => event.type === type)
+    .reduce((sum, event) => sum + (typeof event.data[key] === "number" ? event.data[key] : 0), 0);
+}
+
+function latestEventNumber(events: StoredEvent[], type: string, key: string): number | undefined {
+  const event = [...events]
+    .filter((item) => item.type === type && typeof item.data[key] === "number")
+    .sort((left, right) => right.timestamp.getTime() - left.timestamp.getTime())[0];
+
+  return typeof event?.data[key] === "number" ? event.data[key] : undefined;
+}
+
+function latestImpulseValue(events: StoredEvent[]): number | undefined {
+  const event = [...events]
+    .filter(
+      (item) =>
+        item.type === "reflection.impulse_logged" &&
+        typeof item.data.value === "number" &&
+        (item.data.kind === "gambling" || item.data.kind === "trading")
+    )
+    .sort((left, right) => right.timestamp.getTime() - left.timestamp.getTime())[0];
+
+  return typeof event?.data.value === "number" ? event.data.value : undefined;
+}
+
+function uniqueStrings(values: Array<string | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value && value.trim())))];
+}
+
+function formatLocalDate(date: Date): string {
+  return date.toISOString().slice(0, 10);
 }
 
 async function composeFinalAgentResponse(
@@ -4845,6 +5143,34 @@ type GmailErrorStage =
   | "gmail_message_fetch"
   | "classification"
   | "event_creation";
+
+interface DailyOperatorBrief {
+  date: string;
+  summary: string;
+  topPriorities: string[];
+  openActions: DailyOperatorBriefAction[];
+  overdueActions: DailyOperatorBriefAction[];
+  goalStatus: DailyOperatorBriefGoalStatus[];
+  recentWins: string[];
+  risks: string[];
+  suggestedNextStep: string;
+}
+
+interface DailyOperatorBriefAction {
+  id: string;
+  title: string;
+  status: ActionItem["status"];
+  priority: ActionItem["priority"];
+  dueAt?: string;
+  snoozedUntil?: string;
+}
+
+interface DailyOperatorBriefGoalStatus {
+  goalId: string;
+  title: string;
+  status: string;
+  note: string;
+}
 
 interface GmailMessagePart {
   mimeType?: string;

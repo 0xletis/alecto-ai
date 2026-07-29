@@ -152,6 +152,7 @@ Telegram commands:
 - `/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today`: save a manual daily check-in
 - `/checkin_natural`: show natural-language daily check-in examples
 - `/review`: daily review
+- `/today`: concise daily operator brief with actions, goals, wins, risks, and one next move
 - `/insight`: daily interpretive coaching insight
 - `/daily_insight`: alias of `/insight`
 - `/weekly`: weekly interpretive coaching insight
@@ -612,6 +613,7 @@ Manual insight tests:
 - `PATCH /users/:userId/actions/:actionId/snooze`
 - `PATCH /users/:userId/actions/:actionId/archive`
 - `GET /users/:userId/review/daily`
+- `GET /users/:userId/today`
 - `GET /users/:userId/insights/daily`
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`
 - `GET /users/:userId/insights/weekly`

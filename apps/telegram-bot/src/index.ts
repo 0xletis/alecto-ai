@@ -1045,6 +1045,19 @@ bot.command("review", async (ctx) => {
   }
 });
 
+bot.command("today", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<DailyOperatorBriefResponse>(`/users/${getTelegramUserId(ctx)}/today`);
+    await ctx.reply(formatDailyOperatorBrief(response.brief));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not fetch today's brief right now.");
+  }
+});
+
 bot.command("insight", async (ctx) => {
   await sendInsight(ctx, "daily");
 });
@@ -2438,6 +2451,42 @@ function formatDailyReview(review: DailyReview) {
     .join("\n");
 }
 
+function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
+  return [
+    `Today - ${brief.date}`,
+    "",
+    "Status:",
+    brief.summary,
+    "",
+    "Top priorities:",
+    brief.topPriorities.length > 0 ? brief.topPriorities.map((item, index) => `${index + 1}. ${item}`).join("\n") : "No clear priorities yet.",
+    "",
+    "Open actions:",
+    brief.openActions.length > 0 ? brief.openActions.map(formatBriefAction).join("\n") : "No open action items.",
+    "",
+    brief.recentWins.length > 0 ? `Recent wins:\n${brief.recentWins.map((win) => `- ${win}`).join("\n")}` : undefined,
+    brief.goalStatus.length > 0
+      ? `Goals:\n${brief.goalStatus.map((goal) => `- ${goal.title}: ${goal.note}`).join("\n")}`
+      : undefined,
+    brief.risks.length > 0 ? `Risks / watchouts:\n${brief.risks.map((risk) => `- ${risk}`).join("\n")}` : undefined,
+    "",
+    "Next move:",
+    brief.suggestedNextStep
+  ]
+    .filter((item) => item !== undefined)
+    .join("\n");
+}
+
+function formatBriefAction(action: DailyOperatorBriefAction): string {
+  const detail = action.dueAt
+    ? `due ${new Date(action.dueAt).toLocaleString()}`
+    : action.snoozedUntil
+      ? `snoozed until ${new Date(action.snoozedUntil).toLocaleString()}`
+      : undefined;
+
+  return `- ${action.title}${detail ? ` - ${detail}` : ""}`;
+}
+
 function formatInsight(insight: InsightReport) {
   return [
     insight.headline,
@@ -3052,6 +3101,10 @@ interface DailyReviewResponse {
   review: DailyReview;
 }
 
+interface DailyOperatorBriefResponse {
+  brief: DailyOperatorBrief;
+}
+
 interface InsightResponse {
   insight: InsightReport;
 }
@@ -3324,6 +3377,34 @@ interface DailyReviewGoal {
   title: string;
   status: string;
   templateId?: string;
+}
+
+interface DailyOperatorBrief {
+  date: string;
+  summary: string;
+  topPriorities: string[];
+  openActions: DailyOperatorBriefAction[];
+  overdueActions: DailyOperatorBriefAction[];
+  goalStatus: DailyOperatorBriefGoalStatus[];
+  recentWins: string[];
+  risks: string[];
+  suggestedNextStep: string;
+}
+
+interface DailyOperatorBriefAction {
+  id: string;
+  title: string;
+  status: string;
+  priority: string;
+  dueAt?: string;
+  snoozedUntil?: string;
+}
+
+interface DailyOperatorBriefGoalStatus {
+  goalId: string;
+  title: string;
+  status: string;
+  note: string;
 }
 
 interface InsightReport {

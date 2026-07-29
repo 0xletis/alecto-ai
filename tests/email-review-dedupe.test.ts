@@ -501,6 +501,127 @@ test("unsupported non-core review creates no Event or ActionItem", async () => {
   }
 });
 
+test("/today returns safe empty brief", async () => {
+  const server = buildServer();
+  const briefUserId = `brief-empty-${randomUUID()}`;
+  await prisma.user.create({ data: { id: briefUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${briefUserId}/today`
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.brief.openActions.length, 0);
+    assert.equal(payload.brief.overdueActions.length, 0);
+    assert.equal(payload.brief.suggestedNextStep, "Log one meaningful action.");
+    assert.equal(JSON.stringify(payload).includes("accessToken"), false);
+    assert.equal(JSON.stringify(payload).includes("refreshToken"), false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: briefUserId } });
+  }
+});
+
+test("/today shows open, completed, overdue action items and picks overdue first", async () => {
+  const server = buildServer();
+  const briefUserId = `brief-actions-${randomUUID()}`;
+  await prisma.user.create({ data: { id: briefUserId } });
+
+  const overdue = await prisma.actionItem.create({
+    data: {
+      userId: briefUserId,
+      source: "manual",
+      title: "Send dashboard issues",
+      priority: "high",
+      dueAt: new Date(Date.now() - 60 * 60 * 1000)
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: briefUserId,
+      source: "manual",
+      title: "Review product notes",
+      priority: "medium"
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: briefUserId,
+      source: "manual",
+      title: "Finished earlier task",
+      status: "completed",
+      priority: "medium",
+      completedAt: new Date()
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${briefUserId}/today`
+    });
+    assert.equal(response.statusCode, 200);
+    const brief = response.json().brief;
+    assert.equal(brief.overdueActions[0].id, overdue.id);
+    assert.match(brief.topPriorities[0], /Overdue: Send dashboard issues/);
+    assert.equal(brief.recentWins.includes("Completed action: Finished earlier task"), true);
+    assert.equal(brief.suggestedNextStep, "Handle overdue action: Send dashboard issues.");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: briefUserId } });
+  }
+});
+
+test("/today shows goal progress and betting cooldown risk", async () => {
+  const server = buildServer();
+  const briefUserId = `brief-events-${randomUUID()}`;
+  await prisma.user.create({ data: { id: briefUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: briefUserId,
+      title: "Find a new job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+  await prisma.event.create({
+    data: {
+      userId: briefUserId,
+      type: "career.application_sent",
+      timestamp: new Date(),
+      source: "manual",
+      data: { count: 1 },
+      confidence: 0.9
+    }
+  });
+  await prisma.event.create({
+    data: {
+      userId: briefUserId,
+      type: "finance.betting.cooldown_triggered",
+      timestamp: new Date(),
+      source: "manual",
+      data: { reason: "red_risk_state" },
+      confidence: 1
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${briefUserId}/today`
+    });
+    assert.equal(response.statusCode, 200);
+    const brief = response.json().brief;
+    assert.equal(brief.goalStatus[0].note, "1 application sent today");
+    assert.equal(brief.risks.some((risk: string) => risk.includes("Betting impulse detected recently")), true);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: briefUserId } });
+  }
+});
+
 async function createReview(input: {
   subject: string;
   from: string;

@@ -1284,6 +1284,20 @@ export async function getActionItems(
   return actionItems.map(toActionItem);
 }
 
+export async function getRecentActionItems(userId: string, limit = 50): Promise<ActionItem[]> {
+  await ensureUser(userId);
+
+  const actionItems = await prisma.actionItem.findMany({
+    where: {
+      userId
+    },
+    orderBy: { updatedAt: "desc" },
+    take: limit
+  });
+
+  return actionItems.map(toActionItem);
+}
+
 export async function completeActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
   await ensureUser(userId);
 
