@@ -45,6 +45,9 @@ export interface GmailSemanticEventDedupeInput {
   from?: string;
   company?: string;
   role?: string;
+  project?: string;
+  deadline?: string;
+  actionRequired?: boolean;
   since?: Date;
 }
 
@@ -58,6 +61,9 @@ export interface GmailSemanticReviewDedupeInput {
   from?: string;
   company?: string;
   role?: string;
+  project?: string;
+  deadline?: string;
+  actionRequired?: boolean;
   since?: Date;
 }
 
@@ -412,6 +418,8 @@ export async function findGmailSemanticDuplicateEvent(
   const from = normalizeEmailAddress(input.from);
   const company = normalizeSemanticText(input.company);
   const role = normalizeSemanticText(input.role);
+  const project = normalizeSemanticText(input.project);
+  const deadline = normalizeSemanticText(input.deadline);
 
   if (!subject || !from) {
     return undefined;
@@ -439,7 +447,10 @@ export async function findGmailSemanticDuplicateEvent(
       normalizeSemanticText(readString(data.subject)) === subject &&
       normalizeEmailAddress(readString(data.from)) === from &&
       normalizeSemanticText(readString(data.company)) === company &&
-      normalizeSemanticText(readString(data.role)) === role
+      normalizeSemanticText(readString(data.role)) === role &&
+      normalizeSemanticText(readString(data.project)) === project &&
+      normalizeSemanticText(readString(data.deadline)) === deadline &&
+      normalizeBoolean(data.actionRequired) === normalizeBoolean(input.actionRequired)
     );
   });
 
@@ -455,6 +466,8 @@ export async function findGmailSemanticDuplicateReviewItem(
   const from = normalizeEmailAddress(input.from);
   const company = normalizeSemanticText(input.company);
   const role = normalizeSemanticText(input.role);
+  const project = normalizeSemanticText(input.project);
+  const deadline = normalizeSemanticText(input.deadline);
 
   if (!subject || !from || !input.proposedEventType) {
     return undefined;
@@ -481,7 +494,10 @@ export async function findGmailSemanticDuplicateReviewItem(
       normalizeSemanticText(item.subject ?? undefined) === subject &&
       normalizeEmailAddress(item.from ?? undefined) === from &&
       normalizeSemanticText(readString(extracted.company)) === company &&
-      normalizeSemanticText(readString(extracted.role)) === role
+      normalizeSemanticText(readString(extracted.role)) === role &&
+      normalizeSemanticText(readString(extracted.project)) === project &&
+      normalizeSemanticText(readString(extracted.deadline)) === deadline &&
+      normalizeBoolean(extracted.actionRequired) === normalizeBoolean(input.actionRequired)
     );
   });
 
@@ -502,6 +518,9 @@ export async function approvePendingGmailReviewItemsForSemanticEvent(input: {
   from?: string;
   company?: string;
   role?: string;
+  project?: string;
+  deadline?: string;
+  actionRequired?: boolean;
   eventId: string;
   since?: Date;
 }): Promise<EmailReviewItem[]> {
@@ -511,6 +530,8 @@ export async function approvePendingGmailReviewItemsForSemanticEvent(input: {
   const from = normalizeEmailAddress(input.from);
   const company = normalizeSemanticText(input.company);
   const role = normalizeSemanticText(input.role);
+  const project = normalizeSemanticText(input.project);
+  const deadline = normalizeSemanticText(input.deadline);
 
   if (!subject || !from) {
     return [];
@@ -538,7 +559,10 @@ export async function approvePendingGmailReviewItemsForSemanticEvent(input: {
         normalizeSemanticText(item.subject ?? undefined) === subject &&
         normalizeEmailAddress(item.from ?? undefined) === from &&
         normalizeSemanticText(readString(extracted.company)) === company &&
-        normalizeSemanticText(readString(extracted.role)) === role
+        normalizeSemanticText(readString(extracted.role)) === role &&
+        normalizeSemanticText(readString(extracted.project)) === project &&
+        normalizeSemanticText(readString(extracted.deadline)) === deadline &&
+        normalizeBoolean(extracted.actionRequired) === normalizeBoolean(input.actionRequired)
       );
     })
     .map((item) => item.id);
@@ -650,6 +674,10 @@ function normalizeEmailAddress(value?: string): string {
 
 function readString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
+}
+
+function normalizeBoolean(value: unknown): string {
+  return typeof value === "boolean" ? String(value) : "";
 }
 
 function shouldIgnoreArchivedCleanupEvent(

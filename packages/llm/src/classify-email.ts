@@ -12,7 +12,20 @@ export const JobSearchEmailAllowedEventTypes = [
   "career.offer_received"
 ] as const;
 
-const allowedNonCoreReviewTypes = ["application_action_required", "security_code", "verify_email"] as const;
+export const WorkActionEmailAllowedEventTypes = [
+  "work.feedback_received",
+  "work.blocker_reported",
+  "work.task_completed",
+  "work.project_milestone_completed"
+] as const;
+
+const jobSearchNonCoreReviewTypes = ["application_action_required", "security_code", "verify_email"] as const;
+const workActionNonCoreReviewTypes = [
+  "work_action_required",
+  "work_deadline_detected",
+  "work_follow_up_requested",
+  "work_project_update_detected"
+] as const;
 
 const LLMEmailClassificationSchema = z.object({
   decision: z.enum(["log_event", "needs_review", "ignore"]),
@@ -24,12 +37,14 @@ const LLMEmailClassificationSchema = z.object({
     company: z.string().nullable(),
     role: z.string().nullable(),
     deadline: z.string().nullable(),
-    actionRequired: z.boolean().nullable()
+    actionRequired: z.boolean().nullable(),
+    project: z.string().nullable(),
+    senderIntent: z.string().nullable()
   })
 });
 
 export interface ClassifyEmailWithLLMInput {
-  adapterId: "job_search_email";
+  adapterId: "job_search_email" | "work_action_email";
   source: "gmail";
   subject?: string;
   from?: string;
@@ -111,7 +126,8 @@ function normalizeLLMEmailClassification(
 ): EmailClassification {
   const eventType = parsed.eventType ?? undefined;
   const allowedEventType = eventType && allowedEventTypes.includes(eventType);
-  const allowedNonCoreReviewType = eventType && allowedNonCoreReviewTypes.includes(eventType as (typeof allowedNonCoreReviewTypes)[number]);
+  const nonCoreReviewTypes: readonly string[] = input.adapterId === "work_action_email" ? workActionNonCoreReviewTypes : jobSearchNonCoreReviewTypes;
+  const allowedNonCoreReviewType = eventType && nonCoreReviewTypes.includes(eventType);
   const combinedText = normalizeText([
     input.subject,
     input.from,
@@ -121,11 +137,11 @@ function normalizeLLMEmailClassification(
     parsed.evidence
   ].filter(Boolean).join("\n"));
 
-  if (isIrrelevantJobSearchEmail(combinedText, parsed)) {
+  if (isIrrelevantEmail(combinedText, parsed, input.adapterId)) {
     return EmailClassificationSchema.parse({
       decision: "ignore",
       confidence: parsed.confidence,
-      reason: "irrelevant_to_job_search",
+      reason: input.adapterId === "work_action_email" ? "irrelevant_to_work_action" : "irrelevant_to_job_search",
       evidence: parsed.evidence,
       extracted: cleanExtracted(parsed.extracted),
       metadata: {
@@ -241,11 +257,34 @@ function cleanExtracted(extracted: z.infer<typeof LLMEmailClassificationSchema>[
     ...(extracted.company ? { company: extracted.company } : {}),
     ...(extracted.role ? { role: extracted.role } : {}),
     ...(extracted.deadline ? { deadline: extracted.deadline } : {}),
+    ...(extracted.project ? { project: extracted.project } : {}),
+    ...(extracted.senderIntent ? { senderIntent: extracted.senderIntent } : {}),
     ...(typeof extracted.actionRequired === "boolean" ? { actionRequired: extracted.actionRequired } : {})
   };
 }
 
 function buildEmailClassifierPrompt(allowedEventTypes: readonly string[]): string {
+  const workAction = allowedEventTypes.some((eventType) => eventType.startsWith("work."));
+
+  if (workAction) {
+    return [
+      "Classify one Gmail message for Alecto's work_action_email adapter.",
+      "Return JSON only matching the schema.",
+      "Classify only the email content. Do not use outside assumptions.",
+      "Use approved event types only for direct core events.",
+      `Approved event types: ${allowedEventTypes.join(", ")}`,
+      "Allowed non-core review eventType values: work_action_required, work_deadline_detected, work_follow_up_requested, work_project_update_detected.",
+      "Be conservative. If meaningful but ambiguous, prefer needs_review.",
+      "Only classify as a work action if it is related to actual work, a project, a client, or collaboration.",
+      "Ignore retail, finance, travel, account, login, privacy, marketing, newsletters, product promotions, receipts, KYC, and bank/card/crypto admin emails.",
+      "Ignore login/security codes, password resets, social notifications, generic product updates, webinars, event invitations, and promo announcements.",
+      "No-reply messages are ignored unless from an explicit work/project tool and requiring user action.",
+      "A deadline only matters if it is for a work/project action, not promo/account compliance.",
+      "Do not invent project or deadline. Leave absent fields null.",
+      "Use concise reason and short evidence from the email."
+    ].join("\n");
+  }
+
   return [
     "Classify one Gmail message for Alecto's job_search_email adapter.",
     "Return JSON only matching the schema.",
@@ -262,12 +301,82 @@ function buildEmailClassifierPrompt(allowedEventTypes: readonly string[]): strin
   ].join("\n");
 }
 
-function isIrrelevantJobSearchEmail(
+function isIrrelevantEmail(
   text: string,
-  parsed: z.infer<typeof LLMEmailClassificationSchema>
+  parsed: z.infer<typeof LLMEmailClassificationSchema>,
+  adapterId: ClassifyEmailWithLLMInput["adapterId"]
 ): boolean {
   if (parsed.decision === "ignore") {
     return true;
+  }
+
+  if (adapterId === "work_action_email") {
+    const hardIgnored = hasAny(text, [
+      "confirm this login",
+      "confirm login",
+      "login attempt",
+      "verification code",
+      "security code",
+      "password reset",
+      "access code",
+      "login code",
+      "newsletter",
+      "unsubscribe",
+      "sale",
+      "rebajas",
+      "promotion",
+      "promo",
+      "discount",
+      "cashback",
+      "points",
+      "revpoints",
+      "privilege",
+      "birthday gift",
+      "webinar",
+      "event invitation",
+      "re:invent",
+      "product announcement",
+      "receipt",
+      "invoice",
+      "privacy notice",
+      "privacy notices",
+      "terms update",
+      "account update",
+      "confirm your occupation",
+      "occupation confirmation",
+      "kyc",
+      "know your customer",
+      "bank compliance",
+      "finance compliance",
+      "payment notice",
+      "card notice",
+      "crypto deposit",
+      "social notification",
+      "product update",
+      "release notes",
+      "generic update"
+    ]);
+
+    if (hardIgnored) {
+      return true;
+    }
+
+    const noisySender = hasAny(text, ["noreply@", "no-reply@", "donotreply@", "do-not-reply@", "marketing@"]);
+    const actionContext = hasAny(text, [
+      "can you review",
+      "please review",
+      "please send",
+      "action required",
+      "deadline",
+      "due by",
+      "blocked by",
+      "waiting on",
+      "feedback",
+      "review"
+    ]);
+    const workTool = hasAny(text, ["jira", "linear", "asana", "notion", "github", "gitlab", "slack", "trello"]);
+
+    return noisySender && !(workTool && actionContext);
   }
 
   const explicitlyIrrelevant = hasAny(text, [
@@ -326,6 +435,10 @@ function normalizeText(text: string): string {
 }
 
 function buildEmailClassificationJsonSchema(allowedEventTypes: readonly string[]) {
+  const nonCoreTypes = allowedEventTypes.some((eventType) => eventType.startsWith("work."))
+    ? workActionNonCoreReviewTypes
+    : jobSearchNonCoreReviewTypes;
+
   return {
     type: "object",
     additionalProperties: false,
@@ -337,7 +450,7 @@ function buildEmailClassificationJsonSchema(allowedEventTypes: readonly string[]
       },
       eventType: {
         anyOf: [
-          { type: "string", enum: [...allowedEventTypes, "application_action_required", "security_code", "verify_email"] },
+          { type: "string", enum: [...allowedEventTypes, ...nonCoreTypes] },
           { type: "null" }
         ]
       },
@@ -357,12 +470,14 @@ function buildEmailClassificationJsonSchema(allowedEventTypes: readonly string[]
       extracted: {
         type: "object",
         additionalProperties: false,
-        required: ["company", "role", "deadline", "actionRequired"],
+        required: ["company", "role", "deadline", "actionRequired", "project", "senderIntent"],
         properties: {
           company: { anyOf: [{ type: "string" }, { type: "null" }] },
           role: { anyOf: [{ type: "string" }, { type: "null" }] },
           deadline: { anyOf: [{ type: "string" }, { type: "null" }] },
-          actionRequired: { anyOf: [{ type: "boolean" }, { type: "null" }] }
+          actionRequired: { anyOf: [{ type: "boolean" }, { type: "null" }] },
+          project: { anyOf: [{ type: "string" }, { type: "null" }] },
+          senderIntent: { anyOf: [{ type: "string" }, { type: "null" }] }
         }
       }
     }

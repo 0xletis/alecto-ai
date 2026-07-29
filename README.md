@@ -128,6 +128,7 @@ Telegram commands:
 - `/connect_gmail`: get the Gmail readonly OAuth URL
 - `/my_email_rules`: show Gmail email signal rules
 - `/enable_email_rule job_search`: enable job-search email scanning after Gmail is connected
+- `/enable_email_rule work_action`: enable review-first work/action email scanning after Gmail is connected
 - `/enable_email_rule job_search goal=GOAL_ID`: attach the job-search email rule to a goal
 - `/pause_email_rule RULE_ID`: pause an email rule
 - `/resume_email_rule RULE_ID`: resume a paused email rule
@@ -393,8 +394,9 @@ Expected:
 - `/goal-templates` returns structured goal templates such as `career.job_search`, `health.strength_energy`, `health.sleep_better`, `learning.reading_more`, and `finance.control_betting_trading`.
 - `/integrations` returns Integration Registry v1. `github_public` and `gmail` are available; `wallet_public` is planned.
 - Gmail is a generic readonly email source. It does not scan anything until the user connects Gmail and explicitly enables an email rule.
-- `job_search_email` is the first email adapter. It searches user-approved Gmail results for recruiter replies, interview scheduling, application confirmations, rejections, and offers, then feeds the existing `job_search_text` ingestion adapter.
-- Planned email adapters include work/client action emails, finance receipts, learning deadlines, and custom goal email signals.
+- `job_search_email` searches user-approved Gmail results for recruiter replies, interview scheduling, application confirmations, rejections, and offers, then feeds the existing `job_search_text` ingestion adapter.
+- `work_action_email` is a review-first adapter for action requests, deadlines, follow-ups, feedback, blockers, and project updates. It uses the existing Gmail source and readonly scope.
+- Planned email adapters include finance receipts, learning deadlines, and custom goal email signals.
 - Email rules control the fetch strategy, lookback window, classifier mode, message cap, event cap, and confidence thresholds. Supported fetch strategies are `query` and `all_recent`; `sender_allowlist` and `label` are reserved for later and fail safely.
 - Classifier modes are `rules`, `hybrid`, and `llm`. `rules` uses the deterministic classifier and never calls OpenAI. `hybrid` keeps hard deterministic filters first, uses rules for obvious high-confidence classifications, and can use OpenAI only for ambiguous cases when `OPENAI_API_KEY` is available. `llm` still applies hard filters before OpenAI and does not crash without a key; it marks the email for review instead of auto-logging.
 - Rule sync is capped by `maxMessagesPerSync` and `maxEventsPerSync`, creates at most one event per email, and only logs approved event types from the ontology.
@@ -515,6 +517,7 @@ Telegram integration commands:
 /my_email_rules
 /enable_email_rule job_search
 /enable_email_rule job_search goal=GOAL_ID
+/enable_email_rule work_action
 /pause_email_rule RULE_ID
 /resume_email_rule RULE_ID
 /set_email_rule_config RULE_ID maxMessagesPerSync=10 maxEventsPerSync=3 classifierMode=rules

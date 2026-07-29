@@ -7,6 +7,7 @@ import {
   composeAgentResponse,
   buildWeeklyInsight,
   classifyJobSearchEmail,
+  classifyWorkActionEmail,
   CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
   CustomGoalConfigInputSchema,
@@ -53,6 +54,7 @@ import {
   classifyEmailWithLLM,
   composeResponseWithOpenAI,
   JobSearchEmailAllowedEventTypes,
+  WorkActionEmailAllowedEventTypes,
   polishInsightWithOpenAI,
   type OpenAIMessageAnalysis
 } from "@operator-agent/llm";
@@ -786,19 +788,21 @@ export function buildServer() {
 
     const adapter = getEmailAdapterDefinition(parsed.data.adapterId);
 
-    if (!adapter || adapter.status !== "available" || adapter.id !== "job_search_email") {
+    if (!adapter || adapter.status !== "available" || !["job_search_email", "work_action_email"].includes(adapter.id)) {
       return reply.status(400).send({
         error: "Unsupported email adapter."
       });
     }
 
-    await archiveStaleJobSearchEmailRules(request.params.userId, connection.id);
+    if (adapter.id === "job_search_email") {
+      await archiveStaleJobSearchEmailRules(request.params.userId, connection.id);
+    }
 
     const existingCurrentRule = (await getEmailSignalRules(request.params.userId)).find(
       (rule) =>
         rule.status === "active" &&
         rule.connectionId === connection.id &&
-        rule.adapterId === "job_search_email"
+        rule.adapterId === adapter.id
     );
 
     if (existingCurrentRule) {
@@ -810,6 +814,7 @@ export function buildServer() {
 
     const rule = await createEmailSignalRule(request.params.userId, {
       ...parsed.data,
+      ...defaultEmailRuleConfigForAdapter(adapter.id, request.body),
       query: parsed.data.query ?? adapter.defaultQuery ?? "",
       createdBy: "user"
     });
@@ -940,7 +945,7 @@ export function buildServer() {
           ...review.extracted,
           provider: "gmail",
           emailAdapterId: review.adapterId,
-          adapterId: "job_search_text",
+          adapterId: review.adapterId === "job_search_email" ? "job_search_text" : review.adapterId,
           classification: review.reason,
           ruleId: review.ruleId,
           gmailMessageId: review.providerMessageId,
@@ -1250,6 +1255,25 @@ export function buildServer() {
   );
 
   return server;
+}
+
+function defaultEmailRuleConfigForAdapter(adapterId: string, rawBody: unknown) {
+  if (adapterId === "work_action_email") {
+    const input = typeof rawBody === "object" && rawBody !== null ? (rawBody as Record<string, unknown>) : {};
+
+    return {
+      ...(!("fetchStrategy" in input) ? { fetchStrategy: "query" as const } : {}),
+      ...(!("lookbackDays" in input) ? { lookbackDays: 7 } : {}),
+      ...(!("maxMessagesPerSync" in input) ? { maxMessagesPerSync: 25 } : {}),
+      ...(!("maxEventsPerSync" in input) ? { maxEventsPerSync: 5 } : {}),
+      ...(!("classifierMode" in input) ? { classifierMode: "hybrid" as const } : {}),
+      ...(!("minAutoLogConfidence" in input) ? { minAutoLogConfidence: 0.95 } : {}),
+      ...(!("minReviewConfidence" in input) ? { minReviewConfidence: 0.7 } : {}),
+      ...(!("reviewBeforeLogging" in input) ? { reviewBeforeLogging: true } : {})
+    };
+  }
+
+  return {};
 }
 
 function analyzeMessage(
@@ -1724,7 +1748,7 @@ async function syncEmailSignalRule(input: {
     }
     summary.processed += 1;
 
-    if (classification.reason === "filtered_marketing") {
+    if (classification.reason === "filtered_marketing" || classification.reason === "filtered_non_action_email") {
       summary.filteredMarketing += 1;
       continue;
     }
@@ -1743,6 +1767,11 @@ async function syncEmailSignalRule(input: {
       input.rule.reviewBeforeLogging ||
       classification.confidence < input.rule.minAutoLogConfidence
     ) {
+      if (isReviewItemCapReached(input.rule, summary)) {
+        summary.skippedDueMaxEventsPerSync += 1;
+        continue;
+      }
+
       if (classification.confidence < input.rule.minReviewConfidence) {
         summary.lowConfidenceIgnored += 1;
         continue;
@@ -1812,7 +1841,10 @@ async function syncEmailSignalRule(input: {
         subject,
         from,
         company: typeof classification.extracted.company === "string" ? classification.extracted.company : undefined,
-        role: typeof classification.extracted.role === "string" ? classification.extracted.role : undefined
+        role: typeof classification.extracted.role === "string" ? classification.extracted.role : undefined,
+        project: typeof classification.extracted.project === "string" ? classification.extracted.project : undefined,
+        deadline: typeof classification.extracted.deadline === "string" ? classification.extracted.deadline : undefined,
+        actionRequired: typeof classification.extracted.actionRequired === "boolean" ? classification.extracted.actionRequired : undefined
       })
     );
 
@@ -1833,7 +1865,7 @@ async function syncEmailSignalRule(input: {
           ...classification.extracted,
           provider: "gmail",
           emailAdapterId: input.rule.adapterId,
-          adapterId: "job_search_text",
+          adapterId: input.rule.adapterId === "job_search_email" ? "job_search_text" : input.rule.adapterId,
           classification: classification.reason,
           ruleId: input.rule.id,
           gmailMessageId: message.id,
@@ -1865,6 +1897,9 @@ async function syncEmailSignalRule(input: {
           from,
           company: typeof classification.extracted.company === "string" ? classification.extracted.company : undefined,
           role: typeof classification.extracted.role === "string" ? classification.extracted.role : undefined,
+          project: typeof classification.extracted.project === "string" ? classification.extracted.project : undefined,
+          deadline: typeof classification.extracted.deadline === "string" ? classification.extracted.deadline : undefined,
+          actionRequired: typeof classification.extracted.actionRequired === "boolean" ? classification.extracted.actionRequired : undefined,
           eventId: created.event.id
         })
       );
@@ -1896,13 +1931,9 @@ async function classifyEmailForRule(
   message: GmailMessage,
   text: string
 ): Promise<{ classification: ReturnType<typeof classifyJobSearchEmail>; llmStatus?: "classified" | "unavailable" | "error" }> {
-  const rulesClassification = classifyJobSearchEmail({
-    text,
-    classifierMode: "rules",
-    llmAvailable: false
-  });
+  const rulesClassification = classifyEmailWithRules(rule.adapterId, text);
 
-  if (rule.adapterId !== "job_search_email") {
+  if (!["job_search_email", "work_action_email"].includes(rule.adapterId)) {
     return { classification: rulesClassification };
   }
 
@@ -1929,7 +1960,7 @@ async function classifyEmailForRule(
   if (!process.env.OPENAI_API_KEY) {
     if (rule.classifierMode === "llm") {
       return {
-        classification: classifyJobSearchEmail({ text, classifierMode: "llm", llmAvailable: false }),
+        classification: unavailableEmailClassification(rule.adapterId, text, rule.classifierMode, rule.minReviewConfidence),
         llmStatus: "unavailable"
       };
     }
@@ -1939,13 +1970,13 @@ async function classifyEmailForRule(
 
   try {
     const llmClassification = await classifyEmailWithLLM({
-      adapterId: "job_search_email",
+      adapterId: rule.adapterId === "work_action_email" ? "work_action_email" : "job_search_email",
       source: "gmail",
       subject: getGmailHeader(message, "subject"),
       from: getGmailHeader(message, "from"),
       snippet: message.snippet,
       bodyText: text,
-      allowedEventTypes: JobSearchEmailAllowedEventTypes,
+      allowedEventTypes: rule.adapterId === "work_action_email" ? WorkActionEmailAllowedEventTypes : JobSearchEmailAllowedEventTypes,
       classifierMode: rule.classifierMode === "llm" ? "llm" : "hybrid",
       minAutoLogConfidence: rule.minAutoLogConfidence,
       minReviewConfidence: rule.minReviewConfidence
@@ -1963,7 +1994,7 @@ async function classifyEmailForRule(
         extracted: {},
         metadata: {
           classifierMode: rule.classifierMode,
-          adapterId: "job_search_email",
+          adapterId: rule.adapterId,
           source: "gmail",
           classifier: "llm"
         }
@@ -1974,7 +2005,46 @@ async function classifyEmailForRule(
 }
 
 function isHardEmailClassification(classification: ReturnType<typeof classifyJobSearchEmail>): boolean {
-  return classification.reason === "filtered_marketing" || classification.reason === "application_action_required";
+  return ["filtered_marketing", "application_action_required", "filtered_non_action_email"].includes(classification.reason);
+}
+
+function isReviewItemCapReached(rule: EmailSignalRule, summary: EmailRuleSyncSummary): boolean {
+  const cap = rule.adapterId === "work_action_email" ? Math.min(3, rule.maxEventsPerSync) : rule.maxEventsPerSync;
+
+  return summary.reviewItemsCreated >= cap;
+}
+
+function classifyEmailWithRules(adapterId: string, text: string): ReturnType<typeof classifyJobSearchEmail> {
+  if (adapterId === "work_action_email") {
+    return classifyWorkActionEmail({ text, classifierMode: "rules", llmAvailable: false });
+  }
+
+  return classifyJobSearchEmail({ text, classifierMode: "rules", llmAvailable: false });
+}
+
+function unavailableEmailClassification(
+  adapterId: string,
+  text: string,
+  classifierMode: "llm" | "hybrid" | "rules",
+  minReviewConfidence: number
+): ReturnType<typeof classifyJobSearchEmail> {
+  if (adapterId === "work_action_email") {
+    return {
+      decision: "needs_review",
+      confidence: minReviewConfidence,
+      reason: "LLM classifier unavailable",
+      evidence: text.slice(0, 300),
+      extracted: {},
+      metadata: {
+        classifierMode,
+        adapterId,
+        source: "gmail",
+        classifier: "llm"
+      }
+    };
+  }
+
+  return classifyJobSearchEmail({ text, classifierMode: "llm", llmAvailable: false });
 }
 
 async function createEmailReviewItemForClassification(input: {
@@ -1990,6 +2060,9 @@ async function createEmailReviewItemForClassification(input: {
   const proposedEventType = input.classification.eventType ?? safeEmailReviewProposedType(input.classification.reason);
   const company = typeof input.classification.extracted.company === "string" ? input.classification.extracted.company : undefined;
   const role = typeof input.classification.extracted.role === "string" ? input.classification.extracted.role : undefined;
+  const project = typeof input.classification.extracted.project === "string" ? input.classification.extracted.project : undefined;
+  const deadline = typeof input.classification.extracted.deadline === "string" ? input.classification.extracted.deadline : undefined;
+  const actionRequired = typeof input.classification.extracted.actionRequired === "boolean" ? input.classification.extracted.actionRequired : undefined;
   const semanticKey = buildEmailReviewSemanticKey({
     userId: input.userId,
     ruleId: input.rule.id,
@@ -1998,7 +2071,10 @@ async function createEmailReviewItemForClassification(input: {
     subject,
     from,
     company,
-    role
+    role,
+    project,
+    deadline,
+    actionRequired
   });
   const baseDebug = {
     subject: truncatePlainText(subject ?? "", 120),
@@ -2006,6 +2082,9 @@ async function createEmailReviewItemForClassification(input: {
     proposedEventType,
     company,
     role,
+    project,
+    deadline,
+    actionRequired,
     semanticKey
   };
 
@@ -2017,7 +2096,10 @@ async function createEmailReviewItemForClassification(input: {
       subject,
       from,
       company,
-      role
+      role,
+      project,
+      deadline,
+      actionRequired
     });
 
     if (activeEvent) {
@@ -2042,7 +2124,10 @@ async function createEmailReviewItemForClassification(input: {
     subject,
     from,
     company,
-    role
+    role,
+    project,
+    deadline,
+    actionRequired
   });
 
   if (semanticReview) {
@@ -2144,7 +2229,17 @@ async function createEmailReviewItemForClassification(input: {
 }
 
 function safeEmailReviewProposedType(reason: string): string | undefined {
-  return ["application_action_required", "security_code", "verify_email"].includes(reason) ? reason : undefined;
+  return [
+    "application_action_required",
+    "security_code",
+    "verify_email",
+    "work_action_required",
+    "work_deadline_detected",
+    "work_follow_up_requested",
+    "work_project_update_detected"
+  ].includes(reason)
+    ? reason
+    : undefined;
 }
 
 function dedupeDecisionForReviewStatus(status: string): EmailReviewCandidateDebug["decision"] {
@@ -2176,6 +2271,9 @@ function buildEmailReviewSemanticKey(input: {
   from?: string;
   company?: string;
   role?: string;
+  project?: string;
+  deadline?: string;
+  actionRequired?: boolean;
 }): string {
   return [
     input.userId,
@@ -2185,7 +2283,10 @@ function buildEmailReviewSemanticKey(input: {
     normalizeDebugSemanticText(input.subject),
     normalizeDebugEmailAddress(input.from),
     normalizeDebugSemanticText(input.company),
-    normalizeDebugSemanticText(input.role)
+    normalizeDebugSemanticText(input.role),
+    normalizeDebugSemanticText(input.project),
+    normalizeDebugSemanticText(input.deadline),
+    typeof input.actionRequired === "boolean" ? String(input.actionRequired) : ""
   ].join("|");
 }
 
@@ -4429,6 +4530,9 @@ interface EmailReviewCandidateDebug {
   proposedEventType?: string;
   company?: string;
   role?: string;
+  project?: string;
+  deadline?: string;
+  actionRequired?: boolean;
   decision:
     | "created"
     | "existing_pending"

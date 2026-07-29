@@ -484,8 +484,8 @@ bot.command("enable_email_rule", async (ctx) => {
 
   const parsed = parseEnableEmailRuleCommand(getCommandText(ctx));
 
-  if (!parsed || parsed.kind !== "job_search") {
-    await ctx.reply("Usage: /enable_email_rule job_search or /enable_email_rule job_search goal=GOAL_ID");
+  if (!parsed || !["job_search", "work_action"].includes(parsed.kind)) {
+    await ctx.reply("Usage: /enable_email_rule job_search|work_action or /enable_email_rule job_search goal=GOAL_ID");
     return;
   }
 
@@ -503,9 +503,7 @@ bot.command("enable_email_rule", async (ctx) => {
     const response = await apiPost<EmailRuleResponse>(`/users/${getTelegramUserId(ctx)}/email-rules`, {
       connectionId: gmailConnection.id,
       goalId: parsed.goalId,
-      adapterId: "job_search_email",
-      name: "Job search emails",
-      reviewBeforeLogging: false
+      ...emailRuleInputForKind(parsed.kind)
     });
 
     await ctx.reply(`${response.message ?? `Email rule enabled: ${response.emailRule.id}`}\n${formatEmailRule(response.emailRule, gmailConnection)}`);
@@ -1401,6 +1399,29 @@ function parseCreateGoal(text: string) {
   };
 }
 
+function emailRuleInputForKind(kind: string) {
+  if (kind === "work_action") {
+    return {
+      adapterId: "work_action_email",
+      name: "Work action emails",
+      fetchStrategy: "query",
+      classifierMode: "hybrid",
+      reviewBeforeLogging: true,
+      lookbackDays: 7,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 5,
+      minAutoLogConfidence: 0.95,
+      minReviewConfidence: 0.7
+    };
+  }
+
+  return {
+    adapterId: "job_search_email",
+    name: "Job search emails",
+    reviewBeforeLogging: false
+  };
+}
+
 function parseCreateGoalFromTemplate(text: string) {
   const [templateId, title, why] = text.split("|").map((part) => part.trim());
 
@@ -1936,6 +1957,9 @@ function formatEmailReviewCandidateDebug(candidate: EmailReviewCandidateDebug): 
     candidate.proposedEventType ? `type=${candidate.proposedEventType}` : undefined,
     candidate.company ? `company=${truncateText(candidate.company, 60)}` : undefined,
     candidate.role ? `role=${truncateText(candidate.role, 60)}` : undefined,
+    candidate.project ? `project=${truncateText(candidate.project, 60)}` : undefined,
+    candidate.deadline ? `deadline=${truncateText(candidate.deadline, 60)}` : undefined,
+    typeof candidate.actionRequired === "boolean" ? `actionRequired=${candidate.actionRequired}` : undefined,
     candidate.matchedReviewId ? `matchedReviewId=${candidate.matchedReviewId}` : undefined,
     candidate.matchedReviewStatus ? `matchedReviewStatus=${candidate.matchedReviewStatus}` : undefined,
     candidate.matchedEventId ? `matchedEventId=${candidate.matchedEventId}` : undefined,
@@ -3052,6 +3076,9 @@ interface EmailReviewCandidateDebug {
   proposedEventType?: string;
   company?: string;
   role?: string;
+  project?: string;
+  deadline?: string;
+  actionRequired?: boolean;
   decision:
     | "created"
     | "existing_pending"

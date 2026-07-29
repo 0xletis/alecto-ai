@@ -89,8 +89,10 @@ export const emailAdapterRegistry: EmailAdapterDefinition[] = [
   {
     id: "work_action_email",
     domain: "work",
-    description: "Planned adapter for work/client action emails.",
-    status: "planned"
+    description: "Detects work action requests, deadlines, follow-ups, feedback, blockers, and project updates.",
+    status: "available",
+    defaultQuery:
+      'newer_than:7d ("can you review" OR "please review" OR "please send" OR "action required" OR deadline OR "due by" OR "blocked by" OR "waiting on you" OR "follow up on" OR "feedback requested")'
   },
   {
     id: "finance_receipt_email",
@@ -136,7 +138,11 @@ export const integrationRegistry: IntegrationDefinition[] = [
       "career.recruiter_reply_received",
       "career.interview_scheduled",
       "career.rejection_received",
-      "career.offer_received"
+      "career.offer_received",
+      "work.feedback_received",
+      "work.blocker_reported",
+      "work.task_completed",
+      "work.project_milestone_completed"
     ]
   },
   {
