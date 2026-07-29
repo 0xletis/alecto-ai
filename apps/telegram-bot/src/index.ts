@@ -779,6 +779,68 @@ bot.command("snooze_action", async (ctx) => {
   }
 });
 
+bot.command("trigger_action_reminders", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiPost<ActionReminderTriggerResponse>(
+      `/users/${getTelegramUserId(ctx)}/actions/reminders/trigger`,
+      {}
+    );
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not trigger action reminders right now.");
+  }
+});
+
+bot.command("debug_make_action_due", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  const actionId = getCommandText(ctx);
+
+  if (!actionId) {
+    await ctx.reply("Usage: /debug_make_action_due ACTION_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<ActionMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/actions/${actionId}/debug-force-due`,
+      {}
+    );
+    await ctx.reply(response.message ?? `Action forced due: ${response.action.title}`);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not force that action due.");
+  }
+});
+
+bot.command("debug_make_snoozed_due", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  const actionId = getCommandText(ctx);
+
+  if (!actionId) {
+    await ctx.reply("Usage: /debug_make_snoozed_due ACTION_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<ActionMutationResponse>(
+      `/users/${getTelegramUserId(ctx)}/actions/${actionId}/debug-force-snoozed-due`,
+      {}
+    );
+    await ctx.reply(response.message ?? `Action forced snoozed due: ${response.action.title}`);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not force that action snoozed due.");
+  }
+});
+
 bot.command("sync_gmail", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -1466,6 +1528,17 @@ async function guardAllowedUser(ctx: Context, command?: "start"): Promise<boolea
         ? "This private agent is not available for this Telegram account. Send /whoami to get your Telegram ID and ask the owner for access."
         : "This private agent is not available for this Telegram account. Send /whoami to get your Telegram ID."
     );
+    return false;
+  }
+
+  return true;
+}
+
+async function guardDebugAllowedUser(ctx: Context): Promise<boolean> {
+  const telegramUserId = ctx.from?.id;
+
+  if (!telegramUserId || !allowedUserIds?.has(String(telegramUserId))) {
+    await ctx.reply("Debug commands are only available to allowlisted users.");
     return false;
   }
 
@@ -3261,6 +3334,16 @@ interface ActionsResponse {
 interface ActionMutationResponse {
   action: ActionItem;
   message?: string;
+}
+
+interface ActionReminderTriggerResponse {
+  sent: number;
+  message: string;
+  reminders: Array<{
+    actionItem: ActionItem;
+    reminderType: "due" | "snoozed";
+    message: string;
+  }>;
 }
 
 interface ManualActionResponse {

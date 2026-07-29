@@ -915,6 +915,274 @@ test("duplicate open manual action is reused but completed old action does not b
   }
 });
 
+test("action reminder trigger sends open due action and includes commands", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: reminderUserId,
+      source: "manual",
+      title: "Review homepage copy",
+      priority: "medium",
+      dueAt: new Date(Date.now() - 60_000)
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.sent, 1);
+    assert.match(payload.message, /Action due:/);
+    assert.match(payload.message, new RegExp(`/complete_action ${action.id}`));
+    assert.match(payload.message, new RegExp(`/snooze_action ${action.id} tomorrow`));
+    assert.match(payload.message, new RegExp(`/archive_action ${action.id}`));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("action reminder trigger skips future, completed, and archived actions", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  await prisma.actionItem.createMany({
+    data: [
+      {
+        userId: reminderUserId,
+        source: "manual",
+        title: "Future action",
+        priority: "medium",
+        dueAt: new Date(Date.now() + 60 * 60_000)
+      },
+      {
+        userId: reminderUserId,
+        source: "manual",
+        title: "Completed action",
+        status: "completed",
+        priority: "medium",
+        dueAt: new Date(Date.now() - 60_000)
+      },
+      {
+        userId: reminderUserId,
+        source: "manual",
+        title: "Archived action",
+        status: "archived",
+        priority: "medium",
+        dueAt: new Date(Date.now() - 60_000)
+      }
+    ]
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().sent, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("snoozed due action sends reminder and becomes open", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: reminderUserId,
+      source: "manual",
+      title: "Call Alex",
+      status: "snoozed",
+      priority: "medium",
+      dueAt: new Date(Date.now() - 24 * 60 * 60_000),
+      snoozedUntil: new Date(Date.now() - 60_000)
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().sent, 1);
+    assert.match(response.json().message, /Snoozed action is back:/);
+
+    const updated = await prisma.actionItem.findUniqueOrThrow({ where: { id: action.id } });
+    assert.equal(updated.status, "open");
+    assert.equal(updated.snoozedUntil, null);
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().sent, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("snoozed future action does not send reminder", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  await prisma.actionItem.create({
+    data: {
+      userId: reminderUserId,
+      source: "manual",
+      title: "Call Alex",
+      status: "snoozed",
+      priority: "medium",
+      snoozedUntil: new Date(Date.now() + 60 * 60_000)
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().sent, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("duplicate action reminder within 12 hours is skipped", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  await prisma.actionItem.create({
+    data: {
+      userId: reminderUserId,
+      source: "manual",
+      title: "Send the CV",
+      priority: "medium",
+      dueAt: new Date(Date.now() - 60_000)
+    }
+  });
+
+  try {
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().sent, 1);
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().sent, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("debug force due action makes future action remind once", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: reminderUserId,
+      source: "manual",
+      title: "Review homepage copy",
+      priority: "medium",
+      dueAt: new Date(Date.now() + 24 * 60 * 60_000)
+    }
+  });
+
+  try {
+    const forced = await server.inject({
+      method: "PATCH",
+      url: `/users/${reminderUserId}/actions/${action.id}/debug-force-due`
+    });
+    assert.equal(forced.statusCode, 200);
+    assert.equal(forced.json().message, "Action forced due: Review homepage copy");
+
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().sent, 1);
+    assert.match(first.json().message, /Action due:/);
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().sent, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("debug force snoozed due action makes snoozed action remind once", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: reminderUserId,
+      source: "manual",
+      title: "Call Alex",
+      status: "open",
+      priority: "medium"
+    }
+  });
+
+  try {
+    const forced = await server.inject({
+      method: "PATCH",
+      url: `/users/${reminderUserId}/actions/${action.id}/debug-force-snoozed-due`
+    });
+    assert.equal(forced.statusCode, 200);
+    assert.equal(forced.json().message, "Action forced snoozed due: Call Alex");
+
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().sent, 1);
+    assert.match(first.json().message, /Snoozed action is back:/);
+
+    const updated = await prisma.actionItem.findUniqueOrThrow({ where: { id: action.id } });
+    assert.equal(updated.status, "open");
+    assert.equal(updated.snoozedUntil, null);
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().sent, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
 async function createReview(input: {
   subject: string;
   from: string;

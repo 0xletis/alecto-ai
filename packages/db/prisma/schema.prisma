@@ -24,6 +24,7 @@ model User {
   emailSignalRules       EmailSignalRule[]
   emailReviewItems       EmailReviewItem[]
   actionItems            ActionItem[]
+  actionItemReminderLogs ActionItemReminderLog[]
 }
 
 model Goal {
@@ -292,11 +293,27 @@ model ActionItem {
   completedAt    DateTime?
   snoozedUntil   DateTime?
 
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user         User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reminderLogs ActionItemReminderLog[]
 
   @@index([userId, status])
   @@index([userId, dueAt])
   @@index([source, sourceId])
+}
+
+model ActionItemReminderLog {
+  id           String   @id @default(uuid())
+  userId       String
+  actionItemId String
+  reminderType String
+  sentAt       DateTime @default(now())
+  createdAt    DateTime @default(now())
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  actionItem ActionItem @relation(fields: [actionItemId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([actionItemId, reminderType, sentAt])
 }
 
 enum GoalStatus {

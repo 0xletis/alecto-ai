@@ -236,6 +236,13 @@ export interface CreateActionItemInput {
   evidence?: string;
 }
 
+export type ActionItemReminderType = "due" | "snoozed";
+
+export interface ActionItemReminderCandidate {
+  actionItem: ActionItem;
+  reminderType: ActionItemReminderType;
+}
+
 export interface EmailReviewItemInput {
   userId: string;
   connectionId: string;
@@ -1386,6 +1393,143 @@ export async function snoozeActionItem(userId: string, actionItemId: string, sno
       status: "snoozed",
       snoozedUntil,
       completedAt: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
+export async function forceActionItemDue(userId: string, actionItemId: string, dueAt: Date): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing || existing.status === "archived") {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "open",
+      dueAt,
+      snoozedUntil: null,
+      completedAt: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
+export async function forceActionItemSnoozedDue(userId: string, actionItemId: string, snoozedUntil: Date): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing || existing.status === "archived") {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "snoozed",
+      snoozedUntil,
+      completedAt: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
+export async function getActionItemsEligibleForReminder(options: {
+  userId?: string;
+  now?: Date;
+  limit?: number;
+  reminderWindowHours?: number;
+} = {}): Promise<ActionItemReminderCandidate[]> {
+  const now = options.now ?? new Date();
+  const reminderWindowMs = (options.reminderWindowHours ?? 12) * 60 * 60 * 1000;
+  const since = new Date(now.getTime() - reminderWindowMs);
+  const actionItems = await prisma.actionItem.findMany({
+    where: {
+      ...(options.userId ? { userId: options.userId } : {}),
+      OR: [
+        {
+          status: "open",
+          dueAt: {
+            lte: now
+          }
+        },
+        {
+          status: "snoozed",
+          snoozedUntil: {
+            lte: now
+          }
+        }
+      ]
+    },
+    orderBy: [{ dueAt: "asc" }, { snoozedUntil: "asc" }, { updatedAt: "asc" }],
+    take: options.limit ?? 20
+  });
+  const candidates: ActionItemReminderCandidate[] = [];
+
+  for (const actionItem of actionItems) {
+    const reminderType: ActionItemReminderType = actionItem.status === "snoozed" ? "snoozed" : "due";
+    const recentLog = await prisma.actionItemReminderLog.findFirst({
+      where: {
+        actionItemId: actionItem.id,
+        reminderType,
+        sentAt: {
+          gte: since
+        }
+      },
+      orderBy: {
+        sentAt: "desc"
+      }
+    });
+
+    if (recentLog && !(reminderType === "snoozed" && actionItem.updatedAt > recentLog.sentAt)) {
+      continue;
+    }
+
+    candidates.push({
+      actionItem: toActionItem(actionItem),
+      reminderType
+    });
+  }
+
+  return candidates;
+}
+
+export async function createActionItemReminderLog(input: {
+  userId: string;
+  actionItemId: string;
+  reminderType: ActionItemReminderType;
+  sentAt?: Date;
+}): Promise<void> {
+  await prisma.actionItemReminderLog.create({
+    data: {
+      userId: input.userId,
+      actionItemId: input.actionItemId,
+      reminderType: input.reminderType,
+      sentAt: input.sentAt
+    }
+  });
+}
+
+export async function reopenSnoozedActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing || existing.status !== "snoozed") {
+    return existing;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "open",
+      snoozedUntil: null
     }
   });
 

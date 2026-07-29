@@ -109,6 +109,7 @@ import {
   getEmailReviewItems,
   getActionItem,
   getActionItems,
+  getActionItemsEligibleForReminder,
   getIntegrationConnection,
   getIntegrationConnections,
   approveEmailReviewItem,
@@ -117,6 +118,10 @@ import {
   rejectEmailReviewItem,
   completeActionItem,
   archiveActionItem,
+  createActionItemReminderLog,
+  reopenSnoozedActionItem,
+  forceActionItemDue,
+  forceActionItemSnoozedDue,
   snoozeActionItem,
   undoLastEvents,
   archiveEmailSignalRule,
@@ -128,6 +133,7 @@ import {
   type EmailSignalRule,
   type EmailReviewItem,
   type ActionItem,
+  type ActionItemReminderType,
   type CreateActionItemInput,
   updateIntegrationConnection,
   updateIntegrationConnectionConfig,
@@ -1064,6 +1070,56 @@ export function buildServer() {
     }
   );
 
+  server.post<{ Params: { userId: string } }>(
+    "/users/:userId/actions/reminders/trigger",
+    async (request) => {
+      const reminders = await dispatchActionRemindersForUser(request.params.userId, new Date());
+
+      return {
+        reminders,
+        sent: reminders.length,
+        message:
+          reminders.length > 0
+            ? reminders.map((reminder) => reminder.message).join("\n\n")
+            : "No due action reminders."
+      };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; actionId: string } }>(
+    "/users/:userId/actions/:actionId/debug-force-due",
+    async (request, reply) => {
+      const dueAt = new Date(Date.now() - 60_000);
+      const actionItem = await forceActionItemDue(request.params.userId, request.params.actionId, dueAt);
+
+      if (!actionItem) {
+        return reply.status(404).send({ error: "Action item not found" });
+      }
+
+      return {
+        action: sanitizeActionItem(actionItem),
+        message: `Action forced due: ${actionItem.title}`
+      };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; actionId: string } }>(
+    "/users/:userId/actions/:actionId/debug-force-snoozed-due",
+    async (request, reply) => {
+      const snoozedUntil = new Date(Date.now() - 60_000);
+      const actionItem = await forceActionItemSnoozedDue(request.params.userId, request.params.actionId, snoozedUntil);
+
+      if (!actionItem) {
+        return reply.status(404).send({ error: "Action item not found" });
+      }
+
+      return {
+        action: sanitizeActionItem(actionItem),
+        message: `Action forced snoozed due: ${actionItem.title}`
+      };
+    }
+  );
+
   server.patch<{ Params: { userId: string; actionId: string } }>(
     "/users/:userId/actions/:actionId/complete",
     async (request, reply) => {
@@ -1861,6 +1917,60 @@ function formatActionCreatedReply(input: {
     `complete: /complete_action ${input.action.id}`,
     `snooze: /snooze_action ${input.action.id} tomorrow`,
     `archive: /archive_action ${input.action.id}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function dispatchActionRemindersForUser(userId: string, now: Date): Promise<ActionReminderDispatch[]> {
+  const candidates = await getActionItemsEligibleForReminder({
+    userId,
+    now,
+    limit: 20
+  });
+  const reminders: ActionReminderDispatch[] = [];
+
+  for (const candidate of candidates) {
+    const message = formatActionReminderMessage(candidate.actionItem, candidate.reminderType);
+
+    await createActionItemReminderLog({
+      userId,
+      actionItemId: candidate.actionItem.id,
+      reminderType: candidate.reminderType,
+      sentAt: now
+    });
+
+    if (candidate.reminderType === "snoozed") {
+      await createActionItemReminderLog({
+        userId,
+        actionItemId: candidate.actionItem.id,
+        reminderType: "due",
+        sentAt: now
+      });
+      await reopenSnoozedActionItem(userId, candidate.actionItem.id);
+    }
+
+    reminders.push({
+      actionItem: sanitizeActionItem(candidate.actionItem),
+      reminderType: candidate.reminderType,
+      message
+    });
+  }
+
+  return reminders;
+}
+
+function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType): string {
+  const header = reminderType === "snoozed" ? "Snoozed action is back:" : "Action due:";
+  const dueLine = actionItem.dueAt ? `due: ${actionItem.dueAt.toISOString()}` : undefined;
+
+  return [
+    header,
+    actionItem.title,
+    dueLine,
+    `complete: /complete_action ${actionItem.id}`,
+    `snooze tomorrow: /snooze_action ${actionItem.id} tomorrow`,
+    `archive: /archive_action ${actionItem.id}`
   ]
     .filter(Boolean)
     .join("\n");
@@ -5317,6 +5427,12 @@ interface DailyOperatorBriefGoalStatus {
   title: string;
   status: string;
   note: string;
+}
+
+interface ActionReminderDispatch {
+  actionItem: ReturnType<typeof sanitizeActionItem>;
+  reminderType: ActionItemReminderType;
+  message: string;
 }
 
 interface GmailMessagePart {

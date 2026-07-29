@@ -84,7 +84,7 @@ pnpm dev:api
 pnpm dev:telegram
 ```
 
-Run the reminder worker in a third terminal when you want proactive daily check-ins:
+Run the worker in a third terminal when you want proactive daily check-ins, insight delivery, integration sync, or action reminders:
 
 ```bash
 pnpm dev:worker
@@ -148,6 +148,9 @@ Telegram commands:
 - `/complete_action ACTION_ID`: mark an action item completed
 - `/snooze_action ACTION_ID tomorrow`: snooze an action item; also supports `3d` and `YYYY-MM-DD`
 - `/archive_action ACTION_ID`: archive an action item
+- `/trigger_action_reminders`: dev helper that sends due/snoozed action reminders now
+- `/debug_make_action_due ACTION_ID`: allowlist-only dev helper that forces an action due for reminder testing
+- `/debug_make_snoozed_due ACTION_ID`: allowlist-only dev helper that forces a snoozed action due for reminder testing
 - `/sync_gmail`: manually sync active Gmail rules
 - `/sync_gmail_debug`: manually sync Gmail and show safe per-rule counters
 - `/create_goal category | title | why`: create a goal
@@ -451,9 +454,11 @@ Expected:
 - `/ingest` and `/ingest_job` call `POST /users/:userId/ingest/text`. Telegram also routes obvious pasted job-search emails, such as recruiter interview scheduling or rejection emails, to ingestion. Casual logs like `i sent 2 cvs today` stay on the normal message/check-in path.
 - `/events` and `/events_archived` truncate long data/evidence fields to avoid Telegram message length failures. Use `/events 10` or `/events_archived 10` for more, up to 20.
 - Natural check-in warnings include high anxiety plus gambling impulse and low sleep.
-- Daily check-in reminders, daily insights, and weekly insights are sent by `pnpm dev:worker`.
+- Daily check-in reminders, daily insights, weekly insights, and due action reminders are sent by `pnpm dev:worker`.
 - Daily reminders send once per user per day because of `NotificationLog`. Daily insights use `daily_insight` logs, and weekly insights use `weekly_insight` logs.
 - Use `/send_checkin_now`, `/send_daily_insight_now`, and `/send_weekly_insight_now` to test message text repeatedly without creating notification logs.
+- Action reminders are sent when an open action is due or a snoozed action is back. Reminder logs prevent repeats within 12 hours, and snoozed actions are reopened after the reminder is sent.
+- Action reminders can route only users mapped as `telegram:<id>`. Use `/debug_make_action_due`, `/debug_make_snoozed_due`, and `/trigger_action_reminders` for local testing without waiting for real due times. The debug force commands require `TELEGRAM_ALLOWED_USER_IDS`.
 - Daily check-in prompts are goal-aware. Active goal templates influence the prompt, for example career goals ask about applications and interviews, health goals ask about workout/sleep, finance goals ask about impulse and thesis-before-risk.
 - Custom goals with check-in config add up to two goal-specific lines to the daily check-in prompt.
 - `/send_checkin_now` previews the same goal-aware prompt the worker sends.
@@ -619,6 +624,9 @@ Manual insight tests:
 - `PATCH /users/:userId/actions/:actionId/complete`
 - `PATCH /users/:userId/actions/:actionId/snooze`
 - `PATCH /users/:userId/actions/:actionId/archive`
+- `POST /users/:userId/actions/reminders/trigger`
+- `PATCH /users/:userId/actions/:actionId/debug-force-due`
+- `PATCH /users/:userId/actions/:actionId/debug-force-snoozed-due`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/today`
 - `GET /users/:userId/insights/daily`

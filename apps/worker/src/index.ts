@@ -1,13 +1,18 @@
 import { config } from "dotenv";
 import {
+  createActionItemReminderLog,
   createNotificationLog,
+  getActionItemsEligibleForReminder,
   getActiveGoals,
   getActiveIntegrationConnectionsForSync,
   getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
   getUsersWithEnabledNotifications,
-  hasNotificationLog
+  hasNotificationLog,
+  reopenSnoozedActionItem,
+  type ActionItem,
+  type ActionItemReminderType
 } from "@operator-agent/db";
 import { buildDailyCheckinPrompt } from "@operator-agent/core";
 
@@ -64,6 +69,48 @@ async function runTick() {
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
+  }
+
+  await sendDueActionReminders(now);
+}
+
+export async function sendDueActionReminders(now = new Date()) {
+  const candidates = await getActionItemsEligibleForReminder({
+    now,
+    limit: 20
+  });
+
+  for (const candidate of candidates) {
+    const chatId = telegramChatIdFromUserId(candidate.actionItem.userId);
+
+    if (!chatId) {
+      console.log(`Skipping action reminder for unroutable user ${candidate.actionItem.userId}.`);
+      continue;
+    }
+
+    try {
+      await sendTelegramMessage(chatId, formatActionReminderMessage(candidate.actionItem, candidate.reminderType));
+      await createActionItemReminderLog({
+        userId: candidate.actionItem.userId,
+        actionItemId: candidate.actionItem.id,
+        reminderType: candidate.reminderType,
+        sentAt: now
+      });
+
+      if (candidate.reminderType === "snoozed") {
+        await createActionItemReminderLog({
+          userId: candidate.actionItem.userId,
+          actionItemId: candidate.actionItem.id,
+          reminderType: "due",
+          sentAt: now
+        });
+        await reopenSnoozedActionItem(candidate.actionItem.userId, candidate.actionItem.id);
+      }
+
+      console.log(`Sent ${candidate.reminderType} action reminder for ${candidate.actionItem.id}.`);
+    } catch (error) {
+      console.error(`Action reminder failed for ${candidate.actionItem.id}`, error);
+    }
   }
 }
 
@@ -277,6 +324,27 @@ function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): 
 
     return messages;
   });
+}
+
+function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType): string {
+  const header = reminderType === "snoozed" ? "Snoozed action is back:" : "Action due:";
+  const dueLine = actionItem.dueAt ? `due: ${actionItem.dueAt.toISOString()}` : undefined;
+
+  return [
+    header,
+    actionItem.title,
+    dueLine,
+    `complete: /complete_action ${actionItem.id}`,
+    `snooze tomorrow: /snooze_action ${actionItem.id} tomorrow`,
+    `archive: /archive_action ${actionItem.id}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function telegramChatIdFromUserId(userId: string): string | undefined {
+  const match = userId.match(/^telegram:(\d+)$/);
+  return match?.[1];
 }
 
 async function sendTelegramMessage(chatId: string, text: string) {
