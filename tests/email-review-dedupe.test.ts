@@ -7,6 +7,7 @@ import {
   prisma
 } from "../packages/db/src/index.ts";
 import { classifyJobSearchEmail, classifyWorkActionEmail } from "../packages/core/src/index.ts";
+import { buildServer } from "../apps/api/src/server.ts";
 
 const userId = `test-user-${randomUUID()}`;
 const connectionId = randomUUID();
@@ -300,6 +301,206 @@ test("work action semantic key distinguishes project and deadline", async () => 
   assert.equal(otherProjectMatch, undefined);
 });
 
+test("approving work action review creates one ActionItem and no Event", async () => {
+  const server = buildServer();
+  const reviewId = await createReview({
+    subject: "Follow up on dashboard review",
+    from: "manager@example.com",
+    proposedEventType: "work_deadline_detected",
+    status: "pending",
+    extracted: { project: "dashboard", deadline: "Friday", actionRequired: true },
+    adapterId: "work_action_email",
+    evidence: "Can you review the dashboard metrics by Friday and send me any issues you find?"
+  });
+
+  try {
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(first.statusCode, 200);
+    const firstPayload = first.json();
+    assert.equal(firstPayload.event, null);
+    assert.equal(firstPayload.actionItem.title, "Review dashboard metrics");
+    assert.equal(firstPayload.actionItem.status, "open");
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(second.statusCode, 200);
+    const secondPayload = second.json();
+    assert.equal(secondPayload.actionItem.id, firstPayload.actionItem.id);
+
+    const actions = await server.inject({
+      method: "GET",
+      url: `/users/${userId}/actions`
+    });
+    assert.equal(actions.statusCode, 200);
+    assert.equal(actions.json().actions.some((action: { id: string }) => action.id === firstPayload.actionItem.id), true);
+  } finally {
+    await server.close();
+  }
+});
+
+test("work action approval title strips email headers and caps length", async () => {
+  const server = buildServer();
+  const reviewId = await createReview({
+    subject: "Please review dashboard export",
+    from: "Letis <letiskate@gmail.com>",
+    proposedEventType: "work_action_required",
+    status: "pending",
+    extracted: { project: "dashboard", actionRequired: true },
+    adapterId: "work_action_email",
+    evidence: [
+      "Subject: Please review dashboard export",
+      "From: Letis <letiskate@gmail.com>",
+      "Snippet: Can you review the dashboard export by Friday and send me any issues?",
+      "Body: Can you review the dashboard export by Friday and send me any issues?"
+    ].join("\n")
+  });
+
+  try {
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(first.statusCode, 200);
+    const firstPayload = first.json();
+    assert.equal(firstPayload.actionItem.title, "Review dashboard export");
+    assert.equal(firstPayload.actionItem.title.includes("From:"), false);
+    assert.equal(firstPayload.actionItem.title.includes("Subject:"), false);
+    assert.equal(firstPayload.actionItem.title.includes("@"), false);
+    assert.ok(firstPayload.actionItem.title.length <= 80);
+    assert.equal(firstPayload.actionItem.description, "Send any issues found.");
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().actionItem.id, firstPayload.actionItem.id);
+  } finally {
+    await server.close();
+  }
+});
+
+test("work action title prefers body action over follow-up subject", async () => {
+  const server = buildServer();
+  const reviewId = await createReview({
+    subject: "Follow up on dashboard review",
+    from: "manager@example.com",
+    proposedEventType: "work_deadline_detected",
+    status: "pending",
+    extracted: { project: "dashboard", deadline: "Friday", actionRequired: true },
+    adapterId: "work_action_email",
+    evidence: [
+      "Subject: Follow up on dashboard review",
+      "From: manager@example.com",
+      "Body: Can you review the dashboard metrics by Friday and send me any issues you find?"
+    ].join("\n")
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().actionItem.title, "Review dashboard metrics");
+  } finally {
+    await server.close();
+  }
+});
+
+test("action item lifecycle routes update status", async () => {
+  const server = buildServer();
+  const action = await prisma.actionItem.create({
+    data: {
+      userId,
+      source: "manual",
+      title: "Review launch checklist",
+      priority: "medium"
+    }
+  });
+
+  try {
+    const snooze = await server.inject({
+      method: "PATCH",
+      url: `/users/${userId}/actions/${action.id}/snooze`,
+      payload: { snoozedUntil: "2026-08-01T09:00:00.000Z" }
+    });
+    assert.equal(snooze.statusCode, 200);
+    assert.equal(snooze.json().action.status, "snoozed");
+
+    const complete = await server.inject({
+      method: "PATCH",
+      url: `/users/${userId}/actions/${action.id}/complete`
+    });
+    assert.equal(complete.statusCode, 200);
+    assert.equal(complete.json().action.status, "completed");
+
+    const archive = await server.inject({
+      method: "PATCH",
+      url: `/users/${userId}/actions/${action.id}/archive`
+    });
+    assert.equal(archive.statusCode, 200);
+    assert.equal(archive.json().action.status, "archived");
+  } finally {
+    await server.close();
+  }
+});
+
+test("approving core career review still creates Event", async () => {
+  const server = buildServer();
+  const reviewId = await createReview({
+    subject: "Interview for Backend Engineer role",
+    from: "recruiter@example.com",
+    proposedEventType: "career.interview_scheduled",
+    status: "pending",
+    extracted: { company: "Example Co", role: "Backend Engineer" },
+    evidence: "We would like to schedule an interview next week."
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.event.type, "career.interview_scheduled");
+    assert.equal(payload.actionItem, undefined);
+  } finally {
+    await server.close();
+  }
+});
+
+test("unsupported non-core review creates no Event or ActionItem", async () => {
+  const server = buildServer();
+  const reviewId = await createReview({
+    subject: "Application action required",
+    from: "jobs@example.com",
+    proposedEventType: "application_action_required",
+    status: "pending",
+    extracted: { company: "Example Co", actionRequired: true },
+    evidence: "Complete your application."
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${reviewId}/approve`
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.event, null);
+    assert.match(payload.message, /does not map to an approved event type/);
+  } finally {
+    await server.close();
+  }
+});
+
 async function createReview(input: {
   subject: string;
   from: string;
@@ -307,8 +508,9 @@ async function createReview(input: {
   status: "pending" | "approved" | "rejected" | "archived";
   extracted: Record<string, unknown>;
   adapterId?: string;
+  evidence?: string;
 }) {
-  await prisma.emailReviewItem.create({
+  const item = await prisma.emailReviewItem.create({
     data: {
       userId,
       connectionId,
@@ -322,9 +524,11 @@ async function createReview(input: {
       proposedEventType: input.proposedEventType,
       confidence: 0.95,
       reason: input.proposedEventType,
-      evidence: input.subject,
+      evidence: input.evidence ?? input.subject,
       extracted: input.extracted,
       status: input.status
     }
   });
+
+  return item.id;
 }

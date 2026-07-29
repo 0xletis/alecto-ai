@@ -185,10 +185,46 @@ export interface EmailReviewItem {
   extracted: Record<string, unknown>;
   status: "pending" | "approved" | "rejected" | "archived";
   eventId?: string;
+  actionItemId?: string;
   archiveReason?: string;
   reviewedAt?: Date;
   createdAt: Date;
   updatedAt: Date;
+}
+
+export interface ActionItem {
+  id: string;
+  userId: string;
+  source: "email_review" | "manual" | "system";
+  sourceId?: string;
+  sourceProvider?: string;
+  sourceRuleId?: string;
+  title: string;
+  description?: string;
+  status: "open" | "completed" | "snoozed" | "archived";
+  priority: "low" | "medium" | "high";
+  dueAt?: Date;
+  project?: string;
+  actionType?: "work_action_required" | "work_deadline_detected" | "work_follow_up_requested" | "work_project_update_detected" | "generic";
+  evidence?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  completedAt?: Date;
+  snoozedUntil?: Date;
+}
+
+export interface CreateActionItemInput {
+  source: ActionItem["source"];
+  sourceId?: string;
+  sourceProvider?: string;
+  sourceRuleId?: string;
+  title: string;
+  description?: string;
+  priority?: ActionItem["priority"];
+  dueAt?: Date;
+  project?: string;
+  actionType?: ActionItem["actionType"];
+  evidence?: string;
 }
 
 export interface EmailReviewItemInput {
@@ -1154,10 +1190,167 @@ export async function getEmailReviewItem(userId: string, reviewId: string): Prom
   return item ? toEmailReviewItem(item) : undefined;
 }
 
+export async function createActionItemIfNotExists(
+  userId: string,
+  input: CreateActionItemInput
+): Promise<{ created: boolean; actionItem: ActionItem }> {
+  await ensureUser(userId);
+
+  if (input.sourceId) {
+    const existing = await prisma.actionItem.findFirst({
+      where: {
+        userId,
+        source: input.source,
+        sourceId: input.sourceId,
+        status: {
+          not: "archived"
+        }
+      }
+    });
+
+    if (existing) {
+      return { created: false, actionItem: toActionItem(existing) };
+    }
+  }
+
+  const semanticDuplicate = await prisma.actionItem.findFirst({
+    where: {
+      userId,
+      source: input.source,
+      sourceProvider: input.sourceProvider,
+      sourceRuleId: input.sourceRuleId,
+      title: input.title,
+      actionType: input.actionType,
+      project: input.project,
+      status: {
+        in: ["open", "snoozed"]
+      }
+    },
+    orderBy: { updatedAt: "desc" }
+  });
+
+  if (semanticDuplicate) {
+    return { created: false, actionItem: toActionItem(semanticDuplicate) };
+  }
+
+  const actionItem = await prisma.actionItem.create({
+    data: {
+      userId,
+      source: input.source,
+      sourceId: input.sourceId,
+      sourceProvider: input.sourceProvider,
+      sourceRuleId: input.sourceRuleId,
+      title: input.title,
+      description: input.description,
+      priority: input.priority ?? "medium",
+      dueAt: input.dueAt,
+      project: input.project,
+      actionType: input.actionType ?? "generic",
+      evidence: input.evidence
+    }
+  });
+
+  return { created: true, actionItem: toActionItem(actionItem) };
+}
+
+export async function getActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const actionItem = await prisma.actionItem.findFirst({
+    where: {
+      id: actionItemId,
+      userId
+    }
+  });
+
+  return actionItem ? toActionItem(actionItem) : undefined;
+}
+
+export async function getActionItems(
+  userId: string,
+  options: { status?: ActionItem["status"] | "all"; limit?: number } = {}
+): Promise<ActionItem[]> {
+  await ensureUser(userId);
+
+  const actionItems = await prisma.actionItem.findMany({
+    where: {
+      userId,
+      ...(options.status && options.status !== "all" ? { status: options.status } : {})
+    },
+    orderBy: [{ status: "asc" }, { dueAt: "asc" }, { updatedAt: "desc" }],
+    take: options.limit ?? 10
+  });
+
+  return actionItems.map(toActionItem);
+}
+
+export async function completeActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing || existing.status === "archived") {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "completed",
+      completedAt: new Date(),
+      snoozedUntil: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
+export async function archiveActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing) {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "archived",
+      snoozedUntil: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
+export async function snoozeActionItem(userId: string, actionItemId: string, snoozedUntil: Date): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing || existing.status === "archived") {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "snoozed",
+      snoozedUntil,
+      completedAt: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
 export async function approveEmailReviewItem(
   userId: string,
   reviewId: string,
-  eventId?: string
+  eventId?: string,
+  actionItemId?: string
 ): Promise<EmailReviewItem | undefined> {
   await ensureUser(userId);
 
@@ -1177,6 +1370,7 @@ export async function approveEmailReviewItem(
     data: {
       status: "approved",
       eventId,
+      actionItemId,
       reviewedAt: new Date()
     }
   });
@@ -2142,11 +2336,81 @@ function toEmailReviewItem(item: Prisma.EmailReviewItemGetPayload<object>): Emai
     extracted: toRecord(item.extracted),
     status: normalizeEmailReviewStatus(item.status),
     eventId: item.eventId ?? undefined,
+    actionItemId: item.actionItemId ?? undefined,
     archiveReason: item.archiveReason ?? undefined,
     reviewedAt: item.reviewedAt ?? undefined,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt
   };
+}
+
+function toActionItem(item: Prisma.ActionItemGetPayload<object>): ActionItem {
+  return {
+    id: item.id,
+    userId: item.userId,
+    source: normalizeActionItemSource(item.source),
+    sourceId: item.sourceId ?? undefined,
+    sourceProvider: item.sourceProvider ?? undefined,
+    sourceRuleId: item.sourceRuleId ?? undefined,
+    title: item.title,
+    description: item.description ?? undefined,
+    status: normalizeActionItemStatus(item.status),
+    priority: normalizeActionItemPriority(item.priority),
+    dueAt: item.dueAt ?? undefined,
+    project: item.project ?? undefined,
+    actionType: normalizeActionItemType(item.actionType),
+    evidence: item.evidence ?? undefined,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    completedAt: item.completedAt ?? undefined,
+    snoozedUntil: item.snoozedUntil ?? undefined
+  };
+}
+
+function normalizeActionItemSource(source: string | null | undefined): ActionItem["source"] {
+  const normalized = normalizeStatus(source);
+
+  if (normalized === "email_review" || normalized === "manual" || normalized === "system") {
+    return normalized;
+  }
+
+  return "system";
+}
+
+function normalizeActionItemStatus(status: string | null | undefined): ActionItem["status"] {
+  const normalized = normalizeStatus(status);
+
+  if (normalized === "completed" || normalized === "snoozed" || normalized === "archived") {
+    return normalized;
+  }
+
+  return "open";
+}
+
+function normalizeActionItemPriority(priority: string | null | undefined): ActionItem["priority"] {
+  const normalized = normalizeStatus(priority);
+
+  if (normalized === "low" || normalized === "high") {
+    return normalized;
+  }
+
+  return "medium";
+}
+
+function normalizeActionItemType(actionType: string | null | undefined): ActionItem["actionType"] | undefined {
+  const normalized = normalizeStatus(actionType);
+
+  if (
+    normalized === "work_action_required" ||
+    normalized === "work_deadline_detected" ||
+    normalized === "work_follow_up_requested" ||
+    normalized === "work_project_update_detected" ||
+    normalized === "generic"
+  ) {
+    return normalized;
+  }
+
+  return undefined;
 }
 
 function normalizeEmailReviewStatus(status: string | null | undefined): EmailReviewItem["status"] {

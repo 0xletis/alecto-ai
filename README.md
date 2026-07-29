@@ -137,8 +137,13 @@ Telegram commands:
 - `/cleanup_gmail_rule_events RULE_ID`: archive active Gmail events created by one email rule
 - `/email_reviews`: show pending Gmail email review items
 - `/email_reviews all`: show recent pending/approved/rejected email review items
-- `/approve_email_review REVIEW_ID`: approve a pending email review item
+- `/approve_email_review REVIEW_ID`: approve a pending email review item; core career reviews create events, work-action reviews create action items
 - `/reject_email_review REVIEW_ID`: reject a pending email review item
+- `/actions`: show open action items
+- `/actions all`: show recent open/completed/snoozed/archived action items
+- `/complete_action ACTION_ID`: mark an action item completed
+- `/snooze_action ACTION_ID tomorrow`: snooze an action item; also supports `3d` and `YYYY-MM-DD`
+- `/archive_action ACTION_ID`: archive an action item
 - `/sync_gmail`: manually sync active Gmail rules
 - `/sync_gmail_debug`: manually sync Gmail and show safe per-rule counters
 - `/create_goal category | title | why`: create a goal
@@ -407,6 +412,8 @@ Expected:
 - Gmail `job_search_email` is conservative. It requires strong recruiting/job context, ignores obvious marketing/newsletter/promotional emails, and never treats the word `offer` alone as a career offer.
 - Gmail emails below auto-log confidence are not logged automatically. Uncertain messages count as `needs review`; weak matches count as low-confidence ignored or unknown.
 - Gmail `needs_review` classifications create pending email review items. Approving only creates an event when the proposed event type is already in the core ontology.
+- `work_action_email` reviews are different: approving `work_action_required`, `work_deadline_detected`, `work_follow_up_requested`, or `work_project_update_detected` creates an ActionItem, not an Event.
+- ActionItems are things to do. Events are things that happened. Use `/actions`, `/complete_action`, `/snooze_action`, and `/archive_action` to manage open work items.
 - Use `/cleanup_gmail_rule_events RULE_ID` to archive test Gmail events from one rule without deleting historical data.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
 - Explicit memory phrases like `remember that`, `recuerda que`, or `guarda que` create visible memories immediately and reply `Saved to memory.`
@@ -594,6 +601,16 @@ Manual insight tests:
 - `PATCH /users/:userId/email-rules/:ruleId`
 - `DELETE /users/:userId/email-rules/:ruleId`
 - `POST /users/:userId/email-rules/:ruleId/cleanup-events`
+- `POST /users/:userId/email-rules/:ruleId/cleanup-reviews`
+- `GET /users/:userId/email-reviews`
+- `GET /users/:userId/email-reviews?status=all`
+- `POST /users/:userId/email-reviews/:reviewId/approve`
+- `POST /users/:userId/email-reviews/:reviewId/reject`
+- `GET /users/:userId/actions`
+- `GET /users/:userId/actions?status=all`
+- `PATCH /users/:userId/actions/:actionId/complete`
+- `PATCH /users/:userId/actions/:actionId/snooze`
+- `PATCH /users/:userId/actions/:actionId/archive`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/insights/daily`
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`

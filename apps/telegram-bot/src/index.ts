@@ -673,6 +673,83 @@ bot.command("cleanup_email_reviews", async (ctx) => {
   }
 });
 
+bot.command("actions", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const showAll = getCommandText(ctx).trim().toLowerCase() === "all";
+
+  try {
+    const response = await apiGet<ActionsResponse>(`/users/${getTelegramUserId(ctx)}/actions${showAll ? "?status=all" : ""}`);
+    await replyWithIntegrationMessage(ctx, formatActions(response.actions, showAll));
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("complete_action", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const actionId = getCommandText(ctx);
+
+  if (!actionId) {
+    await ctx.reply("Usage: /complete_action ACTION_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${actionId}/complete`, {});
+    await ctx.reply(response.message ?? "Action completed.");
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("archive_action", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const actionId = getCommandText(ctx);
+
+  if (!actionId) {
+    await ctx.reply("Usage: /archive_action ACTION_ID");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${actionId}/archive`, {});
+    await ctx.reply(response.message ?? "Action archived.");
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
+bot.command("snooze_action", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseSnoozeActionCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /snooze_action ACTION_ID tomorrow\nOr: /snooze_action ACTION_ID 3d\nOr: /snooze_action ACTION_ID 2026-08-01");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${parsed.actionId}/snooze`, {
+      snoozedUntil: parsed.snoozedUntil.toISOString()
+    });
+    await ctx.reply(response.message ?? "Action snoozed.");
+  } catch (error) {
+    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+  }
+});
+
 bot.command("sync_gmail", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -2547,6 +2624,74 @@ function formatEmailReview(review: EmailReviewItem): string {
     .join("\n");
 }
 
+function formatActions(actions: ActionItem[], showAll: boolean): string {
+  if (actions.length === 0) {
+    return showAll ? "No recent action items." : "No open action items.";
+  }
+
+  return actions.map(formatAction).join("\n\n");
+}
+
+function formatAction(action: ActionItem): string {
+  return [
+    `id: ${action.id}`,
+    `title: ${truncateText(action.title, 120)}`,
+    `status: ${action.status}`,
+    `priority: ${action.priority}`,
+    action.dueAt ? `dueAt: ${new Date(action.dueAt).toLocaleString()}` : undefined,
+    action.snoozedUntil ? `snoozedUntil: ${new Date(action.snoozedUntil).toLocaleString()}` : undefined,
+    action.project ? `project: ${truncateText(action.project, 80)}` : undefined,
+    action.actionType ? `type: ${action.actionType}` : undefined,
+    `source: ${action.source}`,
+    action.description ? `description: ${truncateText(action.description, 180)}` : undefined,
+    action.evidence ? `evidence: ${truncateText(action.evidence, 180)}` : undefined,
+    action.status === "open" || action.status === "snoozed" ? `complete: /complete_action ${action.id}` : undefined,
+    action.status === "open" || action.status === "snoozed" ? `snooze: /snooze_action ${action.id} tomorrow` : undefined,
+    action.status !== "archived" ? `archive: /archive_action ${action.id}` : undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function parseSnoozeActionCommand(text: string): { actionId: string; snoozedUntil: Date } | undefined {
+  const [actionId, value] = text.trim().split(/\s+/, 2);
+
+  if (!actionId || !value) {
+    return undefined;
+  }
+
+  const snoozedUntil = parseSnoozeValue(value);
+  return snoozedUntil ? { actionId, snoozedUntil } : undefined;
+}
+
+function parseSnoozeValue(value: string): Date | undefined {
+  const normalized = value.trim().toLowerCase();
+  const now = new Date();
+
+  if (normalized === "tomorrow") {
+    const date = new Date(now);
+    date.setDate(date.getDate() + 1);
+    date.setHours(9, 0, 0, 0);
+    return date;
+  }
+
+  const dayMatch = normalized.match(/^(\d+)d$/);
+
+  if (dayMatch) {
+    const date = new Date(now);
+    date.setDate(date.getDate() + Number(dayMatch[1]));
+    date.setHours(9, 0, 0, 0);
+    return date;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    const date = new Date(`${normalized}T09:00:00`);
+    return Number.isNaN(date.getTime()) ? undefined : date;
+  }
+
+  return undefined;
+}
+
 function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnection) {
   const connectionStatus = connection?.status ?? "missing";
   const staleWarning =
@@ -2991,6 +3136,16 @@ interface EmailReviewsResponse {
 interface EmailReviewMutationResponse {
   emailReview: EmailReviewItem;
   event?: Event | null;
+  actionItem?: ActionItem | null;
+  message?: string;
+}
+
+interface ActionsResponse {
+  actions: ActionItem[];
+}
+
+interface ActionMutationResponse {
+  action: ActionItem;
   message?: string;
 }
 
@@ -3301,10 +3456,32 @@ interface EmailReviewItem {
   extracted: Record<string, unknown>;
   status: "pending" | "approved" | "rejected" | "archived";
   eventId?: string;
+  actionItemId?: string;
   archiveReason?: string;
   reviewedAt?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+interface ActionItem {
+  id: string;
+  userId: string;
+  source: "email_review" | "manual" | "system";
+  sourceId?: string;
+  sourceProvider?: string;
+  sourceRuleId?: string;
+  title: string;
+  description?: string;
+  status: "open" | "completed" | "snoozed" | "archived";
+  priority: "low" | "medium" | "high";
+  dueAt?: string;
+  project?: string;
+  actionType?: "work_action_required" | "work_deadline_detected" | "work_follow_up_requested" | "work_project_update_detected" | "generic";
+  evidence?: string;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  snoozedUntil?: string;
 }
 
 interface Event {

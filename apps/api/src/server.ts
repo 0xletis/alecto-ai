@@ -72,6 +72,7 @@ import {
   createGoal,
   createGmailConnection,
   createEmailSignalRule,
+  createActionItemIfNotExists,
   createMemory,
   createMemoryFromPendingPayload,
   createPendingAction,
@@ -102,12 +103,17 @@ import {
   getEmailSignalRules,
   getEmailReviewItem,
   getEmailReviewItems,
+  getActionItem,
+  getActionItems,
   getIntegrationConnection,
   getIntegrationConnections,
   approveEmailReviewItem,
   approvePendingGmailReviewItemsForSemanticEvent,
   rejectPendingAction,
   rejectEmailReviewItem,
+  completeActionItem,
+  archiveActionItem,
+  snoozeActionItem,
   undoLastEvents,
   archiveEmailSignalRule,
   archivePendingEmailReviewItemsForRule,
@@ -117,6 +123,8 @@ import {
   type IntegrationConnection,
   type EmailSignalRule,
   type EmailReviewItem,
+  type ActionItem,
+  type CreateActionItemInput,
   updateIntegrationConnection,
   updateIntegrationConnectionConfig,
   updateIntegrationConnectionSyncState,
@@ -918,10 +926,36 @@ export function buildServer() {
       }
 
       if (review.status !== "pending") {
+        if (review.status === "approved" && review.actionItemId) {
+          const actionItem = await getActionItem(request.params.userId, review.actionItemId);
+
+          if (actionItem) {
+            return {
+              emailReview: sanitizeEmailReviewItem(review),
+              actionItem: sanitizeActionItem(actionItem),
+              event: null,
+              message: `Email review already approved. Action item exists: ${actionItem.title}`
+            };
+          }
+        }
+
         return reply.status(400).send({
           error: `Email review item is already ${review.status}.`,
           emailReview: sanitizeEmailReviewItem(review)
         });
+      }
+
+      if (isWorkActionReviewType(review.proposedEventType)) {
+        const actionInput = actionItemInputFromEmailReview(review);
+        const result = await createActionItemIfNotExists(request.params.userId, actionInput);
+        const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId, undefined, result.actionItem.id);
+
+        return {
+          emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
+          actionItem: sanitizeActionItem(result.actionItem),
+          event: null,
+          message: `Email review approved. Action item ${result.created ? "created" : "already exists"}: ${result.actionItem.title}`
+        };
       }
 
       if (!review.proposedEventType || !EventTypeSchema.safeParse(review.proposedEventType).success) {
@@ -966,6 +1000,75 @@ export function buildServer() {
         emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
         event: created.event,
         message: created.created ? "Email review approved and event created." : "Email review approved. Event already existed."
+      };
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { status?: string } }>(
+    "/users/:userId/actions",
+    async (request) => {
+      const status = request.query.status === "all" ? "all" : "open";
+
+      return {
+        actions: (await getActionItems(request.params.userId, {
+          status,
+          limit: 10
+        })).map(sanitizeActionItem)
+      };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; actionId: string } }>(
+    "/users/:userId/actions/:actionId/complete",
+    async (request, reply) => {
+      const actionItem = await completeActionItem(request.params.userId, request.params.actionId);
+
+      if (!actionItem) {
+        return reply.status(404).send({ error: "Action item not found" });
+      }
+
+      return {
+        action: sanitizeActionItem(actionItem),
+        message: `Action completed: ${actionItem.title}`
+      };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; actionId: string } }>(
+    "/users/:userId/actions/:actionId/archive",
+    async (request, reply) => {
+      const actionItem = await archiveActionItem(request.params.userId, request.params.actionId);
+
+      if (!actionItem) {
+        return reply.status(404).send({ error: "Action item not found" });
+      }
+
+      return {
+        action: sanitizeActionItem(actionItem),
+        message: `Action archived: ${actionItem.title}`
+      };
+    }
+  );
+
+  server.patch<{ Params: { userId: string; actionId: string } }>(
+    "/users/:userId/actions/:actionId/snooze",
+    async (request, reply) => {
+      const body = request.body as { snoozedUntil?: string };
+      const snoozedUntil = body.snoozedUntil ? new Date(body.snoozedUntil) : undefined;
+
+      if (!snoozedUntil || Number.isNaN(snoozedUntil.getTime())) {
+        return reply.status(400).send({ error: "Invalid snoozedUntil" });
+      }
+
+      const actionItem = await snoozeActionItem(request.params.userId, request.params.actionId, snoozedUntil);
+
+      if (!actionItem) {
+        return reply.status(404).send({ error: "Action item not found" });
+      }
+
+      return {
+        action: sanitizeActionItem(actionItem),
+        message: `Action snoozed until ${actionItem.snoozedUntil?.toISOString()}: ${actionItem.title}`
       };
     }
   );
@@ -2333,6 +2436,186 @@ function sanitizeEmailReviewItem(item: EmailReviewItem) {
     evidence: item.evidence ? truncatePlainText(item.evidence, 500) : undefined,
     snippet: item.snippet ? truncatePlainText(item.snippet, 300) : undefined
   };
+}
+
+function sanitizeActionItem(item: ActionItem) {
+  return {
+    ...item,
+    evidence: item.evidence ? truncatePlainText(item.evidence, 500) : undefined,
+    description: item.description ? truncatePlainText(item.description, 500) : undefined
+  };
+}
+
+function isWorkActionReviewType(type?: string): type is NonNullable<ActionItem["actionType"]> {
+  return (
+    type === "work_action_required" ||
+    type === "work_deadline_detected" ||
+    type === "work_follow_up_requested" ||
+    type === "work_project_update_detected"
+  );
+}
+
+function actionItemInputFromEmailReview(review: EmailReviewItem): CreateActionItemInput {
+  const extracted = review.extracted ?? {};
+  const project = stringValue(extracted.project);
+  const title = buildActionTitle(review, project);
+
+  return {
+    source: "email_review",
+    sourceId: review.id,
+    sourceProvider: review.provider,
+    sourceRuleId: review.ruleId,
+    title,
+    description: buildActionDescription(review),
+    priority: "medium",
+    dueAt: parseActionDueAt(extracted.deadline),
+    project,
+    actionType: isWorkActionReviewType(review.proposedEventType) ? review.proposedEventType : "generic",
+    evidence: review.evidence ?? review.snippet
+  };
+}
+
+function buildActionTitle(review: EmailReviewItem, project?: string): string {
+  const subject = cleanEmailFragment(review.subject ?? "");
+  const bodyText = cleanEmailFragment(extractBodyLikeText(review.evidence) || review.snippet || "");
+  const subjectAction = actionTitleFromText(subject);
+
+  if (subjectAction && !/^follow up on\b/i.test(subjectAction)) {
+    return subjectAction;
+  }
+
+  const bodyAction = actionTitleFromText(bodyText);
+
+  if (bodyAction) {
+    return bodyAction;
+  }
+
+  if (subjectAction) {
+    return subjectAction;
+  }
+
+  if (project) {
+    return `Follow up on ${cleanActionPhrase(project)}`;
+  }
+
+  return cleanActionPhrase(review.subject ?? "Review work action");
+}
+
+function buildActionDescription(review: EmailReviewItem): string | undefined {
+  const text = cleanEmailFragment(`${extractBodyLikeText(review.evidence) || review.evidence || ""} ${review.snippet ?? ""}`);
+
+  if (/send (?:me |us )?any issues/i.test(text)) {
+    return "Send any issues found.";
+  }
+
+  return text.trim() ? truncatePlainText(text, 240) : undefined;
+}
+
+function parseActionDueAt(value: unknown): Date | undefined {
+  if (typeof value !== "string" || !value.trim()) {
+    return undefined;
+  }
+
+  const dueAt = new Date(value);
+  return Number.isNaN(dueAt.getTime()) ? undefined : dueAt;
+}
+
+function cleanActionPhrase(value: string): string {
+  const cleaned = value
+    .replace(/&[a-z0-9#]+;/gi, " ")
+    .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, " ")
+    .replace(/\b(?:subject|from|snippet|body):.*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/^follow up on\s+/i, "")
+    .replace(/^the\s+/i, "")
+    .trim();
+
+  if (!cleaned) {
+    return "Review work action";
+  }
+
+  const capped = truncatePlainText(cleaned, 80);
+  return `${capped.charAt(0).toUpperCase()}${capped.slice(1)}`;
+}
+
+function cleanActionObject(value: string): string {
+  const cleaned = value
+    .replace(/&[a-z0-9#]+;/gi, " ")
+    .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, " ")
+    .replace(/\b(?:subject|from|snippet|body):.*$/i, "")
+    .replace(/\s+/g, " ")
+    .replace(/^the\s+/i, "")
+    .trim();
+
+  return truncatePlainText(cleaned || "work action", 73);
+}
+
+function actionTitleFromText(text: string): string | undefined {
+  const clean = cleanEmailFragment(text);
+
+  if (!clean) {
+    return undefined;
+  }
+
+  const reviewMatch = clean.match(/\b(?:please\s+)?review (?:the )?(.+?)(?:\s+by\b|\s+and\b|[.!?]|$)/i);
+
+  if (reviewMatch?.[1]) {
+    return `Review ${cleanActionObject(reviewMatch[1])}`;
+  }
+
+  const canReviewMatch = clean.match(/\bcan you review (?:the )?(.+?)(?:\s+by\b|\s+and\b|[.!?]|$)/i);
+
+  if (canReviewMatch?.[1]) {
+    return `Review ${cleanActionObject(canReviewMatch[1])}`;
+  }
+
+  const sendMatch = clean.match(/\b(?:please\s+)?send (?:me |us )?(.+?)(?:\s+by\b|\s+and\b|[.!?]|$)/i);
+
+  if (sendMatch?.[1]) {
+    return `Send ${cleanActionObject(sendMatch[1])}`;
+  }
+
+  const followUpMatch = clean.match(/\bfollow up on (.+?)(?:\s+by\b|[.!?]|$)/i);
+
+  if (followUpMatch?.[1]) {
+    return `Follow up on ${cleanActionObject(followUpMatch[1])}`;
+  }
+
+  return undefined;
+}
+
+function extractBodyLikeText(text?: string): string | undefined {
+  if (!text) {
+    return undefined;
+  }
+
+  const bodyMatch = text.match(/\bBody:\s*([\s\S]*)/i);
+
+  if (bodyMatch?.[1]) {
+    return bodyMatch[1];
+  }
+
+  const lines = text
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*(subject|from|snippet):/i.test(line));
+
+  return lines.join("\n");
+}
+
+function cleanEmailFragment(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, " ")
+    .replace(/\b(?:subject|from|snippet|body):\s*/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 async function archiveStaleJobSearchEmailRules(userId: string, currentConnectionId: string): Promise<void> {

@@ -23,6 +23,7 @@ model User {
   integrationSyncLogs    IntegrationSyncLog[]
   emailSignalRules       EmailSignalRule[]
   emailReviewItems       EmailReviewItem[]
+  actionItems            ActionItem[]
 }
 
 model Goal {
@@ -257,6 +258,7 @@ model EmailReviewItem {
   extracted          Json
   status             String    @default("pending")
   eventId            String?
+  actionItemId        String?
   archiveReason      String?
   reviewedAt         DateTime?
   createdAt          DateTime  @default(now())
@@ -268,6 +270,33 @@ model EmailReviewItem {
 
   @@index([userId, status])
   @@index([ruleId, status])
+}
+
+model ActionItem {
+  id             String    @id @default(uuid())
+  userId         String
+  source         String
+  sourceId       String?
+  sourceProvider String?
+  sourceRuleId   String?
+  title          String
+  description    String?
+  status         String    @default("open")
+  priority       String    @default("medium")
+  dueAt          DateTime?
+  project        String?
+  actionType     String?
+  evidence       String?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  completedAt    DateTime?
+  snoozedUntil   DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status])
+  @@index([userId, dueAt])
+  @@index([source, sourceId])
 }
 
 enum GoalStatus {
