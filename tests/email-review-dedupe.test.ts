@@ -862,6 +862,209 @@ test("action item lifecycle routes update status", async () => {
   }
 });
 
+test("completing linked action creates one generic goal progress event", async () => {
+  const server = buildServer();
+  const actionUserId = `action-complete-linked-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const goal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Send CV",
+      priority: "medium",
+      goalId: goal.id,
+      goalSlug: "career.job_search",
+      goalTitleSnapshot: goal.title
+    }
+  });
+
+  try {
+    const first = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/complete`,
+      payload: {}
+    });
+    assert.equal(first.statusCode, 200);
+    assert.match(first.json().message, /Action completed: Send CV/);
+    assert.match(first.json().message, /Goal progress logged: Find a new developer job/);
+
+    const second = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/complete`,
+      payload: {}
+    });
+    assert.equal(second.statusCode, 200);
+    assert.match(second.json().message, /Action already completed: Send CV/);
+
+    const events = await prisma.event.findMany({
+      where: { userId: actionUserId, type: "custom.goal_progress_logged" }
+    });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].source, "manual");
+    assert.equal(events[0].provider, "action_completion");
+    assert.equal((events[0].data as { source?: string }).source, "action_completion");
+    assert.equal((events[0].data as { goalId?: string }).goalId, goal.id);
+    assert.equal((events[0].data as { actionItemId?: string }).actionItemId, action.id);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("completing unlinked action creates no goal progress event", async () => {
+  const server = buildServer();
+  const actionUserId = `action-complete-unlinked-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Buy milk",
+      priority: "medium"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/complete`,
+      payload: {}
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().message, "Action completed: Buy milk");
+
+    const events = await prisma.event.findMany({
+      where: { userId: actionUserId, type: "custom.goal_progress_logged" }
+    });
+    assert.equal(events.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("/today shows completed linked action as goal progress", async () => {
+  const server = buildServer();
+  const actionUserId = `today-completed-linked-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const goal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative"
+    }
+  });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      goalId: goal.id,
+      goalTitleSnapshot: goal.title
+    }
+  });
+
+  try {
+    const complete = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/complete`,
+      payload: {}
+    });
+    assert.equal(complete.statusCode, 200);
+
+    const today = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today`
+    });
+    assert.equal(today.statusCode, 200);
+    const goalStatus = today.json().brief.goalStatus[0];
+    assert.equal(goalStatus.status, "progress");
+    assert.match(goalStatus.note, /completed action: Write YouTube script/);
+    assert.ok(!goalStatus.note.includes("no progress logged today"));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("completing linked actions does not create fake domain events", async () => {
+  const server = buildServer();
+  const actionUserId = `action-complete-no-domain-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const [jobGoal, healthGoal] = await Promise.all([
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Find a new developer job",
+        category: "career",
+        templateId: "career.job_search"
+      }
+    }),
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Build strength and energy",
+        category: "health",
+        templateId: "health.strength_energy"
+      }
+    })
+  ]);
+  const [sendCv, trainLegs] = await Promise.all([
+    prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Send CV",
+        priority: "medium",
+        goalId: jobGoal.id,
+        goalTitleSnapshot: jobGoal.title
+      }
+    }),
+    prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Train legs",
+        priority: "medium",
+        goalId: healthGoal.id,
+        goalTitleSnapshot: healthGoal.title
+      }
+    })
+  ]);
+
+  try {
+    for (const action of [sendCv, trainLegs]) {
+      const response = await server.inject({
+        method: "PATCH",
+        url: `/users/${actionUserId}/actions/${action.id}/complete`,
+        payload: {}
+      });
+      assert.equal(response.statusCode, 200);
+    }
+
+    const [progressEvents, applicationEvents, workoutEvents] = await Promise.all([
+      prisma.event.findMany({ where: { userId: actionUserId, type: "custom.goal_progress_logged" } }),
+      prisma.event.findMany({ where: { userId: actionUserId, type: "career.application_sent" } }),
+      prisma.event.findMany({ where: { userId: actionUserId, type: "health.workout_completed" } })
+    ]);
+    assert.equal(progressEvents.length, 2);
+    assert.equal(applicationEvents.length, 0);
+    assert.equal(workoutEvents.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
 test("approving core career review still creates Event", async () => {
   const server = buildServer();
   const reviewId = await createReview({

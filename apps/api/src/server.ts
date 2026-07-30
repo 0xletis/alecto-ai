@@ -1188,15 +1188,37 @@ export function buildServer() {
   server.patch<{ Params: { userId: string; actionId: string } }>(
     "/users/:userId/actions/:actionId/complete",
     async (request, reply) => {
+      const existingAction = await getActionItem(request.params.userId, request.params.actionId);
+
+      if (!existingAction) {
+        return reply.status(404).send({ error: "Action item not found" });
+      }
+
+      if (existingAction.status === "completed") {
+        return {
+          action: sanitizeActionItem(existingAction),
+          event: null,
+          message: `Action already completed: ${existingAction.title}`
+        };
+      }
+
       const actionItem = await completeActionItem(request.params.userId, request.params.actionId);
 
       if (!actionItem) {
         return reply.status(404).send({ error: "Action item not found" });
       }
 
+      const progressEvent = await createGoalProgressFromCompletedAction(request.params.userId, actionItem);
+
       return {
         action: sanitizeActionItem(actionItem),
-        message: `Action completed: ${actionItem.title}`
+        event: progressEvent?.event,
+        message: [
+          `Action completed: ${actionItem.title}`,
+          progressEvent?.created ? `Goal progress logged: ${progressEvent.goalTitle}` : undefined
+        ]
+          .filter(Boolean)
+          .join("\n")
       };
     }
   );
@@ -1618,7 +1640,7 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
   const completedToday = visibleActions.filter(
     (action) => action.status === "completed" && action.completedAt && action.completedAt >= todayStart
   );
-  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, openActions));
+  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, openActions, completedToday));
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews);
   const risks = buildOperatorRisks(recentEvents);
   const topPriorities = buildOperatorTopPriorities({
@@ -1734,18 +1756,28 @@ function pickOperatorNextStep(input: {
 function buildOperatorGoalStatus(
   goal: Awaited<ReturnType<typeof getActiveGoals>>[number],
   todayEvents: StoredEvent[],
-  openActions: ActionItem[]
+  openActions: ActionItem[],
+  completedActions: ActionItem[]
 ): DailyOperatorBriefGoalStatus {
   const openAction = openActions.find((action) => action.goalId === goal.id);
+  const completedAction = completedActions.find((action) => action.goalId === goal.id);
   const progressNote = goalProgressNoteForToday(goal, todayEvents);
-  const note = openAction ? `${progressNote}, open action: ${openAction.title}` : progressNote;
+  const shouldShowProgressNote = progressNote !== "no progress logged today" || !completedAction;
+  const note = [
+    shouldShowProgressNote ? progressNote : undefined,
+    completedAction ? `completed action: ${completedAction.title}` : undefined,
+    openAction ? `open action: ${openAction.title}` : undefined
+  ]
+    .filter(Boolean)
+    .join(", ");
 
   return {
     goalId: goal.id,
     title: goal.title,
-    status: progressNote === "no progress logged today" ? "no_progress" : "progress",
+    status: progressNote === "no progress logged today" && !completedAction ? "no_progress" : "progress",
     note,
-    openActionTitle: openAction?.title
+    openActionTitle: openAction?.title,
+    completedActionTitle: completedAction?.title
   };
 }
 
@@ -2068,6 +2100,36 @@ function formatActionCreatedReply(input: {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+async function createGoalProgressFromCompletedAction(userId: string, actionItem: ActionItem) {
+  if (!actionItem.goalId) {
+    return undefined;
+  }
+
+  const goal = (await getGoals(userId)).find((item) => item.id === actionItem.goalId);
+  const goalTitle = actionItem.goalTitleSnapshot ?? goal?.title ?? "Linked goal";
+  const created = await createExternalEventIfNotExists(userId, {
+    type: "custom.goal_progress_logged",
+    source: "manual",
+    provider: "action_completion",
+    externalId: `action-completion:${actionItem.id}`,
+    timestamp: actionItem.completedAt ?? new Date(),
+    data: {
+      goalId: actionItem.goalId,
+      goalTitle,
+      actionItemId: actionItem.id,
+      actionTitle: actionItem.title,
+      source: "action_completion"
+    },
+    confidence: 1,
+    evidence: [`Completed action: ${actionItem.title}`]
+  });
+
+  return {
+    ...created,
+    goalTitle
+  };
 }
 
 async function dispatchActionRemindersForUser(userId: string, now: Date): Promise<ActionReminderDispatch[]> {
@@ -5583,6 +5645,7 @@ interface DailyOperatorBriefGoalStatus {
   status: string;
   note: string;
   openActionTitle?: string;
+  completedActionTitle?: string;
 }
 
 interface ActionReminderDispatch {

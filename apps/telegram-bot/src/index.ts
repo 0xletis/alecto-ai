@@ -3651,6 +3651,7 @@ interface DailyOperatorBriefGoalStatus {
   status: string;
   note: string;
   openActionTitle?: string;
+  completedActionTitle?: string;
 }
 
 interface InsightReport {
