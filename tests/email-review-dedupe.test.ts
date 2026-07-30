@@ -117,7 +117,7 @@ test("route debug explains commands and does not imply command execution", () =>
   assert.equal(gmailDebug.allowedSideEffects.sendNotification, false);
 });
 
-test("route debug explains action, event, risk, and standalone now routes", () => {
+test("route debug explains action, event, goal guardrail, and standalone now routes", () => {
   const now = explainNormalizedInboundRoute(
     buildNormalizedInboundMessage({
       channel: "telegram",
@@ -158,6 +158,22 @@ test("route debug explains action, event, risk, and standalone now routes", () =
       text: "/action bet 500 tomorrow"
     })
   );
+  const reference = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "api",
+      userId: "api:123",
+      externalUserId: "123",
+      text: "You are working in the repo. Tests: /action bet 500 tomorrow"
+    })
+  );
+  const debugOutput = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "api",
+      userId: "api:123",
+      externalUserId: "123",
+      text: "Observed debug output: intentType risk_guardrail for /action bet 500 tomorrow"
+    })
+  );
 
   assert.equal(now.intentType, "unknown");
   assert.equal(now.allowedSideEffects.createAction, false);
@@ -166,17 +182,34 @@ test("route debug explains action, event, risk, and standalone now routes", () =
   assert.equal(action.allowedSideEffects.createAction, true);
   assert.equal(event.intentType, "event_log");
   assert.equal(event.allowedSideEffects.createEvent, true);
-  assert.equal(risk.intentType, "risk_guardrail");
+  assert.equal(risk.intentType, "goal_guardrail");
+  assert.equal(risk.handlerName, "goal_guardrail_engine");
+  assert.equal(risk.goal, "Control impulsive betting");
+  assert.equal(risk.severity, "hard");
   assert.equal(risk.allowedSideEffects.createAction, false);
-  assert.equal(actionRisk.intentType, "command_with_risk");
+  assert.equal(actionRisk.intentType, "command_with_guardrail");
   assert.equal(actionRisk.handlerName, "action");
   assert.equal(actionRisk.allowedSideEffects.createAction, false);
+  assert.equal(reference.intentType, "generic_chat");
+  assert.equal(reference.isReferenceOnly, true);
+  assert.equal(reference.allowedSideEffects.createAction, false);
+  assert.equal(reference.allowedSideEffects.createEvent, false);
+  assert.equal(debugOutput.intentType, "generic_chat");
+  assert.equal(debugOutput.isReferenceOnly, true);
 });
 
 test("risky action command text routes to guardrail response without creating ActionItem", async () => {
   const server = buildServer();
   const actionUserId = `action-risk-command-${randomUUID()}`;
   await prisma.user.create({ data: { id: actionUserId } });
+  const riskGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Control impulsive betting",
+      category: "finance",
+      templateId: "finance.control_betting_trading"
+    }
+  });
 
   const cases = [
     { command: "/action", text: "bet 500 tomorrow", intent: "betting_intent" },
@@ -194,7 +227,7 @@ test("risky action command text routes to guardrail response without creating Ac
           text: `${testCase.command} ${testCase.text}`
         })
       );
-      assert.equal(debug.intentType, "command_with_risk");
+      assert.equal(debug.intentType, "command_with_guardrail");
       assert.equal(debug.allowedSideEffects.createAction, false);
 
       const response = await server.inject({
@@ -209,6 +242,43 @@ test("risky action command text routes to guardrail response without creating Ac
 
     const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
     assert.equal(actions.length, 0);
+    const cooldowns = await prisma.event.findMany({
+      where: { userId: actionUserId, type: "finance.betting.cooldown_triggered" },
+      orderBy: { createdAt: "asc" }
+    });
+    assert.equal(cooldowns.length, 3);
+    const guardrail = (cooldowns[0].data as { guardrail?: { goalId?: string; category?: string; severity?: string } }).guardrail;
+    assert.equal(guardrail?.goalId, riskGoal.id);
+    assert.equal(guardrail?.category, "impulse_control");
+    assert.equal(guardrail?.severity, "hard");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("pasted prompt with risky examples does not trigger guardrail or cooldown", async () => {
+  const server = buildServer();
+  const actionUserId = `risk-reference-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId: actionUserId,
+        message: "You are working in the repo. Tests: /action bet 500 tomorrow. Expected: no ActionItem."
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.notEqual(response.json().intent, "betting_intent");
+    assert.notEqual(response.json().riskState, "RED");
+
+    const cooldowns = await prisma.event.findMany({
+      where: { userId: actionUserId, type: "finance.betting.cooldown_triggered" }
+    });
+    assert.equal(cooldowns.length, 0);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
@@ -1200,6 +1270,14 @@ test("/today shows goal progress and betting cooldown risk", async () => {
       templateId: "career.job_search"
     }
   });
+  await prisma.goal.create({
+    data: {
+      userId: briefUserId,
+      title: "Control impulsive betting",
+      category: "finance",
+      templateId: "finance.control_betting_trading"
+    }
+  });
   await prisma.event.create({
     data: {
       userId: briefUserId,
@@ -1228,7 +1306,10 @@ test("/today shows goal progress and betting cooldown risk", async () => {
     });
     assert.equal(response.statusCode, 200);
     const brief = response.json().brief;
-    assert.equal(brief.goalStatus[0].note, "1 application sent today");
+    const jobStatus = brief.goalStatus.find((status: { title: string }) => status.title === "Find a new job");
+    const riskStatus = brief.goalStatus.find((status: { title: string }) => status.title === "Control impulsive betting");
+    assert.equal(jobStatus?.note, "1 application sent today");
+    assert.equal(riskStatus?.note, "guardrail triggered today, no betting actions created");
     assert.equal(brief.risks.some((risk: string) => risk.includes("Betting impulse detected recently")), true);
   } finally {
     await server.close();

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { EventTypeSchema } from "./event-registry.js";
+import { evaluateGoalGuardrails } from "./goal-guardrails.js";
 import { RiskStateSchema } from "./risk.js";
 import type { StoredEvent } from "./events.js";
 import type { UserOperatingProfile } from "./user-operating-profile.js";
@@ -132,6 +133,11 @@ export function processMessageFromAnalysis(
 
 export function routeIntent(message: string): MessageIntent {
   const text = message.toLowerCase();
+  const guardrail = evaluateGoalGuardrails({ text: message });
+
+  if (guardrail.isReferenceOnly) {
+    return "general_chat";
+  }
 
   if (/\b(bet|betting|gamble|apuesta|apostar|polymarket)\b/i.test(message)) {
     return "betting_intent";
@@ -237,6 +243,10 @@ export function assessRisk(
 
   if (!isFinancialRiskIntent) {
     return "GREEN";
+  }
+
+  if (evaluateGoalGuardrails({ text: message }).triggered) {
+    return "RED";
   }
 
   return getRiskSignals(intent, message, recentEvents).length > 0 ? "RED" : "ORANGE";

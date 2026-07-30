@@ -2000,8 +2000,13 @@ function formatRouteDebug(debug: InboundRouteDebug): string {
     `- createMemory: ${String(debug.allowedSideEffects.createMemory)}`,
     `- sendNotification: ${String(debug.allowedSideEffects.sendNotification)}`,
     `- callLLM: ${String(debug.allowedSideEffects.callLLM)}`,
+    debug.goal ? `goal: ${debug.goal}` : undefined,
+    debug.severity ? `severity: ${debug.severity}` : undefined,
+    debug.isReferenceOnly !== undefined ? `isReferenceOnly: ${String(debug.isReferenceOnly)}` : undefined,
     `reason: ${debug.reason}`
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function getRecentDailyCheckInReminder(message: NormalizedInboundMessage): Promise<boolean> {
@@ -2914,7 +2919,7 @@ async function createManualActionFromCommand(ctx: Context, commandName: string) 
   try {
     const routeDebug = explainNormalizedInboundRoute(buildNormalizedTelegramMessage(ctx, `${commandName} ${text}`));
 
-    if (routeDebug.intentType === "command_with_risk") {
+    if (routeDebug.intentType === "command_with_guardrail" || routeDebug.intentType === "command_with_risk") {
       const riskResponse = await apiPost<ProcessMessageResponse>("/messages/process", {
         userId: getTelegramUserId(ctx),
         message: text

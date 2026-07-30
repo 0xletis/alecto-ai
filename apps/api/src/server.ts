@@ -22,6 +22,7 @@ import {
   extractEvents,
   findGoalDuplicateWarnings,
   getGoalTemplate,
+  evaluateGoalGuardrails,
   inferGoalLinkForAction,
   goalTemplates,
   IngestTextBodySchema,
@@ -311,6 +312,7 @@ export function buildServer() {
     const result = withMemoryContextReply(analyzeMessage(processInput, openAIAnalysis), activeMemories);
     const savedEvents = await createEventsFromExtracted(result.userId, result.extractedEvents);
     const isRedFinancialRisk = isFinancialRiskIntent(result.intent) && result.riskState === "RED";
+    const guardrail = evaluateGoalGuardrails({ text: result.message, activeGoals });
 
     if (isRedFinancialRisk) {
       const cooldownEvent = await createEvent(result.userId, {
@@ -319,7 +321,19 @@ export function buildServer() {
         source: "manual",
         data: {
           intent: result.intent,
-          reason: "red_risk_state"
+          reason: "red_risk_state",
+          guardrail: guardrail.triggered
+            ? {
+                goalId: guardrail.goalId,
+                goalTitle: guardrail.goalTitle,
+                category: guardrail.guardrailCategory,
+                severity: guardrail.severity,
+                responseMode: guardrail.responseMode,
+                blockedActionCreation: guardrail.blockedActionCreation,
+                cooldownRequired: guardrail.cooldownRequired,
+                reason: guardrail.reason
+              }
+            : undefined
         },
         confidence: 1,
         evidence: [result.message]
@@ -1812,6 +1826,16 @@ function goalProgressNoteForToday(goal: Awaited<ReturnType<typeof getActiveGoals
   if (templateId.includes("reading") || category === "learning") {
     const minutes = sumEventNumber(events, "learning.reading_session_completed", "duration_minutes");
     return minutes > 0 ? `${minutes} minutes reading today` : "no progress logged today";
+  }
+
+  if (templateId === "finance.control_betting_trading" || category === "finance") {
+    const guardrails = events.filter((event) => event.type === "finance.betting.cooldown_triggered");
+
+    if (guardrails.length > 0) {
+      return "guardrail triggered today, no betting actions created";
+    }
+
+    return "no progress logged today";
   }
 
   const customLogs = events.filter((event) => event.type === "custom.goal_progress_logged" && event.data.goalId === goal.id);

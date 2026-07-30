@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { extractManualAction } from "./action-intake.js";
+import { evaluateGoalGuardrails } from "./goal-guardrails.js";
 import { extractEvents, routeIntent } from "./message-processing.js";
 
 export const InboundChannelSchema = z.enum(["telegram", "whatsapp", "web", "api"]);
@@ -67,7 +68,10 @@ export const InboundRouteDebugSchema = z.object({
   allowedSideEffects: RouteSideEffectsSchema,
   reason: z.string(),
   routeKind: z.string(),
-  commandName: z.string().optional()
+  commandName: z.string().optional(),
+  goal: z.string().optional(),
+  severity: z.string().optional(),
+  isReferenceOnly: z.boolean().optional()
 });
 
 export type InboundChannel = z.infer<typeof InboundChannelSchema>;
@@ -173,16 +177,21 @@ export function explainNormalizedInboundRoute(
   if (route.kind === "command") {
     const commandText = route.command.args.trim();
 
-    if (commandText && isRiskText(commandText)) {
+    const guardrail = commandText ? evaluateGoalGuardrails({ text: commandText }) : undefined;
+
+    if (guardrail?.triggered) {
       return debugResult({
-        intentType: "command_with_risk",
-        confidence: 0.95,
+        intentType: "command_with_guardrail",
+        confidence: guardrail.confidence,
         handlerName: route.command.name,
         shouldRunGenericChat: false,
         allowedSideEffects: noSideEffects(),
-        reason: "Slash command arguments contain betting/trading risk language. Debug does not execute the command.",
+        reason: `${guardrail.reason}. Debug does not execute the command.`,
         routeKind: route.kind,
-        commandName: route.command.name
+        commandName: route.command.name,
+        goal: guardrail.goalTitle,
+        severity: guardrail.severity,
+        isReferenceOnly: guardrail.isReferenceOnly
       });
     }
 
@@ -286,11 +295,26 @@ function explainProcessMessageRoute(message: NormalizedInboundMessage): InboundR
     });
   }
 
-  if (isRiskText(message.text)) {
+  const guardrail = evaluateGoalGuardrails({ text: message.text });
+
+  if (guardrail.isReferenceOnly) {
     return debugResult({
-      intentType: "risk_guardrail",
-      confidence: 0.95,
+      intentType: "generic_chat",
+      confidence: guardrail.confidence,
       handlerName: "process_message",
+      shouldRunGenericChat: false,
+      allowedSideEffects: noSideEffects(),
+      reason: guardrail.reason,
+      routeKind: "process_message",
+      isReferenceOnly: true
+    });
+  }
+
+  if (guardrail.triggered) {
+    return debugResult({
+      intentType: "goal_guardrail",
+      confidence: guardrail.confidence,
+      handlerName: "goal_guardrail_engine",
       shouldRunGenericChat: false,
       allowedSideEffects: {
         createEvent: true,
@@ -299,8 +323,11 @@ function explainProcessMessageRoute(message: NormalizedInboundMessage): InboundR
         sendNotification: false,
         callLLM: false
       },
-      reason: "Betting/trading language routes to deterministic risk guardrails. It must not become an action item.",
-      routeKind: "process_message"
+      reason: guardrail.reason,
+      routeKind: "process_message",
+      goal: guardrail.goalTitle,
+      severity: guardrail.severity,
+      isReferenceOnly: false
     });
   }
 
@@ -364,7 +391,7 @@ function explainProcessMessageRoute(message: NormalizedInboundMessage): InboundR
 }
 
 function isRiskText(text: string): boolean {
-  return isDirectBettingTradingIntent(text) || /\b(bet|betting|gamble|apuesta|apostar|polymarket|trade|trading|long|short|leverage)\b/i.test(text);
+  return evaluateGoalGuardrails({ text }).triggered;
 }
 
 function noSideEffects(): RouteSideEffects {

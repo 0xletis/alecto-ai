@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { evaluateGoalGuardrails } from "./goal-guardrails.js";
 
 export const ManualActionTypeSchema = z.enum(["manual", "reminder", "follow_up", "deadline", "generic"]);
 
@@ -63,7 +64,6 @@ const actionPrefixPatterns = [
 
 const vagueActionPattern =
   /\b(be better|work harder|change my life|build a product|do more|try harder|improve myself|sort my life out)\b/i;
-const bettingActionPattern = /\b(bet|betting|gamble|apuesta|apostar|polymarket|trade|trading|long|short|leverage)\b/i;
 
 export function extractManualAction(input: { text: string }, context: ActionIntakeContext = {}): ActionExtractionResult {
   const text = input.text.trim();
@@ -72,7 +72,7 @@ export function extractManualAction(input: { text: string }, context: ActionInta
     return noAction("empty_text", input.text);
   }
 
-  if (bettingActionPattern.test(text)) {
+  if (evaluateGoalGuardrails({ text }).triggered) {
     return noAction("risk_action_blocked", text);
   }
 
