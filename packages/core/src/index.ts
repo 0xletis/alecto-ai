@@ -6,6 +6,7 @@ export * from "./email-classification.js";
 export * from "./event-registry.js";
 export * from "./events.js";
 export * from "./goal-templates.js";
+export * from "./goal-linking.js";
 export * from "./goals.js";
 export * from "./insights.js";
 export * from "./ingestion.js";

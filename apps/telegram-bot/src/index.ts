@@ -912,6 +912,22 @@ bot.command("debug_make_snoozed_due", async (ctx) => {
   }
 });
 
+bot.command("debug_link_actions_to_goals", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiPost<{ linked: number; message: string }>(
+      `/users/${getTelegramUserId(ctx)}/actions/debug-link-goals`,
+      {}
+    );
+    await ctx.reply(response.message ?? `Linked ${response.linked} actions to goals.`);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not link actions to goals right now.");
+  }
+});
+
 bot.command("sync_gmail", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -2589,8 +2605,9 @@ function formatBriefAction(action: DailyOperatorBriefAction): string {
     : action.snoozedUntil
       ? `snoozed until ${formatLocalDateTime(action.snoozedUntil)}`
       : undefined;
+  const goal = action.goalTitle ? `goal: ${action.goalTitle}` : undefined;
 
-  return `- ${action.title}${detail ? ` - ${detail}` : ""}`;
+  return `- ${action.title}${detail ? ` - ${detail}` : ""}${goal ? ` - ${goal}` : ""}`;
 }
 
 function formatInsight(insight: InsightReport) {
@@ -2868,6 +2885,7 @@ function formatAction(action: ActionItem): string {
     `priority: ${action.priority}`,
     action.dueAt ? `dueAt: ${formatLocalDateTime(action.dueAt)}` : undefined,
     action.snoozedUntil ? `snoozedUntil: ${formatLocalDateTime(action.snoozedUntil)}` : undefined,
+    action.goalTitleSnapshot ? `goal: ${truncateText(action.goalTitleSnapshot, 100)}` : undefined,
     action.project ? `project: ${truncateText(action.project, 80)}` : undefined,
     action.actionType ? `type: ${action.actionType}` : undefined,
     `source: ${action.source}`,
@@ -3623,6 +3641,8 @@ interface DailyOperatorBriefAction {
   priority: string;
   dueAt?: string;
   snoozedUntil?: string;
+  goalId?: string;
+  goalTitle?: string;
 }
 
 interface DailyOperatorBriefGoalStatus {
@@ -3630,6 +3650,7 @@ interface DailyOperatorBriefGoalStatus {
   title: string;
   status: string;
   note: string;
+  openActionTitle?: string;
 }
 
 interface InsightReport {
@@ -3776,6 +3797,9 @@ interface ActionItem {
   sourceId?: string;
   sourceProvider?: string;
   sourceRuleId?: string;
+  goalId?: string;
+  goalSlug?: string;
+  goalTitleSnapshot?: string;
   title: string;
   description?: string;
   status: "open" | "completed" | "snoozed" | "archived";

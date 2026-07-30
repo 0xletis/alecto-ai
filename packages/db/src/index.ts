@@ -199,6 +199,9 @@ export interface ActionItem {
   sourceId?: string;
   sourceProvider?: string;
   sourceRuleId?: string;
+  goalId?: string;
+  goalSlug?: string;
+  goalTitleSnapshot?: string;
   title: string;
   description?: string;
   status: "open" | "completed" | "snoozed" | "archived";
@@ -227,6 +230,9 @@ export interface CreateActionItemInput {
   sourceId?: string;
   sourceProvider?: string;
   sourceRuleId?: string;
+  goalId?: string;
+  goalSlug?: string;
+  goalTitleSnapshot?: string;
   title: string;
   description?: string;
   priority?: ActionItem["priority"];
@@ -1256,6 +1262,9 @@ export async function createActionItemIfNotExists(
       sourceId: input.sourceId,
       sourceProvider: input.sourceProvider,
       sourceRuleId: input.sourceRuleId,
+      goalId: input.goalId,
+      goalSlug: input.goalSlug,
+      goalTitleSnapshot: input.goalTitleSnapshot,
       title: input.title,
       description: input.description,
       priority: input.priority ?? "medium",
@@ -1279,6 +1288,9 @@ export async function createActionItem(userId: string, input: CreateActionItemIn
       sourceId: input.sourceId,
       sourceProvider: input.sourceProvider,
       sourceRuleId: input.sourceRuleId,
+      goalId: input.goalId,
+      goalSlug: input.goalSlug,
+      goalTitleSnapshot: input.goalTitleSnapshot,
       title: input.title,
       description: input.description,
       priority: input.priority ?? "medium",
@@ -1335,6 +1347,30 @@ export async function getRecentActionItems(userId: string, limit = 50): Promise<
   });
 
   return actionItems.map(toActionItem);
+}
+
+export async function linkActionItemToGoal(
+  userId: string,
+  actionItemId: string,
+  input: { goalId: string; goalSlug?: string; goalTitleSnapshot?: string }
+): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing) {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      goalId: input.goalId,
+      goalSlug: input.goalSlug,
+      goalTitleSnapshot: input.goalTitleSnapshot
+    }
+  });
+
+  return toActionItem(actionItem);
 }
 
 export async function completeActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
@@ -2542,6 +2578,9 @@ function toActionItem(item: Prisma.ActionItemGetPayload<object>): ActionItem {
     sourceId: item.sourceId ?? undefined,
     sourceProvider: item.sourceProvider ?? undefined,
     sourceRuleId: item.sourceRuleId ?? undefined,
+    goalId: item.goalId ?? undefined,
+    goalSlug: item.goalSlug ?? undefined,
+    goalTitleSnapshot: item.goalTitleSnapshot ?? undefined,
     title: item.title,
     description: item.description ?? undefined,
     status: normalizeActionItemStatus(item.status),

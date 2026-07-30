@@ -215,6 +215,215 @@ test("risky action command text routes to guardrail response without creating Ac
   }
 });
 
+test("manual actions infer links to active goals", async () => {
+  const server = buildServer();
+  const actionUserId = `action-goal-links-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+  const healthGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build strength and energy",
+      category: "health",
+      templateId: "health.strength_energy"
+    }
+  });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative"
+    }
+  });
+  const carGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a cheap car to buy",
+      category: "custom"
+    }
+  });
+
+  try {
+    const cases = [
+      { text: "send CV tonight", goalId: jobGoal.id, title: "Send CV" },
+      { text: "apply to 2 jobs tomorrow", goalId: jobGoal.id },
+      { text: "train legs tomorrow", goalId: healthGoal.id },
+      { text: "write YouTube script tonight", goalId: youtubeGoal.id },
+      { text: "check cheap car listings tomorrow", goalId: carGoal.id },
+      { text: "pay electricity tomorrow", goalId: undefined }
+    ];
+
+    for (const testCase of cases) {
+      const response = await server.inject({
+        method: "POST",
+        url: `/users/${actionUserId}/actions/manual`,
+        payload: { text: testCase.text }
+      });
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().action.goalId, testCase.goalId);
+      if (testCase.goalId) {
+        assert.ok(response.json().action.goalTitleSnapshot);
+      }
+      if (testCase.title) {
+        assert.equal(response.json().action.title, testCase.title);
+      }
+    }
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("unrelated manual action creates unlinked ActionItem", async () => {
+  const server = buildServer();
+  const actionUserId = `action-unlinked-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "buy milk tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().action.title, "Buy milk");
+    assert.equal(response.json().action.goalId, undefined);
+    assert.equal(response.json().action.goalTitleSnapshot, undefined);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("archived goals are ignored by action goal inference", async () => {
+  const server = buildServer();
+  const actionUserId = `action-archived-goal-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      status: "archived"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "send CV tonight" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().action.goalId, undefined);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("debug goal-link backfill leaves unrelated actions unlinked", async () => {
+  const server = buildServer();
+  const actionUserId = `action-backfill-goals-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+  const milk = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Buy milk",
+      priority: "medium"
+    }
+  });
+  const cv = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Send CV",
+      priority: "medium"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/debug-link-goals`,
+      payload: {}
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().linked, 1);
+
+    const [updatedMilk, updatedCv] = await Promise.all([
+      prisma.actionItem.findUniqueOrThrow({ where: { id: milk.id } }),
+      prisma.actionItem.findUniqueOrThrow({ where: { id: cv.id } })
+    ]);
+    assert.equal(updatedMilk.goalId, null);
+    assert.equal(updatedCv.goalId, jobGoal.id);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("/today shows linked action under goal and skips generic progress prompt", async () => {
+  const server = buildServer();
+  const actionUserId = `today-linked-action-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+
+  try {
+    const actionResponse = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "send CV tonight" }
+    });
+    assert.equal(actionResponse.statusCode, 200);
+    assert.equal(actionResponse.json().action.goalId, jobGoal.id);
+
+    const today = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today`
+    });
+    assert.equal(today.statusCode, 200);
+    const brief = today.json().brief;
+    assert.equal(brief.openActions[0].goalTitle, "Find a new developer job");
+    assert.match(brief.goalStatus[0].note, /open action: Send CV/);
+    assert.ok(!brief.topPriorities.some((priority: string) => priority.includes("Log progress for Find a new developer job")));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
 test.before(async () => {
   await prisma.user.create({
     data: { id: userId }
@@ -1149,6 +1358,38 @@ test("natural concrete action message creates ActionItem", async () => {
   }
 });
 
+test("unrelated natural action message creates unlinked ActionItem", async () => {
+  const server = buildServer();
+  const actionUserId = `action-natural-unlinked-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "I need to buy milk tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action created/);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].title, "Buy milk");
+    assert.equal(actions[0].goalId, null);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
 test("manual action command and natural text with article dedupe to one open action", async () => {
   const server = buildServer();
   const actionUserId = `action-article-dedupe-${randomUUID()}`;
@@ -1297,6 +1538,38 @@ test("explicit memory concrete task saves memory and creates ActionItem", async 
     assert.equal(memories.length, 1);
     assert.equal(actions.length, 1);
     assert.equal(actions[0].title, "Review homepage copy");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("explicit memory unrelated concrete task creates unlinked ActionItem", async () => {
+  const server = buildServer();
+  const actionUserId = `action-memory-unlinked-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "remember that I need to buy milk tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Saved to memory/);
+    assert.match(response.json().reply, /Action created/);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].title, "Buy milk");
+    assert.equal(actions[0].goalId, null);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });

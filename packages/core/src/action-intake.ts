@@ -154,7 +154,7 @@ function cleanManualActionTitle(text: string, dueText?: string): string {
     .replace(/\b(?:by|on|next)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, "")
     .replace(/\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(?:morning|afternoon|evening)\b/gi, "")
     .replace(/\bin\s+\d+\s+(?:day|days|week|weeks)\b/gi, "")
-    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete|pay|test)\s+the\s+/gi, "$1 ")
+    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete|pay|test|train|buy|purchase)\s+the\s+/gi, "$1 ")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -166,7 +166,7 @@ function isConcreteActionTitle(title?: string): title is string {
     return false;
   }
 
-  return /\b(review|call|send|finish|update|apply|write|prepare|book|schedule|check|reply|follow up|complete|pay|test)\b/i.test(title);
+  return /\b(review|call|send|finish|update|apply|write|prepare|book|schedule|check|reply|follow up|complete|pay|test|train|buy|purchase)\b/i.test(title);
 }
 
 function inferManualActionType(text: string, dueText?: string): ManualActionType {
@@ -511,7 +511,7 @@ function escapeRegExp(text: string): string {
 export function normalizeManualActionTitleKey(text: string): string {
   return cleanManualActionTitle(text)
     .toLowerCase()
-    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete|pay|test)\s+(?:the|a|an)\s+/gi, "$1 ")
+    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete|pay|test|train|buy|purchase)\s+(?:the|a|an)\s+/gi, "$1 ")
     .replace(/[^\w\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();

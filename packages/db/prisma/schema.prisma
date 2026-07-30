@@ -285,6 +285,9 @@ model ActionItem {
   sourceId       String?
   sourceProvider String?
   sourceRuleId   String?
+  goalId         String?
+  goalSlug       String?
+  goalTitleSnapshot String?
   title          String
   description    String?
   status         String    @default("open")
@@ -303,6 +306,7 @@ model ActionItem {
 
   @@index([userId, status])
   @@index([userId, dueAt])
+  @@index([userId, goalId])
   @@index([source, sourceId])
 }
 

@@ -22,6 +22,7 @@ import {
   extractEvents,
   findGoalDuplicateWarnings,
   getGoalTemplate,
+  inferGoalLinkForAction,
   goalTemplates,
   IngestTextBodySchema,
   CreateEmailSignalRuleInputSchema,
@@ -111,6 +112,7 @@ import {
   getActionItem,
   getActionItems,
   getActionItemsEligibleForReminder,
+  linkActionItemToGoal,
   getIntegrationConnection,
   getIntegrationConnections,
   approveEmailReviewItem,
@@ -982,6 +984,15 @@ export function buildServer() {
 
       if (isWorkActionReviewType(review.proposedEventType)) {
         const actionInput = actionItemInputFromEmailReview(review);
+        const goalLink = await inferActionGoalLink(
+          request.params.userId,
+          actionInput.title,
+          actionInput.description,
+          actionInput.evidence
+        );
+        actionInput.goalId = goalLink.goalId ?? undefined;
+        actionInput.goalSlug = goalLink.goalSlug ?? undefined;
+        actionInput.goalTitleSnapshot = goalLink.matchedGoalTitle;
         const result = await createActionItemIfNotExists(request.params.userId, actionInput);
         const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId, undefined, result.actionItem.id);
 
@@ -1084,6 +1095,42 @@ export function buildServer() {
         duplicate: result.duplicate,
         extraction: result.extraction,
         message: formatActionCreatedReply(result)
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string } }>(
+    "/users/:userId/actions/debug-link-goals",
+    async (request) => {
+      const actions = (await getRecentActionItems(request.params.userId, 200)).filter(
+        (action) => (action.status === "open" || action.status === "snoozed") && !action.goalId
+      );
+      let linked = 0;
+
+      for (const action of actions) {
+        const goalLink = await inferActionGoalLink(
+          request.params.userId,
+          action.title,
+          action.description,
+          action.evidence
+        );
+
+        if (goalLink.goalId) {
+          const updated = await linkActionItemToGoal(request.params.userId, action.id, {
+            goalId: goalLink.goalId,
+            goalSlug: goalLink.goalSlug ?? undefined,
+            goalTitleSnapshot: goalLink.matchedGoalTitle
+          });
+
+          if (updated) {
+            linked += 1;
+          }
+        }
+      }
+
+      return {
+        linked,
+        message: `Linked ${linked} action${linked === 1 ? "" : "s"} to goals.`
       };
     }
   );
@@ -1571,7 +1618,7 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
   const completedToday = visibleActions.filter(
     (action) => action.status === "completed" && action.completedAt && action.completedAt >= todayStart
   );
-  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents));
+  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, openActions));
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews);
   const risks = buildOperatorRisks(recentEvents);
   const topPriorities = buildOperatorTopPriorities({
@@ -1646,7 +1693,7 @@ function buildOperatorTopPriorities(input: {
   input.dueSoonActions.forEach((action) => addActionPriority(action, "Due soon"));
   input.openActions.forEach((action) => addActionPriority(action));
 
-  for (const goal of input.goalStatus.filter((item) => item.status === "no_progress")) {
+  for (const goal of input.goalStatus.filter((item) => item.status === "no_progress" && !item.openActionTitle)) {
     priorities.push(`Log progress for ${goal.title}`);
   }
 
@@ -1686,15 +1733,19 @@ function pickOperatorNextStep(input: {
 
 function buildOperatorGoalStatus(
   goal: Awaited<ReturnType<typeof getActiveGoals>>[number],
-  todayEvents: StoredEvent[]
+  todayEvents: StoredEvent[],
+  openActions: ActionItem[]
 ): DailyOperatorBriefGoalStatus {
-  const note = goalProgressNoteForToday(goal, todayEvents);
+  const openAction = openActions.find((action) => action.goalId === goal.id);
+  const progressNote = goalProgressNoteForToday(goal, todayEvents);
+  const note = openAction ? `${progressNote}, open action: ${openAction.title}` : progressNote;
 
   return {
     goalId: goal.id,
     title: goal.title,
-    status: note === "no progress logged today" ? "no_progress" : "progress",
-    note
+    status: progressNote === "no progress logged today" ? "no_progress" : "progress",
+    note,
+    openActionTitle: openAction?.title
   };
 }
 
@@ -1808,7 +1859,9 @@ function toBriefAction(action: ActionItem): DailyOperatorBriefAction {
     status: action.status,
     priority: action.priority,
     dueAt: action.dueAt?.toISOString(),
-    snoozedUntil: action.snoozedUntil?.toISOString()
+    snoozedUntil: action.snoozedUntil?.toISOString(),
+    goalId: action.goalId,
+    goalTitle: action.goalTitleSnapshot
   };
 }
 
@@ -1934,8 +1987,12 @@ async function maybeCreateManualActionFromText(
   const description = [extraction.description, extraction.dueText && !extraction.dueAt ? `Due: ${extraction.dueText}.` : undefined]
     .filter(Boolean)
     .join(" ");
+  const goalLink = await inferActionGoalLink(userId, extraction.title, description || undefined, extraction.evidence);
   const action = await createActionItem(userId, {
     source: "manual",
+    goalId: goalLink.goalId ?? undefined,
+    goalSlug: goalLink.goalSlug ?? undefined,
+    goalTitleSnapshot: goalLink.matchedGoalTitle,
     title: extraction.title,
     description: description || undefined,
     priority: extraction.priority,
@@ -1950,6 +2007,20 @@ async function maybeCreateManualActionFromText(
     action,
     duplicate: false
   };
+}
+
+async function inferActionGoalLink(
+  userId: string,
+  actionTitle: string,
+  actionDescription?: string,
+  evidence?: string
+) {
+  return inferGoalLinkForAction({
+    actionTitle,
+    actionDescription,
+    evidence,
+    activeGoals: await getActiveGoals(userId)
+  });
 }
 
 async function findDuplicateManualAction(
@@ -5502,6 +5573,8 @@ interface DailyOperatorBriefAction {
   priority: ActionItem["priority"];
   dueAt?: string;
   snoozedUntil?: string;
+  goalId?: string;
+  goalTitle?: string;
 }
 
 interface DailyOperatorBriefGoalStatus {
@@ -5509,6 +5582,7 @@ interface DailyOperatorBriefGoalStatus {
   title: string;
   status: string;
   note: string;
+  openActionTitle?: string;
 }
 
 interface ActionReminderDispatch {
