@@ -33,6 +33,9 @@ model Goal {
   title         String
   category      String
   status        GoalStatus @default(active)
+  priority      String     @default("medium")
+  importanceScore Float?
+  priorityReason String?
   why           String?
   templateId    String?
   targetMetrics Json?

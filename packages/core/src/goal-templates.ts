@@ -1,10 +1,11 @@
 import { z } from "zod";
-import { GoalCheckInQuestionSchema, GoalMetricSchema } from "./goals.js";
+import { GoalCheckInQuestionSchema, GoalMetricSchema, GoalPrioritySchema } from "./goals.js";
 
 export const GoalTemplateSchema = z.object({
   id: z.string().min(1),
   title: z.string().min(1),
   category: z.string().min(1),
+  defaultPriority: GoalPrioritySchema,
   description: z.string().min(1),
   relevantEventTypes: z.array(z.string().min(1)),
   suggestedMetrics: z.array(GoalMetricSchema),
@@ -19,6 +20,7 @@ export const goalTemplates = [
     id: "career.job_search",
     title: "Job Search",
     category: "career",
+    defaultPriority: "critical",
     description: "Track applications, recruiter replies, interviews, and career materials.",
     relevantEventTypes: [
       "career.application_sent",
@@ -61,6 +63,7 @@ export const goalTemplates = [
     id: "work.deep_work",
     title: "Deep Work",
     category: "work",
+    defaultPriority: "high",
     description: "Track focused work sessions, tasks, blockers, and milestones.",
     relevantEventTypes: ["work.deep_work_session_completed", "work.task_completed", "work.blocker_reported"],
     suggestedMetrics: [
@@ -84,6 +87,7 @@ export const goalTemplates = [
     id: "health.strength_energy",
     title: "Strength and Energy",
     category: "health",
+    defaultPriority: "high",
     description: "Track training, steps, energy, meals, and recovery.",
     relevantEventTypes: [
       "health.workout_completed",
@@ -125,6 +129,7 @@ export const goalTemplates = [
     id: "health.sleep_better",
     title: "Sleep Better",
     category: "health",
+    defaultPriority: "high",
     description: "Track sleep duration, energy, and recovery patterns.",
     relevantEventTypes: ["health.sleep_logged", "reflection.energy_logged", "health.rest_day_logged"],
     suggestedMetrics: [
@@ -148,6 +153,7 @@ export const goalTemplates = [
     id: "learning.reading_more",
     title: "Read More",
     category: "learning",
+    defaultPriority: "low",
     description: "Track reading sessions, notes, and finished books.",
     relevantEventTypes: [
       "learning.reading_session_completed",
@@ -176,6 +182,7 @@ export const goalTemplates = [
     id: "learning.skill_learning",
     title: "Skill Learning",
     category: "learning",
+    defaultPriority: "medium",
     description: "Track practice, course progress, notes, and mastered concepts.",
     relevantEventTypes: [
       "learning.practice_session_completed",
@@ -204,6 +211,7 @@ export const goalTemplates = [
     id: "finance.control_betting_trading",
     title: "Control Betting and Trading",
     category: "finance",
+    defaultPriority: "critical",
     description: "Track betting/trading impulses, cooldowns, theses, losses, and risk patterns.",
     relevantEventTypes: [
       "finance.betting.cooldown_triggered",
@@ -241,6 +249,7 @@ export const goalTemplates = [
     id: "creative.build_project",
     title: "Build Project",
     category: "creative",
+    defaultPriority: "medium",
     description: "Track creative or startup project momentum.",
     relevantEventTypes: ["work.deep_work_session_completed", "work.task_completed", "work.project_milestone_completed"],
     suggestedMetrics: [
@@ -264,6 +273,7 @@ export const goalTemplates = [
     id: "social.social_connection",
     title: "Social Connection",
     category: "social",
+    defaultPriority: "medium",
     description: "Track meaningful conversations, friend/family contact, and loneliness signals.",
     relevantEventTypes: [
       "social.meaningful_conversation_logged",

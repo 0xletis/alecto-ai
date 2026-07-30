@@ -1906,9 +1906,25 @@ test("daily priority scorer keeps true urgency and manual high priority", () => 
   });
   assert.equal(overdueRanked[0].action.id, "milk");
 
-  const highPriorityRanked = sortDailyActionsByPriority([tomorrowGoalAction, highPriorityChore], {
-    goals: [goal],
-    goalStatuses: [{ goalId: goal.id, hasProgressToday: false, hasCompletedActionToday: false, hasOpenAction: true }],
+  const lowGoal = {
+    ...goal,
+    id: "goal-low",
+    title: "Find a cheap car to buy",
+    category: "custom",
+    templateId: undefined,
+    priority: "low" as const,
+    importanceScore: 10
+  };
+  const lowGoalAction = {
+    ...tomorrowGoalAction,
+    id: "car",
+    title: "Check cheap car listings",
+    goalId: lowGoal.id,
+    goalTitleSnapshot: lowGoal.title
+  };
+  const highPriorityRanked = sortDailyActionsByPriority([lowGoalAction, highPriorityChore], {
+    goals: [lowGoal],
+    goalStatuses: [{ goalId: lowGoal.id, hasProgressToday: false, hasCompletedActionToday: false, hasOpenAction: true }],
     recentEvents: [],
     now
   });
@@ -2038,6 +2054,304 @@ test("/today ranks goal-linked priorities above same-window chores and exposes d
     const priorities = debug.json().priorities;
     assert.equal(priorities[0].title, "Apply to 2 jobs");
     assert.match(priorities[0].rankReason, /goal-linked/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("goal priority weights rank critical over medium and medium over low with same due window", () => {
+  const now = new Date(2026, 6, 30, 4, 30);
+  const dueAt = new Date(2026, 6, 31, 9, 0);
+  const criticalGoal = {
+    id: "goal-critical",
+    userId: "score-user",
+    title: "Find a new developer job",
+    category: "career",
+    status: "active" as const,
+    templateId: "career.job_search",
+    priority: "critical" as const,
+    importanceScore: 70,
+    createdAt: now,
+    updatedAt: now
+  };
+  const mediumGoal = {
+    id: "goal-medium",
+    userId: "score-user",
+    title: "Build a YouTube channel",
+    category: "creative",
+    status: "active" as const,
+    priority: "medium" as const,
+    importanceScore: 25,
+    createdAt: now,
+    updatedAt: now
+  };
+  const lowGoal = {
+    id: "goal-low",
+    userId: "score-user",
+    title: "Find a cheap car to buy",
+    category: "custom",
+    status: "active" as const,
+    priority: "low" as const,
+    importanceScore: 10,
+    createdAt: now,
+    updatedAt: now
+  };
+  const action = (id: string, title: string, goal: typeof criticalGoal | typeof mediumGoal | typeof lowGoal) => ({
+    id,
+    userId: "score-user",
+    source: "manual" as const,
+    title,
+    status: "open" as const,
+    priority: "medium" as const,
+    dueAt,
+    goalId: goal.id,
+    goalTitleSnapshot: goal.title,
+    createdAt: now,
+    updatedAt: now
+  });
+  const goals = [lowGoal, mediumGoal, criticalGoal];
+  const ranked = sortDailyActionsByPriority(
+    [
+      action("car", "Check cheap car listings", lowGoal),
+      action("youtube", "Write YouTube script", mediumGoal),
+      action("jobs", "Apply to 2 jobs", criticalGoal)
+    ],
+    {
+      goals,
+      goalStatuses: goals.map((goal) => ({
+        goalId: goal.id,
+        hasProgressToday: false,
+        hasCompletedActionToday: false,
+        hasOpenAction: true
+      })),
+      recentEvents: [],
+      now
+    }
+  );
+
+  assert.deepEqual(ranked.map((item) => item.action.id), ["jobs", "youtube", "car"]);
+  assert.match(ranked[0].score.rankReason, /critical goal/);
+  assert.match(ranked[1].score.rankReason, /medium goal/);
+  assert.match(ranked[2].score.rankReason, /low goal/);
+});
+
+test("/goal priorities routes list, update, backfill, and /today uses weighted scorer", async () => {
+  const server = buildServer();
+  const actionUserId = `goal-priority-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const dueAt = new Date(Date.now() + 60 * 60 * 1000);
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      dueAt,
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      dueAt,
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title
+    }
+  });
+
+  try {
+    const update = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/goals/priority`,
+      payload: { goal: jobGoal.id, priority: "critical" }
+    });
+    assert.equal(update.statusCode, 200);
+    assert.equal(update.json().goal.priority, "critical");
+
+    const list = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/goals/priorities`
+    });
+    assert.equal(list.statusCode, 200);
+    assert.ok(list.json().goals.some((goal: { title: string; priority: string }) => goal.title === "Find a new developer job" && goal.priority === "critical"));
+
+    const today = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today`
+    });
+    assert.equal(today.statusCode, 200);
+    assert.equal(today.json().brief.openActions[0].title, "Apply to 2 jobs");
+    assert.equal(today.json().brief.suggestedNextStep, "Handle due action: Apply to 2 jobs.");
+
+    const debug = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today/debug-priorities`
+    });
+    assert.equal(debug.statusCode, 200);
+    assert.match(debug.json().priorities[0].rankReason, /critical goal/);
+
+    await prisma.goal.update({
+      where: { id: youtubeGoal.id },
+      data: { importanceScore: null }
+    });
+    const backfill = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/goals/priorities/backfill`
+    });
+    assert.equal(backfill.statusCode, 200);
+    assert.ok(backfill.json().updated >= 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("goal priority backfill corrects broken default medium priorities and preserves manual choices", async () => {
+  const server = buildServer();
+  const actionUserId = `goal-priority-backfill-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const goals = await Promise.all([
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Find a new developer job",
+        category: "career",
+        priority: "medium",
+        importanceScore: 25,
+        priorityReason: "default priority backfill"
+      }
+    }),
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        priority: "medium",
+        importanceScore: 25,
+        priorityReason: "default priority backfill"
+      }
+    }),
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Improve strength and energy",
+        category: "health",
+        priority: "medium",
+        importanceScore: 25,
+        priorityReason: "default priority backfill"
+      }
+    }),
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Build a YouTube channel",
+        category: "creative",
+        priority: "medium",
+        importanceScore: 25,
+        priorityReason: "default priority backfill"
+      }
+    }),
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Find a cheap car to buy",
+        category: "custom",
+        priority: "medium",
+        importanceScore: 25,
+        priorityReason: "default priority backfill"
+      }
+    }),
+    prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Read more",
+        category: "learning",
+        priority: "medium",
+        importanceScore: 25,
+        priorityReason: "default priority backfill"
+      }
+    })
+  ]);
+
+  try {
+    const backfill = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/goals/priorities/backfill`,
+      payload: {}
+    });
+    assert.equal(backfill.statusCode, 200);
+    assert.match(backfill.json().message, /Find a new developer job: medium -> critical/);
+    assert.match(backfill.json().message, /Control impulsive betting: medium -> critical/);
+    assert.match(backfill.json().message, /Improve strength and energy: medium -> high/);
+    assert.match(backfill.json().message, /Find a cheap car to buy: medium -> low/);
+    assert.match(backfill.json().message, /Read more: medium -> low/);
+
+    const updatedGoals = await prisma.goal.findMany({ where: { userId: actionUserId } });
+    const priorities = new Map(updatedGoals.map((goal) => [goal.title, goal.priority]));
+    const scores = new Map(updatedGoals.map((goal) => [goal.title, goal.importanceScore]));
+    assert.equal(priorities.get("Find a new developer job"), "critical");
+    assert.equal(scores.get("Find a new developer job"), 70);
+    assert.equal(priorities.get("Control impulsive betting"), "critical");
+    assert.equal(scores.get("Control impulsive betting"), 70);
+    assert.equal(priorities.get("Improve strength and energy"), "high");
+    assert.equal(scores.get("Improve strength and energy"), 45);
+    assert.equal(priorities.get("Build a YouTube channel"), "medium");
+    assert.equal(scores.get("Build a YouTube channel"), 25);
+    assert.equal(priorities.get("Find a cheap car to buy"), "low");
+    assert.equal(scores.get("Find a cheap car to buy"), 10);
+    assert.equal(priorities.get("Read more"), "low");
+    assert.equal(scores.get("Read more"), 10);
+
+    const manualCarGoal = goals.find((goal) => goal.title === "Find a cheap car to buy");
+    assert.ok(manualCarGoal);
+    const manualUpdate = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/goals/priority`,
+      payload: { goal: manualCarGoal.id, priority: "critical" }
+    });
+    assert.equal(manualUpdate.statusCode, 200);
+
+    const normalBackfill = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/goals/priorities/backfill`,
+      payload: {}
+    });
+    assert.match(normalBackfill.json().message, /Skipped manual priorities:/);
+    const preservedManual = await prisma.goal.findUniqueOrThrow({ where: { id: manualCarGoal.id } });
+    assert.equal(preservedManual.priority, "critical");
+
+    const forceBackfill = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/goals/priorities/backfill`,
+      payload: { force: true }
+    });
+    assert.equal(forceBackfill.statusCode, 200);
+    const forcedManual = await prisma.goal.findUniqueOrThrow({ where: { id: manualCarGoal.id } });
+    assert.equal(forcedManual.priority, "low");
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });

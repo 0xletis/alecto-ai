@@ -1278,6 +1278,55 @@ bot.command("goals", async (ctx) => {
   }
 });
 
+bot.command("goal_priorities", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<GoalPrioritiesResponse>(`/users/${getTelegramUserId(ctx)}/goals/priorities`);
+    await ctx.reply(formatGoalPriorities(response.goals));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not fetch goal priorities right now.");
+  }
+});
+
+bot.command("set_goal_priority", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseSetGoalPriorityCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /set_goal_priority GOAL_ID_OR_NUMBER low|medium|high|critical");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<GoalPriorityUpdateResponse>(`/users/${getTelegramUserId(ctx)}/goals/priority`, parsed);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not update that goal priority.");
+  }
+});
+
+bot.command("debug_backfill_goal_priorities", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const force = getCommandText(ctx).trim().toLowerCase() === "force";
+    const response = await apiPost<GoalPriorityBackfillResponse>(`/users/${getTelegramUserId(ctx)}/goals/priorities/backfill`, {
+      force
+    });
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not backfill goal priorities right now.");
+  }
+});
+
 bot.command("events", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -3100,11 +3149,36 @@ function formatGoal(goal: Goal, duplicateWarnings: GoalDuplicateWarning[] = []) 
     `category: ${goal.category}`,
     goal.templateId ? `template: ${goal.templateId}` : undefined,
     `status: ${goal.status}`,
+    `priority: ${goal.priority ?? "medium"}`,
+    goal.importanceScore !== undefined ? `importanceScore: ${goal.importanceScore}` : undefined,
     goal.why ? `why: ${goal.why}` : undefined,
     warning ? `Possible duplicate: this goal looks similar to ${warning.similarGoalTitle}.` : undefined
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatGoalPriorities(goals: GoalPriorityListItem[]): string {
+  if (goals.length === 0) {
+    return "No active goals.";
+  }
+
+  return goals
+    .map((goal) => `${goal.number}. ${goal.title} - ${goal.priority}${goal.importanceScore !== undefined ? ` (${goal.importanceScore})` : ""}`)
+    .join("\n");
+}
+
+function parseSetGoalPriorityCommand(text: string): { goal: string; priority: string } | undefined {
+  const match = text.trim().match(/^(.+?)\s+(low|medium|high|critical)$/i);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    goal: match[1].trim().replace(/^["']|["']$/g, ""),
+    priority: match[2].toLowerCase()
+  };
 }
 
 function formatGoalPlan(goal: Goal) {
@@ -3360,6 +3434,37 @@ interface InsightResponse {
 interface GoalsResponse {
   goals: Goal[];
   duplicateWarnings?: GoalDuplicateWarning[];
+}
+
+interface GoalPrioritiesResponse {
+  goals: GoalPriorityListItem[];
+}
+
+interface GoalPriorityListItem {
+  number: number;
+  id: string;
+  title: string;
+  category: string;
+  templateId?: string;
+  priority: string;
+  importanceScore?: number;
+  priorityReason?: string;
+}
+
+interface GoalPriorityUpdateResponse {
+  goal: Goal;
+  message: string;
+}
+
+interface GoalPriorityBackfillResponse {
+  updated: number;
+  updatedGoals: Array<{
+    goal: Goal;
+    previousPriority: string;
+    nextPriority: string;
+  }>;
+  skippedManual: Goal[];
+  message: string;
 }
 
 interface GoalResponse {
@@ -3729,6 +3834,9 @@ interface Goal {
   title: string;
   category: string;
   status: string;
+  priority?: string;
+  importanceScore?: number;
+  priorityReason?: string;
   why?: string;
   templateId?: string;
   targetMetrics?: GoalMetric[];

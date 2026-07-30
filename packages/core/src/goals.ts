@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const GoalStatusSchema = z.enum(["active", "paused", "archived"]);
+export const GoalPrioritySchema = z.enum(["low", "medium", "high", "critical"]);
 export const MetricAggregationSchema = z.enum(["count", "sum", "average", "latest"]);
 export const MetricWindowSchema = z.enum(["daily", "weekly"]);
 export const CheckInAnswerTypeSchema = z.enum(["text", "number", "scale_1_10", "yes_no"]);
@@ -26,6 +27,9 @@ export const GoalSchema = z.object({
   title: z.string().min(1),
   category: z.string().min(1),
   status: GoalStatusSchema.default("active"),
+  priority: GoalPrioritySchema.default("medium"),
+  importanceScore: z.number().nullable().optional(),
+  priorityReason: z.string().optional(),
   why: z.string().optional(),
   templateId: z.string().optional(),
   targetMetrics: z.array(GoalMetricSchema).optional(),
@@ -39,6 +43,9 @@ export const CreateGoalInputSchema = z.object({
   category: z.string().min(1),
   why: z.string().optional(),
   templateId: z.string().optional(),
+  priority: GoalPrioritySchema.optional(),
+  importanceScore: z.number().nullable().optional(),
+  priorityReason: z.string().optional(),
   targetMetrics: z.array(GoalMetricSchema).optional(),
   checkInConfig: z.array(GoalCheckInQuestionSchema).optional(),
   allowDuplicate: z.boolean().optional()
@@ -49,15 +56,82 @@ export const CreateGoalFromTemplateInputSchema = z.object({
   title: z.string().min(1),
   why: z.string().optional(),
   targetMetrics: z.array(GoalMetricSchema).optional(),
+  priority: GoalPrioritySchema.optional(),
+  importanceScore: z.number().nullable().optional(),
+  priorityReason: z.string().optional(),
   allowDuplicate: z.boolean().optional()
 });
 
 export type GoalStatus = z.infer<typeof GoalStatusSchema>;
+export type GoalPriority = z.infer<typeof GoalPrioritySchema>;
 export type GoalMetric = z.infer<typeof GoalMetricSchema>;
 export type GoalCheckInQuestion = z.infer<typeof GoalCheckInQuestionSchema>;
 export type Goal = z.infer<typeof GoalSchema>;
 export type CreateGoalInput = z.infer<typeof CreateGoalInputSchema>;
 export type CreateGoalFromTemplateInput = z.infer<typeof CreateGoalFromTemplateInputSchema>;
+
+export const goalPriorityScores: Record<GoalPriority, number> = {
+  low: 10,
+  medium: 25,
+  high: 45,
+  critical: 70
+};
+
+export function scoreForGoalPriority(priority: GoalPriority): number {
+  return goalPriorityScores[priority];
+}
+
+export function normalizeGoalPriority(priority: unknown): GoalPriority {
+  return GoalPrioritySchema.safeParse(priority).success ? (priority as GoalPriority) : "medium";
+}
+
+export function defaultGoalPriority(input: Pick<Goal, "title" | "category"> & { templateId?: string }): GoalPriority {
+  const templateId = input.templateId ?? "";
+  const text = normalizeGoalTitle(`${input.title} ${input.category} ${templateId}`);
+
+  if (
+    templateId === "career.job_search" ||
+    /\b(find )?(a )?(new )?(developer )?job\b/.test(text) ||
+    /\bjob search\b/.test(text) ||
+    /\bnew developer job\b/.test(text)
+  ) {
+    return "critical";
+  }
+
+  if (
+    templateId === "finance.control_betting_trading" ||
+    /\b(control betting|control impulsive betting|control betting trading|finance control betting trading)\b/.test(text) ||
+    /\b(betting|trading|gambling|impulsive betting|risk control)\b/.test(text)
+  ) {
+    return "critical";
+  }
+
+  if (
+    templateId === "health.strength_energy" ||
+    templateId === "health.sleep_better" ||
+    /\b(improve strength and energy|strength|gym|sleep better)\b/.test(text)
+  ) {
+    return "high";
+  }
+
+  if (templateId === "work.deep_work") {
+    return "high";
+  }
+
+  if (templateId === "creative.build_project" || /\b(youtube|channel|video|script|build project|creative)\b/.test(text)) {
+    return "medium";
+  }
+
+  if (/\b(cheap car|buy car|car|vehicle)\b/.test(text)) {
+    return "low";
+  }
+
+  if (templateId === "learning.reading_more" || /\b(read more|reading)\b/.test(text)) {
+    return "low";
+  }
+
+  return "medium";
+}
 
 export interface GoalDuplicateWarning {
   goalId: string;

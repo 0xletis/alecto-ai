@@ -1,5 +1,6 @@
 import { normalizeManualActionTitleKey } from "./action-intake.js";
-import type { Goal } from "./goals.js";
+import { normalizeGoalPriority, scoreForGoalPriority } from "./goals.js";
+import type { Goal, GoalPriority } from "./goals.js";
 import type { StoredEvent } from "./events.js";
 
 export interface DailyPriorityAction {
@@ -81,6 +82,10 @@ export function scoreDailyActionPriority(input: DailyPriorityScoreInput): DailyP
   if (input.linkedGoal) {
     score += 25;
     factors.push("goal-linked");
+    const priority = normalizeGoalPriority(input.linkedGoal.priority);
+    const priorityScore = goalPriorityScoringBoost(input.linkedGoal.importanceScore, priority);
+    score += priorityScore;
+    factors.push(`${priority} goal`);
 
     if (!input.goalStatusToday?.hasProgressToday) {
       score += 15;
@@ -159,6 +164,24 @@ export function isRiskControlGoal(goal?: Pick<Goal, "title" | "category" | "temp
 
   const text = `${goal.title} ${goal.category} ${goal.templateId ?? ""}`.toLowerCase();
   return /\b(finance|betting|trading|gambling|impulse|risk|risk-control|control_betting_trading)\b/.test(text);
+}
+
+function goalPriorityScoringBoost(importanceScore: number | null | undefined, priority: GoalPriority): number {
+  if (typeof importanceScore === "number" && Number.isFinite(importanceScore)) {
+    return Math.max(0, Math.min(80, Math.round(importanceScore * 0.7)));
+  }
+
+  const base = scoreForGoalPriority(priority);
+  if (priority === "low") {
+    return 5;
+  }
+  if (priority === "medium") {
+    return 15;
+  }
+  if (priority === "high") {
+    return 30;
+  }
+  return Math.min(50, Math.round(base * 0.72));
 }
 
 function compareDailyPriority(

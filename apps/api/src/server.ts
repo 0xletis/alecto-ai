@@ -10,6 +10,7 @@ import {
   classifyWorkActionEmail,
   CreateGoalFromTemplateInputSchema,
   CreateGoalInputSchema,
+  GoalPrioritySchema,
   CustomGoalConfigInputSchema,
   CustomGoalProgressInputSchema,
   DailyCheckInInputSchema,
@@ -70,6 +71,7 @@ import {
   archiveEventGroup,
   archiveGmailRuleEvents,
   archiveGoal,
+  backfillGoalPriorities,
   archiveIntegrationConnection,
   archiveMemory,
   correctEvent,
@@ -116,6 +118,7 @@ import {
   getActionItems,
   getActionItemsEligibleForReminder,
   linkActionItemToGoal,
+  updateGoalPriority,
   getIntegrationConnection,
   getIntegrationConnections,
   approveEmailReviewItem,
@@ -475,6 +478,67 @@ export function buildServer() {
   server.get<{ Params: { userId: string } }>("/users/:userId/goals", async (request) => ({
     ...formatGoalsResponse(await getGoals(request.params.userId))
   }));
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/goals/priorities", async (request) => {
+    const goals = (await getGoals(request.params.userId)).filter((goal) => goal.status === "active");
+
+    return {
+      goals: goals.map((goal, index) => ({
+        number: index + 1,
+        id: goal.id,
+        title: goal.title,
+        category: goal.category,
+        templateId: goal.templateId,
+        priority: goal.priority,
+        importanceScore: goal.importanceScore,
+        priorityReason: goal.priorityReason
+      }))
+    };
+  });
+
+  server.patch<{ Params: { userId: string }; Body: { goal?: string; priority?: string; priorityReason?: string } }>(
+    "/users/:userId/goals/priority",
+    async (request, reply) => {
+      const body = isRecord(request.body) ? request.body : {};
+      const goalSelector = typeof body.goal === "string" ? body.goal.trim() : "";
+      const parsedPriority = GoalPrioritySchema.safeParse(body.priority);
+
+      if (!goalSelector || !parsedPriority.success) {
+        return reply.status(400).send({ error: "Provide goal and priority: low, medium, high, or critical." });
+      }
+
+      const goals = (await getGoals(request.params.userId)).filter((goal) => goal.status === "active");
+      const goal = findGoalBySelector(goals, goalSelector);
+
+      if (!goal) {
+        return reply.status(404).send({ error: "Active goal not found." });
+      }
+
+      const updated = await updateGoalPriority(request.params.userId, goal.id, {
+        priority: parsedPriority.data,
+        priorityReason: typeof body.priorityReason === "string" ? body.priorityReason : "manual priority update"
+      });
+
+      if (!updated) {
+        return reply.status(404).send({ error: "Active goal not found." });
+      }
+
+      return {
+        goal: updated,
+        message: `Goal priority updated: ${updated.title} -> ${updated.priority}`
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string }; Body: { force?: boolean } }>("/users/:userId/goals/priorities/backfill", async (request) => {
+    const body = isRecord(request.body) ? request.body : {};
+    const result = await backfillGoalPriorities(request.params.userId, { force: body.force === true });
+
+    return {
+      ...result,
+      message: formatGoalPriorityBackfillMessage(result)
+    };
+  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/profile", async (request) => ({
     profile: await getOrCreateUserOperatingProfile(request.params.userId)
@@ -1466,6 +1530,9 @@ export function buildServer() {
         why: parsed.data.why,
         templateId: template.id,
         targetMetrics: parsed.data.targetMetrics,
+        priority: parsed.data.priority,
+        importanceScore: parsed.data.importanceScore,
+        priorityReason: parsed.data.priorityReason,
         allowDuplicate: parsed.data.allowDuplicate
       })
     );
@@ -2029,6 +2096,18 @@ function latestImpulseValue(events: StoredEvent[]): number | undefined {
 
 function uniqueStrings(values: Array<string | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value && value.trim())))];
+}
+
+function findGoalBySelector<T extends { id: string; title: string }>(goals: T[], selector: string): T | undefined {
+  const trimmed = selector.trim().replace(/^["']|["']$/g, "");
+  const numericIndex = Number(trimmed);
+
+  if (Number.isInteger(numericIndex) && numericIndex >= 1 && numericIndex <= goals.length) {
+    return goals[numericIndex - 1];
+  }
+
+  const normalizedSelector = normalizeManualActionTitleKey(trimmed);
+  return goals.find((goal) => goal.id === trimmed || normalizeManualActionTitleKey(goal.title) === normalizedSelector);
 }
 
 function formatLocalDate(date: Date): string {
@@ -4383,6 +4462,24 @@ function formatCreateGoalResult(result: Awaited<ReturnType<typeof createGoal>>) 
     duplicate: false,
     goal: result.goal
   };
+}
+
+function formatGoalPriorityBackfillMessage(result: Awaited<ReturnType<typeof backfillGoalPriorities>>): string {
+  const lines = [`Updated ${result.updated} goal${result.updated === 1 ? "" : "s"}:`];
+
+  if (result.updatedGoals.length > 0) {
+    lines.push(...result.updatedGoals.map((item) => `- ${item.goal.title}: ${item.previousPriority} -> ${item.nextPriority}`));
+  }
+
+  if (result.skippedManual.length > 0) {
+    lines.push(
+      "",
+      "Skipped manual priorities:",
+      ...result.skippedManual.map((goal) => `- ${goal.title}: ${goal.priority}`)
+    );
+  }
+
+  return lines.join("\n");
 }
 
 async function createCustomGoalProgressEvent(

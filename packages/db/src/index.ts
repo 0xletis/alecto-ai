@@ -1,6 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { PrismaClient, type Prisma } from "@prisma/client";
-import { findDuplicateActiveGoal, getGoalTemplate, GoalCheckInQuestionSchema, GoalMetricSchema } from "@operator-agent/core";
+import {
+  defaultGoalPriority,
+  findDuplicateActiveGoal,
+  getGoalTemplate,
+  GoalCheckInQuestionSchema,
+  GoalMetricSchema,
+  normalizeGoalPriority,
+  scoreForGoalPriority
+} from "@operator-agent/core";
 import type {
   CreateMemoryInput,
   CreateEmailSignalRuleInput,
@@ -242,6 +250,22 @@ export interface CreateActionItemInput {
   evidence?: string;
 }
 
+export interface UpdateGoalPriorityInput {
+  priority: Goal["priority"];
+  importanceScore?: number | null;
+  priorityReason?: string;
+}
+
+export interface GoalPriorityBackfillResult {
+  updated: number;
+  updatedGoals: Array<{
+    goal: Goal;
+    previousPriority: Goal["priority"];
+    nextPriority: Goal["priority"];
+  }>;
+  skippedManual: Goal[];
+}
+
 export type ActionItemReminderType = "due" | "snoozed";
 
 export interface ActionItemReminderCandidate {
@@ -326,11 +350,19 @@ export async function createGoal(userId: string, input: CreateGoalInput): Promis
     };
   }
 
+  const priority = input.priority ?? defaultGoalPriority({
+    title: input.title,
+    category: input.category,
+    templateId: input.templateId
+  });
   const goal = await prisma.goal.create({
     data: {
       userId,
       title: input.title,
       category: input.category,
+      priority,
+      importanceScore: input.importanceScore ?? scoreForGoalPriority(priority),
+      priorityReason: input.priorityReason ?? "default priority on create",
       why: input.why,
       templateId: input.templateId,
       targetMetrics: input.targetMetrics
@@ -383,6 +415,100 @@ export async function archiveGoal(userId: string, goalId: string): Promise<Goal 
   });
 
   return toGoal(goal);
+}
+
+export async function updateGoalPriority(
+  userId: string,
+  goalId: string,
+  input: UpdateGoalPriorityInput
+): Promise<Goal | undefined> {
+  await ensureUser(userId);
+
+  const existingGoal = await prisma.goal.findFirst({
+    where: {
+      id: goalId,
+      userId,
+      status: "active"
+    }
+  });
+
+  if (!existingGoal) {
+    return undefined;
+  }
+
+  const goal = await prisma.goal.update({
+    where: { id: goalId },
+    data: {
+      priority: input.priority,
+      importanceScore: input.importanceScore ?? scoreForGoalPriority(input.priority),
+      priorityReason: input.priorityReason
+    }
+  });
+
+  return toGoal(goal);
+}
+
+export async function backfillGoalPriorities(userId: string, options: { force?: boolean } = {}): Promise<GoalPriorityBackfillResult> {
+  await ensureUser(userId);
+
+  const goals = await prisma.goal.findMany({
+    where: {
+      userId,
+      status: "active"
+    },
+    orderBy: { createdAt: "asc" }
+  });
+  const updatedGoals: GoalPriorityBackfillResult["updatedGoals"] = [];
+  const skippedManual: Goal[] = [];
+
+  for (const goal of goals) {
+    const currentPriority = normalizeGoalPriority(goal.priority);
+    const inferredPriority = defaultGoalPriority({
+      title: goal.title,
+      category: goal.category,
+      templateId: goal.templateId ?? undefined
+    });
+    const canUpdate = options.force || isSystemAssignedGoalPriority(goal.priorityReason) || goal.importanceScore === null;
+    const alreadyCorrect = currentPriority === inferredPriority && goal.importanceScore === scoreForGoalPriority(inferredPriority);
+
+    if (!canUpdate) {
+      skippedManual.push(toGoal(goal));
+      continue;
+    }
+
+    if (alreadyCorrect) {
+      continue;
+    }
+
+    const updated = await prisma.goal.update({
+      where: { id: goal.id },
+      data: {
+        priority: inferredPriority,
+        importanceScore: scoreForGoalPriority(inferredPriority),
+        priorityReason: options.force ? "force default priority backfill" : "default priority backfill"
+      }
+    });
+
+    updatedGoals.push({
+      goal: toGoal(updated),
+      previousPriority: currentPriority,
+      nextPriority: inferredPriority
+    });
+  }
+
+  return {
+    updated: updatedGoals.length,
+    updatedGoals,
+    skippedManual
+  };
+}
+
+function isSystemAssignedGoalPriority(reason: string | null | undefined): boolean {
+  if (!reason) {
+    return true;
+  }
+
+  return /\b(default|backfill|migration)\b/i.test(reason);
 }
 
 export async function createEvent(userId: string, eventInput: CreateEventInput): Promise<StoredEvent> {
@@ -2288,6 +2414,9 @@ function toGoal(goal: Prisma.GoalGetPayload<object>): Goal {
     title: goal.title,
     category: goal.category,
     status: goal.status,
+    priority: normalizeGoalPriority(goal.priority),
+    importanceScore: goal.importanceScore ?? undefined,
+    priorityReason: goal.priorityReason ?? undefined,
     why: goal.why ?? undefined,
     templateId: goal.templateId ?? undefined,
     targetMetrics: parseGoalMetrics(goal.targetMetrics),
