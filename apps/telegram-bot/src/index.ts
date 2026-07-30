@@ -1236,6 +1236,19 @@ bot.command("today", async (ctx) => {
   }
 });
 
+bot.command("debug_daily_priorities", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<DailyPriorityDebugResponse>(`/users/${getTelegramUserId(ctx)}/today/debug-priorities`);
+    await ctx.reply(formatDailyPriorityDebug(response.priorities));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not score daily priorities right now.");
+  }
+});
+
 bot.command("insight", async (ctx) => {
   await sendInsight(ctx, "daily");
 });
@@ -2604,6 +2617,18 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
     .join("\n");
 }
 
+function formatDailyPriorityDebug(priorities: DailyOperatorBriefPriorityDebug[]): string {
+  if (priorities.length === 0) {
+    return "No open actions to score.";
+  }
+
+  return priorities
+    .map((priority) =>
+      `${priority.rank}. ${priority.title} - score ${priority.score} - ${priority.rankReason || priority.factors.join(", ")}`
+    )
+    .join("\n");
+}
+
 function formatBriefAction(action: DailyOperatorBriefAction): string {
   const detail = action.dueAt
     ? `due ${formatLocalDateTime(action.dueAt)}`
@@ -3323,6 +3348,11 @@ interface DailyOperatorBriefResponse {
   brief: DailyOperatorBrief;
 }
 
+interface DailyPriorityDebugResponse {
+  priorities: DailyOperatorBriefPriorityDebug[];
+  message: string;
+}
+
 interface InsightResponse {
   insight: InsightReport;
 }
@@ -3637,6 +3667,7 @@ interface DailyOperatorBrief {
   recentWins: string[];
   risks: string[];
   suggestedNextStep: string;
+  priorityDebug?: DailyOperatorBriefPriorityDebug[];
 }
 
 interface DailyOperatorBriefAction {
@@ -3657,6 +3688,15 @@ interface DailyOperatorBriefGoalStatus {
   note: string;
   openActionTitle?: string;
   completedActionTitle?: string;
+}
+
+interface DailyOperatorBriefPriorityDebug {
+  rank: number;
+  actionId: string;
+  title: string;
+  score: number;
+  rankReason: string;
+  factors: string[];
 }
 
 interface InsightReport {

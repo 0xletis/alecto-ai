@@ -19,6 +19,7 @@ import {
   extractManualAction,
   parseActionDueDate,
   normalizeManualActionTitleKey,
+  sortDailyActionsByPriority,
   extractEvents,
   findGoalDuplicateWarnings,
   getGoalTemplate,
@@ -49,6 +50,7 @@ import {
   type InsightReport,
   type AgentResponse,
   type AgentResponseComposerInput,
+  type DailyPriorityScore,
   type MemoryEntry,
   type ProcessMessageResult,
   type StoredEvent,
@@ -618,6 +620,18 @@ export function buildServer() {
   server.get<{ Params: { userId: string } }>("/users/:userId/today", async (request) => ({
     brief: await generateDailyOperatorBrief(request.params.userId)
   }));
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/today/debug-priorities", async (request) => {
+    const brief = await generateDailyOperatorBrief(request.params.userId);
+
+    return {
+      priorities: brief.priorityDebug ?? [],
+      message:
+        brief.priorityDebug && brief.priorityDebug.length > 0
+          ? "Daily priorities scored."
+          : "No open actions to score."
+    };
+  });
 
   server.get<{ Params: { userId: string }; Querystring: { date?: string } }>(
     "/users/:userId/insights/daily",
@@ -1654,20 +1668,41 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
   const completedToday = visibleActions.filter(
     (action) => action.status === "completed" && action.completedAt && action.completedAt >= todayStart
   );
-  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, openActions, completedToday));
+  const goalStatusesToday = activeGoals.map((goal) => buildGoalStatusToday(goal, todayEvents, openActions, completedToday));
+  const guardrailContext = {
+    hardGuardrailTriggeredToday: todayEvents.some((event) => event.type === "finance.betting.cooldown_triggered")
+  };
+  const rankedOpenActions = sortDailyActionsByPriority(openActions, {
+    goals: activeGoals,
+    goalStatuses: goalStatusesToday,
+    recentEvents,
+    guardrailContext,
+    now
+  });
+  const rankedActions = rankedOpenActions.map((item) => item.action);
+  const priorityDebug = rankedOpenActions.map((item, index) => ({
+    rank: index + 1,
+    actionId: item.action.id,
+    title: item.action.title,
+    score: item.score.score,
+    rankReason: item.score.rankReason,
+    factors: item.score.factors
+  }));
+  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, rankedActions, completedToday));
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews);
   const risks = buildOperatorRisks(recentEvents);
   const topPriorities = buildOperatorTopPriorities({
     overdueActions,
     dueSoonActions,
-    openActions,
+    openActions: rankedActions,
     goalStatus,
-    risks
+    risks,
+    priorityScores: rankedOpenActions.map((item) => item.score)
   });
   const suggestedNextStep = pickOperatorNextStep({
     overdueActions,
     dueSoonActions,
-    openActions,
+    openActions: rankedActions,
     goalStatus
   });
 
@@ -1675,12 +1710,13 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
     date: formatLocalDate(now),
     summary: buildOperatorSummary({ openActions, overdueActions, activeGoals, todayEvents, risks }),
     topPriorities,
-    openActions: openActions.slice(0, 10).map(toBriefAction),
+    openActions: rankedActions.slice(0, 10).map(toBriefAction),
     overdueActions: overdueActions.slice(0, 10).map(toBriefAction),
     goalStatus,
     recentWins,
     risks,
-    suggestedNextStep
+    suggestedNextStep,
+    priorityDebug
   };
 }
 
@@ -1708,12 +1744,14 @@ function buildOperatorTopPriorities(input: {
   openActions: ActionItem[];
   goalStatus: DailyOperatorBriefGoalStatus[];
   risks: string[];
+  priorityScores: DailyPriorityScore[];
 }): string[] {
   const priorities: string[] = [];
   const seenActionIds = new Set<string>();
   const seenActionTitles = new Set<string>();
+  const scoresByActionId = new Map(input.priorityScores.map((score) => [score.actionId, score]));
 
-  const addActionPriority = (action: ActionItem, label?: string) => {
+  const addActionPriority = (action: ActionItem) => {
     const titleKey = normalizeManualActionTitleKey(action.title);
 
     if (seenActionIds.has(action.id) || seenActionTitles.has(titleKey)) {
@@ -1722,11 +1760,9 @@ function buildOperatorTopPriorities(input: {
 
     seenActionIds.add(action.id);
     seenActionTitles.add(titleKey);
-    priorities.push(label ? `${label}: ${action.title}` : action.title);
+    priorities.push(formatPriorityAction(action, scoresByActionId.get(action.id)));
   };
 
-  input.overdueActions.forEach((action) => addActionPriority(action, "Overdue"));
-  input.dueSoonActions.forEach((action) => addActionPriority(action, "Due soon"));
   input.openActions.forEach((action) => addActionPriority(action));
 
   for (const goal of input.goalStatus.filter((item) => item.status === "no_progress" && !item.openActionTitle)) {
@@ -1744,19 +1780,17 @@ function pickOperatorNextStep(input: {
   openActions: ActionItem[];
   goalStatus: DailyOperatorBriefGoalStatus[];
 }): string {
-  const overdue = input.overdueActions[0];
-  if (overdue) {
-    return `Handle overdue action: ${overdue.title}.`;
-  }
+  const topAction = input.openActions[0];
+  if (topAction) {
+    if (input.overdueActions.some((action) => action.id === topAction.id)) {
+      return `Handle overdue action: ${topAction.title}.`;
+    }
 
-  const due = input.dueSoonActions[0];
-  if (due) {
-    return `Handle due action: ${due.title}.`;
-  }
+    if (input.dueSoonActions.some((action) => action.id === topAction.id)) {
+      return `Handle due action: ${topAction.title}.`;
+    }
 
-  const open = input.openActions[0];
-  if (open) {
-    return `Do this first: ${open.title}.`;
+    return `Do this first: ${topAction.title}.`;
   }
 
   const staleGoal = input.goalStatus.find((goal) => goal.status === "no_progress");
@@ -1765,6 +1799,34 @@ function pickOperatorNextStep(input: {
   }
 
   return "Log one meaningful action.";
+}
+
+function formatPriorityAction(action: ActionItem, score?: DailyPriorityScore): string {
+  if (score?.factors.includes("overdue")) {
+    return `Overdue: ${action.title}`;
+  }
+
+  if (score?.factors.includes("due today") || score?.factors.includes("due tomorrow morning") || score?.factors.includes("due tomorrow")) {
+    return `Due soon: ${action.title}`;
+  }
+
+  return action.title;
+}
+
+function buildGoalStatusToday(
+  goal: Awaited<ReturnType<typeof getActiveGoals>>[number],
+  todayEvents: StoredEvent[],
+  openActions: ActionItem[],
+  completedActions: ActionItem[]
+) {
+  const progressNote = goalProgressNoteForToday(goal, todayEvents);
+
+  return {
+    goalId: goal.id,
+    hasProgressToday: progressNote !== "no progress logged today" || completedActions.some((action) => action.goalId === goal.id),
+    hasCompletedActionToday: completedActions.some((action) => action.goalId === goal.id),
+    hasOpenAction: openActions.some((action) => action.goalId === goal.id)
+  };
 }
 
 function buildOperatorGoalStatus(
@@ -5650,6 +5712,7 @@ interface DailyOperatorBrief {
   recentWins: string[];
   risks: string[];
   suggestedNextStep: string;
+  priorityDebug?: DailyOperatorBriefPriorityDebug[];
 }
 
 interface DailyOperatorBriefAction {
@@ -5670,6 +5733,15 @@ interface DailyOperatorBriefGoalStatus {
   note: string;
   openActionTitle?: string;
   completedActionTitle?: string;
+}
+
+interface DailyOperatorBriefPriorityDebug {
+  rank: number;
+  actionId: string;
+  title: string;
+  score: number;
+  rankReason: string;
+  factors: string[];
 }
 
 interface ActionReminderDispatch {

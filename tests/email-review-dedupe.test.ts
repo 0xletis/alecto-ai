@@ -13,7 +13,8 @@ import {
   explainNormalizedInboundRoute,
   normalizeManualActionTitleKey,
   parseActionDueDate,
-  routeNormalizedInboundMessage
+  routeNormalizedInboundMessage,
+  sortDailyActionsByPriority
 } from "../packages/core/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
@@ -1794,6 +1795,249 @@ test("/today does not duplicate due-soon action in top priorities", async () => 
     const priorities = response.json().brief.topPriorities as string[];
     assert.equal(priorities.filter((priority) => priority.includes("Review homepage copy")).length, 1);
     assert.equal(priorities[0], "Due soon: Review homepage copy");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("daily priority scorer ranks goal-linked action above unlinked chore with same due window", () => {
+  const now = new Date(2026, 6, 30, 4, 30);
+  const dueAt = new Date(2026, 6, 31, 9, 0);
+  const goal = {
+    id: "goal-job",
+    userId: "score-user",
+    title: "Find a new developer job",
+    category: "career",
+    status: "active" as const,
+    templateId: "career.job_search",
+    createdAt: now,
+    updatedAt: now
+  };
+  const ranked = sortDailyActionsByPriority(
+    [
+      {
+        id: "milk",
+        userId: "score-user",
+        source: "manual",
+        title: "Buy milk",
+        status: "open",
+        priority: "medium",
+        dueAt,
+        createdAt: now,
+        updatedAt: now
+      },
+      {
+        id: "jobs",
+        userId: "score-user",
+        source: "manual",
+        title: "Apply to 2 jobs",
+        status: "open",
+        priority: "medium",
+        dueAt,
+        goalId: goal.id,
+        goalTitleSnapshot: goal.title,
+        createdAt: now,
+        updatedAt: now
+      }
+    ],
+    {
+      goals: [goal],
+      goalStatuses: [{ goalId: goal.id, hasProgressToday: false, hasCompletedActionToday: false, hasOpenAction: true }],
+      recentEvents: [],
+      now
+    }
+  );
+
+  assert.equal(ranked[0].action.id, "jobs");
+  assert.ok(ranked[0].score.score > ranked[1].score.score);
+  assert.match(ranked[0].score.rankReason, /goal-linked/);
+});
+
+test("daily priority scorer keeps true urgency and manual high priority", () => {
+  const now = new Date(2026, 6, 30, 4, 30);
+  const goal = {
+    id: "goal-job",
+    userId: "score-user",
+    title: "Find a new developer job",
+    category: "career",
+    status: "active" as const,
+    templateId: "career.job_search",
+    createdAt: now,
+    updatedAt: now
+  };
+  const overdueChore = {
+    id: "milk",
+    userId: "score-user",
+    source: "manual" as const,
+    title: "Buy milk",
+    status: "open" as const,
+    priority: "medium" as const,
+    dueAt: new Date(2026, 6, 29, 9, 0),
+    createdAt: now,
+    updatedAt: now
+  };
+  const tomorrowGoalAction = {
+    id: "jobs",
+    userId: "score-user",
+    source: "manual" as const,
+    title: "Apply to 2 jobs",
+    status: "open" as const,
+    priority: "medium" as const,
+    dueAt: new Date(2026, 6, 31, 9, 0),
+    goalId: goal.id,
+    goalTitleSnapshot: goal.title,
+    createdAt: now,
+    updatedAt: now
+  };
+  const highPriorityChore = {
+    ...overdueChore,
+    id: "urgent-admin",
+    title: "Pay rent",
+    priority: "high" as const,
+    dueAt: new Date(2026, 6, 31, 9, 0)
+  };
+
+  const overdueRanked = sortDailyActionsByPriority([tomorrowGoalAction, overdueChore], {
+    goals: [goal],
+    goalStatuses: [{ goalId: goal.id, hasProgressToday: false, hasCompletedActionToday: false, hasOpenAction: true }],
+    recentEvents: [],
+    now
+  });
+  assert.equal(overdueRanked[0].action.id, "milk");
+
+  const highPriorityRanked = sortDailyActionsByPriority([tomorrowGoalAction, highPriorityChore], {
+    goals: [goal],
+    goalStatuses: [{ goalId: goal.id, hasProgressToday: false, hasCompletedActionToday: false, hasOpenAction: true }],
+    recentEvents: [],
+    now
+  });
+  assert.equal(highPriorityRanked[0].action.id, "urgent-admin");
+});
+
+test("daily priority scorer reduces job-search boost after progress and ignores completed actions", () => {
+  const now = new Date(2026, 6, 30, 4, 30);
+  const dueAt = new Date(2026, 6, 31, 9, 0);
+  const goal = {
+    id: "goal-job",
+    userId: "score-user",
+    title: "Find a new developer job",
+    category: "career",
+    status: "active" as const,
+    templateId: "career.job_search",
+    createdAt: now,
+    updatedAt: now
+  };
+  const openAction = {
+    id: "jobs",
+    userId: "score-user",
+    source: "manual" as const,
+    title: "Apply to 2 jobs",
+    status: "open" as const,
+    priority: "medium" as const,
+    dueAt,
+    goalId: goal.id,
+    goalTitleSnapshot: goal.title,
+    createdAt: now,
+    updatedAt: now
+  };
+  const completedAction = {
+    ...openAction,
+    id: "completed-jobs",
+    title: "Send CV",
+    status: "completed" as const,
+    completedAt: now
+  };
+
+  const noProgressScore = sortDailyActionsByPriority([openAction], {
+    goals: [goal],
+    goalStatuses: [{ goalId: goal.id, hasProgressToday: false, hasCompletedActionToday: false, hasOpenAction: true }],
+    recentEvents: [],
+    now
+  })[0].score.score;
+  const withProgressScore = sortDailyActionsByPriority([openAction], {
+    goals: [goal],
+    goalStatuses: [{ goalId: goal.id, hasProgressToday: true, hasCompletedActionToday: true, hasOpenAction: true }],
+    recentEvents: [],
+    now
+  })[0].score.score;
+
+  assert.ok(noProgressScore > withProgressScore);
+  assert.equal(
+    sortDailyActionsByPriority([completedAction], {
+      goals: [goal],
+      goalStatuses: [{ goalId: goal.id, hasProgressToday: true, hasCompletedActionToday: true, hasOpenAction: false }],
+      recentEvents: [],
+      now
+    })[0].score.score,
+    -1000
+  );
+});
+
+test("/today ranks goal-linked priorities above same-window chores and exposes debug scores", async () => {
+  const server = buildServer();
+  const actionUserId = `today-scored-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search"
+    }
+  });
+  const dueAt = new Date(Date.now() + 60 * 60 * 1000);
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Buy milk",
+      priority: "medium",
+      dueAt
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      dueAt,
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title
+    }
+  });
+  await prisma.event.create({
+    data: {
+      userId: actionUserId,
+      type: "finance.betting.cooldown_triggered",
+      timestamp: new Date(),
+      source: "manual",
+      data: {},
+      confidence: 1
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today`
+    });
+    assert.equal(response.statusCode, 200);
+    const brief = response.json().brief;
+    assert.equal(brief.openActions[0].title, "Apply to 2 jobs");
+    assert.match(brief.topPriorities[0], /Apply to 2 jobs/);
+    assert.equal(brief.suggestedNextStep, "Handle due action: Apply to 2 jobs.");
+    assert.ok(brief.risks.some((risk: string) => risk.includes("Betting impulse detected")));
+
+    const debug = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today/debug-priorities`
+    });
+    assert.equal(debug.statusCode, 200);
+    const priorities = debug.json().priorities;
+    assert.equal(priorities[0].title, "Apply to 2 jobs");
+    assert.match(priorities[0].rankReason, /goal-linked/);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
