@@ -74,6 +74,29 @@ export const InboundRouteDebugSchema = z.object({
   isReferenceOnly: z.boolean().optional()
 });
 
+export const InboundMessageSegmentResultSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("single_command"),
+    commands: z.array(z.string()).length(1),
+    reason: z.string()
+  }),
+  z.object({
+    kind: z.literal("command_batch"),
+    commands: z.array(z.string()).min(2),
+    reason: z.string()
+  }),
+  z.object({
+    kind: z.literal("reference_text"),
+    text: z.string(),
+    reason: z.string()
+  }),
+  z.object({
+    kind: z.literal("normal_text"),
+    text: z.string(),
+    reason: z.string()
+  })
+]);
+
 export type InboundChannel = z.infer<typeof InboundChannelSchema>;
 export type InboundMessageType = z.infer<typeof InboundMessageTypeSchema>;
 export type NormalizedInboundAttachment = z.infer<typeof NormalizedInboundAttachmentSchema>;
@@ -82,6 +105,7 @@ export type NormalizedInboundMessage = z.infer<typeof NormalizedInboundMessageSc
 export type InboundRoute = z.infer<typeof InboundRouteSchema>;
 export type RouteSideEffects = z.infer<typeof RouteSideEffectsSchema>;
 export type InboundRouteDebug = z.infer<typeof InboundRouteDebugSchema>;
+export type InboundMessageSegmentResult = z.infer<typeof InboundMessageSegmentResultSchema>;
 
 export interface BuildNormalizedInboundMessageInput {
   channel: InboundChannel;
@@ -128,6 +152,62 @@ export function parseInboundCommand(text: string): NormalizedInboundCommand | un
     args: (match[2] ?? "").trim(),
     raw: text.trim()
   };
+}
+
+export function segmentInboundMessage(text: string): InboundMessageSegmentResult {
+  const trimmed = text.trim();
+
+  if (!trimmed) {
+    return InboundMessageSegmentResultSchema.parse({
+      kind: "normal_text",
+      text: "",
+      reason: "Empty text."
+    });
+  }
+
+  const nonEmptyLines = trimmed
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const commandLines = nonEmptyLines.filter((line) => line.startsWith("/"));
+
+  if (looksLikeCommandReference(trimmed, nonEmptyLines)) {
+    return InboundMessageSegmentResultSchema.parse({
+      kind: "reference_text",
+      text: trimmed,
+      reason: "Message looks like pasted command reference text, so commands should not execute."
+    });
+  }
+
+  if (nonEmptyLines.length === 1 && commandLines.length === 1) {
+    return InboundMessageSegmentResultSchema.parse({
+      kind: "single_command",
+      commands: [commandLines[0]],
+      reason: "Single slash command."
+    });
+  }
+
+  if (nonEmptyLines.length > 1 && commandLines.length === nonEmptyLines.length) {
+    return InboundMessageSegmentResultSchema.parse({
+      kind: "command_batch",
+      commands: commandLines,
+      reason: "Multiple command lines detected."
+    });
+  }
+
+  if (nonEmptyLines[0]?.startsWith("/") && commandLines.length > 0) {
+    return InboundMessageSegmentResultSchema.parse({
+      kind: "reference_text",
+      text: trimmed,
+      reason: "command_plus_extra_text"
+    });
+  }
+
+  return InboundMessageSegmentResultSchema.parse({
+    kind: "normal_text",
+    text: trimmed,
+    reason: "No command batch or reference pattern detected."
+  });
 }
 
 export function routeNormalizedInboundMessage(
@@ -406,6 +486,30 @@ function noSideEffects(): RouteSideEffects {
 
 function debugResult(input: InboundRouteDebug): InboundRouteDebug {
   return InboundRouteDebugSchema.parse(input);
+}
+
+function looksLikeCommandReference(text: string, nonEmptyLines: string[]): boolean {
+  const hasCommandLookingLine = nonEmptyLines.some((line) => line.startsWith("/") || /:\s*\/[a-zA-Z0-9_]+/.test(line));
+  const looksLikeDevPrompt =
+    /\bYou are working in the\b/i.test(text) ||
+    /\b(Requirements|Tests|Expected|Observed):/i.test(text) ||
+    /\b(Codex\/dev prompts|debug outputs):/i.test(text);
+  const looksLikeRouteDebugDump = /\b(intentType|handlerName|allowedSideEffects):/i.test(text);
+
+  if (looksLikeDevPrompt || looksLikeRouteDebugDump) {
+    return true;
+  }
+
+  if (!hasCommandLookingLine) {
+    return false;
+  }
+
+  return (
+    /```/.test(text) ||
+    /^\[\d{1,2}\/\d{1,2}\/\d{4}[,\s]+\d{1,2}:\d{2}\]/m.test(text) ||
+    /\bAlecto AI:/i.test(text) ||
+    /\b(example|expected|actual|observed|log|transcript):/i.test(text)
+  );
 }
 
 export function isExplicitMemoryRequest(message: string): boolean {

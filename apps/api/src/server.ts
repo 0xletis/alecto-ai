@@ -23,6 +23,8 @@ import {
   sortDailyActionsByPriority,
   extractEvents,
   findGoalDuplicateWarnings,
+  getLocalTodayRange,
+  isWithinLocalDay,
   getGoalTemplate,
   evaluateGoalGuardrails,
   inferGoalLinkForAction,
@@ -91,6 +93,7 @@ import {
   getActiveMemories,
   getEventById,
   getEvents,
+  getEventsBetween,
   getEventsSince,
   getGoals,
   getLatestPendingAction,
@@ -665,14 +668,13 @@ export function buildServer() {
   });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/review/daily", async (request) => {
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    const todayRange = getLocalTodayRange(new Date(), await getUserTimezone(request.params.userId));
 
     return {
       review: buildDailyReview({
         userId: request.params.userId,
         activeGoals: await getActiveGoals(request.params.userId),
-        todayEvents: await getEventsSince(request.params.userId, todayStart),
+        todayEvents: await getEventsBetween(request.params.userId, todayRange.start, todayRange.end),
         activeMemories: await getRelevantMemories(request.params.userId, {
           types: ["risk_pattern"],
           limit: 3
@@ -681,12 +683,12 @@ export function buildServer() {
     };
   });
 
-  server.get<{ Params: { userId: string } }>("/users/:userId/today", async (request) => ({
-    brief: await generateDailyOperatorBrief(request.params.userId)
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/today", async (request) => ({
+    brief: await generateDailyOperatorBrief(request.params.userId, { now: parseOptionalNow(request.query.now) })
   }));
 
-  server.get<{ Params: { userId: string } }>("/users/:userId/today/debug-priorities", async (request) => {
-    const brief = await generateDailyOperatorBrief(request.params.userId);
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/today/debug-priorities", async (request) => {
+    const brief = await generateDailyOperatorBrief(request.params.userId, { now: parseOptionalNow(request.query.now) });
 
     return {
       priorities: brief.priorityDebug ?? [],
@@ -1700,7 +1702,8 @@ async function buildAgentContext(userId: string) {
   const recentEvents = await getRecentEvents(userId, 10);
   const memories = await getRelevantMemories(userId, { limit: 5 });
   const profile = await getOrCreateUserOperatingProfile(userId);
-  const todayEvents = await getEventsSince(userId, startOfToday());
+  const todayRange = getLocalTodayRange(new Date(), await getUserTimezone(userId));
+  const todayEvents = await getEventsBetween(userId, todayRange.start, todayRange.end);
   const todaySummary = buildDailyReview({
     userId,
     activeGoals,
@@ -1717,14 +1720,15 @@ async function buildAgentContext(userId: string) {
   };
 }
 
-async function generateDailyOperatorBrief(userId: string): Promise<DailyOperatorBrief> {
-  const now = new Date();
-  const todayStart = startOfToday();
+async function generateDailyOperatorBrief(userId: string, options: { now?: Date } = {}): Promise<DailyOperatorBrief> {
+  const now = options.now ?? new Date();
+  const timezone = await getUserTimezone(userId);
+  const todayRange = getLocalTodayRange(now, timezone);
   const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
   const [actions, activeGoals, todayEvents, recentEvents, recentReviews] = await Promise.all([
     getRecentActionItems(userId, 50),
     getActiveGoals(userId),
-    getEventsSince(userId, todayStart),
+    getEventsBetween(userId, todayRange.start, todayRange.end),
     getEventsSince(userId, last24h),
     getEmailReviewItems(userId, { status: "all", limit: 10 })
   ]);
@@ -1733,7 +1737,7 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
   const overdueActions = openActions.filter((action) => action.dueAt && action.dueAt < now);
   const dueSoonActions = openActions.filter((action) => isActionDueSoon(action, now));
   const completedToday = visibleActions.filter(
-    (action) => action.status === "completed" && action.completedAt && action.completedAt >= todayStart
+    (action) => action.status === "completed" && isWithinLocalDay(action.completedAt, todayRange)
   );
   const goalStatusesToday = activeGoals.map((goal) => buildGoalStatusToday(goal, todayEvents, openActions, completedToday));
   const guardrailContext = {
@@ -1744,7 +1748,8 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
     goalStatuses: goalStatusesToday,
     recentEvents,
     guardrailContext,
-    now
+    now,
+    timezone
   });
   const rankedActions = rankedOpenActions.map((item) => item.action);
   const priorityDebug = rankedOpenActions.map((item, index) => ({
@@ -1756,7 +1761,7 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
     factors: item.score.factors
   }));
   const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, rankedActions, completedToday));
-  const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews);
+  const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews, todayRange);
   const risks = buildOperatorRisks(recentEvents);
   const topPriorities = buildOperatorTopPriorities({
     overdueActions,
@@ -1774,7 +1779,7 @@ async function generateDailyOperatorBrief(userId: string): Promise<DailyOperator
   });
 
   return {
-    date: formatLocalDate(now),
+    date: todayRange.date,
     summary: buildOperatorSummary({ openActions, overdueActions, activeGoals, todayEvents, risks }),
     topPriorities,
     openActions: rankedActions.slice(0, 10).map(toBriefAction),
@@ -1873,7 +1878,7 @@ function formatPriorityAction(action: ActionItem, score?: DailyPriorityScore): s
     return `Overdue: ${action.title}`;
   }
 
-  if (score?.factors.includes("due today") || score?.factors.includes("due tomorrow morning") || score?.factors.includes("due tomorrow")) {
+  if (score?.factors.some((factor) => factor.startsWith("due today") || factor === "due tomorrow morning" || factor === "due tomorrow")) {
     return `Due soon: ${action.title}`;
   }
 
@@ -1983,7 +1988,12 @@ function goalProgressNoteForToday(goal: Awaited<ReturnType<typeof getActiveGoals
   return "no progress logged today";
 }
 
-function buildOperatorRecentWins(events: StoredEvent[], completedActions: ActionItem[], recentReviews: EmailReviewItem[]): string[] {
+function buildOperatorRecentWins(
+  events: StoredEvent[],
+  completedActions: ActionItem[],
+  recentReviews: EmailReviewItem[],
+  todayRange: ReturnType<typeof getLocalTodayRange>
+): string[] {
   const wins = [
     ...completedActions.map((action) => `Completed action: ${action.title}`),
     sumEventNumber(events, "career.application_sent", "count") > 0
@@ -1994,7 +2004,7 @@ function buildOperatorRecentWins(events: StoredEvent[], completedActions: Action
       ? `${sumEventNumber(events, "learning.reading_session_completed", "duration_minutes")} minutes reading`
       : undefined,
     countEvent(events, "custom.goal_progress_logged") > 0 ? `${countEvent(events, "custom.goal_progress_logged")} custom progress log${countEvent(events, "custom.goal_progress_logged") === 1 ? "" : "s"}` : undefined,
-    recentReviews.some((review) => review.status === "approved" && review.reviewedAt && review.reviewedAt >= startOfToday())
+    recentReviews.some((review) => review.status === "approved" && isWithinLocalDay(review.reviewedAt, todayRange))
       ? "Email review approved today"
       : undefined
   ].filter(Boolean);
@@ -4240,6 +4250,24 @@ async function maybePolishInsight(
 
 function isDirectInsightProfile(profile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>): boolean {
   return profile.directness >= 5 || profile.motivationalStyle === "tough_love" || profile.gamblingGuardrails === "hard_guardian";
+}
+
+async function getUserTimezone(userId: string): Promise<string> {
+  try {
+    const settings = await getOrCreateNotificationSettings(userId);
+    return settings.timezone || "Europe/Madrid";
+  } catch {
+    return "Europe/Madrid";
+  }
+}
+
+function parseOptionalNow(value: string | undefined): Date | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
 }
 
 function startOfToday(): Date {

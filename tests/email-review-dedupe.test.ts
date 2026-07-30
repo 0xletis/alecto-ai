@@ -11,9 +11,12 @@ import {
   classifyJobSearchEmail,
   classifyWorkActionEmail,
   explainNormalizedInboundRoute,
+  classifyDueWindow,
+  getLocalTodayRange,
   normalizeManualActionTitleKey,
   parseActionDueDate,
   routeNormalizedInboundMessage,
+  segmentInboundMessage,
   sortDailyActionsByPriority
 } from "../packages/core/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
@@ -50,6 +53,67 @@ test("normalized inbound messages parse channel-neutral slash commands", () => {
   });
 });
 
+test("inbound message segmentation detects command batches and references", () => {
+  const single = segmentInboundMessage("/today");
+  assert.equal(single.kind, "single_command");
+
+  const batch = segmentInboundMessage(
+    [
+      "/archive_action c8d460ea-875b-40d7-b094-95565dfc43f9",
+      "/archive_action cac5a63f-3211-4dfe-90f0-79cfa88b977e",
+      "/archive_action 4bf37417-2a26-44af-8095-32dd8188a33c"
+    ].join("\n")
+  );
+  assert.equal(batch.kind, "command_batch");
+  assert.deepEqual(batch.kind === "command_batch" ? batch.commands : [], [
+    "/archive_action c8d460ea-875b-40d7-b094-95565dfc43f9",
+    "/archive_action cac5a63f-3211-4dfe-90f0-79cfa88b977e",
+    "/archive_action 4bf37417-2a26-44af-8095-32dd8188a33c"
+  ]);
+
+  const readOnlyBatch = segmentInboundMessage("/actions\n/today");
+  assert.equal(readOnlyBatch.kind, "command_batch");
+  assert.deepEqual(readOnlyBatch.kind === "command_batch" ? readOnlyBatch.commands : [], ["/actions", "/today"]);
+
+  const mixedCommand = segmentInboundMessage("/archive_action abc\nextra text");
+  assert.equal(mixedCommand.kind, "reference_text");
+  assert.equal(mixedCommand.reason, "command_plus_extra_text");
+
+  const telegramExport = segmentInboundMessage("[30/07/2026 04:56] letis: /archive_action abc");
+  assert.equal(telegramExport.kind, "reference_text");
+
+  const codeFence = segmentInboundMessage("```text\n/archive_action abc\n/archive_action def\n```");
+  assert.equal(codeFence.kind, "reference_text");
+
+  const codexPrompt = segmentInboundMessage(
+    [
+      "You are working in the alecto-ai repository.",
+      "Requirements:",
+      "- /archive_action abc should not run in this pasted prompt.",
+      "Expected:",
+      "No side effects."
+    ].join("\n")
+  );
+  assert.equal(codexPrompt.kind, "reference_text");
+
+  const debugDump = segmentInboundMessage(
+    [
+      "intentType: command",
+      "handlerName: archive_action",
+      "allowedSideEffects:",
+      "- createAction: false"
+    ].join("\n")
+  );
+  assert.equal(debugDump.kind, "reference_text");
+
+  const unknownBatch = segmentInboundMessage("/unknown_one abc\n/unknown_two def");
+  assert.equal(unknownBatch.kind, "command_batch");
+  assert.deepEqual(unknownBatch.kind === "command_batch" ? unknownBatch.commands : [], ["/unknown_one abc", "/unknown_two def"]);
+
+  const normalText = segmentInboundMessage("I sent 2 CVs and trained 30 min");
+  assert.equal(normalText.kind, "normal_text");
+});
+
 test("normalized inbound router prioritizes memory and risk before check-in routing", () => {
   const memoryMessage = buildNormalizedInboundMessage({
     channel: "telegram",
@@ -73,6 +137,38 @@ test("normalized inbound router prioritizes memory and risk before check-in rout
   assert.equal(routeNormalizedInboundMessage(memoryMessage).kind, "process_message");
   assert.equal(routeNormalizedInboundMessage(bettingMessage).kind, "process_message");
   assert.equal(routeNormalizedInboundMessage(checkInMessage).kind, "daily_checkin");
+});
+
+test("normalized inbound route debug preserves normal free-text behavior", () => {
+  const action = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "I need to call Alex tomorrow"
+    })
+  );
+  const event = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "sent 2 CVs and trained 30 min"
+    })
+  );
+  const risk = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "remind me to bet 500 tomorrow"
+    })
+  );
+
+  assert.equal(action.intentType, "action_create");
+  assert.equal(event.intentType, "event_log");
+  assert.equal(risk.intentType, "goal_guardrail");
+  assert.equal(risk.allowedSideEffects.createAction, false);
 });
 
 test("normalized inbound router sends pasted job-search emails to ingestion", () => {
@@ -1722,7 +1818,7 @@ test("same manual task dedupes by local due date and time", async () => {
       source: "manual",
       title: "Review homepage copy",
       priority: "medium",
-      dueAt: new Date("2026-07-30T07:00:00.000Z")
+      dueAt: new Date("2026-08-03T07:00:00.000Z")
     }
   });
 
@@ -1730,7 +1826,7 @@ test("same manual task dedupes by local due date and time", async () => {
     const response = await server.inject({
       method: "POST",
       url: `/users/${actionUserId}/actions/manual`,
-      payload: { text: "I need to review the homepage copy 2026-07-30" }
+      payload: { text: "I need to review the homepage copy 2026-08-03" }
     });
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().duplicate, true);
@@ -2054,6 +2150,116 @@ test("/today ranks goal-linked priorities above same-window chores and exposes d
     const priorities = debug.json().priorities;
     assert.equal(priorities[0].title, "Apply to 2 jobs");
     assert.match(priorities[0].rankReason, /goal-linked/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("/today uses user timezone for local day and due-window priority reasons", async () => {
+  const server = buildServer();
+  const actionUserId = `today-timezone-${randomUUID()}`;
+  const now = new Date("2026-07-30T23:40:00.000Z");
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: actionUserId,
+      timezone: "Europe/Madrid"
+    }
+  });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      dueAt: new Date("2026-07-31T07:00:00.000Z"),
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      dueAt: new Date("2026-07-31T14:30:00.000Z")
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Send CV",
+      status: "completed",
+      priority: "medium",
+      completedAt: new Date("2026-07-30T23:20:00.000Z"),
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title
+    }
+  });
+  await prisma.event.createMany({
+    data: [
+      {
+        userId: actionUserId,
+        type: "career.application_sent",
+        timestamp: new Date("2026-07-30T23:30:00.000Z"),
+        source: "manual",
+        data: { count: 1 },
+        confidence: 1
+      },
+      {
+        userId: actionUserId,
+        type: "health.workout_completed",
+        timestamp: new Date("2026-07-30T21:30:00.000Z"),
+        source: "manual",
+        data: { duration_minutes: 30 },
+        confidence: 1
+      }
+    ]
+  });
+
+  try {
+    const range = getLocalTodayRange(now, "Europe/Madrid");
+    assert.equal(range.date, "2026-07-31");
+    assert.equal(range.start.toISOString(), "2026-07-30T22:00:00.000Z");
+    assert.equal(range.end.toISOString(), "2026-07-31T22:00:00.000Z");
+    assert.equal(classifyDueWindow(new Date("2026-07-31T07:00:00.000Z"), now, "Europe/Madrid"), "due today morning");
+    assert.equal(classifyDueWindow(new Date("2026-07-31T14:30:00.000Z"), now, "Europe/Madrid"), "due today afternoon");
+
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today?now=${encodeURIComponent(now.toISOString())}`
+    });
+    assert.equal(response.statusCode, 200);
+    const brief = response.json().brief;
+    assert.equal(brief.date, "2026-07-31");
+    assert.match(brief.summary, /1 event logged today/);
+    assert.ok(brief.goalStatus.some((goal: { title: string; note: string }) => goal.title === "Find a new developer job" && goal.note.includes("1 application sent today")));
+    assert.ok(brief.goalStatus.some((goal: { title: string; note: string }) => goal.title === "Find a new developer job" && goal.note.includes("completed action: Send CV")));
+    assert.ok(brief.recentWins.some((win: string) => win.includes("Completed action: Send CV")));
+    assert.ok(!brief.recentWins.some((win: string) => win.includes("Training logged")));
+
+    const debug = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today/debug-priorities?now=${encodeURIComponent(now.toISOString())}`
+    });
+    assert.equal(debug.statusCode, 200);
+    const reasons = debug.json().priorities.map((priority: { rankReason: string }) => priority.rankReason).join("\n");
+    assert.match(reasons, /due today morning/);
+    assert.match(reasons, /due today afternoon/);
+    assert.doesNotMatch(reasons, /due tomorrow/);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });

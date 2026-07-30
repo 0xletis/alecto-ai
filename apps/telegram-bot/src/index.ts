@@ -4,6 +4,7 @@ import {
   buildNormalizedInboundMessage,
   explainNormalizedInboundRoute,
   routeNormalizedInboundMessage,
+  segmentInboundMessage,
   shouldCheckRecentDailyCheckInReminder,
   type InboundRouteDebug,
   type NormalizedInboundMessage
@@ -22,6 +23,46 @@ if (!token) {
 }
 
 const bot = new Bot(token);
+
+bot.use(async (ctx, next) => {
+  const text = ctx.message?.text;
+
+  if (!text) {
+    await next();
+    return;
+  }
+
+  const segment = segmentInboundMessage(text);
+
+  if (text.trim().match(/^\/debug_route(?:@\w+)?\b/i)) {
+    await next();
+    return;
+  }
+
+  if (segment.kind === "command_batch") {
+    if (!(await guardAllowedUser(ctx))) {
+      return;
+    }
+
+    await replyWithIntegrationMessage(ctx, await executeCommandBatch(ctx, segment.commands));
+    return;
+  }
+
+  if (segment.kind === "reference_text") {
+    if (!(await guardAllowedUser(ctx))) {
+      return;
+    }
+
+    await ctx.reply(
+      segment.reason === "command_plus_extra_text"
+        ? "That looks like a command plus extra text. Send one command per message or use a supported multiline command."
+        : "That looks like pasted reference text, so I did not execute any commands."
+    );
+    return;
+  }
+
+  await next();
+});
 
 bot.command("whoami", async (ctx) => {
   const telegramUserId = ctx.from?.id;
@@ -804,7 +845,7 @@ bot.command("complete_action", async (ctx) => {
     const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${actionId}/complete`, {});
     await ctx.reply(response.message ?? "Action completed.");
   } catch (error) {
-    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+    await replyWithApiFailure(ctx, error, "I could not complete that action. Check the ID and try again.");
   }
 });
 
@@ -824,7 +865,7 @@ bot.command("archive_action", async (ctx) => {
     const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${actionId}/archive`, {});
     await ctx.reply(response.message ?? "Action archived.");
   } catch (error) {
-    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+    await replyWithApiFailure(ctx, error, "I could not archive that action. Check the ID and try again.");
   }
 });
 
@@ -846,7 +887,7 @@ bot.command("snooze_action", async (ctx) => {
     });
     await ctx.reply(response.message ?? "Action snoozed.");
   } catch (error) {
-    await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
+    await replyWithApiFailure(ctx, error, "I could not snooze that action. Check the ID and time.");
   }
 });
 
@@ -1679,14 +1720,17 @@ async function guardAllowedUser(ctx: Context, command?: "start"): Promise<boolea
 }
 
 async function guardDebugAllowedUser(ctx: Context): Promise<boolean> {
-  const telegramUserId = ctx.from?.id;
-
-  if (!telegramUserId || !allowedUserIds?.has(String(telegramUserId))) {
+  if (!isDebugAllowedUser(ctx)) {
     await ctx.reply("Debug commands are only available to allowlisted users.");
     return false;
   }
 
   return true;
+}
+
+function isDebugAllowedUser(ctx: Context): boolean {
+  const telegramUserId = ctx.from?.id;
+  return Boolean(telegramUserId && allowedUserIds?.has(String(telegramUserId)));
 }
 
 function isAllowedTelegramUser(telegramUserId: string): boolean {
@@ -1719,6 +1763,152 @@ function parseAllowedUserIds(value?: string): Set<string> | undefined {
 
 function getCommandText(ctx: Context): string {
   return typeof ctx.match === "string" ? ctx.match.trim() : "";
+}
+
+async function executeCommandBatch(ctx: Context, commands: string[]): Promise<string> {
+  const replies: string[] = [];
+  const limitedCommands = commands.slice(0, 10);
+
+  for (const command of limitedCommands) {
+    replies.push(await executeBatchCommandLine(ctx, command));
+  }
+
+  const header =
+    commands.length > limitedCommands.length
+      ? `Processed first ${limitedCommands.length} commands (limit 10):`
+      : `Processed ${limitedCommands.length} command${limitedCommands.length === 1 ? "" : "s"}:`;
+  const numberedReplies = replies.map((reply, index) => `${index + 1}. ${truncateText(reply, 900)}`);
+
+  if (commands.length > limitedCommands.length) {
+    numberedReplies.push(`Skipped ${commands.length - limitedCommands.length} extra command${commands.length - limitedCommands.length === 1 ? "" : "s"}. Send a smaller batch.`);
+  }
+
+  return [header, ...numberedReplies].join("\n");
+}
+
+async function executeBatchCommandLine(ctx: Context, commandLine: string): Promise<string> {
+  const parsed = parseBatchCommandLine(commandLine);
+
+  if (!parsed) {
+    return `Could not parse command: ${truncateText(commandLine, 80)}`;
+  }
+
+  try {
+    if (parsed.name === "actions") {
+      const showAll = parsed.args.trim().toLowerCase() === "all";
+      const response = await apiGet<ActionsResponse>(`/users/${getTelegramUserId(ctx)}/actions${showAll ? "?status=all" : ""}`);
+      return `/${parsed.name}: ${formatActions(response.actions, showAll)}`;
+    }
+
+    if (parsed.name === "today") {
+      const response = await apiGet<DailyOperatorBriefResponse>(`/users/${getTelegramUserId(ctx)}/today`);
+      return `/${parsed.name}: ${formatDailyOperatorBrief(response.brief)}`;
+    }
+
+    if (parsed.name === "goals") {
+      const response = await apiGet<GoalsResponse>(`/users/${getTelegramUserId(ctx)}/goals`);
+      return `/${parsed.name}: ${formatGoals(response.goals, response.duplicateWarnings ?? [])}`;
+    }
+
+    if (parsed.name === "goal_priorities") {
+      const response = await apiGet<GoalPrioritiesResponse>(`/users/${getTelegramUserId(ctx)}/goals/priorities`);
+      return `/${parsed.name}: ${formatGoalPriorities(response.goals)}`;
+    }
+
+    if (parsed.name === "debug_daily_priorities") {
+      if (!isDebugAllowedUser(ctx)) {
+        return `/${parsed.name}: Debug commands are only available to allowlisted users.`;
+      }
+
+      const response = await apiGet<DailyPriorityDebugResponse>(`/users/${getTelegramUserId(ctx)}/today/debug-priorities`);
+      return `/${parsed.name}: ${formatDailyPriorityDebug(response.priorities)}`;
+    }
+
+    if (parsed.name === "events") {
+      const limit = parseEventLimit(parsed.args);
+      const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events`);
+      const events = response.events.slice(-limit).reverse();
+      return `/${parsed.name}: ${formatEvents(events, {
+        intro: formatEventsIntro("events", events.length, response.events.length, limit)
+      })}`;
+    }
+
+    if (parsed.name === "memory") {
+      const response = await apiGet<MemoriesResponse>(`/users/${getTelegramUserId(ctx)}/memory`);
+      return `/${parsed.name}: ${formatMemories(response.memories)}`;
+    }
+
+    if (parsed.name === "reminder_settings") {
+      const response = await apiGet<NotificationSettingsResponse>(`/users/${getTelegramUserId(ctx)}/notification-settings`);
+      return `/${parsed.name}: ${formatReminderSettings(response.notificationSettings)}`;
+    }
+
+    if (parsed.name === "archive_action") {
+      if (!parsed.args) {
+        return "Usage: /archive_action ACTION_ID";
+      }
+
+      const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${parsed.args}/archive`, {});
+      return response.message ?? `Action archived: ${parsed.args}`;
+    }
+
+    if (parsed.name === "complete_action") {
+      if (!parsed.args) {
+        return "Usage: /complete_action ACTION_ID";
+      }
+
+      const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${parsed.args}/complete`, {});
+      return response.message ?? `Action completed: ${parsed.args}`;
+    }
+
+    if (parsed.name === "snooze_action") {
+      const snooze = parseSnoozeActionCommand(parsed.args);
+
+      if (!snooze) {
+        return "Usage: /snooze_action ACTION_ID tomorrow";
+      }
+
+      const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${snooze.actionId}/snooze`, {
+        snoozeText: snooze.value
+      });
+      return response.message ?? `Action snoozed: ${snooze.actionId}`;
+    }
+
+    return `/${parsed.name}: skipped, unsupported batch command`;
+  } catch (error) {
+    return safeActionCommandErrorMessage(error);
+  }
+}
+
+function safeActionCommandErrorMessage(error: unknown): string {
+  if (isFetchError(error)) {
+    return "I cannot reach the agent API right now. Make sure the API server is running.";
+  }
+
+  const message = safeErrorMessage(error);
+
+  if (!message) {
+    return "I could not run that action command. Check the ID and try again.";
+  }
+
+  if (message.includes("404") || message.toLowerCase().includes("not found")) {
+    return "Action not found. Check the ID and try again.";
+  }
+
+  return message;
+}
+
+function parseBatchCommandLine(commandLine: string): { name: string; args: string } | undefined {
+  const match = commandLine.trim().match(/^\/([a-zA-Z0-9_]+)(?:@\w+)?(?:\s+([\s\S]*))?$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return {
+    name: match[1].toLowerCase(),
+    args: (match[2] ?? "").trim()
+  };
 }
 
 function parseCreateGoal(text: string) {

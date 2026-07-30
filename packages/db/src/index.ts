@@ -1840,6 +1840,28 @@ export async function getEventsSince(
   return events.map(toStoredEvent);
 }
 
+export async function getEventsBetween(
+  userId: string,
+  startDate: Date,
+  endDate: Date,
+  options: EventQueryOptions = {}
+): Promise<StoredEvent[]> {
+  await ensureUser(userId);
+
+  const events = await prisma.event.findMany({
+    where: {
+      ...eventWhere(userId, options),
+      timestamp: {
+        gte: startDate,
+        lt: endDate
+      }
+    },
+    orderBy: { timestamp: "asc" }
+  });
+
+  return events.map(toStoredEvent);
+}
+
 export async function getEventById(
   userId: string,
   eventId: string,

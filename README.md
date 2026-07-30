@@ -150,6 +150,7 @@ Telegram commands:
 - `/complete_action ACTION_ID`: mark an action item completed
 - `/snooze_action ACTION_ID tomorrow afternoon`: snooze an action item; also supports `3d`, `YYYY-MM-DD`, `tomorrow at 6pm`, and similar simple times
 - `/archive_action ACTION_ID`: archive an action item
+- Multi-line batches of safe read-only commands like `/actions` and `/today`, plus `/archive_action`, `/complete_action`, and `/snooze_action`, are handled one command per line. Pasted logs/examples with slash commands are treated as reference text and are not executed.
 - `/trigger_action_reminders`: dev helper that sends due/snoozed action reminders now
 - `/debug_make_action_due ACTION_ID`: allowlist-only dev helper that forces an action due for reminder testing
 - `/debug_make_snoozed_due ACTION_ID`: allowlist-only dev helper that forces a snoozed action due for reminder testing

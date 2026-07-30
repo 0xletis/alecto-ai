@@ -2,6 +2,7 @@ import { normalizeManualActionTitleKey } from "./action-intake.js";
 import { normalizeGoalPriority, scoreForGoalPriority } from "./goals.js";
 import type { Goal, GoalPriority } from "./goals.js";
 import type { StoredEvent } from "./events.js";
+import { classifyDueWindow, type DueWindow } from "./time.js";
 
 export interface DailyPriorityAction {
   id: string;
@@ -34,6 +35,7 @@ export interface DailyPriorityScoreInput {
   recentEvents: StoredEvent[];
   guardrailContext?: DailyGuardrailContext;
   now: Date;
+  timezone?: string;
 }
 
 export interface DailyPriorityScore {
@@ -65,7 +67,7 @@ export function scoreDailyActionPriority(input: DailyPriorityScoreInput): DailyP
     };
   }
 
-  const dueFactor = scoreDueDate(input.action.dueAt, input.now);
+  const dueFactor = scoreDueDate(input.action.dueAt, input.now, input.timezone);
   score += dueFactor.score;
   if (dueFactor.reason) {
     factors.push(dueFactor.reason);
@@ -102,7 +104,7 @@ export function scoreDailyActionPriority(input: DailyPriorityScoreInput): DailyP
       factors.push("some goal progress today");
     }
 
-    const categoryBoost = scoreGoalCategory(input.linkedGoal, input.goalStatusToday, input.action, input.now);
+    const categoryBoost = scoreGoalCategory(input.linkedGoal, input.goalStatusToday, input.action, input.now, input.timezone);
     score += categoryBoost.score;
     if (categoryBoost.reason) {
       factors.push(categoryBoost.reason);
@@ -137,6 +139,7 @@ export function sortDailyActionsByPriority<T extends DailyPriorityAction>(
     recentEvents: StoredEvent[];
     guardrailContext?: DailyGuardrailContext;
     now: Date;
+    timezone?: string;
   }
 ): Array<{ action: T; score: DailyPriorityScore }> {
   const goalsById = new Map(options.goals.map((goal) => [goal.id, goal]));
@@ -151,7 +154,8 @@ export function sortDailyActionsByPriority<T extends DailyPriorityAction>(
         goalStatusToday: action.goalId ? goalStatusById.get(action.goalId) : undefined,
         recentEvents: options.recentEvents,
         guardrailContext: options.guardrailContext,
-        now: options.now
+        now: options.now,
+        timezone: options.timezone
       })
     }))
     .sort((left, right) => compareDailyPriority(left, right, options.now));
@@ -216,50 +220,28 @@ function compareDailyPriority(
   return leftCreatedAt - rightCreatedAt;
 }
 
-function scoreDueDate(dueAt: Date | undefined, now: Date): { score: number; reason?: string } {
+function scoreDueDate(dueAt: Date | undefined, now: Date, timezone = "UTC"): { score: number; reason?: string } {
   if (!dueAt) {
     return { score: 0 };
   }
 
-  const dueStart = startOfLocalDay(dueAt);
-  const todayStart = startOfLocalDay(now);
-  const tomorrowStart = addDays(todayStart, 1);
-  const afterTomorrowStart = addDays(todayStart, 2);
-  const weekEnd = addDays(todayStart, 7);
-
-  if (dueAt < now) {
-    return { score: 90, reason: "overdue" };
-  }
-
-  if (dueStart.getTime() === todayStart.getTime()) {
-    return { score: 40, reason: "due today" };
-  }
-
-  if (dueStart.getTime() === tomorrowStart.getTime()) {
-    return dueAt.getHours() < 12
-      ? { score: 25, reason: "due tomorrow morning" }
-      : { score: 15, reason: "due tomorrow" };
-  }
-
-  if (dueAt < weekEnd) {
-    return { score: 5, reason: "due later this week" };
-  }
-
-  return { score: 0 };
+  const dueWindow = classifyDueWindow(dueAt, now, timezone);
+  return scoreDueWindow(dueWindow);
 }
 
 function scoreGoalCategory(
   goal: Goal,
   status: GoalStatusToday | undefined,
   action: DailyPriorityAction,
-  now: Date
+  now: Date,
+  timezone = "UTC"
 ): { score: number; reason?: string } {
   if (status?.hasProgressToday || isRiskControlGoal(goal)) {
     return { score: 0 };
   }
 
   const text = `${goal.templateId ?? ""} ${goal.category}`.toLowerCase();
-  const dueToday = Boolean(action.dueAt && startOfLocalDay(action.dueAt).getTime() === startOfLocalDay(now).getTime());
+  const dueToday = Boolean(action.dueAt && classifyDueWindow(action.dueAt, now, timezone).startsWith("due today"));
 
   if (text.includes("career") || text.includes("job_search")) {
     return { score: 5, reason: "no job-search progress" };
@@ -297,16 +279,28 @@ function isGenericChore(title: string): boolean {
   return /\b(buy milk|groceries|laundry|clean|dishes|trash|shopping)\b/i.test(title);
 }
 
-function startOfLocalDay(date: Date): Date {
-  const copy = new Date(date);
-  copy.setHours(0, 0, 0, 0);
-  return copy;
-}
+function scoreDueWindow(dueWindow: DueWindow): { score: number; reason?: string } {
+  if (dueWindow === "overdue") {
+    return { score: 90, reason: dueWindow };
+  }
 
-function addDays(date: Date, days: number): Date {
-  const copy = new Date(date);
-  copy.setDate(copy.getDate() + days);
-  return copy;
+  if (dueWindow.startsWith("due today")) {
+    return { score: 40, reason: dueWindow };
+  }
+
+  if (dueWindow === "due tomorrow morning") {
+    return { score: 25, reason: dueWindow };
+  }
+
+  if (dueWindow === "due tomorrow") {
+    return { score: 15, reason: dueWindow };
+  }
+
+  if (dueWindow === "due later this week") {
+    return { score: 5, reason: dueWindow };
+  }
+
+  return { score: 0 };
 }
 
 export function dailyPriorityDedupeKey(action: Pick<DailyPriorityAction, "id" | "title">): string {
