@@ -104,6 +104,8 @@ Telegram commands:
 - `/remember <text>`: save a visible memory immediately
 - `/forget_memory <memoryId>`: archive a memory
 - `/notifications`: show notification settings
+- `/reminder_settings`: show action reminder default times
+- `/set_reminder_time default 09:00`: set the default action due time; also supports `morning`, `afternoon`, `evening`, and `tonight`
 - `/enable_checkin 09:00`: enable daily check-in reminders at local time
 - `/disable_checkin`: disable daily check-in reminders
 - `/send_checkin_now`: preview the same goal-aware daily check-in prompt the worker sends
@@ -146,7 +148,7 @@ Telegram commands:
 - `/actions`: show open action items
 - `/actions all`: show recent open/completed/snoozed/archived action items
 - `/complete_action ACTION_ID`: mark an action item completed
-- `/snooze_action ACTION_ID tomorrow`: snooze an action item; also supports `3d` and `YYYY-MM-DD`
+- `/snooze_action ACTION_ID tomorrow afternoon`: snooze an action item; also supports `3d`, `YYYY-MM-DD`, `tomorrow at 6pm`, and similar simple times
 - `/archive_action ACTION_ID`: archive an action item
 - `/trigger_action_reminders`: dev helper that sends due/snoozed action reminders now
 - `/debug_make_action_due ACTION_ID`: allowlist-only dev helper that forces an action due for reminder testing
@@ -458,6 +460,7 @@ Expected:
 - Daily reminders send once per user per day because of `NotificationLog`. Daily insights use `daily_insight` logs, and weekly insights use `weekly_insight` logs.
 - Use `/send_checkin_now`, `/send_daily_insight_now`, and `/send_weekly_insight_now` to test message text repeatedly without creating notification logs.
 - Action reminders are sent when an open action is due or a snoozed action is back. Reminder logs prevent repeats within 12 hours, and snoozed actions are reopened after the reminder is sent.
+- Action due dates use reminder preferences from `/reminder_settings`. Date-only phrases like `tomorrow` use the default action time, while `tomorrow afternoon`, `tomorrow evening`, `tonight`, `Friday morning`, and `tomorrow at 6pm` resolve to configured stable times.
 - Action reminders can route only users mapped as `telegram:<id>`. Use `/debug_make_action_due`, `/debug_make_snoozed_due`, and `/trigger_action_reminders` for local testing without waiting for real due times. The debug force commands require `TELEGRAM_ALLOWED_USER_IDS`.
 - Daily check-in prompts are goal-aware. Active goal templates influence the prompt, for example career goals ask about applications and interviews, health goals ask about workout/sleep, finance goals ask about impulse and thesis-before-risk.
 - Custom goals with check-in config add up to two goal-specific lines to the daily check-in prompt.

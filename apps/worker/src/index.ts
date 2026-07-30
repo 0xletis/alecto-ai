@@ -89,7 +89,11 @@ export async function sendDueActionReminders(now = new Date()) {
     }
 
     try {
-      await sendTelegramMessage(chatId, formatActionReminderMessage(candidate.actionItem, candidate.reminderType));
+      const settings = await getOrCreateNotificationSettings(candidate.actionItem.userId);
+      await sendTelegramMessage(
+        chatId,
+        formatActionReminderMessage(candidate.actionItem, candidate.reminderType, settings.timezone)
+      );
       await createActionItemReminderLog({
         userId: candidate.actionItem.userId,
         actionItemId: candidate.actionItem.id,
@@ -326,9 +330,9 @@ function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): 
   });
 }
 
-function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType): string {
+function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {
   const header = reminderType === "snoozed" ? "Snoozed action is back:" : "Action due:";
-  const dueLine = actionItem.dueAt ? `due: ${actionItem.dueAt.toISOString()}` : undefined;
+  const dueLine = actionItem.dueAt ? `due: ${formatLocalDateTime(actionItem.dueAt, timezone)}` : undefined;
 
   return [
     header,
@@ -345,6 +349,18 @@ function formatActionReminderMessage(actionItem: ActionItem, reminderType: Actio
 function telegramChatIdFromUserId(userId: string): string | undefined {
   const match = userId.match(/^telegram:(\d+)$/);
   return match?.[1];
+}
+
+function formatLocalDateTime(date: Date, timezone: string): string {
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(date);
 }
 
 async function sendTelegramMessage(chatId: string, text: string) {

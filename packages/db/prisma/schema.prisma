@@ -151,6 +151,11 @@ model NotificationSettings {
   weeklyInsightDay     String?
   weeklyInsightTime    String?
   timezone             String   @default("Europe/Madrid")
+  defaultActionTimeMinutes Int   @default(540)
+  morningTimeMinutes       Int   @default(540)
+  afternoonTimeMinutes     Int   @default(900)
+  eveningTimeMinutes       Int   @default(1140)
+  tonightTimeMinutes       Int   @default(1200)
   createdAt            DateTime @default(now())
   updatedAt            DateTime @updatedAt
 

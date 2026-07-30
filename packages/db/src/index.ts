@@ -2668,6 +2668,11 @@ function toNotificationSettings(
     weeklyInsightDay: (settings.weeklyInsightDay as NotificationSettings["weeklyInsightDay"]) ?? undefined,
     weeklyInsightTime: settings.weeklyInsightTime ?? undefined,
     timezone: settings.timezone,
+    defaultActionTimeMinutes: settings.defaultActionTimeMinutes ?? 540,
+    morningTimeMinutes: settings.morningTimeMinutes ?? 540,
+    afternoonTimeMinutes: settings.afternoonTimeMinutes ?? 900,
+    eveningTimeMinutes: settings.eveningTimeMinutes ?? 1140,
+    tonightTimeMinutes: settings.tonightTimeMinutes ?? 1200,
     createdAt: settings.createdAt,
     updatedAt: settings.updatedAt
   };

@@ -144,6 +144,44 @@ bot.command("notifications", async (ctx) => {
   }
 });
 
+bot.command("reminder_settings", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`
+    );
+    await ctx.reply(formatReminderSettings(response.notificationSettings));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not load reminder settings right now.");
+  }
+});
+
+bot.command("set_reminder_time", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseSetReminderTimeCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /set_reminder_time default 09:00\nOptions: default, morning, afternoon, evening, tonight");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`,
+      { [parsed.field]: parsed.minutes }
+    );
+    await ctx.reply(formatReminderSettings(response.notificationSettings));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not update reminder settings right now.");
+  }
+});
+
 bot.command("enable_checkin", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -771,7 +809,7 @@ bot.command("snooze_action", async (ctx) => {
 
   try {
     const response = await apiPatch<ActionMutationResponse>(`/users/${getTelegramUserId(ctx)}/actions/${parsed.actionId}/snooze`, {
-      snoozedUntil: parsed.snoozedUntil.toISOString()
+      snoozeText: parsed.value
     });
     await ctx.reply(response.message ?? "Action snoozed.");
   } catch (error) {
@@ -1478,6 +1516,16 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (isStandaloneNowText(message)) {
+      const response = await apiPost<ProcessMessageResponse>("/messages/process", {
+        userId: getTelegramUserId(ctx),
+        message
+      });
+
+      await ctx.reply(response.reply);
+      return;
+    }
+
     if (await shouldTreatAsNaturalCheckIn(ctx)) {
       const response = await apiPost<NaturalCheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/text`, {
         text: message
@@ -1922,6 +1970,10 @@ function isDirectBettingTradingIntent(message: string): boolean {
   return /\b(quiero apostar|voy a apostar|i want to bet|i'?m going to bet|quiero tradear|voy a tradear|i want to trade|long|short|leverage)\b/i.test(
     message
   );
+}
+
+function isStandaloneNowText(message: string): boolean {
+  return /^now$/i.test(message.trim());
 }
 
 function looksLikeJobSearchPaste(message: string): boolean {
@@ -2581,9 +2633,9 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
 
 function formatBriefAction(action: DailyOperatorBriefAction): string {
   const detail = action.dueAt
-    ? `due ${new Date(action.dueAt).toLocaleString()}`
+    ? `due ${formatLocalDateTime(action.dueAt)}`
     : action.snoozedUntil
-      ? `snoozed until ${new Date(action.snoozedUntil).toLocaleString()}`
+      ? `snoozed until ${formatLocalDateTime(action.snoozedUntil)}`
       : undefined;
 
   return `- ${action.title}${detail ? ` - ${detail}` : ""}`;
@@ -2679,8 +2731,81 @@ function formatNotificationSettings(settings: NotificationSettings) {
     `weeklyInsightDay: ${settings.weeklyInsightDay ?? "not set"}`,
     `weeklyInsightTime: ${settings.weeklyInsightTime ?? "not set"}`,
     `timezone: ${settings.timezone}`,
+    `defaultActionTime: ${formatMinutesOfDay(settings.defaultActionTimeMinutes)}`,
+    `morning: ${formatMinutesOfDay(settings.morningTimeMinutes)}`,
+    `afternoon: ${formatMinutesOfDay(settings.afternoonTimeMinutes)}`,
+    `evening: ${formatMinutesOfDay(settings.eveningTimeMinutes)}`,
+    `tonight: ${formatMinutesOfDay(settings.tonightTimeMinutes)}`,
     `telegramUserId: ${settings.telegramUserId ?? "not set"}`
   ].join("\n");
+}
+
+function formatReminderSettings(settings: NotificationSettings) {
+  return [
+    "Reminder settings:",
+    `timezone: ${settings.timezone}`,
+    `default action time: ${formatMinutesOfDay(settings.defaultActionTimeMinutes)}`,
+    `morning: ${formatMinutesOfDay(settings.morningTimeMinutes)}`,
+    `afternoon: ${formatMinutesOfDay(settings.afternoonTimeMinutes)}`,
+    `evening: ${formatMinutesOfDay(settings.eveningTimeMinutes)}`,
+    `tonight: ${formatMinutesOfDay(settings.tonightTimeMinutes)}`
+  ].join("\n");
+}
+
+function parseSetReminderTimeCommand(text: string): { field: keyof ReminderTimePatch; minutes: number } | undefined {
+  const [kind, value] = text.trim().split(/\s+/, 2);
+  const minutes = parseMinutesOfDay(value ?? "");
+  const fieldByKind: Record<string, keyof ReminderTimePatch> = {
+    default: "defaultActionTimeMinutes",
+    morning: "morningTimeMinutes",
+    afternoon: "afternoonTimeMinutes",
+    evening: "eveningTimeMinutes",
+    tonight: "tonightTimeMinutes"
+  };
+
+  if (!kind || minutes === undefined || !fieldByKind[kind]) {
+    return undefined;
+  }
+
+  return {
+    field: fieldByKind[kind],
+    minutes
+  };
+}
+
+function parseMinutesOfDay(value: string): number | undefined {
+  const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function formatMinutesOfDay(minutes: number): string {
+  const safeMinutes = Number.isInteger(minutes) && minutes >= 0 && minutes <= 1439 ? minutes : 0;
+  const hour = Math.floor(safeMinutes / 60);
+  const minute = safeMinutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+function formatLocalDateTime(value: string | Date, timezone = "Europe/Madrid"): string {
+  const date = value instanceof Date ? value : new Date(value);
+
+  if (Number.isNaN(date.getTime())) {
+    return String(value);
+  }
+
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(date);
 }
 
 function formatGoals(goals: Goal[], duplicateWarnings: GoalDuplicateWarning[] = []) {
@@ -2789,8 +2914,8 @@ function formatAction(action: ActionItem): string {
     `title: ${truncateText(action.title, 120)}`,
     `status: ${action.status}`,
     `priority: ${action.priority}`,
-    action.dueAt ? `dueAt: ${new Date(action.dueAt).toLocaleString()}` : undefined,
-    action.snoozedUntil ? `snoozedUntil: ${new Date(action.snoozedUntil).toLocaleString()}` : undefined,
+    action.dueAt ? `dueAt: ${formatLocalDateTime(action.dueAt)}` : undefined,
+    action.snoozedUntil ? `snoozedUntil: ${formatLocalDateTime(action.snoozedUntil)}` : undefined,
     action.project ? `project: ${truncateText(action.project, 80)}` : undefined,
     action.actionType ? `type: ${action.actionType}` : undefined,
     `source: ${action.source}`,
@@ -2836,43 +2961,16 @@ async function tryCreateManualAction(ctx: Context, text: string): Promise<Manual
   }
 }
 
-function parseSnoozeActionCommand(text: string): { actionId: string; snoozedUntil: Date } | undefined {
-  const [actionId, value] = text.trim().split(/\s+/, 2);
+function parseSnoozeActionCommand(text: string): { actionId: string; value: string } | undefined {
+  const match = text.trim().match(/^(\S+)\s+(.+)$/);
+  const actionId = match?.[1];
+  const value = match?.[2]?.trim();
 
   if (!actionId || !value) {
     return undefined;
   }
 
-  const snoozedUntil = parseSnoozeValue(value);
-  return snoozedUntil ? { actionId, snoozedUntil } : undefined;
-}
-
-function parseSnoozeValue(value: string): Date | undefined {
-  const normalized = value.trim().toLowerCase();
-  const now = new Date();
-
-  if (normalized === "tomorrow") {
-    const date = new Date(now);
-    date.setDate(date.getDate() + 1);
-    date.setHours(9, 0, 0, 0);
-    return date;
-  }
-
-  const dayMatch = normalized.match(/^(\d+)d$/);
-
-  if (dayMatch) {
-    const date = new Date(now);
-    date.setDate(date.getDate() + Number(dayMatch[1]));
-    date.setHours(9, 0, 0, 0);
-    return date;
-  }
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
-    const date = new Date(`${normalized}T09:00:00`);
-    return Number.isNaN(date.getTime()) ? undefined : date;
-  }
-
-  return undefined;
+  return { actionId, value: value.match(/^\d+d$/i) ? `in ${value.slice(0, -1)} days` : value };
 }
 
 function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnection) {
@@ -3787,6 +3885,19 @@ interface NotificationSettings {
   weeklyInsightDay?: string;
   weeklyInsightTime?: string;
   timezone: string;
+  defaultActionTimeMinutes: number;
+  morningTimeMinutes: number;
+  afternoonTimeMinutes: number;
+  eveningTimeMinutes: number;
+  tonightTimeMinutes: number;
+}
+
+interface ReminderTimePatch {
+  defaultActionTimeMinutes?: number;
+  morningTimeMinutes?: number;
+  afternoonTimeMinutes?: number;
+  eveningTimeMinutes?: number;
+  tonightTimeMinutes?: number;
 }
 
 interface PendingAction {

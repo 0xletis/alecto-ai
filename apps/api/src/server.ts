@@ -17,6 +17,7 @@ import {
   EventTypeSchema,
   eventRegistry,
   extractManualAction,
+  parseActionDueDate,
   normalizeManualActionTitleKey,
   extractEvents,
   findGoalDuplicateWarnings,
@@ -195,6 +196,10 @@ export function buildServer() {
     await ensureUser(parsed.data.userId);
     await expireOldPendingActions(parsed.data.userId);
 
+    if (isStandaloneNowMessage(parsed.data.message)) {
+      return replyOnly(parsed.data.userId, parsed.data.message, "What should I schedule now? Example: /action call Alex now");
+    }
+
     const latestPendingAction = await getLatestPendingAction(parsed.data.userId);
 
     if (latestPendingAction && isConfirmationMessage(parsed.data.message)) {
@@ -223,6 +228,8 @@ export function buildServer() {
       const actionResult = await maybeCreateManualActionFromText(parsed.data.userId, explicitMemory.summary);
       const replyText = actionResult.extraction.shouldCreateAction
         ? ["Saved to memory.", formatActionCreatedReply(actionResult)].join("\n")
+        : actionResult.extraction.reason === "past_explicit_time"
+          ? "Saved to memory.\nThat time has already passed. Use a future time, or say 'now'."
         : "Saved to memory.";
 
       return replyOnly(parsed.data.userId, parsed.data.message, replyText);
@@ -241,6 +248,10 @@ export function buildServer() {
 
     if (manualActionResult.extraction.shouldCreateAction) {
       return replyOnly(parsed.data.userId, parsed.data.message, formatActionCreatedReply(manualActionResult));
+    }
+
+    if (manualActionResult.extraction.reason === "past_explicit_time") {
+      return replyOnly(parsed.data.userId, parsed.data.message, "That time has already passed. Use a future time, or say 'now'.");
     }
 
     const naturalCustomProgress = detectNaturalCustomProgress(parsed.data.message, activeGoals);
@@ -1055,6 +1066,13 @@ export function buildServer() {
       const result = await maybeCreateManualActionFromText(request.params.userId, text, { forceActionIntent: true });
 
       if (!result.extraction.shouldCreateAction) {
+        if (result.extraction.reason === "past_explicit_time") {
+          return reply.status(400).send({
+            error: "That time has already passed. Use a future time, or say 'now'.",
+            extraction: result.extraction
+          });
+        }
+
         return reply.status(400).send({
           error: "I could not turn that into a concrete action item.",
           extraction: result.extraction
@@ -1155,8 +1173,20 @@ export function buildServer() {
   server.patch<{ Params: { userId: string; actionId: string } }>(
     "/users/:userId/actions/:actionId/snooze",
     async (request, reply) => {
-      const body = request.body as { snoozedUntil?: string };
-      const snoozedUntil = body.snoozedUntil ? new Date(body.snoozedUntil) : undefined;
+      const body = request.body as { snoozedUntil?: string; snoozeText?: string };
+      const settings = await getOrCreateNotificationSettings(request.params.userId);
+      const parsedSnooze = body.snoozeText
+        ? parseActionDueDate(body.snoozeText, {
+            timezone: settings.timezone,
+            preferences: settings
+          })
+        : undefined;
+
+      if (parsedSnooze?.invalidReason === "past_explicit_time") {
+        return reply.status(400).send({ error: "That snooze time has already passed." });
+      }
+
+      const snoozedUntil = parsedSnooze?.dueAt ?? (body.snoozedUntil ? new Date(body.snoozedUntil) : undefined);
 
       if (!snoozedUntil || Number.isNaN(snoozedUntil.getTime())) {
         return reply.status(400).send({ error: "Invalid snoozedUntil" });
@@ -1170,7 +1200,7 @@ export function buildServer() {
 
       return {
         action: sanitizeActionItem(actionItem),
-        message: `Action snoozed until ${actionItem.snoozedUntil?.toISOString()}: ${actionItem.title}`
+        message: `Action snoozed until ${formatLocalDateTime(actionItem.snoozedUntil, settings.timezone)}: ${actionItem.title}`
       };
     }
   );
@@ -1834,6 +1864,40 @@ function formatLocalDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
+function formatLocalDateTime(date: Date | undefined, timezone = "Europe/Madrid"): string {
+  if (!date) {
+    return "not set";
+  }
+
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(date);
+}
+
+function formatLocalActionDueKey(date: Date, timezone = "Europe/Madrid"): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+
+  return `${getDateTimePart(parts, "year")}-${getDateTimePart(parts, "month")}-${getDateTimePart(parts, "day")} ${getDateTimePart(parts, "hour")}:${getDateTimePart(parts, "minute")}`;
+}
+
+function getDateTimePart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
+  return parts.find((part) => part.type === type)?.value ?? "";
+}
+
 async function maybeCreateManualActionFromText(
   userId: string,
   text: string,
@@ -1843,13 +1907,21 @@ async function maybeCreateManualActionFromText(
   action?: ActionItem;
   duplicate: boolean;
 }> {
-  const extraction = extractManualAction({ text }, { forceActionIntent: options.forceActionIntent });
+  const settings = await getOrCreateNotificationSettings(userId);
+  const extraction = extractManualAction(
+    { text },
+    {
+      forceActionIntent: options.forceActionIntent,
+      timezone: settings.timezone,
+      reminderPreferences: settings
+    }
+  );
 
   if (!extraction.shouldCreateAction || !extraction.title) {
     return { extraction, duplicate: false };
   }
 
-  const duplicate = await findDuplicateManualAction(userId, extraction.title, extraction.dueAt);
+  const duplicate = await findDuplicateManualAction(userId, extraction.title, extraction.dueAt, settings.timezone);
 
   if (duplicate) {
     return {
@@ -1880,17 +1952,22 @@ async function maybeCreateManualActionFromText(
   };
 }
 
-async function findDuplicateManualAction(userId: string, title: string, dueAt?: Date): Promise<ActionItem | undefined> {
+async function findDuplicateManualAction(
+  userId: string,
+  title: string,
+  dueAt?: Date,
+  timezone = "Europe/Madrid"
+): Promise<ActionItem | undefined> {
   const actions = await getRecentActionItems(userId, 100);
   const titleKey = normalizeManualActionTitleKey(title);
-  const dueKey = dueAt ? formatLocalDate(dueAt) : "";
+  const dueKey = dueAt ? formatLocalActionDueKey(dueAt, timezone) : "";
 
   return actions.find((action) => {
     if (action.source !== "manual" || (action.status !== "open" && action.status !== "snoozed")) {
       return false;
     }
 
-    const actionDueKey = action.dueAt ? formatLocalDate(action.dueAt) : "";
+    const actionDueKey = action.dueAt ? formatLocalActionDueKey(action.dueAt, timezone) : "";
     return normalizeManualActionTitleKey(action.title) === titleKey && actionDueKey === dueKey;
   });
 }
@@ -1905,7 +1982,7 @@ function formatActionCreatedReply(input: {
   }
 
   const dueLine = input.action.dueAt
-    ? `due: ${input.extraction.dueText ?? formatLocalDate(input.action.dueAt)}`
+    ? `due: ${formatLocalDateTime(input.action.dueAt, input.extraction.timezone)}`
     : input.extraction.dueText
       ? `due: ${input.extraction.dueText}`
       : undefined;
@@ -1923,6 +2000,7 @@ function formatActionCreatedReply(input: {
 }
 
 async function dispatchActionRemindersForUser(userId: string, now: Date): Promise<ActionReminderDispatch[]> {
+  const settings = await getOrCreateNotificationSettings(userId);
   const candidates = await getActionItemsEligibleForReminder({
     userId,
     now,
@@ -1931,7 +2009,7 @@ async function dispatchActionRemindersForUser(userId: string, now: Date): Promis
   const reminders: ActionReminderDispatch[] = [];
 
   for (const candidate of candidates) {
-    const message = formatActionReminderMessage(candidate.actionItem, candidate.reminderType);
+    const message = formatActionReminderMessage(candidate.actionItem, candidate.reminderType, settings.timezone);
 
     await createActionItemReminderLog({
       userId,
@@ -1960,9 +2038,9 @@ async function dispatchActionRemindersForUser(userId: string, now: Date): Promis
   return reminders;
 }
 
-function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType): string {
+function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {
   const header = reminderType === "snoozed" ? "Snoozed action is back:" : "Action due:";
-  const dueLine = actionItem.dueAt ? `due: ${actionItem.dueAt.toISOString()}` : undefined;
+  const dueLine = actionItem.dueAt ? `due: ${formatLocalDateTime(actionItem.dueAt, timezone)}` : undefined;
 
   return [
     header,
@@ -3948,6 +4026,10 @@ function isConfirmationMessage(message: string): boolean {
 
 function isRejectionMessage(message: string): boolean {
   return /^(no|cancel|cancelar|nope|stop|don't|dont)$/i.test(message.trim());
+}
+
+function isStandaloneNowMessage(message: string): boolean {
+  return /^now$/i.test(message.trim());
 }
 
 function isFinancialRiskIntent(intent: MessageIntent): boolean {

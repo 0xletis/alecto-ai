@@ -9,6 +9,10 @@ export const ActionExtractionResultSchema = z.object({
   description: z.string().optional(),
   dueAt: z.coerce.date().optional(),
   dueText: z.string().optional(),
+  matchedText: z.string().optional(),
+  timezone: z.string().optional(),
+  explicitTime: z.boolean().optional(),
+  invalidReason: z.string().optional(),
   priority: z.enum(["low", "medium", "high"]),
   project: z.string().optional(),
   actionType: ManualActionTypeSchema,
@@ -24,6 +28,26 @@ export interface ActionIntakeContext {
   now?: Date;
   timezone?: string;
   forceActionIntent?: boolean;
+  reminderPreferences?: Partial<ActionReminderPreferences>;
+}
+
+export interface ActionReminderPreferences {
+  timezone: string;
+  defaultActionTimeMinutes: number;
+  morningTimeMinutes: number;
+  afternoonTimeMinutes: number;
+  eveningTimeMinutes: number;
+  tonightTimeMinutes: number;
+}
+
+export interface ParsedActionDate {
+  dueAt: Date | null;
+  dueText: string | null;
+  matchedText: string | null;
+  confidence: number;
+  timezone: string;
+  explicitTime: boolean;
+  invalidReason?: "past_explicit_time";
 }
 
 const actionPrefixPatterns = [
@@ -58,25 +82,35 @@ export function extractManualAction(input: { text: string }, context: ActionInta
     return noAction(hasActionPrefix ? "vague_action" : "no_action_intent", text);
   }
 
-  const { dueAt, dueText } = parseManualActionDue(text, context.now ?? new Date());
-  const title = cleanManualActionTitle(text, dueText);
+  const parsedDate = parseActionDueDate(text, {
+    now: context.now,
+    timezone: context.timezone,
+    preferences: context.reminderPreferences
+  });
+  const title = cleanManualActionTitle(text, parsedDate.matchedText ?? parsedDate.dueText ?? undefined);
+
+  if (parsedDate.invalidReason === "past_explicit_time") {
+    return noAction("past_explicit_time", text);
+  }
 
   if (!isConcreteActionTitle(title)) {
     return noAction("not_concrete", text);
   }
 
-  const actionType = inferManualActionType(text, dueText);
-
   return ActionExtractionResultSchema.parse({
     shouldCreateAction: true,
     confidence: 0.9,
     title,
-    description: dueText && !dueAt ? `Due: ${dueText}.` : undefined,
-    dueAt,
-    dueText,
+    description: parsedDate.dueText && !parsedDate.dueAt ? `Due: ${parsedDate.dueText}.` : undefined,
+    dueAt: parsedDate.dueAt ?? undefined,
+    dueText: parsedDate.dueText ?? undefined,
+    matchedText: parsedDate.matchedText ?? undefined,
+    timezone: parsedDate.timezone,
+    explicitTime: parsedDate.explicitTime,
+    invalidReason: parsedDate.invalidReason,
     priority: "medium",
     project: inferProject(title),
-    actionType,
+    actionType: inferManualActionType(text, parsedDate.dueText ?? undefined),
     needsConfirmation: false,
     reason: "concrete_manual_action",
     evidence: text
@@ -112,10 +146,15 @@ function cleanManualActionTitle(text: string, dueText?: string): string {
   }
 
   title = title
-    .replace(/\b(?:today|tonight|tomorrow|this evening)\b/gi, "")
+    .replace(/\b(?:today|tomorrow)\s+(?:morning|afternoon|evening)\b/gi, "")
+    .replace(/\bthis\s+(?:morning|afternoon|evening)\b/gi, "")
+    .replace(/\bat\s+now\b/gi, "")
+    .replace(/\b(?:today|tonight|tomorrow|now)\b/gi, "")
+    .replace(/\bat\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\b/gi, "")
     .replace(/\b(?:by|on|next)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/gi, "")
+    .replace(/\b(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(?:morning|afternoon|evening)\b/gi, "")
     .replace(/\bin\s+\d+\s+(?:day|days|week|weeks)\b/gi, "")
-    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete)\s+the\s+/gi, "$1 ")
+    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete|pay|test)\s+the\s+/gi, "$1 ")
     .replace(/\s+/g, " ")
     .trim();
 
@@ -127,7 +166,7 @@ function isConcreteActionTitle(title?: string): title is string {
     return false;
   }
 
-  return /\b(review|call|send|finish|update|apply|write|prepare|book|schedule|check|reply|follow up|complete)\b/i.test(title);
+  return /\b(review|call|send|finish|update|apply|write|prepare|book|schedule|check|reply|follow up|complete|pay|test)\b/i.test(title);
 }
 
 function inferManualActionType(text: string, dueText?: string): ManualActionType {
@@ -162,45 +201,138 @@ function inferProject(title: string): string | undefined {
   return undefined;
 }
 
-function parseManualActionDue(text: string, now: Date): { dueAt?: Date; dueText?: string } {
+export function parseActionDueDate(
+  input: string,
+  options: {
+    now?: Date;
+    timezone?: string;
+    preferences?: Partial<ActionReminderPreferences>;
+  } = {}
+): ParsedActionDate {
+  const now = options.now ?? new Date();
+  const preferences = normalizeActionReminderPreferences({
+    timezone: options.timezone,
+    ...options.preferences
+  });
+  const text = input.trim();
   const lower = text.toLowerCase();
-  const ymd = lower.match(/\b(\d{4}-\d{2}-\d{2})\b/);
+  const explicitTime = parseExplicitTime(lower);
+  const dayPart = parseDayPart(lower);
+  const minutes = explicitTime?.minutes ?? minutesForDayPart(dayPart, preferences);
+  const hour = Math.floor(minutes / 60);
+  const minute = minutes % 60;
+
+  const nowMatch = lower.match(/\b(?:at\s+)?now\b/);
+  if (nowMatch) {
+    return parsedDateResult(new Date(now), nowMatch[0], nowMatch[0], preferences, false);
+  }
+
+  const dmy = lower.match(/\b(\d{2})\/(\d{2})\/(\d{4})(?:\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?|\d{1,2}:\d{2}))?\b/);
+  if (dmy) {
+    const dateTime = dmy[4] ? parseTimeValue(dmy[4]) : undefined;
+    const dateMinutes = dateTime?.minutes ?? minutes;
+    const date = new Date(`${dmy[3]}-${dmy[2]}-${dmy[1]}T00:00:00`);
+    date.setHours(Math.floor(dateMinutes / 60), dateMinutes % 60, 0, 0);
+    const isExplicitTime = Boolean(explicitTime || dateTime);
+    return isExplicitTime && date <= now
+      ? pastExplicitDateResult(dmy[0], dmy[0], preferences)
+      : parsedDateResult(rollVaguePastDate(date, now, preferences, dayPart), dmy[0], dmy[0], preferences, isExplicitTime);
+  }
+
+  const ymd = lower.match(/\b(\d{4}-\d{2}-\d{2})(?:\s+(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm)?|\d{1,2}:\d{2}))?\b/);
 
   if (ymd) {
-    const date = new Date(`${ymd[1]}T09:00:00`);
-    return Number.isNaN(date.getTime()) ? { dueText: ymd[1] } : { dueAt: date, dueText: ymd[1] };
-  }
-
-  if (/\btonight|this evening\b/i.test(text)) {
-    return { dueAt: atLocalTime(now, 20, 0), dueText: lower.includes("this evening") ? "this evening" : "tonight" };
-  }
-
-  if (/\btomorrow\b/i.test(text)) {
-    const date = addDaysAt(now, 1, 9, 0);
-    return { dueAt: date, dueText: "tomorrow" };
-  }
-
-  if (/\btoday\b/i.test(text)) {
-    return { dueAt: atLocalTime(now, 18, 0), dueText: "today" };
+    const dateTime = ymd[2] ? parseTimeValue(ymd[2]) : undefined;
+    const dateMinutes = dateTime?.minutes ?? minutes;
+    const date = new Date(`${ymd[1]}T00:00:00`);
+    date.setHours(Math.floor(dateMinutes / 60), dateMinutes % 60, 0, 0);
+    const isExplicitTime = Boolean(explicitTime || dateTime);
+    return isExplicitTime && date <= now
+      ? pastExplicitDateResult(ymd[0], ymd[0], preferences)
+      : parsedDateResult(rollVaguePastDate(date, now, preferences, dayPart), ymd[0], ymd[0], preferences, isExplicitTime);
   }
 
   const inDays = lower.match(/\bin\s+(\d+)\s+days?\b/);
   if (inDays) {
-    return { dueAt: addDaysAt(now, Number(inDays[1]), 9, 0), dueText: inDays[0] };
+    return parsedDateResult(addDaysAt(now, Number(inDays[1]), hour, minute), inDays[0], inDays[0], preferences, Boolean(explicitTime));
   }
 
   const inWeeks = lower.match(/\bin\s+(\d+)\s+weeks?\b/);
   if (inWeeks) {
-    return { dueAt: addDaysAt(now, Number(inWeeks[1]) * 7, 9, 0), dueText: inWeeks[0] };
+    return parsedDateResult(
+      addDaysAt(now, Number(inWeeks[1]) * 7, hour, minute),
+      inWeeks[0],
+      inWeeks[0],
+      preferences,
+      Boolean(explicitTime)
+    );
   }
 
-  const weekday = lower.match(/\b(?:by|on|next)?\s*(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/);
+  const tomorrow = lower.match(/\btomorrow(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/);
+  if (tomorrow) {
+    return parsedDateResult(addDaysAt(now, 1, hour, minute), tomorrow[0], tomorrow[0], preferences, Boolean(explicitTime));
+  }
+
+  const tonight = lower.match(/\btonight(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/);
+  if (tonight) {
+    const dueAt = atLocalTime(now, hour, minute);
+    if (explicitTime && dueAt <= now) {
+      return pastExplicitDateResult(tonight[0], tonight[0], preferences);
+    }
+    if (dueAt <= now) {
+      dueAt.setDate(dueAt.getDate() + 1);
+    }
+    return parsedDateResult(dueAt, tonight[0], tonight[0], preferences, Boolean(explicitTime));
+  }
+
+  const thisDayPart = lower.match(/\bthis\s+(morning|afternoon|evening)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/);
+  if (thisDayPart) {
+    const dueAt = atLocalTime(now, hour, minute);
+    if (explicitTime && dueAt <= now) {
+      return pastExplicitDateResult(thisDayPart[0], thisDayPart[0], preferences);
+    }
+    return parsedDateResult(
+      rollVaguePastDate(dueAt, now, preferences, thisDayPart[1] as ReturnType<typeof parseDayPart>),
+      thisDayPart[0],
+      thisDayPart[0],
+      preferences,
+      Boolean(explicitTime)
+    );
+  }
+
+  const today = lower.match(/\btoday(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/);
+  if (today) {
+    const dueAt = atLocalTime(now, hour, minute);
+    if (explicitTime && dueAt <= now) {
+      return pastExplicitDateResult(today[0], today[0], preferences);
+    }
+    return parsedDateResult(rollVaguePastDate(dueAt, now, preferences, dayPart), today[0], today[0], preferences, Boolean(explicitTime));
+  }
+
+  const weekday = lower.match(
+    /\b(?:(by|on|next)\s+)?(monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+(morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/
+  );
   if (weekday) {
-    const nextDate = nextWeekdayAt(now, weekday[1], /\bnext\s+/i.test(weekday[0]));
-    return { dueAt: nextDate, dueText: weekday[0].trim() };
+    const nextDate = nextWeekdayAt(now, weekday[2], weekday[1] === "next", hour, minute);
+    return parsedDateResult(nextDate, weekday[0].trim(), weekday[0].trim(), preferences, Boolean(explicitTime));
   }
 
-  return {};
+  if (explicitTime) {
+    const dueAt = atLocalTime(now, Math.floor(explicitTime.minutes / 60), explicitTime.minutes % 60);
+    if (dueAt <= now) {
+      return pastExplicitDateResult(explicitTime.matchedText, explicitTime.matchedText, preferences);
+    }
+    return parsedDateResult(dueAt, explicitTime.matchedText, explicitTime.matchedText, preferences, true);
+  }
+
+  return {
+    dueAt: null,
+    dueText: null,
+    matchedText: null,
+    confidence: 0,
+    timezone: preferences.timezone,
+    explicitTime: false
+  };
 }
 
 function atLocalTime(base: Date, hour: number, minute: number): Date {
@@ -215,10 +347,33 @@ function addDaysAt(base: Date, days: number, hour: number, minute: number): Date
   return date;
 }
 
-function nextWeekdayAt(base: Date, weekday: string, forceNext: boolean): Date {
+function addMinutes(base: Date, minutes: number): Date {
+  return new Date(base.getTime() + minutes * 60_000);
+}
+
+function rollVaguePastDate(
+  dueAt: Date,
+  now: Date,
+  preferences: ActionReminderPreferences,
+  dayPart?: ReturnType<typeof parseDayPart>
+): Date {
+  if (dueAt > now) {
+    return dueAt;
+  }
+
+  if (dayPart === "tonight") {
+    const nextTonight = atLocalTime(now, Math.floor(preferences.tonightTimeMinutes / 60), preferences.tonightTimeMinutes % 60);
+    nextTonight.setDate(nextTonight.getDate() + 1);
+    return nextTonight;
+  }
+
+  return addMinutes(now, 15);
+}
+
+function nextWeekdayAt(base: Date, weekday: string, forceNext: boolean, hour: number, minute: number): Date {
   const weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
   const target = weekdays.indexOf(weekday.toLowerCase());
-  const date = atLocalTime(base, 9, 0);
+  const date = atLocalTime(base, hour, minute);
   let days = (target - date.getDay() + 7) % 7;
 
   if (days === 0 || forceNext) {
@@ -227,6 +382,117 @@ function nextWeekdayAt(base: Date, weekday: string, forceNext: boolean): Date {
 
   date.setDate(date.getDate() + days);
   return date;
+}
+
+function normalizeActionReminderPreferences(input: Partial<ActionReminderPreferences> = {}): ActionReminderPreferences {
+  return {
+    timezone: input.timezone ?? "Europe/Madrid",
+    defaultActionTimeMinutes: validMinuteOfDay(input.defaultActionTimeMinutes) ? input.defaultActionTimeMinutes : 540,
+    morningTimeMinutes: validMinuteOfDay(input.morningTimeMinutes) ? input.morningTimeMinutes : 540,
+    afternoonTimeMinutes: validMinuteOfDay(input.afternoonTimeMinutes) ? input.afternoonTimeMinutes : 900,
+    eveningTimeMinutes: validMinuteOfDay(input.eveningTimeMinutes) ? input.eveningTimeMinutes : 1140,
+    tonightTimeMinutes: validMinuteOfDay(input.tonightTimeMinutes) ? input.tonightTimeMinutes : 1200
+  };
+}
+
+function validMinuteOfDay(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 1439;
+}
+
+function parseDayPart(text: string): "morning" | "afternoon" | "evening" | "tonight" | undefined {
+  if (/\btonight\b/.test(text)) return "tonight";
+  if (/\bmorning\b/.test(text)) return "morning";
+  if (/\bafternoon\b/.test(text)) return "afternoon";
+  if (/\bevening\b/.test(text)) return "evening";
+  return undefined;
+}
+
+function minutesForDayPart(dayPart: ReturnType<typeof parseDayPart>, preferences: ActionReminderPreferences): number {
+  if (dayPart === "morning") return preferences.morningTimeMinutes;
+  if (dayPart === "afternoon") return preferences.afternoonTimeMinutes;
+  if (dayPart === "evening") return preferences.eveningTimeMinutes;
+  if (dayPart === "tonight") return preferences.tonightTimeMinutes;
+  return preferences.defaultActionTimeMinutes;
+}
+
+function parseExplicitTime(text: string): { minutes: number; matchedText: string } | undefined {
+  const match = text.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const parsed = parseTimeParts(match[1], match[2], match[3]);
+
+  return parsed === undefined
+    ? undefined
+    : {
+        minutes: parsed,
+        matchedText: match[0]
+      };
+}
+
+function parseTimeValue(value: string): { minutes: number } | undefined {
+  const match = value.trim().toLowerCase().match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/);
+
+  if (!match) {
+    return undefined;
+  }
+
+  const minutes = parseTimeParts(match[1], match[2], match[3]);
+  return minutes === undefined ? undefined : { minutes };
+}
+
+function parseTimeParts(hourText: string, minuteText?: string, meridiem?: string): number | undefined {
+  let hour = Number(hourText);
+  const minute = minuteText ? Number(minuteText) : 0;
+
+  if (minute < 0 || minute > 59) {
+    return undefined;
+  }
+
+  if (meridiem) {
+    if (hour < 1 || hour > 12) return undefined;
+    if (meridiem === "pm" && hour !== 12) hour += 12;
+    if (meridiem === "am" && hour === 12) hour = 0;
+  } else if (hour < 0 || hour > 23) {
+    return undefined;
+  }
+
+  return hour * 60 + minute;
+}
+
+function parsedDateResult(
+  dueAt: Date,
+  dueText: string,
+  matchedText: string,
+  preferences: ActionReminderPreferences,
+  explicitTime: boolean
+): ParsedActionDate {
+  return {
+    dueAt: Number.isNaN(dueAt.getTime()) ? null : dueAt,
+    dueText,
+    matchedText,
+    confidence: Number.isNaN(dueAt.getTime()) ? 0.2 : 0.95,
+    timezone: preferences.timezone,
+    explicitTime
+  };
+}
+
+function pastExplicitDateResult(
+  dueText: string,
+  matchedText: string,
+  preferences: ActionReminderPreferences
+): ParsedActionDate {
+  return {
+    dueAt: null,
+    dueText,
+    matchedText,
+    confidence: 0,
+    timezone: preferences.timezone,
+    explicitTime: true,
+    invalidReason: "past_explicit_time"
+  };
 }
 
 function sentenceCase(text: string): string {
@@ -245,7 +511,7 @@ function escapeRegExp(text: string): string {
 export function normalizeManualActionTitleKey(text: string): string {
   return cleanManualActionTitle(text)
     .toLowerCase()
-    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete)\s+(?:the|a|an)\s+/gi, "$1 ")
+    .replace(/\b(review|send|finish|update|apply|write|prepare|book|schedule|check|reply|complete|pay|test)\s+(?:the|a|an)\s+/gi, "$1 ")
     .replace(/[^\w\s]/g, " ")
     .replace(/\s+/g, " ")
     .trim();

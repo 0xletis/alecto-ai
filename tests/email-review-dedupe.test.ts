@@ -6,7 +6,12 @@ import {
   findGmailSemanticDuplicateReviewItem,
   prisma
 } from "../packages/db/src/index.ts";
-import { classifyJobSearchEmail, classifyWorkActionEmail, normalizeManualActionTitleKey } from "../packages/core/src/index.ts";
+import {
+  classifyJobSearchEmail,
+  classifyWorkActionEmail,
+  normalizeManualActionTitleKey,
+  parseActionDueDate
+} from "../packages/core/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
 const userId = `test-user-${randomUUID()}`;
@@ -644,6 +649,265 @@ test("manual action API creates titled action with due parsing", async () => {
   }
 });
 
+test("natural action due parser supports day parts and explicit times", () => {
+  const now = new Date("2026-07-30T01:00:00");
+  const preferences = {
+    timezone: "Europe/Madrid",
+    defaultActionTimeMinutes: 540,
+    morningTimeMinutes: 510,
+    afternoonTimeMinutes: 900,
+    eveningTimeMinutes: 1140,
+    tonightTimeMinutes: 1260
+  };
+
+  assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow", { now, preferences }).dueAt), 540);
+  assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow afternoon", { now, preferences }).dueAt), 900);
+  assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow evening", { now, preferences }).dueAt), 1140);
+  assert.equal(localMinutes(parseActionDueDate("send CV tonight", { now, preferences }).dueAt), 1260);
+  assert.equal(localMinutes(parseActionDueDate("review homepage tomorrow at 6pm", { now, preferences }).dueAt), 1080);
+  assert.equal(localMinutes(parseActionDueDate("pay rent Friday morning", { now, preferences }).dueAt), 510);
+  assert.equal(localMinutes(parseActionDueDate("follow up in 2 days", { now, preferences }).dueAt), 540);
+});
+
+test("natural action due parser avoids vague past times and rejects explicit past", () => {
+  const now = new Date("2026-07-30T11:00:00+02:00");
+  const lateNow = new Date("2026-07-30T22:00:00+02:00");
+  const preferences = {
+    timezone: "Europe/Madrid",
+    defaultActionTimeMinutes: 540,
+    morningTimeMinutes: 540,
+    afternoonTimeMinutes: 900,
+    eveningTimeMinutes: 1140,
+    tonightTimeMinutes: 1200
+  };
+
+  const today = parseActionDueDate("call Alex today", { now, preferences });
+  assert.ok(today.dueAt && today.dueAt > now);
+  assert.equal(minutesBetween(now, today.dueAt), 15);
+
+  const todayMorning = parseActionDueDate("call Alex today morning", { now, preferences });
+  assert.ok(todayMorning.dueAt && todayMorning.dueAt > now);
+  assert.equal(minutesBetween(now, todayMorning.dueAt), 15);
+
+  const thisMorning = parseActionDueDate("call Alex this morning", { now, preferences });
+  assert.ok(thisMorning.dueAt && thisMorning.dueAt > now);
+  assert.equal(minutesBetween(now, thisMorning.dueAt), 15);
+
+  const todayAfternoon = parseActionDueDate("call Alex today afternoon", { now, preferences });
+  assert.ok(todayAfternoon.dueAt && todayAfternoon.dueAt > now);
+  assert.equal(localMinutes(todayAfternoon.dueAt), 900);
+
+  const tonight = parseActionDueDate("call Alex tonight", { now, preferences });
+  assert.ok(tonight.dueAt && tonight.dueAt > now);
+  assert.equal(localMinutes(tonight.dueAt), 1200);
+
+  const lateTonight = parseActionDueDate("call Alex tonight", { now: lateNow, preferences });
+  assert.ok(lateTonight.dueAt && lateTonight.dueAt > lateNow);
+  assert.equal(localMinutes(lateTonight.dueAt), 1200);
+  assert.equal(localDate(lateTonight.dueAt), "2026-07-31");
+
+  const explicitPast = parseActionDueDate("call Alex today at 9am", { now, preferences });
+  assert.equal(explicitPast.dueAt, null);
+  assert.equal(explicitPast.invalidReason, "past_explicit_time");
+
+  const dmyExplicitPast = parseActionDueDate("call Alex 30/07/2026 at 09:00", { now, preferences });
+  assert.equal(dmyExplicitPast.dueAt, null);
+  assert.equal(dmyExplicitPast.invalidReason, "past_explicit_time");
+
+  const ymdExplicitPast = parseActionDueDate("call Alex 2026-07-30 09:00", { now, preferences });
+  assert.equal(ymdExplicitPast.dueAt, null);
+  assert.equal(ymdExplicitPast.invalidReason, "past_explicit_time");
+
+  const nowDue = parseActionDueDate("call Alex now", { now, preferences });
+  assert.ok(nowDue.dueAt && nowDue.dueAt.getTime() === now.getTime());
+
+  const atNowDue = parseActionDueDate("call Alex at now", { now, preferences });
+  assert.ok(atNowDue.dueAt && atNowDue.dueAt.getTime() === now.getTime());
+});
+
+test("manual action uses reminder preferences and strips natural time from title", async () => {
+  const server = buildServer();
+  const actionUserId = `action-prefs-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: actionUserId,
+      defaultActionTimeMinutes: 600,
+      afternoonTimeMinutes: 960,
+      timezone: "Europe/Madrid"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "review homepage tomorrow afternoon" }
+    });
+    assert.equal(response.statusCode, 200);
+    const payload = response.json();
+    assert.equal(payload.action.title, "Review homepage");
+    assert.equal(payload.extraction.dueText, "tomorrow afternoon");
+    assert.equal(localMinutes(new Date(payload.action.dueAt)), 960);
+    assert.doesNotMatch(payload.message, /T\d{2}:\d{2}:\d{2}/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("notification settings accept valid reminder time minutes and reject invalid values", async () => {
+  const server = buildServer();
+  const actionUserId = `action-settings-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const valid = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/notification-settings`,
+      payload: { morningTimeMinutes: 480 }
+    });
+    assert.equal(valid.statusCode, 200);
+    assert.equal(valid.json().notificationSettings.morningTimeMinutes, 480);
+
+    const invalid = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/notification-settings`,
+      payload: { morningTimeMinutes: 1500 }
+    });
+    assert.equal(invalid.statusCode, 400);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("manual action route rejects explicit past time and accepts now", async () => {
+  const server = buildServer();
+  const actionUserId = `action-past-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const past = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: `review homepage ${yesterdayLocalDate()} at 09:00` }
+    });
+    assert.equal(past.statusCode, 400);
+    assert.equal(past.json().error, "That time has already passed. Use a future time, or say 'now'.");
+
+    const nowAction = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "test at now" }
+    });
+    assert.equal(nowAction.statusCode, 200);
+    assert.equal(nowAction.json().action.title, "Test");
+    assert.ok(new Date(nowAction.json().action.dueAt) > new Date(Date.now() - 60_000));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("standalone now gets neutral scheduling prompt", async () => {
+  const server = buildServer();
+  const actionUserId = `action-now-standalone-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "now" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "What should I schedule now? Example: /action call Alex now");
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("snooze route avoids vague past times and rejects explicit past time", async () => {
+  const server = buildServer();
+  const actionUserId = `action-snooze-past-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: actionUserId,
+      morningTimeMinutes: 1,
+      timezone: "Europe/Madrid"
+    }
+  });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Call Alex",
+      priority: "medium"
+    }
+  });
+
+  try {
+    const vaguePast = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/snooze`,
+      payload: { snoozeText: "today morning" }
+    });
+    assert.equal(vaguePast.statusCode, 200);
+    assert.ok(new Date(vaguePast.json().action.snoozedUntil) > new Date());
+
+    const explicitPast = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/snooze`,
+      payload: { snoozeText: `${yesterdayLocalDate()} at 09:00` }
+    });
+    assert.equal(explicitPast.statusCode, 400);
+    assert.equal(explicitPast.json().error, "That snooze time has already passed.");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("snooze route accepts now and makes action remindable", async () => {
+  const server = buildServer();
+  const actionUserId = `action-snooze-now-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Call Alex",
+      priority: "medium"
+    }
+  });
+
+  try {
+    const snoozed = await server.inject({
+      method: "PATCH",
+      url: `/users/${actionUserId}/actions/${action.id}/snooze`,
+      payload: { snoozeText: "now" }
+    });
+    assert.equal(snoozed.statusCode, 200);
+
+    const reminder = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/reminders/trigger`
+    });
+    assert.equal(reminder.statusCode, 200);
+    assert.equal(reminder.json().sent, 1);
+    assert.match(reminder.json().message, /Snoozed action is back:/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
 test("todo text creates action and strips tonight from title", async () => {
   const server = buildServer();
   const actionUserId = `action-todo-${randomUUID()}`;
@@ -725,7 +989,7 @@ test("manual action title key treats optional articles as same task", () => {
   assert.equal(normalizeManualActionTitleKey("Review homepage copy"), normalizeManualActionTitleKey("Review the homepage copy"));
 });
 
-test("same manual task dedupes by due day even when timestamps differ", async () => {
+test("same manual task dedupes by local due date and time", async () => {
   const server = buildServer();
   const actionUserId = `action-day-dedupe-${randomUUID()}`;
   await prisma.user.create({ data: { id: actionUserId } });
@@ -735,7 +999,7 @@ test("same manual task dedupes by due day even when timestamps differ", async ()
       source: "manual",
       title: "Review homepage copy",
       priority: "medium",
-      dueAt: new Date("2026-07-30T18:00:00.000Z")
+      dueAt: new Date("2026-07-30T07:00:00.000Z")
     }
   });
 
@@ -750,6 +1014,35 @@ test("same manual task dedupes by due day even when timestamps differ", async ()
 
     const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
     assert.equal(actions.length, 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("same manual task does not dedupe across different due time buckets", async () => {
+  const server = buildServer();
+  const actionUserId = `action-time-dedupe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  try {
+    const morning = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "call Alex tomorrow morning" }
+    });
+    assert.equal(morning.statusCode, 200);
+
+    const evening = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/actions/manual`,
+      payload: { text: "call Alex tomorrow evening" }
+    });
+    assert.equal(evening.statusCode, 200);
+    assert.equal(evening.json().duplicate, false);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 2);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
@@ -941,6 +1234,40 @@ test("action reminder trigger sends open due action and includes commands", asyn
     assert.match(payload.message, new RegExp(`/complete_action ${action.id}`));
     assert.match(payload.message, new RegExp(`/snooze_action ${action.id} tomorrow`));
     assert.match(payload.message, new RegExp(`/archive_action ${action.id}`));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("now action triggers reminder immediately and does not duplicate", async () => {
+  const server = buildServer();
+  const reminderUserId = `telegram:${randomUUID().replace(/-/g, "").slice(0, 10)}`;
+  await prisma.user.create({ data: { id: reminderUserId } });
+
+  try {
+    const created = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/manual`,
+      payload: { text: "test now" }
+    });
+    assert.equal(created.statusCode, 200);
+    assert.equal(created.json().action.title, "Test");
+
+    const first = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(first.statusCode, 200);
+    assert.equal(first.json().sent, 1);
+    assert.match(first.json().message, /Action due:/);
+
+    const second = await server.inject({
+      method: "POST",
+      url: `/users/${reminderUserId}/actions/reminders/trigger`
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(second.json().sent, 0);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: reminderUserId } });
@@ -1213,4 +1540,42 @@ async function createReview(input: {
   });
 
   return item.id;
+}
+
+function localMinutes(date: Date | null): number | undefined {
+  if (!date) {
+    return undefined;
+  }
+
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Madrid",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).formatToParts(date);
+  const hour = Number(parts.find((part) => part.type === "hour")?.value ?? "0");
+  const minute = Number(parts.find((part) => part.type === "minute")?.value ?? "0");
+
+  return hour * 60 + minute;
+}
+
+function localDate(date: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Madrid",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+
+  return `${parts.find((part) => part.type === "year")?.value}-${parts.find((part) => part.type === "month")?.value}-${parts.find((part) => part.type === "day")?.value}`;
+}
+
+function minutesBetween(start: Date, end: Date): number {
+  return Math.round((end.getTime() - start.getTime()) / 60_000);
+}
+
+function yesterdayLocalDate(): string {
+  const date = new Date();
+  date.setDate(date.getDate() - 1);
+  return localDate(date);
 }

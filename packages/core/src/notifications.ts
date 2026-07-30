@@ -12,6 +12,11 @@ export const NotificationSettingsSchema = z.object({
   weeklyInsightDay: z.enum(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]).optional(),
   weeklyInsightTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
   timezone: z.string().default("Europe/Madrid"),
+  defaultActionTimeMinutes: z.number().int().min(0).max(1439).default(540),
+  morningTimeMinutes: z.number().int().min(0).max(1439).default(540),
+  afternoonTimeMinutes: z.number().int().min(0).max(1439).default(900),
+  eveningTimeMinutes: z.number().int().min(0).max(1439).default(1140),
+  tonightTimeMinutes: z.number().int().min(0).max(1439).default(1200),
   createdAt: z.coerce.date(),
   updatedAt: z.coerce.date()
 });
@@ -25,7 +30,12 @@ export const UpdateNotificationSettingsInputSchema = z.object({
   weeklyInsightEnabled: z.boolean().optional(),
   weeklyInsightDay: z.enum(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]).optional(),
   weeklyInsightTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
-  timezone: z.string().optional()
+  timezone: z.string().optional(),
+  defaultActionTimeMinutes: z.number().int().min(0).max(1439).optional(),
+  morningTimeMinutes: z.number().int().min(0).max(1439).optional(),
+  afternoonTimeMinutes: z.number().int().min(0).max(1439).optional(),
+  eveningTimeMinutes: z.number().int().min(0).max(1439).optional(),
+  tonightTimeMinutes: z.number().int().min(0).max(1439).optional()
 });
 
 export type NotificationSettings = z.infer<typeof NotificationSettingsSchema>;
