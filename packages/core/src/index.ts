@@ -9,6 +9,7 @@ export * from "./goal-templates.js";
 export * from "./goals.js";
 export * from "./insights.js";
 export * from "./ingestion.js";
+export * from "./inbound-message.js";
 export * from "./integration-registry.js";
 export * from "./message-processing.js";
 export * from "./memory.js";

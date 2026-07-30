@@ -1,5 +1,13 @@
 import { config } from "dotenv";
 import { Bot, type Context } from "grammy";
+import {
+  buildNormalizedInboundMessage,
+  explainNormalizedInboundRoute,
+  routeNormalizedInboundMessage,
+  shouldCheckRecentDailyCheckInReminder,
+  type InboundRouteDebug,
+  type NormalizedInboundMessage
+} from "@operator-agent/core";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -57,6 +65,31 @@ bot.command("setup", async (ctx) => {
       "5. Use /review to check the day"
     ].join("\n")
   );
+});
+
+bot.command("help", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  await ctx.reply("Try /today, /actions, /goals, /events, /insight, /action_help, or /debug_route <message>.");
+});
+
+bot.command("debug_route", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply("Usage: /debug_route <message>");
+    return;
+  }
+
+  const inbound = buildNormalizedTelegramMessage(ctx, text);
+  const debug = explainNormalizedInboundRoute(inbound);
+  await ctx.reply(formatRouteDebug(debug));
 });
 
 bot.command("profile", async (ctx) => {
@@ -1500,46 +1533,31 @@ bot.on("message:text", async (ctx) => {
   }
 
   try {
-    if (ctx.message.text.startsWith("/")) {
+    const inbound = buildNormalizedTelegramMessage(ctx);
+    const recentDailyCheckInReminder = shouldCheckRecentDailyCheckInReminder(inbound)
+      ? await getRecentDailyCheckInReminder(inbound)
+      : false;
+    const route = routeNormalizedInboundMessage(inbound, { recentDailyCheckInReminder });
+
+    if (route.kind === "command") {
+      await ctx.reply("Unknown command. Try /help.");
       return;
     }
 
-    const message = ctx.message.text;
-
-    if (isExplicitMemoryRequest(message) || isDirectBettingTradingIntent(message)) {
-      const response = await apiPost<ProcessMessageResponse>("/messages/process", {
-        userId: getTelegramUserId(ctx),
-        message
+    if (route.kind === "daily_checkin") {
+      const response = await apiPost<NaturalCheckInResponse>(`/users/${inbound.userId}/checkins/daily/text`, {
+        text: inbound.text
       });
 
       await ctx.reply(response.reply);
       return;
     }
 
-    if (isStandaloneNowText(message)) {
-      const response = await apiPost<ProcessMessageResponse>("/messages/process", {
-        userId: getTelegramUserId(ctx),
-        message
-      });
-
-      await ctx.reply(response.reply);
-      return;
-    }
-
-    if (await shouldTreatAsNaturalCheckIn(ctx)) {
-      const response = await apiPost<NaturalCheckInResponse>(`/users/${getTelegramUserId(ctx)}/checkins/daily/text`, {
-        text: message
-      });
-
-      await ctx.reply(response.reply);
-      return;
-    }
-
-    if (looksLikeJobSearchPaste(message)) {
-      const response = await apiPost<IngestionResponse>(`/users/${getTelegramUserId(ctx)}/ingest/text`, {
-        text: message,
-        source: "telegram",
-        domainHint: "career"
+    if (route.kind === "ingest_text") {
+      const response = await apiPost<IngestionResponse>(`/users/${inbound.userId}/ingest/text`, {
+        text: inbound.text,
+        source: route.source,
+        domainHint: route.domainHint
       });
 
       await ctx.reply(response.reply);
@@ -1547,8 +1565,8 @@ bot.on("message:text", async (ctx) => {
     }
 
     const response = await apiPost<ProcessMessageResponse>("/messages/process", {
-      userId: getTelegramUserId(ctx),
-      message
+      userId: inbound.userId,
+      message: inbound.text
     });
 
     await ctx.reply(response.reply);
@@ -1935,117 +1953,51 @@ function parseCheckInValue(value: string): string | number | boolean {
   return Number.isFinite(numberValue) ? numberValue : value;
 }
 
-async function shouldTreatAsNaturalCheckIn(ctx: Context): Promise<boolean> {
-  const message = ctx.message?.text ?? "";
-  const signalCounts = countNaturalCheckInSignals(message);
+function buildNormalizedTelegramMessage(ctx: Context, textOverride?: string): NormalizedInboundMessage {
+  const externalUserId = String(ctx.from?.id ?? "");
+  const timestamp = ctx.message?.date ? new Date(ctx.message.date * 1000) : new Date();
 
-  if (isExplicitMemoryRequest(message) || isDirectBettingTradingIntent(message)) {
-    return false;
-  }
+  return buildNormalizedInboundMessage({
+    channel: "telegram",
+    userId: getTelegramUserId(ctx),
+    externalUserId,
+    text: textOverride ?? ctx.message?.text ?? "",
+    messageType: "text",
+    timestamp,
+    metadata: {
+      chatId: ctx.chat?.id,
+      messageId: ctx.message?.message_id,
+      username: ctx.from?.username
+    }
+  });
+}
 
-  if (signalCounts.state >= 1 || signalCounts.progress >= 2) {
-    return true;
-  }
+function formatRouteDebug(debug: InboundRouteDebug): string {
+  return [
+    `intentType: ${debug.intentType}`,
+    `confidence: ${debug.confidence.toFixed(2)}`,
+    `handlerName: ${debug.handlerName}`,
+    `shouldRunGenericChat: ${String(debug.shouldRunGenericChat)}`,
+    "allowedSideEffects:",
+    `- createEvent: ${String(debug.allowedSideEffects.createEvent)}`,
+    `- createAction: ${String(debug.allowedSideEffects.createAction)}`,
+    `- createMemory: ${String(debug.allowedSideEffects.createMemory)}`,
+    `- sendNotification: ${String(debug.allowedSideEffects.sendNotification)}`,
+    `- callLLM: ${String(debug.allowedSideEffects.callLLM)}`,
+    `reason: ${debug.reason}`
+  ].join("\n");
+}
 
-  if (signalCounts.state + signalCounts.progress + signalCounts.reminderOnlyImpulse < 1) {
-    return false;
-  }
-
+async function getRecentDailyCheckInReminder(message: NormalizedInboundMessage): Promise<boolean> {
   try {
     const response = await apiGet<RecentDailyCheckInReminderResponse>(
-      `/users/${getTelegramUserId(ctx)}/notification-logs/recent-daily-checkin`
+      `/users/${message.userId}/notification-logs/recent-daily-checkin`
     );
     return response.recent;
   } catch (error) {
     console.error("Could not check recent daily check-in reminder", error);
     return false;
   }
-}
-
-function isExplicitMemoryRequest(message: string): boolean {
-  return /\b(remember that|remember this|note that|recuerda que|acu[eé]rdate de que|guard[ae] que)\b/i.test(message);
-}
-
-function isDirectBettingTradingIntent(message: string): boolean {
-  return /\b(quiero apostar|voy a apostar|i want to bet|i'?m going to bet|quiero tradear|voy a tradear|i want to trade|long|short|leverage)\b/i.test(
-    message
-  );
-}
-
-function isStandaloneNowText(message: string): boolean {
-  return /^now$/i.test(message.trim());
-}
-
-function looksLikeJobSearchPaste(message: string): boolean {
-  const normalized = normalizeSignalText(message);
-  const jobPastePatterns = [
-    /\bunfortunately\b/,
-    /\bnot selected\b/,
-    /\bmove forward with other candidates\b/,
-    /\bnot be proceeding\b/,
-    /\bno longer under consideration\b/,
-    /\bhemos decidido continuar con otros candidatos\b/,
-    /\bthanks for applying\b/,
-    /\bwe received your application\b/,
-    /\bapplication received\b/,
-    /\bgracias por aplicar\b/,
-    /\bhemos recibido tu solicitud\b/,
-    /\bwe'?d like to schedule an interview\b/,
-    /\bwould like to schedule an interview\b/,
-    /\bschedule an interview\b/,
-    /\bschedule a call\b/,
-    /\bare you available\b/,
-    /\bavailable next\b/,
-    /\bavailable times\b/,
-    /\bcalendly\b/,
-    /\bentrevista\b/,
-    /\bagendar\b/,
-    /\bprogramar una llamada\b/,
-    /\bwe would like to offer\b/,
-    /\bemployment agreement\b/,
-    /\boffer\b/,
-    /\brecruiter\b/,
-    /\btalent acquisition\b/,
-    /\bwe'?d like to discuss\b/,
-    /\bwe would like to discuss\b/
-  ];
-
-  return jobPastePatterns.some((pattern) => pattern.test(normalized));
-}
-
-function countNaturalCheckInSignals(message: string): { state: number; progress: number; reminderOnlyImpulse: number } {
-  const normalized = normalizeSignalText(message);
-  const statePatterns = [
-    /\benergy\b|\benergia\b/,
-    /\banxiety\b|\bansiedad\b/,
-    /\bfocus\b|\bfoco\b/,
-    /\bslept\b|\bsleep\b|\bdormi\b|\bdormir\b/
-  ];
-  const progressPatterns = [
-    /\b(?:sent|mande|mandado|envie|enviado)\s+\d*\s*(?:cvs?|applications?)\b|\b\d+\s*(?:cvs?|applications?)\b/,
-    /\btrained\b|\bentrene\b|\bentrenado\b|\bgym\b|\bworkout\b/,
-    /\bread\b|\blei\b|\breading\b/
-  ];
-  const reminderOnlyImpulsePatterns = [
-    /\bganas de apostar\s*\d+(?:\.\d+)?\b/,
-    /\b(?:gambling impulse|trading impulse)\s*(?:is|=|:)?\s*\d+(?:\.\d+)?\b/,
-    /\bno (?:gambling impulse|trading impulse|bets?)\b/
-  ];
-
-  return {
-    state: statePatterns.filter((pattern) => pattern.test(normalized)).length,
-    progress: progressPatterns.filter((pattern) => pattern.test(normalized)).length,
-    reminderOnlyImpulse: reminderOnlyImpulsePatterns.filter((pattern) => pattern.test(normalized)).length
-  };
-}
-
-function normalizeSignalText(message: string): string {
-  return message
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/\p{Diacritic}/gu, "")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 async function sendInsight(ctx: Context, periodType: "daily" | "weekly") {
@@ -2942,6 +2894,17 @@ async function createManualActionFromCommand(ctx: Context, commandName: string) 
   }
 
   try {
+    const routeDebug = explainNormalizedInboundRoute(buildNormalizedTelegramMessage(ctx, `${commandName} ${text}`));
+
+    if (routeDebug.intentType === "command_with_risk") {
+      const riskResponse = await apiPost<ProcessMessageResponse>("/messages/process", {
+        userId: getTelegramUserId(ctx),
+        message: text
+      });
+      await ctx.reply(riskResponse.reply);
+      return;
+    }
+
     const response = await apiPost<ManualActionResponse>(`/users/${getTelegramUserId(ctx)}/actions/manual`, {
       text
     });

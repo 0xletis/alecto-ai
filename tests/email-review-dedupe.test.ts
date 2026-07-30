@@ -7,16 +7,213 @@ import {
   prisma
 } from "../packages/db/src/index.ts";
 import {
+  buildNormalizedInboundMessage,
   classifyJobSearchEmail,
   classifyWorkActionEmail,
+  explainNormalizedInboundRoute,
   normalizeManualActionTitleKey,
-  parseActionDueDate
+  parseActionDueDate,
+  routeNormalizedInboundMessage
 } from "../packages/core/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
 const userId = `test-user-${randomUUID()}`;
 const connectionId = randomUUID();
 const ruleId = randomUUID();
+
+test("normalized inbound messages parse channel-neutral slash commands", () => {
+  const telegramMessage = buildNormalizedInboundMessage({
+    channel: "telegram",
+    userId: "telegram:123",
+    externalUserId: "123",
+    text: "/today",
+    timestamp: new Date("2026-07-30T10:00:00.000Z")
+  });
+  const whatsappMessage = buildNormalizedInboundMessage({
+    channel: "whatsapp",
+    userId: "whatsapp:123",
+    externalUserId: "123",
+    text: "/today",
+    timestamp: new Date("2026-07-30T10:00:00.000Z")
+  });
+
+  assert.equal(telegramMessage.command?.name, "today");
+  assert.equal(whatsappMessage.command?.name, "today");
+  assert.deepEqual(routeNormalizedInboundMessage(telegramMessage), {
+    kind: "command",
+    command: { name: "today", args: "", raw: "/today" }
+  });
+  assert.deepEqual(routeNormalizedInboundMessage(whatsappMessage), {
+    kind: "command",
+    command: { name: "today", args: "", raw: "/today" }
+  });
+});
+
+test("normalized inbound router prioritizes memory and risk before check-in routing", () => {
+  const memoryMessage = buildNormalizedInboundMessage({
+    channel: "telegram",
+    userId: "telegram:123",
+    externalUserId: "123",
+    text: "remember that when I talk about gambling I want you stricter"
+  });
+  const bettingMessage = buildNormalizedInboundMessage({
+    channel: "whatsapp",
+    userId: "whatsapp:123",
+    externalUserId: "123",
+    text: "quiero apostar 1000 porque esto es seguro"
+  });
+  const checkInMessage = buildNormalizedInboundMessage({
+    channel: "web",
+    userId: "web:123",
+    externalUserId: "123",
+    text: "slept 6h, energy 5, anxiety 7, sent 2 cvs, trained 40 min, no gambling impulse"
+  });
+
+  assert.equal(routeNormalizedInboundMessage(memoryMessage).kind, "process_message");
+  assert.equal(routeNormalizedInboundMessage(bettingMessage).kind, "process_message");
+  assert.equal(routeNormalizedInboundMessage(checkInMessage).kind, "daily_checkin");
+});
+
+test("normalized inbound router sends pasted job-search emails to ingestion", () => {
+  const message = buildNormalizedInboundMessage({
+    channel: "telegram",
+    userId: "telegram:123",
+    externalUserId: "123",
+    text: "Hi Miquel, we'd like to schedule an interview for the Backend Engineer role at Test Company. Are you available next Tuesday?"
+  });
+
+  assert.deepEqual(routeNormalizedInboundMessage(message), {
+    kind: "ingest_text",
+    source: "telegram",
+    domainHint: "career"
+  });
+});
+
+test("route debug explains commands and does not imply command execution", () => {
+  const today = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "/today"
+    })
+  );
+  const gmailDebug = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "/sync_gmail_debug"
+    })
+  );
+
+  assert.equal(today.intentType, "command");
+  assert.equal(today.handlerName, "today");
+  assert.equal(today.allowedSideEffects.createEvent, false);
+  assert.equal(today.allowedSideEffects.createAction, false);
+  assert.equal(today.allowedSideEffects.createMemory, false);
+  assert.equal(gmailDebug.intentType, "command");
+  assert.equal(gmailDebug.handlerName, "sync_gmail_debug");
+  assert.equal(gmailDebug.allowedSideEffects.sendNotification, false);
+});
+
+test("route debug explains action, event, risk, and standalone now routes", () => {
+  const now = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "now"
+    })
+  );
+  const action = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "web",
+      userId: "web:123",
+      externalUserId: "123",
+      text: "I need to call Alex tomorrow"
+    })
+  );
+  const event = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "api",
+      userId: "api:123",
+      externalUserId: "123",
+      text: "sent 2 CVs and trained 30 min"
+    })
+  );
+  const risk = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "whatsapp",
+      userId: "whatsapp:123",
+      externalUserId: "123",
+      text: "remind me to bet 500 tomorrow"
+    })
+  );
+  const actionRisk = explainNormalizedInboundRoute(
+    buildNormalizedInboundMessage({
+      channel: "telegram",
+      userId: "telegram:123",
+      externalUserId: "123",
+      text: "/action bet 500 tomorrow"
+    })
+  );
+
+  assert.equal(now.intentType, "unknown");
+  assert.equal(now.allowedSideEffects.createAction, false);
+  assert.equal(now.allowedSideEffects.createEvent, false);
+  assert.equal(action.intentType, "action_create");
+  assert.equal(action.allowedSideEffects.createAction, true);
+  assert.equal(event.intentType, "event_log");
+  assert.equal(event.allowedSideEffects.createEvent, true);
+  assert.equal(risk.intentType, "risk_guardrail");
+  assert.equal(risk.allowedSideEffects.createAction, false);
+  assert.equal(actionRisk.intentType, "command_with_risk");
+  assert.equal(actionRisk.handlerName, "action");
+  assert.equal(actionRisk.allowedSideEffects.createAction, false);
+});
+
+test("risky action command text routes to guardrail response without creating ActionItem", async () => {
+  const server = buildServer();
+  const actionUserId = `action-risk-command-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+
+  const cases = [
+    { command: "/action", text: "bet 500 tomorrow", intent: "betting_intent" },
+    { command: "/todo", text: "open 20x long tomorrow", intent: "trading_intent" },
+    { command: "/add_action", text: "place bet tonight", intent: "betting_intent" }
+  ];
+
+  try {
+    for (const testCase of cases) {
+      const debug = explainNormalizedInboundRoute(
+        buildNormalizedInboundMessage({
+          channel: "telegram",
+          userId: actionUserId,
+          externalUserId: "123",
+          text: `${testCase.command} ${testCase.text}`
+        })
+      );
+      assert.equal(debug.intentType, "command_with_risk");
+      assert.equal(debug.allowedSideEffects.createAction, false);
+
+      const response = await server.inject({
+        method: "POST",
+        url: "/messages/process",
+        payload: { userId: actionUserId, message: testCase.text }
+      });
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().intent, testCase.intent);
+      assert.notEqual(response.json().reply, "I could not turn that into a concrete action item.");
+    }
+
+    const actions = await prisma.actionItem.findMany({ where: { userId: actionUserId } });
+    assert.equal(actions.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
 
 test.before(async () => {
   await prisma.user.create({
