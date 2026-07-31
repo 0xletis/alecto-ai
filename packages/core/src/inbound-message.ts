@@ -107,6 +107,11 @@ export type RouteSideEffects = z.infer<typeof RouteSideEffectsSchema>;
 export type InboundRouteDebug = z.infer<typeof InboundRouteDebugSchema>;
 export type InboundMessageSegmentResult = z.infer<typeof InboundMessageSegmentResultSchema>;
 
+export interface PendingDecisionReplyWithCommands {
+  replyText: string;
+  commands: string[];
+}
+
 export interface BuildNormalizedInboundMessageInput {
   channel: InboundChannel;
   userId: string;
@@ -216,6 +221,29 @@ export function segmentInboundMessage(text: string): InboundMessageSegmentResult
     text: trimmed,
     reason: "No command batch or reference pattern detected."
   });
+}
+
+export function splitPendingDecisionReplyWithCommands(text: string): PendingDecisionReplyWithCommands | undefined {
+  const lines = text
+    .trim()
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2 || !isPendingDecisionReplyLine(lines[0])) {
+    return undefined;
+  }
+
+  const commands = lines.slice(1);
+
+  if (commands.length === 0 || commands.some((line) => !line.startsWith("/"))) {
+    return undefined;
+  }
+
+  return {
+    replyText: lines[0],
+    commands
+  };
 }
 
 export function routeNormalizedInboundMessage(
@@ -532,6 +560,12 @@ export function isDirectBettingTradingIntent(message: string): boolean {
 
 export function isStandaloneNowText(message: string): boolean {
   return /^now$/i.test(message.trim());
+}
+
+function isPendingDecisionReplyLine(text: string): boolean {
+  return /^(?:yes|confirm|no|cancel|[1-9]|first|second|third|fourth|fifth|the first one|the second one|the third one|the fourth one|the fifth one)$/i.test(
+    text.trim()
+  );
 }
 
 export function looksLikeNaturalCheckIn(message: string, context: InboundRoutingContext = {}): boolean {

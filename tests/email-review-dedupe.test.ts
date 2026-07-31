@@ -19,6 +19,7 @@ import {
   parseActionDueDate,
   routeNormalizedInboundMessage,
   segmentInboundMessage,
+  splitPendingDecisionReplyWithCommands,
   sortDailyActionsByPriority,
   validateDailyCoachResponseAgainstContext
 } from "../packages/core/src/index.ts";
@@ -119,6 +120,20 @@ test("inbound message segmentation detects command batches and references", () =
 
   const normalText = segmentInboundMessage("I sent 2 CVs and trained 30 min");
   assert.equal(normalText.kind, "normal_text");
+
+  assert.deepEqual(splitPendingDecisionReplyWithCommands("no\n/actions"), {
+    replyText: "no",
+    commands: ["/actions"]
+  });
+  assert.deepEqual(splitPendingDecisionReplyWithCommands("yes\n/actions"), {
+    replyText: "yes",
+    commands: ["/actions"]
+  });
+  assert.deepEqual(splitPendingDecisionReplyWithCommands("1\n/actions"), {
+    replyText: "1",
+    commands: ["/actions"]
+  });
+  assert.equal(splitPendingDecisionReplyWithCommands("move YouTube to tomorrow\n/actions"), undefined);
 });
 
 test("normalized inbound router prioritizes memory and risk before check-in routing", () => {
@@ -932,6 +947,329 @@ test("conversation control guardrails and debug are side-effect free", async () 
     });
     assert.equal(process.statusCode, 200);
     assert.equal(process.json().mode, "guardian");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("multi-intent orchestrator logs events, mutates actions, and returns readouts safely", async () => {
+  const server = buildServer();
+  const actionUserId = `multi-intent-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      id: randomUUID(),
+      userId: actionUserId,
+      timezone: "Europe/Madrid",
+      afternoonTimeMinutes: 990
+    }
+  });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative",
+      status: "active",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      status: "active",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  const youtubeAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      status: "open",
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title
+    }
+  });
+  const applyAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      status: "open",
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title
+    }
+  });
+  const carAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Check cheap car listings",
+      priority: "medium",
+      status: "open"
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "I applied to 2 jobs, trained 30 min, and what should I do now?",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, true);
+    assert.match(response.json().reply, /Logged 2 job applications/);
+    assert.match(response.json().reply, /Logged 30 min training/);
+    assert.match(response.json().reply, /Next move:/);
+    assert.equal(await prisma.event.count({ where: { userId: actionUserId, type: "career.application_sent" } }), 1);
+    assert.equal(await prisma.event.count({ where: { userId: actionUserId, type: "health.workout_completed" } }), 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "move YouTube script to tomorrow afternoon and show actions",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action rescheduled: Write YouTube script/);
+    assert.match(response.json().reply, /Open actions:/);
+    const movedYoutube = await prisma.actionItem.findUniqueOrThrow({ where: { id: youtubeAction.id } });
+    assert.ok(movedYoutube.dueAt);
+    assert.equal(localDate(movedYoutube.dueAt), "2026-08-01");
+    assert.equal(localMinutes(movedYoutube.dueAt), 990);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "done with apply to 2 jobs and show today",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action completed: Apply to 2 jobs/);
+    assert.match(response.json().reply, /Today - 2026-07-31/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: applyAction.id } })).status, "completed");
+    assert.equal(
+      await prisma.event.count({
+        where: {
+          userId: actionUserId,
+          type: "custom.goal_progress_logged",
+          provider: "action_completion",
+          externalId: `action-completion:${applyAction.id}`
+        }
+      }),
+      1
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: { text: "make YouTube high priority and show goal priorities" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Goal priority updated: Build a YouTube channel -> high/);
+    assert.match(response.json().reply, /Goal priorities:/);
+    assert.equal((await prisma.goal.findUniqueOrThrow({ where: { id: youtubeGoal.id } })).priority, "high");
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "delete car listings and show today",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Needs confirmation/);
+    assert.match(response.json().reply, /Confirm archive action: Check cheap car listings/);
+    assert.doesNotMatch(response.json().reply, /Today - 2026-07-31/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "open");
+    assert.equal(await prisma.pendingAction.count({ where: { userId: actionUserId, type: "action_archive", status: "pending" } }), 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "delete car and show today",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm archive action: Check cheap car listings/);
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action archived: Check cheap car listings/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "archived");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("multi-intent orchestrator stops for ambiguity, guardrails, and dry-run debug has no side effects", async () => {
+  const server = buildServer();
+  const actionUserId = `multi-intent-safe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const youtubeAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      status: "open"
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Call Alex",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-07-31T07:00:00.000Z")
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Call Alex",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-07-31T13:00:00.000Z")
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "done with call Alex and show today",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which action do you mean/);
+    assert.doesNotMatch(response.json().reply, /Today - 2026-07-31/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: "Call Alex", status: "completed" } }), 0);
+    assert.equal(
+      await prisma.pendingAction.count({ where: { userId: actionUserId, type: "action_target_clarification", status: "pending" } }),
+      1
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "cancel" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "delete call Alex and show today",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which action do you mean/);
+    assert.doesNotMatch(response.json().reply, /Today - 2026-07-31/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: "Call Alex", status: "archived" } }), 0);
+    assert.equal(
+      await prisma.pendingAction.count({ where: { userId: actionUserId, type: "action_target_clarification", status: "pending" } }),
+      1
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "cancel" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "I want to bet 500 tomorrow and move YouTube to Saturday",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, true);
+    assert.match(response.json().reply, /No|locked|cooldown|bet/i);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: youtubeAction.id } })).dueAt, null);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: { contains: "bet" } } }), 0);
+    assert.equal(await prisma.event.count({ where: { userId: actionUserId, type: "finance.betting.cooldown_triggered" } }), 1);
+    assert.equal(
+      await prisma.pendingAction.count({ where: { userId: actionUserId, type: { in: ["action_archive", "action_target_clarification"] }, status: "pending" } }),
+      0
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: {
+        text: "I applied to 3 jobs and show actions",
+        dryRun: true
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, false);
+    assert.equal(response.json().plan.isMultiIntent, true);
+    assert.equal(response.json().debug[0].type, "event_log");
+    assert.equal(response.json().debug[0].wouldExecute, true);
+    assert.equal(await prisma.event.count({ where: { userId: actionUserId, type: "career.application_sent" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: { text: "flibbertigibbet and show actions" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Skipped/);
+    assert.match(response.json().reply, /Open actions:/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/multi-intent`,
+      payload: { text: "delete unknown thing and show today", now: "2026-07-31T01:40:00+02:00" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Skipped/);
+    assert.match(response.json().reply, /I could not confidently match/);
+    assert.match(response.json().reply, /Today - 2026-07-31/);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
@@ -3733,7 +4071,7 @@ test("action reminder trigger sends open due action and includes commands", asyn
     assert.equal(response.statusCode, 200);
     const payload = response.json();
     assert.equal(payload.sent, 1);
-    assert.match(payload.message, /Action due:/);
+    assert.match(payload.message, /Action overdue:/);
     assert.match(payload.message, new RegExp(`/complete_action ${action.id}`));
     assert.match(payload.message, new RegExp(`/snooze_action ${action.id} tomorrow`));
     assert.match(payload.message, new RegExp(`/archive_action ${action.id}`));
@@ -3763,7 +4101,7 @@ test("now action triggers reminder immediately and does not duplicate", async ()
     });
     assert.equal(first.statusCode, 200);
     assert.equal(first.json().sent, 1);
-    assert.match(first.json().message, /Action due:/);
+    assert.match(first.json().message, /Action overdue:/);
 
     const second = await server.inject({
       method: "POST",
@@ -3953,7 +4291,7 @@ test("debug force due action makes future action remind once", async () => {
     });
     assert.equal(first.statusCode, 200);
     assert.equal(first.json().sent, 1);
-    assert.match(first.json().message, /Action due:/);
+    assert.match(first.json().message, /Action overdue:/);
 
     const second = await server.inject({
       method: "POST",

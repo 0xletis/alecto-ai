@@ -18,6 +18,7 @@ export * from "./inbound-message.js";
 export * from "./integration-registry.js";
 export * from "./message-processing.js";
 export * from "./memory.js";
+export * from "./multi-intent.js";
 export * from "./notifications.js";
 export * from "./reminders.js";
 export * from "./response-composer.js";

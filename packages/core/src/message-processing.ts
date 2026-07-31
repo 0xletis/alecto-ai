@@ -187,6 +187,7 @@ export function extractEvents(message: string): ExtractedEvent[] {
 
   const applicationMatch =
     message.match(/\b(?:sent|mandado)\s+(\d+)\s+(?:cvs?|applications?)\b/i) ??
+    message.match(/\b(?:applied\s+to|apliqu[eé]\s+a|postul[eé]\s+a)\s+(\d+)\s+(?:jobs?|roles?|applications?|cvs?|trabajos?)\b/i) ??
     message.match(/\b(\d+)\s+applications?\b/i);
 
   if (applicationMatch?.[1]) {

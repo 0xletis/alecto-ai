@@ -140,7 +140,7 @@ export function detectConversationControlIntent(text: string): ConversationContr
     };
   }
 
-  const moveMatch = trimmed.match(/\b(?:move|snooze|reschedule|push)\s+(.+?)\s+(?:to|until|for)\s+(.+)$/i);
+  const moveMatch = trimmed.match(/\b(?:move|snooze|reschedule|push|mueve|mover|posp[oó]n|posponer)\s+(.+?)\s+(?:to|until|for|a|para|hasta)\s+(.+)$/i);
   if (moveMatch) {
     return {
       intent: /\bsnooze\b/i.test(trimmed) ? "snooze_action" : "reschedule_action",
@@ -168,7 +168,7 @@ export function detectConversationControlIntent(text: string): ConversationContr
   }
 
   const archiveMatch = trimmed.match(/\b(?:remove|archive|delete|clear)\s+(.+?)(?:\s+(?:task|action))?$/i);
-  if (archiveMatch && /\b(task|action)\b/i.test(trimmed)) {
+  if (archiveMatch) {
     return {
       intent: "archive_action",
       confidence: 0.82,
@@ -354,14 +354,14 @@ function detectGoalPriority(text: string): ConversationControlDetection | undefi
     return undefined;
   }
 
-  if (!/\b(make|set|lower|raise|increase|decrease)\b/i.test(text)) {
+  if (!/\b(make|set|lower|raise|increase|decrease|haz|hacer|pon|poner)\b/i.test(text)) {
     return undefined;
   }
 
   const priority = GoalPrioritySchema.parse(priorityMatch[1].toLowerCase());
   let goalText = text
     .replace(priorityMatch[0], "")
-    .replace(/\b(make|set|lower|raise|increase|decrease)\b/gi, "")
+    .replace(/\b(make|set|lower|raise|increase|decrease|haz|hacer|pon|poner)\b/gi, "")
     .replace(/\b(to|as|priority)\b/gi, "")
     .trim();
 

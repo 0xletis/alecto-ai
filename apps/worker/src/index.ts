@@ -331,7 +331,8 @@ function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): 
 }
 
 function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {
-  const header = reminderType === "snoozed" ? "Snoozed action is back:" : "Action due:";
+  const isOverdue = reminderType === "due" && Boolean(actionItem.dueAt && actionItem.dueAt < new Date());
+  const header = reminderType === "snoozed" ? "Snoozed action is back:" : isOverdue ? "Action overdue:" : "Action due:";
   const dueLine = actionItem.dueAt ? `due: ${formatLocalDateTime(actionItem.dueAt, timezone)}` : undefined;
 
   return [

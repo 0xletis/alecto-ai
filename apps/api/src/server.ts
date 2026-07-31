@@ -33,8 +33,10 @@ import {
   getGoalTemplate,
   detectConversationControlIntent,
   isConversationalMutationIntent,
+  analyzeMultiIntentMessage,
   evaluateGoalGuardrails,
   inferGoalLinkForAction,
+  looksLikeMultiIntentText,
   goalTemplates,
   IngestTextBodySchema,
   CreateEmailSignalRuleInputSchema,
@@ -68,6 +70,8 @@ import {
   type DailyCoachResponse,
   type GoalSummary,
   type Goal,
+  type ConversationIntentPlan,
+  type ConversationIntentPlanItem,
   type MemoryEntry,
   type ProcessMessageResult,
   type StoredEvent,
@@ -786,6 +790,47 @@ export function buildServer() {
       const result = await handleConversationControl(request.params.userId, text, { now, debug });
 
       return result;
+    }
+  );
+
+  server.post<{ Params: { userId: string }; Body: { text?: string; dryRun?: boolean; now?: string } }>(
+    "/users/:userId/conversation/multi-intent",
+    async (request, reply) => {
+      const body = isRecord(request.body) ? request.body : {};
+      const text = typeof body.text === "string" ? body.text : "";
+      const now = typeof body.now === "string" ? parseOptionalNow(body.now) : undefined;
+
+      if (!text.trim()) {
+        return reply.status(400).send({ error: "Text is required." });
+      }
+
+      const plan = await analyzeMultiIntentMessage(request.params.userId, text, { now });
+      const debug = await buildIntentPlanDebug(request.params.userId, plan);
+
+      if (body.dryRun === true) {
+        return {
+          handled: false,
+          plan,
+          debug
+        };
+      }
+
+      if (!plan.isMultiIntent) {
+        return {
+          handled: false,
+          plan,
+          debug
+        };
+      }
+
+      const result = await executeMultiIntentPlan(request.params.userId, text, plan, { now });
+
+      return {
+        handled: true,
+        ...result,
+        plan,
+        debug
+      };
     }
   );
 
@@ -2384,6 +2429,258 @@ async function handleConversationControl(
   };
 }
 
+async function executeMultiIntentPlan(
+  userId: string,
+  originalText: string,
+  plan: ConversationIntentPlan,
+  options: { now?: Date } = {}
+): Promise<{ reply: string }> {
+  const done: string[] = [];
+  const skipped: string[] = [];
+  const readouts: string[] = [];
+  const confirmations: string[] = [];
+
+  if (plan.intents.some((intent) => intent.type === "goal_guardrail" && intent.blockedByGuardrail)) {
+    return {
+      reply: await executeGuardrailMessage(userId, originalText)
+    };
+  }
+
+  for (const intent of plan.intents) {
+    if (intent.type === "unknown") {
+      skipped.push(`Could not confidently handle "${intent.textSpan}".`);
+      continue;
+    }
+
+    if (intent.confidence < 0.7) {
+      skipped.push(`Low confidence for "${intent.textSpan}".`);
+      continue;
+    }
+
+    if (intent.type === "event_log") {
+      const events = await createEventsFromExtracted(userId, extractEvents(intent.textSpan));
+
+      if (events.length === 0) {
+        skipped.push(`No concrete event found in "${intent.textSpan}".`);
+        continue;
+      }
+
+      done.push(...events.map(formatMultiIntentEventDone));
+      continue;
+    }
+
+    if (intent.type === "action_create") {
+      const actionResult = await maybeCreateManualActionFromText(userId, intent.textSpan);
+
+      if (!actionResult.extraction.shouldCreateAction) {
+        skipped.push(`Could not create action from "${intent.textSpan}".`);
+        continue;
+      }
+
+      if (actionResult.action) {
+        done.push(
+          actionResult.duplicate
+            ? `Action already exists: ${actionResult.action.title}.`
+            : `Created action: ${actionResult.action.title}.`
+        );
+      } else {
+        skipped.push(`Could not create action from "${intent.textSpan}".`);
+      }
+      continue;
+    }
+
+    if (
+      intent.type === "complete_action" ||
+      intent.type === "reschedule_action" ||
+      intent.type === "archive_action" ||
+      intent.type === "set_goal_priority"
+    ) {
+      const debug = await buildConversationControlDebugForUser(userId, intent.textSpan);
+      const control = await handleConversationControl(userId, intent.textSpan, { now: options.now, debug });
+
+      if (!control.handled) {
+        skipped.push(`Could not handle "${intent.textSpan}".`);
+        continue;
+      }
+
+      if (control.reply?.startsWith("Which action do you mean?") || control.reply?.startsWith("Confirm archive action:")) {
+        confirmations.push(control.reply);
+        break;
+      }
+
+      if (control.reply?.startsWith("I could not") || control.reply?.startsWith("That time has already passed")) {
+        skipped.push(control.reply);
+        continue;
+      }
+
+      done.push(control.reply ?? "Done.");
+      continue;
+    }
+
+    if (intent.type === "show_actions") {
+      const actions = await getActionItems(userId, { status: "open", limit: 10 });
+      readouts.push(actions.length > 0 ? ["Open actions:", ...actions.map((action) => `- ${action.title}`)].join("\n") : "No open action items.");
+      continue;
+    }
+
+    if (intent.type === "show_goal_priorities") {
+      readouts.push(formatGoalPrioritiesForConversation(await getActiveGoals(userId)));
+      continue;
+    }
+
+    if (intent.type === "show_today") {
+      readouts.push(formatConversationTodayReply(await generateDailyOperatorBrief(userId, { now: options.now })));
+      continue;
+    }
+
+    if (intent.type === "ask_next_move") {
+      const brief = await generateDailyOperatorBrief(userId, { now: options.now });
+      readouts.push(`Next move: ${brief.suggestedNextStep}`);
+      continue;
+    }
+
+    skipped.push(`Skipped "${intent.textSpan}".`);
+  }
+
+  return {
+    reply: formatMultiIntentExecutionReply({ done, skipped, confirmations, readouts })
+  };
+}
+
+async function executeGuardrailMessage(userId: string, message: string): Promise<string> {
+  const [recentEvents, activeGoals, activeMemories, userOperatingProfile] = await Promise.all([
+    getRecentEvents(userId, 50),
+    getActiveGoals(userId),
+    getActiveMemories(userId),
+    getOrCreateUserOperatingProfile(userId)
+  ]);
+  const result = withMemoryContextReply(
+    processMessage({
+      userId,
+      message,
+      recentEvents,
+      userOperatingProfile
+    }),
+    activeMemories
+  );
+  const guardrail = evaluateGoalGuardrails({ text: result.message, activeGoals });
+  const cooldownEvent = await createEvent(result.userId, {
+    type: "finance.betting.cooldown_triggered",
+    timestamp: new Date(),
+    source: "manual",
+    data: {
+      intent: result.intent,
+      reason: "multi_intent_guardrail",
+      guardrail: guardrail.triggered
+        ? {
+            goalId: guardrail.goalId,
+            goalTitle: guardrail.goalTitle,
+            category: guardrail.guardrailCategory,
+            severity: guardrail.severity,
+            responseMode: guardrail.responseMode,
+            blockedActionCreation: guardrail.blockedActionCreation,
+            cooldownRequired: guardrail.cooldownRequired,
+            reason: guardrail.reason
+          }
+        : undefined
+    },
+    confidence: 1,
+    evidence: [result.message]
+  });
+  const composed = await composeFinalAgentResponse(
+    {
+      ...result,
+      riskState: "RED"
+    },
+    { extractedEvents: [cooldownEvent] }
+  );
+
+  return composed.reply;
+}
+
+async function buildIntentPlanDebug(userId: string, plan: ConversationIntentPlan) {
+  const [actions, goals] = await Promise.all([getRecentActionItems(userId, 50), getActiveGoals(userId)]);
+
+  return plan.intents.map((intent) => {
+    const controlDebug =
+      intent.type === "complete_action" ||
+      intent.type === "reschedule_action" ||
+      intent.type === "archive_action" ||
+      intent.type === "set_goal_priority"
+        ? buildConversationControlDebug({
+            text: intent.textSpan,
+            actions: actions.map(toActionSummary),
+            goals: goals.map(toGoalSummary)
+          })
+        : undefined;
+
+    return {
+      ...intent,
+      wouldExecute: plan.isMultiIntent && intent.type !== "unknown" && !intent.blockedByGuardrail && intent.confidence >= 0.7,
+      requiresConfirmation: intent.requiresConfirmation ?? controlDebug?.requiresConfirmation ?? false,
+      blockedByGuardrail: intent.blockedByGuardrail ?? false,
+      resolvedAction: controlDebug?.resolvedAction,
+      ambiguousActions: controlDebug?.ambiguousActions,
+      resolvedGoal: controlDebug?.resolvedGoal,
+      ambiguousGoals: controlDebug?.ambiguousGoals
+    };
+  });
+}
+
+function formatMultiIntentExecutionReply(input: {
+  done: string[];
+  skipped: string[];
+  confirmations: string[];
+  readouts: string[];
+}): string {
+  const sections: string[] = [];
+
+  if (input.done.length > 0) {
+    sections.push(["Done:", ...input.done.map((item) => `- ${item}`)].join("\n"));
+  }
+
+  if (input.skipped.length > 0) {
+    sections.push(["Skipped:", ...input.skipped.map((item) => `- ${item}`)].join("\n"));
+  }
+
+  if (input.confirmations.length > 0) {
+    sections.push(["Needs confirmation:", ...input.confirmations.map((item) => `- ${item}`)].join("\n"));
+  }
+
+  sections.push(...input.readouts);
+
+  return sections.length > 0 ? sections.join("\n\n") : "I could not confidently execute anything from that message.";
+}
+
+function formatMultiIntentEventDone(event: StoredEvent): string {
+  if (event.type === "career.application_sent" && typeof event.data.count === "number") {
+    return `Logged ${event.data.count} job application${event.data.count === 1 ? "" : "s"}.`;
+  }
+
+  if (event.type === "health.workout_completed" && typeof event.data.duration_minutes === "number") {
+    return `Logged ${event.data.duration_minutes} min training.`;
+  }
+
+  if (event.type === "learning.reading_session_completed" && typeof event.data.duration_minutes === "number") {
+    return `Logged ${event.data.duration_minutes} min reading.`;
+  }
+
+  return `Logged ${event.type}.`;
+}
+
+function formatGoalPrioritiesForConversation(goals: Goal[]): string {
+  const activeGoals = goals.filter((goal) => goal.status === "active");
+
+  if (activeGoals.length === 0) {
+    return "No active goals.";
+  }
+
+  return [
+    "Goal priorities:",
+    ...activeGoals.map((goal, index) => `${index + 1}. ${goal.title} - ${goal.priority ?? "medium"} (${goal.importanceScore ?? 25})`)
+  ].join("\n");
+}
+
 function toActionSummary(action: ActionItem) {
   return {
     id: action.id,
@@ -3087,7 +3384,8 @@ async function dispatchActionRemindersForUser(userId: string, now: Date): Promis
 }
 
 function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {
-  const header = reminderType === "snoozed" ? "Snoozed action is back:" : "Action due:";
+  const isOverdue = reminderType === "due" && Boolean(actionItem.dueAt && actionItem.dueAt < new Date());
+  const header = reminderType === "snoozed" ? "Snoozed action is back:" : isOverdue ? "Action overdue:" : "Action due:";
   const dueLine = actionItem.dueAt ? `due: ${formatLocalDateTime(actionItem.dueAt, timezone)}` : undefined;
 
   return [

@@ -3,9 +3,11 @@ import { Bot, type Context } from "grammy";
 import {
   buildNormalizedInboundMessage,
   explainNormalizedInboundRoute,
+  looksLikeMultiIntentText,
   routeNormalizedInboundMessage,
   segmentInboundMessage,
   shouldCheckRecentDailyCheckInReminder,
+  splitPendingDecisionReplyWithCommands,
   type InboundRouteDebug,
   type NormalizedInboundMessage
 } from "@operator-agent/core";
@@ -39,6 +41,30 @@ bot.use(async (ctx, next) => {
     return;
   }
 
+  const pendingReplyWithCommands = splitPendingDecisionReplyWithCommands(text);
+
+  if (pendingReplyWithCommands) {
+    if (!(await guardAllowedUser(ctx))) {
+      return;
+    }
+
+    const pendingAction = await getLatestPendingAction(ctx);
+
+    if (pendingAction) {
+      const pendingResponse = await apiPost<ProcessMessageResponse>("/messages/process", {
+        userId: getTelegramUserId(ctx),
+        message: pendingReplyWithCommands.replyText
+      });
+      const commandResponse =
+        pendingReplyWithCommands.commands.length > 0
+          ? await executeCommandBatch(ctx, pendingReplyWithCommands.commands)
+          : undefined;
+
+      await replyWithIntegrationMessage(ctx, [pendingResponse.reply, commandResponse].filter(Boolean).join("\n\n"));
+      return;
+    }
+  }
+
   if (segment.kind === "command_batch") {
     if (!(await guardAllowedUser(ctx))) {
       return;
@@ -57,7 +83,7 @@ bot.use(async (ctx, next) => {
       segment.reason === "command_plus_extra_text"
         ? "That looks like a command plus extra text. Send one command per message or use a supported multiline command."
         : segment.reason === "mixed_text_and_command"
-          ? "Send the reschedule and /actions separately."
+          ? "Send the action request and command separately."
           : "That looks like pasted reference text, so I did not execute any commands."
     );
     return;
@@ -156,6 +182,30 @@ bot.command("debug_conversation_intent", async (ctx) => {
     await ctx.reply(formatConversationControlDebug(response.debug));
   } catch (error) {
     await replyWithApiFailure(ctx, error, "I could not debug that conversational intent.");
+  }
+});
+
+bot.command("debug_intent_plan", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply("Usage: /debug_intent_plan <message>");
+    return;
+  }
+
+  try {
+    const response = await apiPost<IntentPlanResponse>(`/users/${getTelegramUserId(ctx)}/conversation/multi-intent`, {
+      text,
+      dryRun: true,
+      now: buildNormalizedTelegramMessage(ctx, text).timestamp.toISOString()
+    });
+    await ctx.reply(formatIntentPlanDebug(response));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not debug that intent plan.");
   }
 });
 
@@ -1702,6 +1752,18 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    if (looksLikeMultiIntentText(inbound.text)) {
+      const multi = await apiPost<MultiIntentResponse>(`/users/${inbound.userId}/conversation/multi-intent`, {
+        text: inbound.text,
+        now: inbound.timestamp.toISOString()
+      });
+
+      if (multi.handled) {
+        await ctx.reply(multi.reply);
+        return;
+      }
+    }
+
     if (route.kind === "daily_checkin") {
       const response = await apiPost<NaturalCheckInResponse>(`/users/${inbound.userId}/checkins/daily/text`, {
         text: inbound.text
@@ -2341,6 +2403,31 @@ function formatConversationControlDebug(debug: ConversationControlDebug): string
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatIntentPlanDebug(response: IntentPlanResponse): string {
+  return [
+    `isMultiIntent: ${response.plan.isMultiIntent ? "yes" : "no"}`,
+    `reason: ${response.plan.reason}`,
+    "intents:",
+    ...response.debug.map((intent, index) =>
+      [
+        `${index + 1}. type: ${intent.type}`,
+        `   textSpan: ${intent.textSpan}`,
+        intent.targetText ? `   targetText: ${intent.targetText}` : undefined,
+        intent.timeText ? `   timeText: ${intent.timeText}` : undefined,
+        intent.goalText ? `   goalText: ${intent.goalText}` : undefined,
+        intent.priority ? `   priority: ${intent.priority}` : undefined,
+        `   confidence: ${intent.confidence.toFixed(2)}`,
+        `   wouldExecute: ${intent.wouldExecute ? "yes" : "no"}`,
+        `   requiresConfirmation: ${intent.requiresConfirmation ? "yes" : "no"}`,
+        `   blockedByGuardrail: ${intent.blockedByGuardrail ? "yes" : "no"}`,
+        `   reason: ${intent.reason}`
+      ]
+        .filter(Boolean)
+        .join("\n")
+    )
+  ].join("\n");
 }
 
 async function getRecentDailyCheckInReminder(message: NormalizedInboundMessage): Promise<boolean> {
@@ -4151,6 +4238,42 @@ interface PendingActionsResponse {
 interface PendingActionMutationResponse {
   pendingAction: PendingAction;
   reply: string;
+}
+
+interface MultiIntentResponse {
+  handled: boolean;
+  reply: string;
+  plan: IntentPlan;
+  debug: IntentPlanDebugItem[];
+}
+
+interface IntentPlanResponse {
+  handled: boolean;
+  plan: IntentPlan;
+  debug: IntentPlanDebugItem[];
+}
+
+interface IntentPlan {
+  isMultiIntent: boolean;
+  reason: string;
+  intents: IntentPlanItem[];
+}
+
+interface IntentPlanItem {
+  type: string;
+  textSpan: string;
+  targetText?: string;
+  timeText?: string;
+  goalText?: string;
+  priority?: string;
+  confidence: number;
+  requiresConfirmation?: boolean;
+  blockedByGuardrail?: boolean;
+  reason: string;
+}
+
+interface IntentPlanDebugItem extends IntentPlanItem {
+  wouldExecute?: boolean;
 }
 
 interface DailyReview {
