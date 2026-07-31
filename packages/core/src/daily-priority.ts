@@ -120,14 +120,15 @@ export function scoreDailyActionPriority(input: DailyPriorityScoreInput): DailyP
     factors.push("risk control tracked separately");
   }
 
-  const rankReason = factors.filter((factor) => factor !== "open" && factor !== "medium priority").join(", ") || "open action";
+  const uniqueFactors = uniqueStrings(factors);
+  const rankReason = uniqueFactors.filter((factor) => factor !== "open" && factor !== "medium priority").join(", ") || "open action";
 
   return {
     actionId: input.action.id,
     title: input.action.title,
     score,
     rankReason,
-    factors
+    factors: uniqueFactors
   };
 }
 
@@ -256,6 +257,10 @@ function scoreGoalCategory(
   }
 
   return { score: 0 };
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values));
 }
 
 function goalShortName(goal: Goal): string {

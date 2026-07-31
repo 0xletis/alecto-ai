@@ -8,6 +8,8 @@ import {
 } from "../packages/db/src/index.ts";
 import {
   buildNormalizedInboundMessage,
+  buildDeterministicDailyCoachResponse,
+  deterministicDailyCoachWarning,
   classifyJobSearchEmail,
   classifyWorkActionEmail,
   explainNormalizedInboundRoute,
@@ -17,7 +19,8 @@ import {
   parseActionDueDate,
   routeNormalizedInboundMessage,
   segmentInboundMessage,
-  sortDailyActionsByPriority
+  sortDailyActionsByPriority,
+  validateDailyCoachResponseAgainstContext
 } from "../packages/core/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
@@ -2246,6 +2249,8 @@ test("/today uses user timezone for local day and due-window priority reasons", 
     const brief = response.json().brief;
     assert.equal(brief.date, "2026-07-31");
     assert.match(brief.summary, /1 event logged today/);
+    assert.equal(brief.coach.nextMove, brief.suggestedNextStep);
+    assert.match(brief.coach.diagnosis, /Apply to 2 jobs/);
     assert.ok(brief.goalStatus.some((goal: { title: string; note: string }) => goal.title === "Find a new developer job" && goal.note.includes("1 application sent today")));
     assert.ok(brief.goalStatus.some((goal: { title: string; note: string }) => goal.title === "Find a new developer job" && goal.note.includes("completed action: Send CV")));
     assert.ok(brief.recentWins.some((win: string) => win.includes("Completed action: Send CV")));
@@ -2261,6 +2266,345 @@ test("/today uses user timezone for local day and due-window priority reasons", 
     assert.match(reasons, /due today afternoon/);
     assert.doesNotMatch(reasons, /due tomorrow/);
   } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("daily coach fallback and validation stay locked to verified brief context", () => {
+  const context = {
+    date: "2026-07-31",
+    timezone: "Europe/Madrid",
+    activeGoals: [
+      {
+        id: "goal-job",
+        title: "Find a new developer job",
+        priority: "critical" as const,
+        importanceScore: 70,
+        statusToday: "no progress logged today",
+        openLinkedActions: ["Apply to 2 jobs"],
+        completedLinkedActionsToday: [],
+        guardrailActivityToday: []
+      }
+    ],
+    scoredPriorities: [
+      {
+        actionId: "action-job",
+        title: "Apply to 2 jobs",
+        dueAt: "2026-07-31T07:00:00.000Z",
+        dueLabel: "due today morning",
+        score: 125,
+        rankReason: "due today morning, goal-linked, critical goal",
+        linkedGoalTitle: "Find a new developer job",
+        linkedGoalPriority: "critical" as const
+      }
+    ],
+    recentWins: [],
+    risksOrWatchouts: ["Betting impulse detected recently. Do not open a bet today without cooldown."],
+    nextMove: "Handle due action: Apply to 2 jobs.",
+    userOperatingProfile: {
+      directness: 5,
+      warmth: 3,
+      confrontation: 5,
+      verbosity: 3,
+      preferredStyle: "tough_love"
+    }
+  };
+
+  const fallback = buildDeterministicDailyCoachResponse(context);
+  assert.equal(fallback.nextMove, context.nextMove);
+  assert.match(fallback.diagnosis, /Apply to 2 jobs/);
+  assert.equal(fallback.warning, "Keep the betting/trading guardrail locked today.");
+
+  const valid = validateDailyCoachResponseAgainstContext(
+    {
+      diagnosis: "Apply to 2 jobs is the first move because it supports Find a new developer job today with a clear, bounded action and no extra tracks. Keep the output factual, then stop adding complexity.",
+      nextMove: "Apply to 2 jobs first.",
+      warning: "Keep the betting/trading guardrail locked today.",
+      encouragement: null
+    },
+    context
+  );
+  assert.equal(valid.nextMove, "Apply to 2 jobs first.");
+  assert.ok(JSON.stringify(valid).length > 270);
+
+  assert.equal(deterministicDailyCoachWarning(context), "Keep the betting/trading guardrail locked today.");
+
+  assert.equal(
+    validateDailyCoachResponseAgainstContext(
+      {
+        diagnosis: "Apply to 2 jobs is the first move.",
+        nextMove: "Apply to 2 jobs first.",
+        warning: "Do not bet today.",
+        encouragement: null
+      },
+      context
+    ).warning,
+    "Do not bet today."
+  );
+
+  assert.throws(() =>
+    validateDailyCoachResponseAgainstContext(
+      {
+        diagnosis: "Call investor first.",
+        nextMove: "Handle due action: Apply to 2 jobs.",
+        warning: null,
+        encouragement: null
+      },
+      context
+    )
+  );
+
+  assert.throws(() =>
+    validateDailyCoachResponseAgainstContext(
+      {
+        diagnosis: "The day is clear.",
+        nextMove: "Write YouTube script.",
+        warning: null,
+        encouragement: null
+      },
+      context
+    )
+  );
+
+  assert.throws(() =>
+    validateDailyCoachResponseAgainstContext(
+      {
+        diagnosis: "The day is clear.",
+        nextMove: "Handle due action: Apply to 2 jobs.",
+        warning: "Only bet if your thesis is strong.",
+        encouragement: null
+      },
+      context
+    )
+  );
+
+  assert.throws(() =>
+    validateDailyCoachResponseAgainstContext(
+      {
+        diagnosis: "The day is clear.",
+        nextMove: "Handle due action: Apply to 2 jobs.",
+        warning: "Trade small with a stop loss.",
+        encouragement: null
+      },
+      context
+    )
+  );
+});
+
+test("daily coach debug reports disabled, llm, invalid, error, and timeout sources", async () => {
+  const originalEnv = {
+    DAILY_COACH_LLM_ENABLED: process.env.DAILY_COACH_LLM_ENABLED,
+    DAILY_COACH_LLM_MOCK_RESPONSE: process.env.DAILY_COACH_LLM_MOCK_RESPONSE,
+    DAILY_COACH_LLM_MOCK_THROW: process.env.DAILY_COACH_LLM_MOCK_THROW,
+    DAILY_COACH_LLM_MOCK_DELAY_MS: process.env.DAILY_COACH_LLM_MOCK_DELAY_MS,
+    DAILY_COACH_LLM_TIMEOUT_MS: process.env.DAILY_COACH_LLM_TIMEOUT_MS,
+    OPENAI_API_KEY: process.env.OPENAI_API_KEY
+  };
+  const server = buildServer();
+  const actionUserId = `daily-coach-debug-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: actionUserId,
+      timezone: "Europe/Madrid"
+    }
+  });
+  const goal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      dueAt: new Date("2026-07-31T07:00:00.000Z"),
+      goalId: goal.id,
+      goalTitleSnapshot: goal.title
+    }
+  });
+  const path = `/users/${actionUserId}/today/debug-daily-coach?now=${encodeURIComponent("2026-07-30T23:40:00.000Z")}`;
+
+  const clearMockEnv = () => {
+    delete process.env.DAILY_COACH_LLM_MOCK_RESPONSE;
+    delete process.env.DAILY_COACH_LLM_MOCK_THROW;
+    delete process.env.DAILY_COACH_LLM_MOCK_DELAY_MS;
+    delete process.env.DAILY_COACH_LLM_TIMEOUT_MS;
+  };
+
+  try {
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "false";
+    process.env.OPENAI_API_KEY = "test-key";
+    let response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_disabled");
+    assert.equal(response.json().schemaValidationPassed, true);
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = JSON.stringify({
+      diagnosis: "Apply to 2 jobs is the first move because it supports Find a new developer job.",
+      nextMove: "Apply to 2 jobs first.",
+      warning: null,
+      encouragement: null
+    });
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "llm");
+    assert.equal(response.json().llmEnabled, true);
+    assert.equal(response.json().llmAttempted, true);
+    assert.equal(response.json().validationStatus, "passed");
+    assert.deepEqual(response.json().validationFailureCodes, []);
+    assert.equal(response.json().schemaValidationPassed, true);
+    assert.equal(response.json().selectedNextMove, "Handle due action: Apply to 2 jobs.");
+    assert.equal(response.json().selectedActionTitle, "Apply to 2 jobs");
+    assert.equal(response.json().topPriorities[0].title, "Apply to 2 jobs");
+    assert.equal(
+      response.json().topPriorities[0].rankReason.split(", ").filter((factor: string) => factor === "no job-search progress").length,
+      1
+    );
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = "This is prose, not JSON.";
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_invalid");
+    assert.equal(response.json().validationStatus, "failed");
+    assert.deepEqual(response.json().validationFailureCodes, ["invalid_json"]);
+    assert.equal(response.json().schemaValidationPassed, false);
+    assert.equal(response.json().validationFailureSummary, "invalid_json");
+    assert.equal(response.json().rawResponseType, "text");
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = JSON.stringify({
+      diagnosis: "Apply to 2 jobs is the first move.",
+      nextMove: "Apply to 2 jobs first.",
+      warning: null
+    });
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_invalid");
+    assert.deepEqual(response.json().validationFailureCodes, ["schema_missing_field"]);
+    assert.deepEqual(response.json().parsedFieldsPresent, ["diagnosis", "nextMove", "warning"]);
+    assert.equal(typeof response.json().diagnosisLength, "number");
+    assert.equal(typeof response.json().nextMoveLength, "number");
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = JSON.stringify({
+      diagnosis: "The day is clear.",
+      nextMove: "Start with the YouTube script.",
+      warning: null,
+      encouragement: null
+    });
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_invalid");
+    assert.ok(response.json().validationFailureCodes.includes("next_move_mismatch"));
+
+    const todayAfterInvalid = await server.inject({ method: "GET", url: `/users/${actionUserId}/today?now=${encodeURIComponent("2026-07-30T23:40:00.000Z")}` });
+    assert.equal(todayAfterInvalid.statusCode, 200);
+    assert.equal(todayAfterInvalid.json().brief.coachDebug.source, "fallback_invalid");
+    assert.equal(todayAfterInvalid.json().brief.coach.nextMove, "Handle due action: Apply to 2 jobs.");
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = JSON.stringify({
+      diagnosis: "The day is clear.",
+      nextMove: "Apply to 2 jobs first.",
+      warning: "Open a trade with small size.",
+      encouragement: null
+    });
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_invalid");
+    assert.ok(response.json().validationFailureCodes.includes("unsafe_guardrail_advice"));
+
+    const riskGoal = await prisma.goal.create({
+      data: {
+        userId: actionUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    await prisma.event.create({
+      data: {
+        userId: actionUserId,
+        type: "finance.betting.cooldown_triggered",
+        timestamp: new Date("2026-07-30T23:30:00.000Z"),
+        source: "manual",
+        data: { goalId: riskGoal.id },
+        confidence: 1
+      }
+    });
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = JSON.stringify({
+      diagnosis: "Apply to 2 jobs is still the first move.",
+      nextMove: "Apply to 2 jobs first.",
+      warning: "Only bet if your thesis is strong.",
+      encouragement: null
+    });
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "llm");
+    assert.deepEqual(response.json().validationFailureCodes, []);
+    const riskToday = await server.inject({ method: "GET", url: `/users/${actionUserId}/today?now=${encodeURIComponent("2026-07-30T23:40:00.000Z")}` });
+    assert.equal(riskToday.statusCode, 200);
+    assert.equal(riskToday.json().brief.coach.warning, "Keep the Control impulsive betting guardrail locked today.");
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_MOCK_THROW = "true";
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_error");
+    assert.equal(response.json().schemaValidationPassed, false);
+
+    clearMockEnv();
+    process.env.DAILY_COACH_LLM_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.DAILY_COACH_LLM_TIMEOUT_MS = "1";
+    process.env.DAILY_COACH_LLM_MOCK_DELAY_MS = "20";
+    process.env.DAILY_COACH_LLM_MOCK_RESPONSE = JSON.stringify({
+      diagnosis: "Apply to 2 jobs is the first move because it supports Find a new developer job.",
+      nextMove: "Handle due action: Apply to 2 jobs.",
+      warning: null,
+      encouragement: null
+    });
+    response = await server.inject({ method: "GET", url: path });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().coachSource, "fallback_timeout");
+    assert.equal(response.json().schemaValidationPassed, false);
+  } finally {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
   }

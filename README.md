@@ -37,6 +37,7 @@ You can also put these values in `.env` or your shell:
 
 ```bash
 USE_OPENAI_ANALYSIS=true
+DAILY_COACH_LLM_ENABLED=false
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_API_KEY=sk-...
 ```
@@ -46,6 +47,7 @@ The deterministic risk engine always runs after analysis and has final authority
 After intent, event extraction, and risk are finalized, `/messages/process` runs ResponseComposer v1.
 The composer uses mode, risk state, profile, active goals, recent events, memories, and today's summary to produce the final reply.
 If OpenAI is enabled, it may rewrite the deterministic fallback for tone, but it cannot create DB changes, invent facts, or override RED risk policy.
+`/today` always builds its facts deterministically first. If `DAILY_COACH_LLM_ENABLED=true` and `OPENAI_API_KEY` is set, Alecto adds a compact LLM-written Coach section from the verified daily brief context only; if the LLM fails validation, the deterministic coach text is used.
 
 Start with your current environment:
 
@@ -154,6 +156,7 @@ Telegram commands:
 - `/trigger_action_reminders`: dev helper that sends due/snoozed action reminders now
 - `/debug_make_action_due ACTION_ID`: allowlist-only dev helper that forces an action due for reminder testing
 - `/debug_make_snoozed_due ACTION_ID`: allowlist-only dev helper that forces a snoozed action due for reminder testing
+- `/debug_daily_coach`: allowlist-only dev helper that shows whether `/today` used LLM coach text or deterministic fallback, without secrets or raw provider errors
 - `/sync_gmail`: manually sync active Gmail rules
 - `/sync_gmail_debug`: manually sync Gmail and show safe per-rule counters
 - `/create_goal category | title | why`: create a goal
@@ -162,7 +165,7 @@ Telegram commands:
 - `/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today`: save a manual daily check-in
 - `/checkin_natural`: show natural-language daily check-in examples
 - `/review`: daily review
-- `/today`: concise daily operator brief with actions, goals, wins, risks, and one next move
+- `/today`: concise daily operator brief with a Coach section, actions, goals, wins, risks, and one deterministic next move
 - `/insight`: daily interpretive coaching insight
 - `/daily_insight`: alias of `/insight`
 - `/weekly`: weekly interpretive coaching insight

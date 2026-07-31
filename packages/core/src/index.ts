@@ -3,6 +3,7 @@ export * from "./checkins.js";
 export * from "./custom-goals.js";
 export * from "./daily-review.js";
 export * from "./daily-priority.js";
+export * from "./daily-coach.js";
 export * from "./email-classification.js";
 export * from "./event-registry.js";
 export * from "./events.js";

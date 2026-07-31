@@ -1290,6 +1290,19 @@ bot.command("debug_daily_priorities", async (ctx) => {
   }
 });
 
+bot.command("debug_daily_coach", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<DailyCoachDebugResponse>(`/users/${getTelegramUserId(ctx)}/today/debug-daily-coach`);
+    await ctx.reply(formatDailyCoachDebug(response));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not debug the daily coach right now.");
+  }
+});
+
 bot.command("insight", async (ctx) => {
   await sendInsight(ctx, "daily");
 });
@@ -1822,6 +1835,15 @@ async function executeBatchCommandLine(ctx: Context, commandLine: string): Promi
 
       const response = await apiGet<DailyPriorityDebugResponse>(`/users/${getTelegramUserId(ctx)}/today/debug-priorities`);
       return `/${parsed.name}: ${formatDailyPriorityDebug(response.priorities)}`;
+    }
+
+    if (parsed.name === "debug_daily_coach") {
+      if (!isDebugAllowedUser(ctx)) {
+        return `/${parsed.name}: Debug commands are only available to allowlisted users.`;
+      }
+
+      const response = await apiGet<DailyCoachDebugResponse>(`/users/${getTelegramUserId(ctx)}/today/debug-daily-coach`);
+      return `/${parsed.name}: ${formatDailyCoachDebug(response)}`;
     }
 
     if (parsed.name === "events") {
@@ -2837,6 +2859,8 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
     "Status:",
     brief.summary,
     "",
+    brief.coach ? formatDailyCoach(brief.coach) : undefined,
+    brief.coach ? "" : undefined,
     "Top priorities:",
     brief.topPriorities.length > 0 ? brief.topPriorities.map((item, index) => `${index + 1}. ${item}`).join("\n") : "No clear priorities yet.",
     "",
@@ -2856,6 +2880,18 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
     .join("\n");
 }
 
+function formatDailyCoach(coach: DailyCoachResponse): string {
+  return [
+    "Coach:",
+    coach.diagnosis,
+    `Next move: ${coach.nextMove}`,
+    coach.warning ? `Warning: ${coach.warning}` : undefined,
+    coach.encouragement ?? undefined
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
 function formatDailyPriorityDebug(priorities: DailyOperatorBriefPriorityDebug[]): string {
   if (priorities.length === 0) {
     return "No open actions to score.";
@@ -2865,6 +2901,37 @@ function formatDailyPriorityDebug(priorities: DailyOperatorBriefPriorityDebug[])
     .map((priority) =>
       `${priority.rank}. ${priority.title} - score ${priority.score} - ${priority.rankReason || priority.factors.join(", ")}`
     )
+    .join("\n");
+}
+
+function formatDailyCoachDebug(debug: DailyCoachDebugResponse): string {
+  return [
+    `coachSource: ${debug.coachSource}`,
+    `DAILY_COACH_LLM_ENABLED: ${debug.dailyCoachLlmEnabled}`,
+    `llmEnabled: ${debug.llmEnabled ? "yes" : "no"}`,
+    `llmAttempted: ${debug.llmAttempted ? "yes" : "no"}`,
+    `validationStatus: ${debug.validationStatus}`,
+    `validationFailureCodes: ${debug.validationFailureCodes.length > 0 ? debug.validationFailureCodes.join(", ") : "none"}`,
+    debug.validationFailureSummary ? `validationFailureSummary: ${debug.validationFailureSummary}` : undefined,
+    `selected nextMove: ${debug.selectedNextMove}`,
+    debug.selectedActionTitle ? `selectedActionTitle: ${debug.selectedActionTitle}` : undefined,
+    `schema validation passed: ${debug.schemaValidationPassed ? "yes" : "no"}`,
+    debug.fallbackReason ? `fallback reason: ${debug.fallbackReason}` : undefined,
+    debug.rawResponseType ? `rawResponseType: ${debug.rawResponseType}` : undefined,
+    debug.parsedFieldsPresent ? `parsedFieldsPresent: ${debug.parsedFieldsPresent.join(",") || "none"}` : undefined,
+    typeof debug.responseLength === "number" ? `responseLength: ${debug.responseLength}` : undefined,
+    typeof debug.diagnosisLength === "number" ? `diagnosisLength: ${debug.diagnosisLength}` : undefined,
+    typeof debug.nextMoveLength === "number" ? `nextMoveLength: ${debug.nextMoveLength}` : undefined,
+    typeof debug.warningLength === "number" ? `warningLength: ${debug.warningLength}` : undefined,
+    typeof debug.encouragementLength === "number" ? `encouragementLength: ${debug.encouragementLength}` : undefined,
+    "top 3 scored priorities:",
+    debug.topPriorities.length > 0
+      ? debug.topPriorities
+          .map((priority) => `${priority.rank}. ${priority.title} - score ${priority.score} - ${priority.rankReason}`)
+          .join("\n")
+      : "none"
+  ]
+    .filter(Boolean)
     .join("\n");
 }
 
@@ -3617,6 +3684,34 @@ interface DailyPriorityDebugResponse {
   message: string;
 }
 
+interface DailyCoachDebugResponse {
+  coachSource: "llm" | "fallback_disabled" | "fallback_invalid" | "fallback_error" | "fallback_timeout";
+  dailyCoachLlmEnabled: string;
+  llmEnabled: boolean;
+  llmAttempted: boolean;
+  validationStatus: "passed" | "failed" | "skipped";
+  validationFailureCodes: string[];
+  validationFailureSummary?: string;
+  selectedNextMove: string;
+  selectedActionTitle?: string;
+  topPriorities: Array<{
+    rank: number;
+    actionId: string;
+    title: string;
+    score: number;
+    rankReason: string;
+  }>;
+  schemaValidationPassed: boolean;
+  fallbackReason?: string;
+  rawResponseType?: "json_object" | "text" | "empty" | "unknown";
+  parsedFieldsPresent?: string[];
+  responseLength?: number;
+  diagnosisLength?: number;
+  nextMoveLength?: number;
+  warningLength?: number;
+  encouragementLength?: number;
+}
+
 interface InsightResponse {
   insight: InsightReport;
 }
@@ -3955,6 +4050,7 @@ interface DailyReviewGoal {
 interface DailyOperatorBrief {
   date: string;
   summary: string;
+  coach?: DailyCoachResponse;
   topPriorities: string[];
   openActions: DailyOperatorBriefAction[];
   overdueActions: DailyOperatorBriefAction[];
@@ -3963,6 +4059,13 @@ interface DailyOperatorBrief {
   risks: string[];
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+interface DailyCoachResponse {
+  diagnosis: string;
+  nextMove: string;
+  warning: string | null;
+  encouragement: string | null;
 }
 
 interface DailyOperatorBriefAction {

@@ -21,6 +21,9 @@ import {
   parseActionDueDate,
   normalizeManualActionTitleKey,
   sortDailyActionsByPriority,
+  buildDeterministicDailyCoachResponse,
+  DailyCoachValidationError,
+  selectedDailyCoachActionTitle,
   extractEvents,
   findGoalDuplicateWarnings,
   getLocalTodayRange,
@@ -54,6 +57,8 @@ import {
   type AgentResponse,
   type AgentResponseComposerInput,
   type DailyPriorityScore,
+  type DailyBriefContext,
+  type DailyCoachResponse,
   type MemoryEntry,
   type ProcessMessageResult,
   type StoredEvent,
@@ -63,6 +68,7 @@ import {
   analyzeMessageWithOpenAI,
   classifyEmailWithLLM,
   composeResponseWithOpenAI,
+  generateDailyCoachResponse,
   JobSearchEmailAllowedEventTypes,
   WorkActionEmailAllowedEventTypes,
   polishInsightWithOpenAI,
@@ -696,6 +702,38 @@ export function buildServer() {
         brief.priorityDebug && brief.priorityDebug.length > 0
           ? "Daily priorities scored."
           : "No open actions to score."
+    };
+  });
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/today/debug-daily-coach", async (request) => {
+    const brief = await generateDailyOperatorBrief(request.params.userId, { now: parseOptionalNow(request.query.now) });
+
+    return {
+      coachSource: brief.coachDebug.source,
+      dailyCoachLlmEnabled: process.env.DAILY_COACH_LLM_ENABLED ?? "false",
+      llmEnabled: shouldUseDailyCoachLLM(),
+      llmAttempted: brief.coachDebug.llmAttempted,
+      validationStatus: brief.coachDebug.validationStatus,
+      validationFailureCodes: brief.coachDebug.validationFailureCodes,
+      validationFailureSummary: brief.coachDebug.validationFailureSummary,
+      selectedNextMove: brief.suggestedNextStep,
+      selectedActionTitle: brief.coachDebug.selectedActionTitle,
+      topPriorities: (brief.priorityDebug ?? []).slice(0, 3).map((priority) => ({
+        rank: priority.rank,
+        actionId: priority.actionId,
+        title: priority.title,
+        score: priority.score,
+        rankReason: priority.rankReason
+      })),
+      schemaValidationPassed: brief.coachDebug.schemaValidationPassed,
+      fallbackReason: brief.coachDebug.fallbackReason,
+      rawResponseType: brief.coachDebug.rawResponseType,
+      parsedFieldsPresent: brief.coachDebug.parsedFieldsPresent,
+      responseLength: brief.coachDebug.responseLength,
+      diagnosisLength: brief.coachDebug.diagnosisLength,
+      nextMoveLength: brief.coachDebug.nextMoveLength,
+      warningLength: brief.coachDebug.warningLength,
+      encouragementLength: brief.coachDebug.encouragementLength
     };
   });
 
@@ -1725,12 +1763,13 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
   const timezone = await getUserTimezone(userId);
   const todayRange = getLocalTodayRange(now, timezone);
   const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
-  const [actions, activeGoals, todayEvents, recentEvents, recentReviews] = await Promise.all([
+  const [actions, activeGoals, todayEvents, recentEvents, recentReviews, userOperatingProfile] = await Promise.all([
     getRecentActionItems(userId, 50),
     getActiveGoals(userId),
     getEventsBetween(userId, todayRange.start, todayRange.end),
     getEventsSince(userId, last24h),
-    getEmailReviewItems(userId, { status: "all", limit: 10 })
+    getEmailReviewItems(userId, { status: "all", limit: 10 }),
+    getOrCreateUserOperatingProfile(userId)
   ]);
   const visibleActions = actions.filter((action) => action.status !== "archived");
   const openActions = visibleActions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
@@ -1757,8 +1796,8 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     actionId: item.action.id,
     title: item.action.title,
     score: item.score.score,
-    rankReason: item.score.rankReason,
-    factors: item.score.factors
+    rankReason: uniqueStrings(item.score.factors).join(", "),
+    factors: uniqueStrings(item.score.factors)
   }));
   const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, rankedActions, completedToday));
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews, todayRange);
@@ -1777,10 +1816,26 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     openActions: rankedActions,
     goalStatus
   });
+  const briefContext = buildDailyBriefContext({
+    date: todayRange.date,
+    timezone,
+    activeGoals,
+    goalStatus,
+    rankedOpenActions,
+    recentWins,
+    risks,
+    suggestedNextStep,
+    userOperatingProfile,
+    todayEvents,
+    completedToday
+  });
+  const coachResult = await maybeGenerateDailyCoach(briefContext);
 
   return {
     date: todayRange.date,
     summary: buildOperatorSummary({ openActions, overdueActions, activeGoals, todayEvents, risks }),
+    coach: coachResult.coach,
+    coachDebug: coachResult.debug,
     topPriorities,
     openActions: rankedActions.slice(0, 10).map(toBriefAction),
     overdueActions: overdueActions.slice(0, 10).map(toBriefAction),
@@ -1808,6 +1863,238 @@ function buildOperatorSummary(input: {
   ].filter(Boolean);
 
   return parts.length > 0 ? `Today has ${parts.join(", ")}.` : "Nothing material is logged for today yet.";
+}
+
+function buildDailyBriefContext(input: {
+  date: string;
+  timezone: string;
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>;
+  goalStatus: DailyOperatorBriefGoalStatus[];
+  rankedOpenActions: Array<{ action: ActionItem; score: DailyPriorityScore }>;
+  recentWins: string[];
+  risks: string[];
+  suggestedNextStep: string;
+  userOperatingProfile: Awaited<ReturnType<typeof getOrCreateUserOperatingProfile>>;
+  todayEvents: StoredEvent[];
+  completedToday: ActionItem[];
+}): DailyBriefContext {
+  const goalStatusById = new Map(input.goalStatus.map((goal) => [goal.goalId, goal]));
+
+  return {
+    date: input.date,
+    timezone: input.timezone,
+    activeGoals: input.activeGoals.map((goal) => {
+      const status = goalStatusById.get(goal.id);
+      const openLinkedActions = input.rankedOpenActions
+        .map((item) => item.action)
+        .filter((action) => action.goalId === goal.id)
+        .map((action) => action.title);
+      const completedLinkedActionsToday = input.completedToday
+        .filter((action) => action.goalId === goal.id)
+        .map((action) => action.title);
+
+      return {
+        id: goal.id,
+        title: goal.title,
+        priority: goal.priority,
+        importanceScore: goal.importanceScore,
+        statusToday: status?.note ?? "no progress logged today",
+        openLinkedActions,
+        completedLinkedActionsToday,
+        guardrailActivityToday: input.todayEvents
+          .filter((event) => event.type === "finance.betting.cooldown_triggered" && goal.id === event.data.goalId)
+          .map((event) => event.type)
+      };
+    }),
+    scoredPriorities: input.rankedOpenActions.slice(0, 10).map((item) => {
+      const linkedGoal = input.activeGoals.find((goal) => goal.id === item.action.goalId);
+
+      return {
+        actionId: item.action.id,
+        title: item.action.title,
+        dueAt: item.action.dueAt?.toISOString(),
+        dueLabel: dueLabelFromPriorityScore(item.score),
+        score: item.score.score,
+        rankReason: item.score.rankReason,
+        linkedGoalTitle: linkedGoal?.title ?? item.action.goalTitleSnapshot,
+        linkedGoalPriority: linkedGoal?.priority
+      };
+    }),
+    recentWins: input.recentWins,
+    risksOrWatchouts: input.risks,
+    nextMove: input.suggestedNextStep,
+    userOperatingProfile: {
+      directness: input.userOperatingProfile.directness,
+      warmth: input.userOperatingProfile.warmth,
+      confrontation: input.userOperatingProfile.confrontation,
+      verbosity: input.userOperatingProfile.verbosity,
+      preferredStyle: input.userOperatingProfile.motivationalStyle
+    }
+  };
+}
+
+async function maybeGenerateDailyCoach(context: DailyBriefContext): Promise<DailyCoachGenerationResult> {
+  const fallback = buildDeterministicDailyCoachResponse(context);
+
+  if (!shouldUseDailyCoachLLM()) {
+    return {
+      coach: fallback,
+      debug: {
+        source: "fallback_disabled",
+        llmAttempted: false,
+        validationStatus: "skipped",
+        validationFailureCodes: [],
+        schemaValidationPassed: true,
+        fallbackReason: "DAILY_COACH_LLM_ENABLED is not true or OPENAI_API_KEY is missing",
+        selectedActionTitle: selectedDailyCoachActionTitle(context)
+      }
+    };
+  }
+
+  try {
+    const coach = await withDailyCoachTimeout(generateDailyCoachResponse(context));
+
+    return {
+      coach,
+      debug: {
+        source: "llm",
+        llmAttempted: true,
+        validationStatus: "passed",
+        validationFailureCodes: [],
+        schemaValidationPassed: true,
+        selectedActionTitle: selectedDailyCoachActionTitle(context)
+      }
+    };
+  } catch (error) {
+    console.warn("OpenAI daily coach failed; using deterministic coach.");
+    const source = dailyCoachFallbackSource(error);
+
+    return {
+      coach: fallback,
+      debug: {
+        source,
+        llmAttempted: true,
+        validationStatus: source === "fallback_timeout" || source === "fallback_error" ? "skipped" : "failed",
+        validationFailureCodes: dailyCoachValidationFailureCodes(error),
+        validationFailureSummary: dailyCoachValidationFailureSummary(error, source),
+        schemaValidationPassed: false,
+        fallbackReason: dailyCoachFallbackReason(source),
+        selectedActionTitle: selectedDailyCoachActionTitle(context),
+        rawResponseType: error instanceof DailyCoachValidationError ? error.details.rawResponseType : undefined,
+        parsedFieldsPresent: error instanceof DailyCoachValidationError ? error.details.parsedFieldsPresent : undefined,
+        responseLength: error instanceof DailyCoachValidationError ? error.details.responseLength : undefined,
+        diagnosisLength: error instanceof DailyCoachValidationError ? error.details.diagnosisLength : undefined,
+        nextMoveLength: error instanceof DailyCoachValidationError ? error.details.nextMoveLength : undefined,
+        warningLength: error instanceof DailyCoachValidationError ? error.details.warningLength : undefined,
+        encouragementLength: error instanceof DailyCoachValidationError ? error.details.encouragementLength : undefined
+      }
+    };
+  }
+}
+
+function shouldUseDailyCoachLLM(): boolean {
+  return process.env.DAILY_COACH_LLM_ENABLED === "true" && Boolean(process.env.OPENAI_API_KEY);
+}
+
+async function withDailyCoachTimeout<T>(promise: Promise<T>): Promise<T> {
+  const parsedTimeoutMs = Number(process.env.DAILY_COACH_LLM_TIMEOUT_MS ?? 3000);
+  const timeoutMs = Number.isFinite(parsedTimeoutMs) ? parsedTimeoutMs : 3000;
+
+  return await Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new DailyCoachTimeoutError()), Math.max(1, timeoutMs));
+    })
+  ]);
+}
+
+function dailyCoachFallbackSource(error: unknown): DailyCoachSource {
+  if (error instanceof DailyCoachTimeoutError) {
+    return "fallback_timeout";
+  }
+
+  if (error instanceof SyntaxError || (error && typeof error === "object" && "name" in error && error.name === "ZodError")) {
+    return "fallback_invalid";
+  }
+
+  if (error instanceof DailyCoachValidationError) {
+    return "fallback_invalid";
+  }
+
+  const message = error instanceof Error ? error.message : "";
+
+  if (/invalid|validation|unsupported|changed deterministic next move|too long|betting\/trading advice/i.test(message)) {
+    return "fallback_invalid";
+  }
+
+  return "fallback_error";
+}
+
+function dailyCoachValidationFailureCodes(error: unknown): string[] {
+  if (error instanceof DailyCoachValidationError) {
+    return error.failureCodes;
+  }
+
+  if (error instanceof SyntaxError) {
+    return ["invalid_json"];
+  }
+
+  if (error && typeof error === "object" && "name" in error && error.name === "ZodError") {
+    return ["schema_invalid"];
+  }
+
+  return [];
+}
+
+function dailyCoachValidationFailureSummary(error: unknown, source: DailyCoachSource): string | undefined {
+  const codes = dailyCoachValidationFailureCodes(error);
+
+  if (codes.length > 0) {
+    return codes.join(", ");
+  }
+
+  if (source === "fallback_timeout") {
+    return "timeout";
+  }
+
+  if (source === "fallback_error") {
+    return "request_error";
+  }
+
+  return undefined;
+}
+
+function dailyCoachFallbackReason(source: DailyCoachSource): string {
+  if (source === "fallback_invalid") {
+    return "LLM response failed schema or policy validation";
+  }
+
+  if (source === "fallback_timeout") {
+    return "LLM response timed out";
+  }
+
+  if (source === "fallback_error") {
+    return "LLM request failed";
+  }
+
+  if (source === "fallback_disabled") {
+    return "DAILY_COACH_LLM_ENABLED is not true or OPENAI_API_KEY is missing";
+  }
+
+  return "";
+}
+
+class DailyCoachTimeoutError extends Error {
+  constructor() {
+    super("Daily coach LLM timed out.");
+  }
+}
+
+function dueLabelFromPriorityScore(score: DailyPriorityScore): string {
+  return (
+    score.factors.find((factor) => factor === "overdue" || factor.startsWith("due today") || factor.startsWith("due tomorrow") || factor === "due later this week") ??
+    "not due"
+  );
 }
 
 function buildOperatorTopPriorities(input: {
@@ -5830,6 +6117,8 @@ type GmailErrorStage =
 interface DailyOperatorBrief {
   date: string;
   summary: string;
+  coach: DailyCoachResponse;
+  coachDebug: DailyCoachDebug;
   topPriorities: string[];
   openActions: DailyOperatorBriefAction[];
   overdueActions: DailyOperatorBriefAction[];
@@ -5838,6 +6127,31 @@ interface DailyOperatorBrief {
   risks: string[];
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+type DailyCoachSource = "llm" | "fallback_disabled" | "fallback_invalid" | "fallback_error" | "fallback_timeout";
+
+interface DailyCoachDebug {
+  source: DailyCoachSource;
+  llmAttempted: boolean;
+  validationStatus: "passed" | "failed" | "skipped";
+  validationFailureCodes: string[];
+  validationFailureSummary?: string;
+  schemaValidationPassed: boolean;
+  fallbackReason?: string;
+  selectedActionTitle?: string;
+  rawResponseType?: "json_object" | "text" | "empty" | "unknown";
+  parsedFieldsPresent?: string[];
+  responseLength?: number;
+  diagnosisLength?: number;
+  nextMoveLength?: number;
+  warningLength?: number;
+  encouragementLength?: number;
+}
+
+interface DailyCoachGenerationResult {
+  coach: DailyCoachResponse;
+  debug: DailyCoachDebug;
 }
 
 interface DailyOperatorBriefAction {
