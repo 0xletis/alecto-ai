@@ -92,6 +92,7 @@ export type PendingActionType =
   | "goal_create"
   | "goal_archive"
   | "action_archive"
+  | "action_target_clarification"
   | "goal_progress_log"
   | "memory_create"
   | "event_undo_last";
@@ -2356,6 +2357,26 @@ export async function createPendingAction(
   });
 
   return toPendingAction(pendingAction);
+}
+
+export async function replacePendingAction(
+  userId: string,
+  input: CreatePendingActionInput
+): Promise<PendingAction> {
+  await ensureUser(userId);
+  await expireOldPendingActions(userId);
+
+  await prisma.pendingAction.updateMany({
+    where: {
+      userId,
+      status: "pending"
+    },
+    data: {
+      status: "rejected"
+    }
+  });
+
+  return createPendingAction(userId, input);
 }
 
 export async function getPendingActions(userId: string): Promise<PendingAction[]> {

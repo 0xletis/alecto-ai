@@ -3549,12 +3549,41 @@ function formatPendingActions(pendingActions: PendingAction[]) {
 }
 
 function formatPendingAction(pendingAction: PendingAction) {
-  return [
+  const lines = [
     `id: ${pendingAction.id}`,
     `type: ${pendingAction.type}`,
     `summary: ${pendingAction.summary}`,
-    `status: ${pendingAction.status}`
-  ].join("\n");
+    `status: ${pendingAction.status}`,
+    pendingAction.expiresAt ? `expiresAt: ${new Date(pendingAction.expiresAt).toLocaleString()}` : undefined
+  ];
+
+  const candidates = readPendingCandidates(pendingAction.payload?.candidateActions);
+
+  if (candidates.length > 0) {
+    lines.push(
+      "candidates:",
+      ...candidates.map((candidate, index) => {
+        const due = candidate.dueAt ? ` - due ${new Date(candidate.dueAt).toLocaleString()}` : "";
+        return `${index + 1}. ${candidate.title}${due}`;
+      })
+    );
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function readPendingCandidates(value: unknown): Array<{ title: string; dueAt?: string }> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item))
+    .map((item) => ({
+      title: typeof item.title === "string" ? item.title : "",
+      dueAt: typeof item.dueAt === "string" ? item.dueAt : undefined
+    }))
+    .filter((item) => item.title);
 }
 
 function formatEvent(event: Event, options: { alwaysShowStatus?: boolean } = {}) {
@@ -4433,4 +4462,6 @@ interface PendingAction {
   type: string;
   summary: string;
   status: string;
+  payload?: Record<string, unknown>;
+  expiresAt?: string;
 }

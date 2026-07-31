@@ -103,6 +103,7 @@ import {
   createMemory,
   createMemoryFromPendingPayload,
   createPendingAction,
+  replacePendingAction,
   expireOldPendingActions,
   getActiveGoals,
   getActiveMemories,
@@ -229,15 +230,14 @@ export function buildServer() {
 
     const latestPendingAction = await getLatestPendingAction(parsed.data.userId);
 
-    if (latestPendingAction && isConfirmationMessage(parsed.data.message)) {
-      const applied = await applyPendingAction(parsed.data.userId, latestPendingAction);
-      await confirmPendingAction(parsed.data.userId, latestPendingAction.id);
-      return replyOnly(parsed.data.userId, parsed.data.message, applied.reply);
-    }
+    if (latestPendingAction) {
+      const pendingReply = await resolvePendingDecisionReply(parsed.data.userId, latestPendingAction, parsed.data.message);
 
-    if (latestPendingAction && isRejectionMessage(parsed.data.message)) {
-      await rejectPendingAction(parsed.data.userId, latestPendingAction.id);
-      return replyOnly(parsed.data.userId, parsed.data.message, "Cancelled. I did not change anything.");
+      if (pendingReply) {
+        return replyOnly(parsed.data.userId, parsed.data.message, pendingReply);
+      }
+    } else if (looksLikePendingDecisionReply(parsed.data.message)) {
+      return replyOnly(parsed.data.userId, parsed.data.message, "That pending decision expired. Please ask again.");
     }
 
     const explicitMemory = extractExplicitMemory(parsed.data.message);
@@ -647,6 +647,12 @@ export function buildServer() {
       if (!pendingAction) {
         return reply.status(404).send({
           error: "Pending action not found"
+        });
+      }
+
+      if (pendingAction.type === "action_target_clarification") {
+        return reply.status(400).send({
+          error: "Reply with the number of the action you mean, or cancel."
         });
       }
 
@@ -2239,6 +2245,19 @@ async function handleConversationControl(
       };
     }
 
+    if (actionResolution.ambiguousMatches.length > 0) {
+      const pending = await createActionTargetClarification(userId, detection, actionResolution, options.now);
+
+      return {
+        handled: true,
+        reply: formatActionTargetClarificationReply(pending.candidates, pending.timezone),
+        debug: {
+          ...debug,
+          requiresConfirmation: true
+        }
+      };
+    }
+
     return {
       handled: true,
       reply: formatActionClarificationReply(actionResolution),
@@ -2285,11 +2304,16 @@ async function handleConversationControl(
 
   if (detection.intent === "archive_action") {
     const action = actionResolution.resolvedAction;
-    await createPendingAction(userId, {
+    await replacePendingAction(userId, {
       type: "action_archive",
       summary: `Archive action: ${action?.title ?? actionResolution.actionId}`,
-      payload: { actionId: actionResolution.actionId },
-      expiresAt: tomorrow()
+      payload: {
+        originalText: text,
+        intendedOperation: "archive_action",
+        actionId: actionResolution.actionId,
+        candidateActions: action ? [toPendingActionCandidate(action)] : []
+      },
+      expiresAt: pendingDecisionExpiry()
     });
 
     return {
@@ -2392,6 +2416,100 @@ function formatActionClarificationReply(resolution: ReturnType<typeof resolveAct
   }
 
   return "I could not confidently match that to an open action. Use /actions to check the exact one.";
+}
+
+async function createActionTargetClarification(
+  userId: string,
+  detection: ReturnType<typeof detectConversationControlIntent>,
+  resolution: ReturnType<typeof resolveActionReference>,
+  now?: Date
+): Promise<{ candidates: PendingActionCandidate[]; timezone: string }> {
+  const settings = await getOrCreateNotificationSettings(userId);
+  const candidates = resolution.ambiguousMatches
+    .map(toPendingActionCandidate)
+    .sort(comparePendingActionCandidates)
+    .slice(0, 5);
+  let parsedDueAt: string | undefined;
+
+  if (detection.intent === "snooze_action" || detection.intent === "reschedule_action") {
+    const parsedTime = parseConversationControlTime(detection.timeText ?? "", {
+      now,
+      timezone: settings.timezone,
+      preferences: settings
+    });
+
+    parsedDueAt = parsedTime.dueAt?.toISOString();
+  }
+
+  await replacePendingAction(userId, {
+    type: "action_target_clarification",
+    summary: `Clarify action target: ${detection.targetText ?? "action"}`,
+    payload: {
+      originalText: detection.targetText,
+      intendedOperation: detection.intent,
+      candidateActions: candidates,
+      selectedTimeText: detection.timeText,
+      parsedDueAt
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
+
+  return { candidates, timezone: settings.timezone };
+}
+
+type PendingActionCandidate = {
+  id: string;
+  title: string;
+  status: string;
+  dueAt?: string;
+  snoozedUntil?: string;
+  goalId?: string;
+  goalTitleSnapshot?: string;
+};
+
+function toPendingActionCandidate(action: {
+  id: string;
+  title: string;
+  status: string;
+  dueAt?: Date | null;
+  snoozedUntil?: Date | null;
+  goalId?: string | null;
+  goalTitleSnapshot?: string | null;
+}): PendingActionCandidate {
+  return {
+    id: action.id,
+    title: action.title,
+    status: action.status,
+    dueAt: action.dueAt?.toISOString(),
+    snoozedUntil: action.snoozedUntil?.toISOString(),
+    goalId: action.goalId ?? undefined,
+    goalTitleSnapshot: action.goalTitleSnapshot ?? undefined
+  };
+}
+
+function formatActionTargetClarificationReply(candidates: PendingActionCandidate[], timezone = "Europe/Madrid"): string {
+  return [
+    "Which action do you mean?",
+    ...candidates.map((action, index) => `${index + 1}. ${formatPendingActionCandidate(action, timezone)}`),
+    `Reply 1-${candidates.length}, or 'cancel'.`
+  ].join("\n");
+}
+
+function formatPendingActionCandidate(action: PendingActionCandidate, timezone = "Europe/Madrid"): string {
+  const due = action.dueAt ? ` - due ${formatLocalDateTime(new Date(action.dueAt), timezone)}` : "";
+  const snoozed = action.snoozedUntil ? ` - snoozed until ${formatLocalDateTime(new Date(action.snoozedUntil), timezone)}` : "";
+  return `${action.title}${due}${snoozed}`;
+}
+
+function comparePendingActionCandidates(left: PendingActionCandidate, right: PendingActionCandidate): number {
+  const leftTime = left.dueAt ? new Date(left.dueAt).getTime() : Number.POSITIVE_INFINITY;
+  const rightTime = right.dueAt ? new Date(right.dueAt).getTime() : Number.POSITIVE_INFINITY;
+
+  if (leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+
+  return left.title.localeCompare(right.title);
 }
 
 function formatGoalClarificationReply(resolution: ReturnType<typeof resolveGoalReference>): string {
@@ -6201,7 +6319,210 @@ function detectOpenAIStructuralProposal(analysis: OpenAIMessageAnalysis | undefi
   return undefined;
 }
 
+async function resolvePendingDecisionReply(
+  userId: string,
+  pendingAction: PendingAction,
+  message: string
+): Promise<string | undefined> {
+  if (isRejectionMessage(message)) {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "Cancelled. I did not change anything.";
+  }
+
+  if (pendingAction.type === "action_target_clarification") {
+    const candidates = readPendingActionCandidates(pendingAction.payload.candidateActions);
+    const selected = selectPendingActionCandidate(message, candidates);
+
+    if (!selected) {
+      return candidates.length > 0
+        ? `Reply with 1-${candidates.length}, the action title, or cancel.`
+        : "That pending decision no longer has any options. Please ask again.";
+    }
+
+    const operation = typeof pendingAction.payload.intendedOperation === "string"
+      ? pendingAction.payload.intendedOperation
+      : "";
+    const action = await getActionItem(userId, selected.id);
+
+    if (!action) {
+      await rejectPendingAction(userId, pendingAction.id);
+      return "I could not find that action anymore. Use /actions to check the exact task.";
+    }
+
+    if (operation === "complete_action") {
+      if (action.status === "completed") {
+        await confirmPendingAction(userId, pendingAction.id);
+        return `Action already completed: ${action.title}`;
+      }
+
+      const completed = await completeActionItem(userId, action.id);
+
+      if (!completed) {
+        await rejectPendingAction(userId, pendingAction.id);
+        return "I could not find that open action.";
+      }
+
+      const progressEvent = await createGoalProgressFromCompletedAction(userId, completed);
+      await confirmPendingAction(userId, pendingAction.id);
+
+      return [
+        `Action completed: ${completed.title}`,
+        progressEvent?.created ? `Goal progress logged: ${progressEvent.goalTitle}` : undefined
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    if (operation === "archive_action") {
+      await replacePendingAction(userId, {
+        type: "action_archive",
+        summary: `Archive action: ${action.title}`,
+        payload: {
+          originalText: pendingAction.payload.originalText,
+          intendedOperation: "archive_action",
+          actionId: action.id,
+          candidateActions: [toPendingActionCandidate(action)]
+        },
+        expiresAt: pendingDecisionExpiry()
+      });
+
+      return `Confirm archive action: ${action.title}? Reply yes to confirm or no to cancel.`;
+    }
+
+    if (operation === "snooze_action" || operation === "reschedule_action") {
+      const settings = await getOrCreateNotificationSettings(userId);
+      const dueAtText = typeof pendingAction.payload.parsedDueAt === "string" ? pendingAction.payload.parsedDueAt : "";
+      const dueAt = dueAtText ? new Date(dueAtText) : undefined;
+
+      if (!dueAt || Number.isNaN(dueAt.getTime())) {
+        await rejectPendingAction(userId, pendingAction.id);
+        return "I could not parse the new time. Try: tomorrow afternoon, 6pm, or Monday morning.";
+      }
+
+      const updated =
+        operation === "snooze_action"
+          ? await snoozeActionItem(userId, action.id, dueAt)
+          : await rescheduleActionItem(userId, action.id, dueAt);
+
+      if (!updated) {
+        await rejectPendingAction(userId, pendingAction.id);
+        return "I could not update that action.";
+      }
+
+      await confirmPendingAction(userId, pendingAction.id);
+
+      return operation === "snooze_action"
+        ? `Action snoozed until ${formatLocalDateTime(updated.snoozedUntil, settings.timezone)}: ${updated.title}`
+        : [`Action rescheduled: ${updated.title}`, `due: ${formatLocalDateTime(updated.dueAt, settings.timezone)}`].join("\n");
+    }
+
+    return "I could not complete that pending decision. Please ask again.";
+  }
+
+  if (isConfirmationMessage(message)) {
+    const applied = await applyPendingAction(userId, pendingAction);
+    await confirmPendingAction(userId, pendingAction.id);
+    return applied.reply;
+  }
+
+  return undefined;
+}
+
+function readPendingActionCandidates(value: unknown): PendingActionCandidate[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(isRecord)
+    .map((item) => ({
+      id: typeof item.id === "string" ? item.id : "",
+      title: typeof item.title === "string" ? item.title : "",
+      status: typeof item.status === "string" ? item.status : "",
+      dueAt: typeof item.dueAt === "string" ? item.dueAt : undefined,
+      snoozedUntil: typeof item.snoozedUntil === "string" ? item.snoozedUntil : undefined,
+      goalId: typeof item.goalId === "string" ? item.goalId : undefined,
+      goalTitleSnapshot: typeof item.goalTitleSnapshot === "string" ? item.goalTitleSnapshot : undefined
+    }))
+    .filter((item) => item.id && item.title);
+}
+
+function selectPendingActionCandidate(message: string, candidates: PendingActionCandidate[]): PendingActionCandidate | undefined {
+  const trimmed = message.trim();
+  const numeric = trimmed.match(/^#?(\d+)$/);
+
+  if (numeric) {
+    const index = Number(numeric[1]) - 1;
+    return candidates[index];
+  }
+
+  const ordinalIndex = ordinalSelectionIndex(trimmed);
+
+  if (ordinalIndex !== undefined) {
+    return candidates[ordinalIndex];
+  }
+
+  const key = normalizeComparableText(trimmed);
+
+  if (!key) {
+    return undefined;
+  }
+
+  const matches = candidates.filter((candidate) => {
+    const titleKey = normalizeComparableText(candidate.title);
+    return titleKey === key || titleKey.includes(key) || key.includes(titleKey);
+  });
+
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function ordinalSelectionIndex(text: string): number | undefined {
+  const normalized = normalizeComparableText(text);
+  const map: Record<string, number> = {
+    first: 0,
+    "first one": 0,
+    primero: 0,
+    primera: 0,
+    second: 1,
+    "second one": 1,
+    segundo: 1,
+    segunda: 1,
+    third: 2,
+    "third one": 2,
+    tercero: 2,
+    tercera: 2,
+    fourth: 3,
+    "fourth one": 3,
+    fourthone: 3,
+    cuarto: 3,
+    cuarta: 3,
+    fifth: 4,
+    "fifth one": 4,
+    quinto: 4,
+    quinta: 4
+  };
+
+  return map[normalized];
+}
+
+function looksLikePendingDecisionReply(message: string): boolean {
+  const trimmed = message.trim();
+  return (
+    isConfirmationMessage(trimmed) ||
+    isRejectionMessage(trimmed) ||
+    /^#?\d+$/.test(trimmed) ||
+    /^(the\s+)?(first|second|third|fourth|fifth)(\s+one)?$/i.test(trimmed) ||
+    /^(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta)$/i.test(trimmed)
+  );
+}
+
 async function applyPendingAction(userId: string, pendingAction: PendingAction): Promise<{ reply: string }> {
+  if (pendingAction.type === "action_target_clarification") {
+    return {
+      reply: "Reply with the number of the action you mean, or cancel."
+    };
+  }
+
   if (pendingAction.type === "profile_update") {
     const profilePatch = pendingAction.payload.profilePatch;
 
@@ -6353,6 +6674,10 @@ function tomorrow(): Date {
   const date = new Date();
   date.setDate(date.getDate() + 1);
   return date;
+}
+
+function pendingDecisionExpiry(): Date {
+  return new Date(Date.now() + 60 * 60 * 1000);
 }
 
 interface GithubCommit {

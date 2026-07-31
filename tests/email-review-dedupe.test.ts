@@ -660,22 +660,24 @@ test("conversational action control asks before destructive or ambiguous mutatio
       status: "open"
     }
   });
-  await prisma.actionItem.create({
+  const callMorning = await prisma.actionItem.create({
     data: {
       userId: actionUserId,
       source: "manual",
       title: "Call Alex",
       priority: "medium",
-      status: "open"
+      status: "open",
+      dueAt: new Date("2026-07-31T07:00:00.000Z")
     }
   });
-  await prisma.actionItem.create({
+  const callAfternoon = await prisma.actionItem.create({
     data: {
       userId: actionUserId,
       source: "manual",
-      title: "Call Alex about rent",
+      title: "Call Alex",
       priority: "medium",
-      status: "open"
+      status: "open",
+      dueAt: new Date("2026-07-31T13:00:00.000Z")
     }
   });
 
@@ -690,15 +692,39 @@ test("conversational action control asks before destructive or ambiguous mutatio
     assert.match(response.json().reply, /Confirm archive action: Check cheap car listings/);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "open");
     assert.equal(await prisma.pendingAction.count({ where: { userId: actionUserId, type: "action_archive", status: "pending" } }), 1);
-    const pending = await prisma.pendingAction.findFirstOrThrow({ where: { userId: actionUserId, type: "action_archive", status: "pending" } });
     const confirm = await server.inject({
       method: "POST",
-      url: `/users/${actionUserId}/pending-actions/${pending.id}/confirm`,
-      payload: {}
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "yes" }
     });
     assert.equal(confirm.statusCode, 200);
     assert.match(confirm.json().reply, /Action archived: Check cheap car listings/);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "archived");
+
+    const removableAction = await prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Remove dashboard draft",
+        priority: "medium",
+        status: "open"
+      }
+    });
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "delete dashboard draft task" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm archive action: Remove dashboard draft/);
+    const reject = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "no" }
+    });
+    assert.equal(reject.statusCode, 200);
+    assert.match(reject.json().reply, /Cancelled/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: removableAction.id } })).status, "open");
 
     response = await server.inject({
       method: "POST",
@@ -707,7 +733,115 @@ test("conversational action control asks before destructive or ambiguous mutatio
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Which action do you mean/);
+    assert.match(response.json().reply, /1\. Call Alex/);
+    assert.match(response.json().reply, /2\. Call Alex/);
+    assert.equal(
+      await prisma.pendingAction.count({ where: { userId: actionUserId, type: "action_target_clarification", status: "pending" } }),
+      1
+    );
     assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, status: "completed" } }), 0);
+
+    const firstChoice = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "1" }
+    });
+    assert.equal(firstChoice.statusCode, 200);
+    assert.match(firstChoice.json().reply, /Action completed: Call Alex/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: callMorning.id } })).status, "completed");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: callAfternoon.id } })).status, "open");
+
+    const callSamMorning = await prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Call Sam",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-07-31T07:00:00.000Z")
+      }
+    });
+    const callSamAfternoon = await prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Call Sam",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-07-31T13:00:00.000Z")
+      }
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with call Sam" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which action do you mean/);
+    const secondChoice = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "second one" }
+    });
+    assert.equal(secondChoice.statusCode, 200);
+    assert.match(secondChoice.json().reply, /Action completed: Call Sam/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: callSamMorning.id } })).status, "open");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: callSamAfternoon.id } })).status, "completed");
+
+    await prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Call Pat",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-07-31T07:00:00.000Z")
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: actionUserId,
+        source: "manual",
+        title: "Call Pat",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-07-31T13:00:00.000Z")
+      }
+    });
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with call Pat" }
+    });
+    assert.equal(response.statusCode, 200);
+    const cancel = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "cancel" }
+    });
+    assert.equal(cancel.statusCode, 200);
+    assert.match(cancel.json().reply, /Cancelled/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: "Call Pat", status: "completed" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with call Pat" }
+    });
+    assert.equal(response.statusCode, 200);
+    await prisma.pendingAction.updateMany({
+      where: { userId: actionUserId, type: "action_target_clarification", status: "pending" },
+      data: { expiresAt: new Date("2026-01-01T00:00:00.000Z") }
+    });
+    const expired = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "1" }
+    });
+    assert.equal(expired.statusCode, 200);
+    assert.equal(expired.json().reply, "That pending decision expired. Please ask again.");
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: "Call Pat", status: "completed" } }), 0);
 
     response = await server.inject({
       method: "POST",
@@ -716,7 +850,14 @@ test("conversational action control asks before destructive or ambiguous mutatio
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /could not confidently match/);
-    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, status: "completed" } }), 0);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: { contains: "impossible" } } }), 0);
+
+    const pendingList = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/pending-actions`
+    });
+    assert.equal(pendingList.statusCode, 200);
+    assert.ok(Array.isArray(pendingList.json().pendingActions));
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
@@ -779,6 +920,7 @@ test("conversation control guardrails and debug are side-effect free", async () 
       assert.equal(response.json().debug.intent, "goal_guardrail");
       assert.equal(response.json().debug.blockedByGuardrail, true);
     }
+    assert.equal(await prisma.pendingAction.count({ where: { userId: actionUserId, status: "pending" } }), 0);
 
     const process = await server.inject({
       method: "POST",
