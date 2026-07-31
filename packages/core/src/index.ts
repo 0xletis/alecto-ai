@@ -1,5 +1,6 @@
 export * from "./action-intake.js";
 export * from "./checkins.js";
+export * from "./conversation-control.js";
 export * from "./custom-goals.js";
 export * from "./daily-review.js";
 export * from "./daily-priority.js";

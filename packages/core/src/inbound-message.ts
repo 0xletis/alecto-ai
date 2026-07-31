@@ -203,6 +203,14 @@ export function segmentInboundMessage(text: string): InboundMessageSegmentResult
     });
   }
 
+  if (nonEmptyLines.length > 1 && commandLines.length > 0) {
+    return InboundMessageSegmentResultSchema.parse({
+      kind: "reference_text",
+      text: trimmed,
+      reason: "mixed_text_and_command"
+    });
+  }
+
   return InboundMessageSegmentResultSchema.parse({
     kind: "normal_text",
     text: trimmed,

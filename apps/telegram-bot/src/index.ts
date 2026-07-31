@@ -56,7 +56,9 @@ bot.use(async (ctx, next) => {
     await ctx.reply(
       segment.reason === "command_plus_extra_text"
         ? "That looks like a command plus extra text. Send one command per message or use a supported multiline command."
-        : "That looks like pasted reference text, so I did not execute any commands."
+        : segment.reason === "mixed_text_and_command"
+          ? "Send the reschedule and /actions separately."
+          : "That looks like pasted reference text, so I did not execute any commands."
     );
     return;
   }
@@ -131,6 +133,30 @@ bot.command("debug_route", async (ctx) => {
   const inbound = buildNormalizedTelegramMessage(ctx, text);
   const debug = explainNormalizedInboundRoute(inbound);
   await ctx.reply(formatRouteDebug(debug));
+});
+
+bot.command("debug_conversation_intent", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  const text = getCommandText(ctx);
+
+  if (!text) {
+    await ctx.reply("Usage: /debug_conversation_intent <message>");
+    return;
+  }
+
+  try {
+    const response = await apiPost<ConversationControlResponse>(`/users/${getTelegramUserId(ctx)}/conversation/control`, {
+      text,
+      dryRun: true,
+      now: buildNormalizedTelegramMessage(ctx, text).timestamp.toISOString()
+    });
+    await ctx.reply(formatConversationControlDebug(response.debug));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not debug that conversational intent.");
+  }
 });
 
 bot.command("profile", async (ctx) => {
@@ -1696,6 +1722,16 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
+    const control = await apiPost<ConversationControlResponse>(`/users/${inbound.userId}/conversation/control`, {
+      text: inbound.text,
+      now: inbound.timestamp.toISOString()
+    });
+
+    if (control.handled) {
+      await ctx.reply(control.reply ?? "Done.");
+      return;
+    }
+
     const response = await apiPost<ProcessMessageResponse>("/messages/process", {
       userId: inbound.userId,
       message: inbound.text
@@ -2277,6 +2313,30 @@ function formatRouteDebug(debug: InboundRouteDebug): string {
     debug.goal ? `goal: ${debug.goal}` : undefined,
     debug.severity ? `severity: ${debug.severity}` : undefined,
     debug.isReferenceOnly !== undefined ? `isReferenceOnly: ${String(debug.isReferenceOnly)}` : undefined,
+    `reason: ${debug.reason}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatConversationControlDebug(debug: ConversationControlDebug): string {
+  return [
+    `intent: ${debug.intent}`,
+    `confidence: ${debug.confidence.toFixed(2)}`,
+    debug.targetText ? `targetText: ${debug.targetText}` : undefined,
+    debug.timeText ? `timeText: ${debug.timeText}` : undefined,
+    debug.goalText ? `goalText: ${debug.goalText}` : undefined,
+    debug.priority ? `priority: ${debug.priority}` : undefined,
+    debug.resolvedAction ? `resolvedAction: ${debug.resolvedAction.title} (${debug.resolvedAction.id})` : undefined,
+    debug.resolvedGoal ? `resolvedGoal: ${debug.resolvedGoal.title} (${debug.resolvedGoal.id})` : undefined,
+    debug.ambiguousActions && debug.ambiguousActions.length > 0
+      ? `ambiguousActions: ${debug.ambiguousActions.map((action) => action.title).join(", ")}`
+      : undefined,
+    debug.ambiguousGoals && debug.ambiguousGoals.length > 0
+      ? `ambiguousGoals: ${debug.ambiguousGoals.map((goal) => goal.title).join(", ")}`
+      : undefined,
+    `requiresConfirmation: ${debug.requiresConfirmation ? "yes" : "no"}`,
+    `blockedByGuardrail: ${debug.blockedByGuardrail ? "yes" : "no"}`,
     `reason: ${debug.reason}`
   ]
     .filter(Boolean)
@@ -3710,6 +3770,40 @@ interface DailyCoachDebugResponse {
   nextMoveLength?: number;
   warningLength?: number;
   encouragementLength?: number;
+}
+
+interface ConversationControlResponse {
+  handled: boolean;
+  reply?: string;
+  debug: ConversationControlDebug;
+}
+
+interface ConversationControlDebug {
+  intent: string;
+  confidence: number;
+  targetText?: string;
+  timeText?: string;
+  goalText?: string;
+  priority?: string;
+  resolvedAction?: ConversationControlActionSummary;
+  resolvedGoal?: ConversationControlGoalSummary;
+  ambiguousActions?: ConversationControlActionSummary[];
+  ambiguousGoals?: ConversationControlGoalSummary[];
+  requiresConfirmation: boolean;
+  blockedByGuardrail: boolean;
+  reason: string;
+}
+
+interface ConversationControlActionSummary {
+  id: string;
+  title: string;
+  status: string;
+}
+
+interface ConversationControlGoalSummary {
+  id: string;
+  title: string;
+  status: string;
 }
 
 interface InsightResponse {

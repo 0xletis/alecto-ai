@@ -82,6 +82,10 @@ test("inbound message segmentation detects command batches and references", () =
   assert.equal(mixedCommand.kind, "reference_text");
   assert.equal(mixedCommand.reason, "command_plus_extra_text");
 
+  const mixedNaturalAndCommand = segmentInboundMessage("move YouTube script to tomorrow afternoon\n/actions");
+  assert.equal(mixedNaturalAndCommand.kind, "reference_text");
+  assert.equal(mixedNaturalAndCommand.reason, "mixed_text_and_command");
+
   const telegramExport = segmentInboundMessage("[30/07/2026 04:56] letis: /archive_action abc");
   assert.equal(telegramExport.kind, "reference_text");
 
@@ -451,6 +455,347 @@ test("manual actions infer links to active goals", async () => {
   }
 });
 
+test("conversational action control completes, reschedules, shows, and updates priorities", async () => {
+  const server = buildServer();
+  const actionUserId = `conversation-control-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: actionUserId,
+      timezone: "Europe/Madrid",
+      afternoonTimeMinutes: 990
+    }
+  });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const applyAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      status: "open",
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title
+    }
+  });
+  const youtubeAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      status: "open",
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: {
+        text: "move YouTube script to tomorrow afternoon",
+        now: "2026-07-31T03:01:00+02:00",
+        dryRun: true
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().debug.intent, "reschedule_action");
+    assert.equal(response.json().debug.targetText, "YouTube script");
+    assert.equal(response.json().debug.timeText, "tomorrow afternoon");
+    assert.equal(response.json().debug.resolvedAction.title, "Write YouTube script");
+    assert.equal(response.json().debug.requiresConfirmation, false);
+    assert.equal(response.json().debug.blockedByGuardrail, false);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: youtubeAction.id } })).dueAt, null);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with apply to 2 jobs" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, true);
+    assert.match(response.json().reply, /Action completed: Apply to 2 jobs/);
+    assert.match(response.json().reply, /Goal progress logged: Find a new developer job/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: applyAction.id } })).status, "completed");
+    assert.equal(
+      await prisma.event.count({
+        where: {
+          userId: actionUserId,
+          type: "custom.goal_progress_logged",
+          provider: "action_completion",
+          externalId: `action-completion:${applyAction.id}`
+        }
+      }),
+      1
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with apply to 2 jobs" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action already completed: Apply to 2 jobs/);
+    assert.equal(
+      await prisma.event.count({
+        where: {
+          userId: actionUserId,
+          type: "custom.goal_progress_logged",
+          provider: "action_completion",
+          externalId: `action-completion:${applyAction.id}`
+        }
+      }),
+      1
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: {
+        text: "move YouTube script to tomorrow afternoon",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action rescheduled: Write YouTube script/);
+    const updatedYoutube = await prisma.actionItem.findUniqueOrThrow({ where: { id: youtubeAction.id } });
+    assert.equal(updatedYoutube.status, "open");
+    assert.ok(updatedYoutube.dueAt);
+    assert.equal(localDate(updatedYoutube.dueAt), "2026-08-01");
+    assert.equal(localMinutes(updatedYoutube.dueAt), 990);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: "Write YouTube script" } }), 1);
+
+    const genericFallback = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId: actionUserId,
+        message: "move YouTube script to tomorrow afternoon"
+      }
+    });
+    assert.equal(genericFallback.statusCode, 200);
+    assert.equal(genericFallback.json().reply, "I could not complete that change. Use /actions to check the exact task.");
+    assert.doesNotMatch(genericFallback.json().reply, /noted|logged|moved|rescheduled/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: {
+        text: "move impossible nonexistent task to tomorrow afternoon",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, true);
+    assert.doesNotMatch(response.json().reply, /Action rescheduled|I.?ve logged|I moved/i);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: "Write YouTube script" } }), 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: {
+        text: "what should I do now?",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, true);
+    assert.match(response.json().reply, /Write YouTube script/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: {
+        text: "show today",
+        now: "2026-07-31T01:40:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Today - 2026-07-31/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "make job search critical" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Goal priority updated: Find a new developer job -> critical");
+    assert.equal((await prisma.goal.findUniqueOrThrow({ where: { id: jobGoal.id } })).priority, "critical");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("conversational action control asks before destructive or ambiguous mutations", async () => {
+  const server = buildServer();
+  const actionUserId = `conversation-control-safe-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const carAction = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Check cheap car listings",
+      priority: "medium",
+      status: "open"
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Call Alex",
+      priority: "medium",
+      status: "open"
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Call Alex about rent",
+      priority: "medium",
+      status: "open"
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "delete the car task" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, true);
+    assert.match(response.json().reply, /Confirm archive action: Check cheap car listings/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "open");
+    assert.equal(await prisma.pendingAction.count({ where: { userId: actionUserId, type: "action_archive", status: "pending" } }), 1);
+    const pending = await prisma.pendingAction.findFirstOrThrow({ where: { userId: actionUserId, type: "action_archive", status: "pending" } });
+    const confirm = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/pending-actions/${pending.id}/confirm`,
+      payload: {}
+    });
+    assert.equal(confirm.statusCode, 200);
+    assert.match(confirm.json().reply, /Action archived: Check cheap car listings/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: carAction.id } })).status, "archived");
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with call Alex" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which action do you mean/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, status: "completed" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with impossible nonexistent task" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /could not confidently match/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, status: "completed" } }), 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("conversation control guardrails and debug are side-effect free", async () => {
+  const server = buildServer();
+  const actionUserId = `conversation-control-debug-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      priority: "medium",
+      status: "open"
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "done with apply to 2 jobs", dryRun: true }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().debug.intent, "complete_action");
+    assert.equal(response.json().debug.resolvedAction.title, "Apply to 2 jobs");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: action.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "remind me to bet 500 tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, false);
+    assert.equal(response.json().debug.blockedByGuardrail, true);
+    assert.equal(await prisma.actionItem.count({ where: { userId: actionUserId, title: { contains: "bet" } } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: { text: "move my bet of 5000 usd to tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, false);
+    assert.equal(response.json().debug.intent, "goal_guardrail");
+    assert.equal(response.json().debug.blockedByGuardrail, true);
+
+    for (const text of ["move my bet to tomorrow", "snooze my bet until tomorrow", "mark betting task done"]) {
+      response = await server.inject({
+        method: "POST",
+        url: `/users/${actionUserId}/conversation/control`,
+        payload: { text }
+      });
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().handled, false);
+      assert.equal(response.json().debug.intent, "goal_guardrail");
+      assert.equal(response.json().debug.blockedByGuardrail, true);
+    }
+
+    const process = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId: actionUserId,
+        message: "remind me to bet 500 tomorrow"
+      }
+    });
+    assert.equal(process.statusCode, 200);
+    assert.equal(process.json().mode, "guardian");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
 test("unrelated manual action creates unlinked ActionItem", async () => {
   const server = buildServer();
   const actionUserId = `action-unlinked-${randomUUID()}`;
@@ -588,6 +933,121 @@ test("/today shows linked action under goal and skips generic progress prompt", 
     assert.equal(brief.openActions[0].goalTitle, "Find a new developer job");
     assert.match(brief.goalStatus[0].note, /open action: Send CV/);
     assert.ok(!brief.topPriorities.some((priority: string) => priority.includes("Log progress for Find a new developer job")));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("daily brief keeps risk-control goals out of normal progress priorities", async () => {
+  const server = buildServer();
+  const actionUserId = `today-risk-control-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Control impulsive betting",
+      category: "finance",
+      templateId: "finance.control_betting_trading",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Read more",
+      category: "learning",
+      templateId: "learning.reading_more",
+      priority: "low",
+      importanceScore: 10
+    }
+  });
+
+  try {
+    const today = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today?now=${encodeURIComponent("2026-07-31T02:51:00+02:00")}`
+    });
+    assert.equal(today.statusCode, 200);
+    const brief = today.json().brief;
+    assert.ok(!brief.topPriorities.some((priority: string) => priority.includes("Log progress for Control impulsive betting")));
+    assert.ok(!brief.suggestedNextStep.includes("Control impulsive betting"));
+    assert.ok(brief.risks.some((risk: string) => risk.includes("Control impulsive betting")));
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("/today top priorities contain real open actions only", async () => {
+  const server = buildServer();
+  const actionUserId = `today-real-priorities-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Build a YouTube channel",
+      category: "creative",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const carGoal = await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Find a cheap car to buy",
+      category: "custom",
+      priority: "low",
+      importanceScore: 10
+    }
+  });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Read more",
+      category: "learning",
+      templateId: "learning.reading_more",
+      priority: "low",
+      importanceScore: 10
+    }
+  });
+  await prisma.actionItem.createMany({
+    data: [
+      {
+        userId: actionUserId,
+        source: "manual",
+        title: "Write YouTube script",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-07-31T14:30:00.000Z"),
+        goalId: youtubeGoal.id,
+        goalTitleSnapshot: youtubeGoal.title
+      },
+      {
+        userId: actionUserId,
+        source: "manual",
+        title: "Check cheap car listings",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-07-31T07:00:00.000Z"),
+        goalId: carGoal.id,
+        goalTitleSnapshot: carGoal.title
+      }
+    ]
+  });
+
+  try {
+    const today = await server.inject({
+      method: "GET",
+      url: `/users/${actionUserId}/today?now=${encodeURIComponent("2026-07-31T03:01:00+02:00")}`
+    });
+    assert.equal(today.statusCode, 200);
+    const priorities = today.json().brief.topPriorities;
+    assert.equal(priorities.length, 2);
+    assert.ok(priorities.some((priority: string) => priority.includes("Write YouTube script")));
+    assert.ok(priorities.some((priority: string) => priority.includes("Check cheap car listings")));
+    assert.ok(!priorities.some((priority: string) => priority.includes("Log progress for Read more")));
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
@@ -2327,6 +2787,45 @@ test("daily coach fallback and validation stay locked to verified brief context"
   );
   assert.equal(valid.nextMove, "Apply to 2 jobs first.");
   assert.ok(JSON.stringify(valid).length > 270);
+
+  assert.throws(
+    () =>
+      validateDailyCoachResponseAgainstContext(
+        {
+          diagnosis: "You've completed two job applications recently.",
+          nextMove: "Apply to 2 jobs first.",
+          warning: null,
+          encouragement: null
+        },
+        {
+          ...context,
+          recentWins: ["Completed action: Apply to 2 jobs"],
+          activeGoals: context.activeGoals.map((goal) => ({
+            ...goal,
+            statusToday: "completed action: Apply to 2 jobs",
+            completedLinkedActionsToday: ["Apply to 2 jobs"]
+          }))
+        }
+      ),
+    /Daily coach response failed validation/
+  );
+
+  assert.equal(
+    validateDailyCoachResponseAgainstContext(
+      {
+        diagnosis: "Two applications were sent today.",
+        nextMove: "Apply to 2 jobs first.",
+        warning: null,
+        encouragement: null
+      },
+      {
+        ...context,
+        recentWins: ["2 applications sent"],
+        activeGoals: context.activeGoals.map((goal) => ({ ...goal, statusToday: "2 applications sent today" }))
+      }
+    ).diagnosis,
+    "Two applications were sent today."
+  );
 
   assert.equal(deterministicDailyCoachWarning(context), "Keep the betting/trading guardrail locked today.");
 

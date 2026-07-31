@@ -4,6 +4,7 @@ import {
   buildDailyInsight,
   buildDailyCheckinPrompt,
   buildCustomGoalConfig,
+  buildConversationControlDebug,
   composeAgentResponse,
   buildWeeklyInsight,
   classifyJobSearchEmail,
@@ -27,8 +28,11 @@ import {
   extractEvents,
   findGoalDuplicateWarnings,
   getLocalTodayRange,
+  isRiskControlGoal,
   isWithinLocalDay,
   getGoalTemplate,
+  detectConversationControlIntent,
+  isConversationalMutationIntent,
   evaluateGoalGuardrails,
   inferGoalLinkForAction,
   goalTemplates,
@@ -46,6 +50,9 @@ import {
   ProcessMessageInputSchema,
   parsedDailyCheckInToAnswers,
   parseDailyCheckinText,
+  parseConversationControlTime,
+  resolveActionReference,
+  resolveGoalReference,
   routeIngestion,
   UpdateIntegrationConnectionInputSchema,
   UpdateNotificationSettingsInputSchema,
@@ -59,6 +66,8 @@ import {
   type DailyPriorityScore,
   type DailyBriefContext,
   type DailyCoachResponse,
+  type GoalSummary,
+  type Goal,
   type MemoryEntry,
   type ProcessMessageResult,
   type StoredEvent,
@@ -136,6 +145,7 @@ import {
   rejectEmailReviewItem,
   completeActionItem,
   archiveActionItem,
+  rescheduleActionItem,
   createActionItemReminderLog,
   reopenSnoozedActionItem,
   forceActionItemDue,
@@ -269,6 +279,16 @@ export function buildServer() {
 
     if (manualActionResult.extraction.reason === "past_explicit_time") {
       return replyOnly(parsed.data.userId, parsed.data.message, "That time has already passed. Use a future time, or say 'now'.");
+    }
+
+    const unhandledControlIntent = detectConversationControlIntent(parsed.data.message);
+
+    if (isConversationalMutationIntent(unhandledControlIntent.intent)) {
+      return replyOnly(
+        parsed.data.userId,
+        parsed.data.message,
+        "I could not complete that change. Use /actions to check the exact task."
+      );
     }
 
     const naturalCustomProgress = detectNaturalCustomProgress(parsed.data.message, activeGoals);
@@ -736,6 +756,32 @@ export function buildServer() {
       encouragementLength: brief.coachDebug.encouragementLength
     };
   });
+
+  server.post<{ Params: { userId: string }; Body: { text?: string; dryRun?: boolean; now?: string } }>(
+    "/users/:userId/conversation/control",
+    async (request, reply) => {
+      const body = isRecord(request.body) ? request.body : {};
+      const text = typeof body.text === "string" ? body.text : "";
+      const now = typeof body.now === "string" ? parseOptionalNow(body.now) : undefined;
+
+      if (!text.trim()) {
+        return reply.status(400).send({ error: "Text is required." });
+      }
+
+      const debug = await buildConversationControlDebugForUser(request.params.userId, text);
+
+      if (body.dryRun === true) {
+        return {
+          handled: false,
+          debug
+        };
+      }
+
+      const result = await handleConversationControl(request.params.userId, text, { now, debug });
+
+      return result;
+    }
+  );
 
   server.get<{ Params: { userId: string }; Querystring: { date?: string } }>(
     "/users/:userId/insights/daily",
@@ -1801,7 +1847,7 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
   }));
   const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, rankedActions, completedToday));
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews, todayRange);
-  const risks = buildOperatorRisks(recentEvents);
+  const risks = uniqueStrings([...buildOperatorRisks(recentEvents), ...buildOperatorGuardrailWatchouts(activeGoals)]);
   const topPriorities = buildOperatorTopPriorities({
     overdueActions,
     dueSoonActions,
@@ -2090,6 +2136,290 @@ class DailyCoachTimeoutError extends Error {
   }
 }
 
+async function buildConversationControlDebugForUser(userId: string, text: string) {
+  const [actions, goals] = await Promise.all([getRecentActionItems(userId, 50), getActiveGoals(userId)]);
+
+  return buildConversationControlDebug({
+    text,
+    actions: actions.map(toActionSummary),
+    goals: goals.map(toGoalSummary)
+  });
+}
+
+async function handleConversationControl(
+  userId: string,
+  text: string,
+  options: { now?: Date; debug?: Awaited<ReturnType<typeof buildConversationControlDebugForUser>> } = {}
+): Promise<ConversationControlResponse> {
+  const detection = detectConversationControlIntent(text);
+  const debug = options.debug ?? (await buildConversationControlDebugForUser(userId, text));
+
+  if (detection.intent === "unknown" || detection.intent === "goal_guardrail") {
+    return {
+      handled: false,
+      debug
+    };
+  }
+
+  if (detection.intent === "show_today") {
+    const brief = await generateDailyOperatorBrief(userId, { now: options.now });
+    return {
+      handled: true,
+      reply: formatConversationTodayReply(brief),
+      brief,
+      debug
+    };
+  }
+
+  if (detection.intent === "ask_next_move") {
+    const brief = await generateDailyOperatorBrief(userId, { now: options.now });
+    return {
+      handled: true,
+      reply: brief.suggestedNextStep,
+      brief,
+      debug
+    };
+  }
+
+  if (detection.intent === "show_actions") {
+    const actions = await getActionItems(userId, { status: "open", limit: 10 });
+    return {
+      handled: true,
+      reply: actions.length > 0 ? actions.map((action) => `- ${action.title}`).join("\n") : "No open action items.",
+      actions: actions.map(sanitizeActionItem),
+      debug
+    };
+  }
+
+  if (detection.intent === "set_goal_priority") {
+    const activeGoals = await getActiveGoals(userId);
+    const goalResolution = resolveGoalReference(detection.goalText ?? "", activeGoals.map(toGoalSummary));
+
+    if (!goalResolution.goalId || goalResolution.confidence < 0.75 || goalResolution.ambiguousMatches.length > 0 || !detection.priority) {
+      return {
+        handled: true,
+        reply: formatGoalClarificationReply(goalResolution),
+        debug
+      };
+    }
+
+    const updated = await updateGoalPriority(userId, goalResolution.goalId, {
+      priority: detection.priority,
+      priorityReason: "natural priority update"
+    });
+
+    return {
+      handled: true,
+      reply: updated ? `Goal priority updated: ${updated.title} -> ${updated.priority}` : "Active goal not found.",
+      goal: updated,
+      debug
+    };
+  }
+
+  const actions = await getRecentActionItems(userId, 50);
+  const actionResolution = resolveActionReference(userId, detection.targetText ?? "", actions.map(toActionSummary));
+
+  if (!actionResolution.actionId || actionResolution.confidence < 0.8 || actionResolution.ambiguousMatches.length > 0) {
+    const completedResolution =
+      detection.intent === "complete_action"
+        ? resolveActionReference(
+            userId,
+            detection.targetText ?? "",
+            actions.filter((action) => action.status === "completed").map(toActionSummary),
+            { includeCompleted: true }
+          )
+        : undefined;
+
+    if (completedResolution?.resolvedAction && completedResolution.confidence >= 0.8) {
+      return {
+        handled: true,
+        reply: `Action already completed: ${completedResolution.resolvedAction.title}`,
+        action: completedResolution.resolvedAction,
+        debug
+      };
+    }
+
+    return {
+      handled: true,
+      reply: formatActionClarificationReply(actionResolution),
+      debug
+    };
+  }
+
+  if (detection.intent === "complete_action") {
+    const existingAction = await getActionItem(userId, actionResolution.actionId);
+
+    if (existingAction?.status === "completed") {
+      return {
+        handled: true,
+        reply: `Action already completed: ${existingAction.title}`,
+        action: sanitizeActionItem(existingAction),
+        debug
+      };
+    }
+
+    const completed = await completeActionItem(userId, actionResolution.actionId);
+
+    if (!completed) {
+      return {
+        handled: true,
+        reply: "I could not find that open action.",
+        debug
+      };
+    }
+
+    const progressEvent = await createGoalProgressFromCompletedAction(userId, completed);
+
+    return {
+      handled: true,
+      reply: [
+        `Action completed: ${completed.title}`,
+        progressEvent?.created ? `Goal progress logged: ${progressEvent.goalTitle}` : undefined
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      action: sanitizeActionItem(completed),
+      debug
+    };
+  }
+
+  if (detection.intent === "archive_action") {
+    const action = actionResolution.resolvedAction;
+    await createPendingAction(userId, {
+      type: "action_archive",
+      summary: `Archive action: ${action?.title ?? actionResolution.actionId}`,
+      payload: { actionId: actionResolution.actionId },
+      expiresAt: tomorrow()
+    });
+
+    return {
+      handled: true,
+      reply: `Confirm archive action: ${action?.title ?? actionResolution.actionId}? Reply yes to confirm or no to cancel.`,
+      action,
+      debug: {
+        ...debug,
+        requiresConfirmation: true
+      }
+    };
+  }
+
+  if (detection.intent === "snooze_action" || detection.intent === "reschedule_action") {
+    const settings = await getOrCreateNotificationSettings(userId);
+    const parsedTime = parseConversationControlTime(detection.timeText ?? "", {
+      now: options.now,
+      timezone: settings.timezone,
+      preferences: settings
+    });
+
+    if (parsedTime.invalidReason === "past_explicit_time") {
+      return {
+        handled: true,
+        reply:
+          detection.intent === "snooze_action"
+            ? "That snooze time has already passed."
+            : "That time has already passed. Use a future time, or say 'now'.",
+        debug
+      };
+    }
+
+    if (!parsedTime.dueAt) {
+      return {
+        handled: true,
+        reply: "I could not parse the new time. Try: tomorrow afternoon, 6pm, or Monday morning.",
+        debug
+      };
+    }
+
+    const updated =
+      detection.intent === "snooze_action"
+        ? await snoozeActionItem(userId, actionResolution.actionId, parsedTime.dueAt)
+        : await rescheduleActionItem(userId, actionResolution.actionId, parsedTime.dueAt);
+
+    if (!updated) {
+      return {
+        handled: true,
+        reply: "I could not update that action.",
+        debug
+      };
+    }
+
+    return {
+      handled: true,
+      reply:
+        detection.intent === "snooze_action"
+          ? `Action snoozed until ${formatLocalDateTime(updated.snoozedUntil, settings.timezone)}: ${updated.title}`
+          : [`Action rescheduled: ${updated.title}`, `due: ${formatLocalDateTime(updated.dueAt, settings.timezone)}`].join("\n"),
+      action: sanitizeActionItem(updated),
+      debug
+    };
+  }
+
+  return {
+    handled: false,
+    debug
+  };
+}
+
+function toActionSummary(action: ActionItem) {
+  return {
+    id: action.id,
+    title: action.title,
+    status: action.status,
+    dueAt: action.dueAt,
+    snoozedUntil: action.snoozedUntil,
+    goalId: action.goalId,
+    goalTitleSnapshot: action.goalTitleSnapshot,
+    evidence: action.evidence
+  };
+}
+
+function toGoalSummary(goal: Goal): GoalSummary {
+  return {
+    id: goal.id,
+    title: goal.title,
+    status: goal.status,
+    category: goal.category,
+    templateId: goal.templateId
+  };
+}
+
+function formatActionClarificationReply(resolution: ReturnType<typeof resolveActionReference>): string {
+  if (resolution.ambiguousMatches.length > 0) {
+    return [
+      "Which action do you mean?",
+      ...resolution.ambiguousMatches.slice(0, 5).map((action) => `- ${action.title} (${action.id})`)
+    ].join("\n");
+  }
+
+  return "I could not confidently match that to an open action. Use /actions to check the exact one.";
+}
+
+function formatGoalClarificationReply(resolution: ReturnType<typeof resolveGoalReference>): string {
+  if (resolution.ambiguousMatches.length > 0) {
+    return [
+      "Which goal do you mean?",
+      ...resolution.ambiguousMatches.slice(0, 5).map((goal) => `- ${goal.title} (${goal.id})`)
+    ].join("\n");
+  }
+
+  return "I could not confidently match that to an active goal. Use /goal_priorities to check the exact one.";
+}
+
+function formatConversationTodayReply(brief: DailyOperatorBrief): string {
+  return [
+    `Today - ${brief.date}`,
+    "",
+    "Status:",
+    brief.summary,
+    "",
+    "Top priorities:",
+    brief.topPriorities.length > 0 ? brief.topPriorities.map((item, index) => `${index + 1}. ${item}`).join("\n") : "No clear priorities yet.",
+    "",
+    "Next move:",
+    brief.suggestedNextStep
+  ].join("\n");
+}
+
 function dueLabelFromPriorityScore(score: DailyPriorityScore): string {
   return (
     score.factors.find((factor) => factor === "overdue" || factor.startsWith("due today") || factor.startsWith("due tomorrow") || factor === "due later this week") ??
@@ -2124,12 +2454,6 @@ function buildOperatorTopPriorities(input: {
 
   input.openActions.forEach((action) => addActionPriority(action));
 
-  for (const goal of input.goalStatus.filter((item) => item.status === "no_progress" && !item.openActionTitle)) {
-    priorities.push(`Log progress for ${goal.title}`);
-  }
-
-  priorities.push(...input.risks.slice(0, 1));
-
   return uniqueStrings(priorities).slice(0, 3);
 }
 
@@ -2152,7 +2476,7 @@ function pickOperatorNextStep(input: {
     return `Do this first: ${topAction.title}.`;
   }
 
-  const staleGoal = input.goalStatus.find((goal) => goal.status === "no_progress");
+  const staleGoal = input.goalStatus.find((goal) => goal.status === "no_progress" && !isRiskControlGoalStatus(goal));
   if (staleGoal) {
     return `Log one concrete action for ${staleGoal.title}.`;
   }
@@ -2332,6 +2656,17 @@ function buildOperatorRisks(events: StoredEvent[]): string[] {
   }
 
   return uniqueStrings(risks).slice(0, 5);
+}
+
+function buildOperatorGuardrailWatchouts(activeGoals: Awaited<ReturnType<typeof getActiveGoals>>): string[] {
+  return activeGoals
+    .filter((goal) => isRiskControlGoal(goal))
+    .map((goal) => `Risk-control goal active: ${goal.title}. Keep guardrail separate from normal task progress.`)
+    .slice(0, 1);
+}
+
+function isRiskControlGoalStatus(goal: Pick<DailyOperatorBriefGoalStatus, "title">): boolean {
+  return /\b(finance|betting|trading|gambling|impulse|risk|apuesta|apostar)\b/i.test(goal.title);
 }
 
 function toBriefAction(action: ActionItem): DailyOperatorBriefAction {
@@ -5953,6 +6288,24 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
     };
   }
 
+  if (pendingAction.type === "action_archive") {
+    const actionId = pendingAction.payload.actionId;
+
+    if (typeof actionId !== "string") {
+      throw new Error("Invalid action_archive payload.");
+    }
+
+    const action = await archiveActionItem(userId, actionId);
+
+    if (!action) {
+      throw new Error("Action item not found.");
+    }
+
+    return {
+      reply: `Action archived: ${action.title}`
+    };
+  }
+
   if (pendingAction.type === "memory_create") {
     const payload = PendingMemoryCreatePayloadSchema.parse(pendingAction.payload);
     const memory = await createMemoryFromPendingPayload(userId, payload);
@@ -6152,6 +6505,16 @@ interface DailyCoachDebug {
 interface DailyCoachGenerationResult {
   coach: DailyCoachResponse;
   debug: DailyCoachDebug;
+}
+
+interface ConversationControlResponse {
+  handled: boolean;
+  reply?: string;
+  debug: Awaited<ReturnType<typeof buildConversationControlDebugForUser>>;
+  action?: unknown;
+  goal?: unknown;
+  brief?: DailyOperatorBrief;
+  actions?: unknown[];
 }
 
 interface DailyOperatorBriefAction {

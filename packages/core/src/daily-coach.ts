@@ -61,7 +61,8 @@ export type DailyCoachValidationFailureCode =
   | "unknown_action_or_goal"
   | "next_move_mismatch"
   | "priority_reordered"
-  | "unsafe_guardrail_advice";
+  | "unsafe_guardrail_advice"
+  | "unsupported_domain_inference";
 
 export class DailyCoachValidationError extends Error {
   constructor(
@@ -121,6 +122,7 @@ export function validateDailyCoachResponseAgainstContext(
   const parsed = schemaResult.data;
   collectCoachTextFitFailures(parsed, failureCodes);
   collectKnownStateFailures(parsed, context, failureCodes);
+  collectUnsupportedDomainInferenceFailures(parsed, context, failureCodes);
   collectBettingAdviceFailures(parsed, failureCodes);
   collectNextMoveFailures(parsed, context, failureCodes);
 
@@ -249,6 +251,22 @@ function collectBettingAdviceFailures(
   }
 }
 
+function collectUnsupportedDomainInferenceFailures(
+  response: DailyCoachResponse,
+  context: DailyBriefContext,
+  failureCodes: DailyCoachValidationFailureCode[]
+) {
+  const text = normalizePhrase(Object.values(response).filter(Boolean).join(" "));
+
+  if (!claimsExplicitApplicationProgress(text)) {
+    return;
+  }
+
+  if (!contextHasExplicitApplicationProgress(context)) {
+    failureCodes.push("unsupported_domain_inference");
+  }
+}
+
 function collectNextMoveFailures(
   response: DailyCoachResponse,
   context: DailyBriefContext,
@@ -297,6 +315,34 @@ function hasUnsafeBettingOrTradingAdvice(text: string): boolean {
   ];
 
   return unsafePatterns.some((pattern) => pattern.test(lower));
+}
+
+function claimsExplicitApplicationProgress(normalizedText: string): boolean {
+  const countWord = "(?:\\d+|one|two|three|four|five|six|seven|eight|nine|ten)";
+  const applicationNoun = "(?:applications?|job applications?|cvs?|cv|resumes?)";
+  const progressVerb = "(?:completed|sent|submitted|filed|finished|logged)";
+  const applyVerb = "(?:applied)";
+  const patterns = [
+    new RegExp(`\\b${progressVerb}\\s+${countWord}\\s+${applicationNoun}\\b`, "i"),
+    new RegExp(`\\b${countWord}\\s+${applicationNoun}\\s+(?:completed|sent|submitted|filed|logged)\\b`, "i"),
+    new RegExp(`\\b${applyVerb}\\s+(?:to\\s+)?${countWord}\\s+(?:jobs?|roles?|applications?)\\b`, "i")
+  ];
+
+  return patterns.some((pattern) => pattern.test(normalizedText));
+}
+
+function contextHasExplicitApplicationProgress(context: DailyBriefContext): boolean {
+  const contextText = normalizePhrase(
+    [
+      ...context.recentWins,
+      ...context.activeGoals.map((goal) => goal.statusToday),
+      ...context.activeGoals.flatMap((goal) => goal.guardrailActivityToday)
+    ].join(" ")
+  );
+
+  return /\b(?:career application sent|applications? sent|job applications? sent|cvs? sent|resumes? sent|applied to \d+ jobs?)\b/i.test(
+    contextText
+  );
 }
 
 function normalizePhrase(value: string): string {

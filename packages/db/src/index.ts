@@ -91,6 +91,7 @@ export type PendingActionType =
   | "profile_update"
   | "goal_create"
   | "goal_archive"
+  | "action_archive"
   | "goal_progress_log"
   | "memory_create"
   | "event_undo_last";
@@ -1554,6 +1555,28 @@ export async function snoozeActionItem(userId: string, actionItemId: string, sno
     data: {
       status: "snoozed",
       snoozedUntil,
+      completedAt: null
+    }
+  });
+
+  return toActionItem(actionItem);
+}
+
+export async function rescheduleActionItem(userId: string, actionItemId: string, dueAt: Date): Promise<ActionItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await getActionItem(userId, actionItemId);
+
+  if (!existing || existing.status === "archived") {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.update({
+    where: { id: actionItemId },
+    data: {
+      status: "open",
+      dueAt,
+      snoozedUntil: null,
       completedAt: null
     }
   });
