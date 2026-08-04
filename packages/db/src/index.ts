@@ -117,6 +117,22 @@ export interface CreatePendingActionInput {
   expiresAt?: Date;
 }
 
+export type DailyLoopStatus = "not_started" | "morning_sent" | "active_day" | "evening_sent" | "completed";
+
+export interface DailyLoopState {
+  id: string;
+  userId: string;
+  localDate: string;
+  timezone: string;
+  morningBriefSentAt?: Date;
+  middayNudgeSentAt?: Date;
+  eveningReviewSentAt?: Date;
+  eveningReviewCompletedAt?: Date;
+  status: DailyLoopStatus;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
 export interface GetRelevantMemoriesOptions {
   limit?: number;
   types?: MemoryEntry["type"][];
@@ -2282,7 +2298,8 @@ export async function getUsersWithEnabledNotifications(): Promise<NotificationSe
       OR: [
         { dailyCheckinEnabled: true },
         { dailyInsightEnabled: true },
-        { weeklyInsightEnabled: true }
+        { weeklyInsightEnabled: true },
+        { dailyLoopEnabled: true }
       ]
     },
     orderBy: {
@@ -2291,6 +2308,94 @@ export async function getUsersWithEnabledNotifications(): Promise<NotificationSe
   });
 
   return settings.map(toNotificationSettings);
+}
+
+export async function getOrCreateDailyLoopState(
+  userId: string,
+  input: { localDate: string; timezone: string }
+): Promise<DailyLoopState> {
+  await ensureUser(userId);
+
+  const state = await prisma.dailyLoopState.upsert({
+    where: {
+      userId_localDate: {
+        userId,
+        localDate: input.localDate
+      }
+    },
+    create: {
+      userId,
+      localDate: input.localDate,
+      timezone: input.timezone
+    },
+    update: {
+      timezone: input.timezone
+    }
+  });
+
+  return toDailyLoopState(state);
+}
+
+export async function markDailyLoopMorningSent(
+  userId: string,
+  input: { localDate: string; timezone: string; sentAt?: Date }
+): Promise<DailyLoopState> {
+  await ensureUser(userId);
+  const sentAt = input.sentAt ?? new Date();
+
+  const state = await prisma.dailyLoopState.upsert({
+    where: {
+      userId_localDate: {
+        userId,
+        localDate: input.localDate
+      }
+    },
+    create: {
+      userId,
+      localDate: input.localDate,
+      timezone: input.timezone,
+      morningBriefSentAt: sentAt,
+      status: "morning_sent"
+    },
+    update: {
+      timezone: input.timezone,
+      morningBriefSentAt: sentAt,
+      status: "morning_sent"
+    }
+  });
+
+  return toDailyLoopState(state);
+}
+
+export async function markDailyLoopEveningSent(
+  userId: string,
+  input: { localDate: string; timezone: string; sentAt?: Date }
+): Promise<DailyLoopState> {
+  await ensureUser(userId);
+  const sentAt = input.sentAt ?? new Date();
+
+  const state = await prisma.dailyLoopState.upsert({
+    where: {
+      userId_localDate: {
+        userId,
+        localDate: input.localDate
+      }
+    },
+    create: {
+      userId,
+      localDate: input.localDate,
+      timezone: input.timezone,
+      eveningReviewSentAt: sentAt,
+      status: "evening_sent"
+    },
+    update: {
+      timezone: input.timezone,
+      eveningReviewSentAt: sentAt,
+      status: "evening_sent"
+    }
+  });
+
+  return toDailyLoopState(state);
 }
 
 export async function createNotificationLog(input: NotificationLogInput): Promise<boolean> {
@@ -2901,6 +3006,7 @@ function toNotificationSettings(
     weeklyInsightEnabled: settings.weeklyInsightEnabled,
     weeklyInsightDay: (settings.weeklyInsightDay as NotificationSettings["weeklyInsightDay"]) ?? undefined,
     weeklyInsightTime: settings.weeklyInsightTime ?? undefined,
+    dailyLoopEnabled: settings.dailyLoopEnabled,
     timezone: settings.timezone,
     defaultActionTimeMinutes: settings.defaultActionTimeMinutes ?? 540,
     morningTimeMinutes: settings.morningTimeMinutes ?? 540,
@@ -2910,6 +3016,31 @@ function toNotificationSettings(
     createdAt: settings.createdAt,
     updatedAt: settings.updatedAt
   };
+}
+
+function toDailyLoopState(state: Prisma.DailyLoopStateGetPayload<object>): DailyLoopState {
+  return {
+    id: state.id,
+    userId: state.userId,
+    localDate: state.localDate,
+    timezone: state.timezone,
+    morningBriefSentAt: state.morningBriefSentAt ?? undefined,
+    middayNudgeSentAt: state.middayNudgeSentAt ?? undefined,
+    eveningReviewSentAt: state.eveningReviewSentAt ?? undefined,
+    eveningReviewCompletedAt: state.eveningReviewCompletedAt ?? undefined,
+    status: normalizeDailyLoopStatus(state.status),
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt
+  };
+}
+
+function normalizeDailyLoopStatus(status: string): DailyLoopStatus {
+  return status === "morning_sent" ||
+    status === "active_day" ||
+    status === "evening_sent" ||
+    status === "completed"
+    ? status
+    : "not_started";
 }
 
 function isPrismaUniqueConstraintError(error: unknown): boolean {

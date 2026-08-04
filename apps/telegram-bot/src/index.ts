@@ -332,6 +332,48 @@ bot.command("set_reminder_time", async (ctx) => {
   }
 });
 
+bot.command("daily_loop_settings", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`
+    );
+    await ctx.reply(formatDailyLoopSettings(response.notificationSettings));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not load daily loop settings right now.");
+  }
+});
+
+bot.command("set_daily_loop", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const parsed = parseSetDailyLoopCommand(getCommandText(ctx));
+
+  if (!parsed) {
+    await ctx.reply("Usage: /set_daily_loop enabled on|off\n/set_daily_loop morning 09:00\n/set_daily_loop evening 21:00");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<NotificationSettingsResponse>(
+      `/users/${getTelegramUserId(ctx)}/notification-settings`,
+      {
+        ...parsed,
+        telegramUserId: getRawTelegramUserId(ctx),
+        timezone: "Europe/Madrid"
+      }
+    );
+    await ctx.reply(formatDailyLoopSettings(response.notificationSettings));
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not update daily loop settings right now.");
+  }
+});
+
 bot.command("enable_checkin", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -1350,6 +1392,77 @@ bot.command("today", async (ctx) => {
     await ctx.reply(formatDailyOperatorBrief(response.brief));
   } catch (error) {
     await replyWithApiFailure(ctx, error, "I could not fetch today's brief right now.");
+  }
+});
+
+bot.command("start_day", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<DailyLoopMessageResponse>(`/users/${getTelegramUserId(ctx)}/daily-loop/start-day`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not build your day-start brief right now.");
+  }
+});
+
+bot.command("end_day", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<DailyLoopMessageResponse>(`/users/${getTelegramUserId(ctx)}/daily-loop/end-day`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not build your evening review right now.");
+  }
+});
+
+bot.command("tomorrow", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<DailyLoopMessageResponse>(`/users/${getTelegramUserId(ctx)}/daily-loop/tomorrow`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not build tomorrow prep right now.");
+  }
+});
+
+bot.command("debug_send_start_day", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const force = String(ctx.match ?? "").trim().toLowerCase() === "force";
+    const response = await apiGet<DailyLoopMessageResponse>(
+      `/users/${getTelegramUserId(ctx)}/daily-loop/start-day?markSent=true${force ? "&force=true" : ""}`
+    );
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not send the debug start-day brief right now.");
+  }
+});
+
+bot.command("debug_send_end_day", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const force = String(ctx.match ?? "").trim().toLowerCase() === "force";
+    const response = await apiGet<DailyLoopMessageResponse>(
+      `/users/${getTelegramUserId(ctx)}/daily-loop/end-day?markSent=true${force ? "&force=true" : ""}`
+    );
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not send the debug end-day review right now.");
   }
 });
 
@@ -3182,6 +3295,7 @@ function formatNotificationSettings(settings: NotificationSettings) {
     `weeklyInsightEnabled: ${settings.weeklyInsightEnabled}`,
     `weeklyInsightDay: ${settings.weeklyInsightDay ?? "not set"}`,
     `weeklyInsightTime: ${settings.weeklyInsightTime ?? "not set"}`,
+    `dailyLoopEnabled: ${settings.dailyLoopEnabled}`,
     `timezone: ${settings.timezone}`,
     `defaultActionTime: ${formatMinutesOfDay(settings.defaultActionTimeMinutes)}`,
     `morning: ${formatMinutesOfDay(settings.morningTimeMinutes)}`,
@@ -3202,6 +3316,42 @@ function formatReminderSettings(settings: NotificationSettings) {
     `evening: ${formatMinutesOfDay(settings.eveningTimeMinutes)}`,
     `tonight: ${formatMinutesOfDay(settings.tonightTimeMinutes)}`
   ].join("\n");
+}
+
+function formatDailyLoopSettings(settings: NotificationSettings) {
+  return [
+    "Daily loop settings:",
+    `enabled: ${settings.dailyLoopEnabled ? "yes" : "no"}`,
+    `morning: ${formatMinutesOfDay(settings.morningTimeMinutes)}`,
+    `evening: ${formatMinutesOfDay(settings.eveningTimeMinutes)}`,
+    `timezone: ${settings.timezone}`
+  ].join("\n");
+}
+
+function parseSetDailyLoopCommand(text: string): Partial<NotificationSettings> | undefined {
+  const [field, value] = text.trim().split(/\s+/, 2);
+
+  if (field === "enabled" && /^(on|off)$/i.test(value ?? "")) {
+    return {
+      dailyLoopEnabled: value?.toLowerCase() === "on"
+    };
+  }
+
+  const minutes = parseMinutesOfDay(value ?? "");
+
+  if (field === "morning" && minutes !== undefined) {
+    return {
+      morningTimeMinutes: minutes
+    };
+  }
+
+  if (field === "evening" && minutes !== undefined) {
+    return {
+      eveningTimeMinutes: minutes
+    };
+  }
+
+  return undefined;
 }
 
 function parseSetReminderTimeCommand(text: string): { field: keyof ReminderTimePatch; minutes: number } | undefined {
@@ -3853,6 +4003,10 @@ interface DailyReviewResponse {
 
 interface DailyOperatorBriefResponse {
   brief: DailyOperatorBrief;
+}
+
+interface DailyLoopMessageResponse {
+  message: string;
 }
 
 interface DailyPriorityDebugResponse {
@@ -4564,6 +4718,7 @@ interface NotificationSettings {
   weeklyInsightEnabled: boolean;
   weeklyInsightDay?: string;
   weeklyInsightTime?: string;
+  dailyLoopEnabled: boolean;
   timezone: string;
   defaultActionTimeMinutes: number;
   morningTimeMinutes: number;

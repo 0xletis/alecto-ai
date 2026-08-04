@@ -26,6 +26,8 @@ export interface ActionSummary {
   snoozedUntil?: Date;
   goalId?: string;
   goalTitleSnapshot?: string;
+  project?: string;
+  actionType?: string;
   evidence?: string;
 }
 
@@ -383,6 +385,9 @@ function detectGoalPriority(text: string): ConversationControlDetection | undefi
 function scoreActionReference(targetKey: string, action: ActionSummary): number {
   const titleKey = normalizeReferenceKey(action.title);
   const goalKey = normalizeReferenceKey(action.goalTitleSnapshot ?? "");
+  const projectKey = normalizeReferenceKey(action.project ?? "");
+  const evidenceKey = normalizeReferenceKey(action.evidence ?? "");
+  const actionTypeKey = normalizeReferenceKey(action.actionType ?? "");
 
   if (targetKey === titleKey || titleKey.includes(targetKey)) {
     return 0.95;
@@ -392,13 +397,23 @@ function scoreActionReference(targetKey: string, action: ActionSummary): number 
     return 0.9;
   }
 
+  if (projectKey && (targetKey === projectKey || targetKey.includes(projectKey) || projectKey.includes(targetKey))) {
+    return 0.88;
+  }
+
   const targetWords = keywordSet(targetKey);
   const titleWords = keywordSet(titleKey);
+  const contextWords = keywordSet(`${titleKey} ${projectKey} ${evidenceKey} ${actionTypeKey}`);
   const shared = [...titleWords].filter((word) => targetWords.has(word));
+  const sharedContext = [...contextWords].filter((word) => targetWords.has(word));
   let score =
     titleWords.size > 0 && targetWords.size > 0
       ? Math.max(shared.length / titleWords.size, shared.length / targetWords.size)
       : 0;
+
+  if (contextWords.size > 0 && targetWords.size > 0) {
+    score = Math.max(score, Math.min(0.82, sharedContext.length / targetWords.size));
+  }
 
   if (goalKey && [...keywordSet(goalKey)].some((word) => targetWords.has(word))) {
     score += 0.12;

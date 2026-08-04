@@ -65,7 +65,11 @@ async function runTick() {
     ) {
       await maybeSendWeeklyInsight(item, now);
     }
+
   }
+
+  await runDailyMorningBriefs(now, settings);
+  await runDailyEveningReviews(now, settings);
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
@@ -114,6 +118,34 @@ export async function sendDueActionReminders(now = new Date()) {
       console.log(`Sent ${candidate.reminderType} action reminder for ${candidate.actionItem.id}.`);
     } catch (error) {
       console.error(`Action reminder failed for ${candidate.actionItem.id}`, error);
+    }
+  }
+}
+
+export async function runDailyMorningBriefs(now = new Date(), settings?: NotificationSettings[]) {
+  const notificationSettings = settings ?? (await getUsersWithEnabledNotifications());
+
+  for (const item of notificationSettings) {
+    if (!item.telegramUserId || !item.dailyLoopEnabled) {
+      continue;
+    }
+
+    if (formatMinutesOfDay(item.morningTimeMinutes) === formatLocalTime(now, item.timezone)) {
+      await maybeSendDailyLoopStart(item, now);
+    }
+  }
+}
+
+export async function runDailyEveningReviews(now = new Date(), settings?: NotificationSettings[]) {
+  const notificationSettings = settings ?? (await getUsersWithEnabledNotifications());
+
+  for (const item of notificationSettings) {
+    if (!item.telegramUserId || !item.dailyLoopEnabled) {
+      continue;
+    }
+
+    if (formatMinutesOfDay(item.eveningTimeMinutes) === formatLocalTime(now, item.timezone)) {
+      await maybeSendDailyLoopEnd(item, now);
     }
   }
 }
@@ -243,6 +275,60 @@ async function maybeSendWeeklyInsight(item: NotificationSettings, now: Date) {
 
   if (logged) {
     console.log(`Sent weekly insight to ${item.userId} for week ${sentForDate}.`);
+  }
+}
+
+async function maybeSendDailyLoopStart(item: NotificationSettings, now: Date) {
+  if (!item.telegramUserId) {
+    return;
+  }
+
+  const sentForDate = formatLocalDate(now, item.timezone);
+  const logInput = {
+    userId: item.userId,
+    type: "daily_loop_morning",
+    sentForDate
+  };
+
+  if (await hasNotificationLog(logInput)) {
+    return;
+  }
+
+  const response = await apiGet<DailyLoopMessageResponse>(
+    `/users/${item.userId}/daily-loop/start-day?markSent=true&now=${encodeURIComponent(now.toISOString())}`
+  );
+  await sendTelegramMessage(item.telegramUserId, response.message);
+  const logged = await createNotificationLog(logInput);
+
+  if (logged) {
+    console.log(`Sent daily loop start to ${item.userId} for ${sentForDate}.`);
+  }
+}
+
+async function maybeSendDailyLoopEnd(item: NotificationSettings, now: Date) {
+  if (!item.telegramUserId) {
+    return;
+  }
+
+  const sentForDate = formatLocalDate(now, item.timezone);
+  const logInput = {
+    userId: item.userId,
+    type: "daily_loop_evening",
+    sentForDate
+  };
+
+  if (await hasNotificationLog(logInput)) {
+    return;
+  }
+
+  const response = await apiGet<DailyLoopMessageResponse>(
+    `/users/${item.userId}/daily-loop/end-day?markSent=true&now=${encodeURIComponent(now.toISOString())}`
+  );
+  await sendTelegramMessage(item.telegramUserId, response.message);
+  const logged = await createNotificationLog(logInput);
+
+  if (logged) {
+    console.log(`Sent daily loop evening review to ${item.userId} for ${sentForDate}.`);
   }
 }
 
@@ -393,6 +479,13 @@ function formatLocalTime(date: Date, timezone: string): string {
   return `${getPart(parts, "hour")}:${getPart(parts, "minute")}`;
 }
 
+function formatMinutesOfDay(minutes: number | undefined): string {
+  const safeMinutes = Number.isInteger(minutes) && minutes !== undefined && minutes >= 0 && minutes <= 1439 ? minutes : 0;
+  const hour = Math.floor(safeMinutes / 60);
+  const minute = safeMinutes % 60;
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
 function formatLocalDate(date: Date, timezone: string): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
@@ -467,11 +560,18 @@ interface NotificationSettings {
   weeklyInsightEnabled: boolean;
   weeklyInsightDay?: string;
   weeklyInsightTime?: string;
+  dailyLoopEnabled: boolean;
   timezone: string;
+  morningTimeMinutes: number;
+  eveningTimeMinutes: number;
 }
 
 interface InsightResponse {
   insight: InsightReport;
+}
+
+interface DailyLoopMessageResponse {
+  message: string;
 }
 
 interface IntegrationSyncResponse {

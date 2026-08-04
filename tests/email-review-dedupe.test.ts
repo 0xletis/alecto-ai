@@ -695,6 +695,26 @@ test("conversational action control asks before destructive or ambiguous mutatio
       dueAt: new Date("2026-07-31T13:00:00.000Z")
     }
   });
+  await prisma.actionItem.createMany({
+    data: [
+      {
+        userId: actionUserId,
+        source: "manual",
+        title: "Review homepage copy",
+        priority: "medium",
+        status: "open",
+        project: "homepage"
+      },
+      {
+        userId: actionUserId,
+        source: "manual",
+        title: "Update homepage hero",
+        priority: "medium",
+        status: "open",
+        project: "homepage"
+      }
+    ]
+  });
 
   try {
     let response = await server.inject({
@@ -765,6 +785,19 @@ test("conversational action control asks before destructive or ambiguous mutatio
     assert.match(firstChoice.json().reply, /Action completed: Call Alex/);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: callMorning.id } })).status, "completed");
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: callAfternoon.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${actionUserId}/conversation/control`,
+      payload: {
+        text: "move homepage to tomorrow morning",
+        now: "2026-07-31T14:37:00+02:00"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which action do you mean/);
+    assert.match(response.json().reply, /Review homepage copy/);
+    assert.match(response.json().reply, /Update homepage hero/);
 
     const callSamMorning = await prisma.actionItem.create({
       data: {
@@ -2248,6 +2281,248 @@ test("/today returns safe empty brief", async () => {
   }
 });
 
+test("daily operating loop builds start/end/tomorrow briefs and routes loop replies through multi-intent", async () => {
+  const server = buildServer();
+  const loopUserId = `daily-loop-${randomUUID()}`;
+  const now = "2026-07-31T09:00:00+02:00";
+  await prisma.user.create({ data: { id: loopUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      id: randomUUID(),
+      userId: loopUserId,
+      dailyLoopEnabled: true,
+      timezone: "Europe/Madrid",
+      morningTimeMinutes: 540,
+      eveningTimeMinutes: 1260
+    }
+  });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: loopUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  await prisma.goal.create({
+    data: {
+      userId: loopUserId,
+      title: "Control impulsive betting",
+      category: "finance",
+      templateId: "finance.control_betting_trading",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  const homepage = await prisma.actionItem.create({
+    data: {
+      userId: loopUserId,
+      source: "manual",
+      title: "Review homepage copy",
+      status: "open",
+      priority: "medium",
+      dueAt: new Date("2026-07-30T07:00:00.000Z"),
+      project: "homepage",
+      evidence: "review homepage copy"
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: loopUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      status: "open",
+      priority: "medium",
+      dueAt: new Date("2026-08-01T14:30:00.000Z")
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: loopUserId,
+      source: "manual",
+      title: "Apply to 2 jobs",
+      status: "completed",
+      priority: "medium",
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title,
+      completedAt: new Date("2026-07-31T06:00:00.000Z")
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/start-day?now=${encodeURIComponent(now)}&markSent=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Today - 2026-07-31/);
+    assert.match(response.json().message, /First move: Review homepage copy/);
+    assert.match(response.json().message, /Overdue: Review homepage copy/);
+    assert.match(response.json().message, /Guardrail: Keep Control impulsive betting locked today/);
+    const state = await prisma.dailyLoopState.findUniqueOrThrow({
+      where: {
+        userId_localDate: {
+          userId: loopUserId,
+          localDate: "2026-07-31"
+        }
+      }
+    });
+    assert.equal(state.status, "morning_sent");
+    assert.ok(state.morningBriefSentAt);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/start-day?now=${encodeURIComponent(now)}&markSent=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Morning brief already sent today/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/start-day?now=${encodeURIComponent(now)}&markSent=true&force=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /First move: Review homepage copy/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/end-day?now=${encodeURIComponent("2026-07-31T21:00:00+02:00")}&markSent=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Evening review/);
+    assert.match(response.json().message, /Completed action: Apply to 2 jobs/);
+    assert.match(response.json().message, /Review homepage copy overdue/);
+    assert.match(response.json().message, /move homepage to tomorrow morning/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/end-day?now=${encodeURIComponent("2026-07-31T21:00:00+02:00")}&markSent=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Evening review already sent today/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/end-day?now=${encodeURIComponent("2026-07-31T21:00:00+02:00")}&markSent=true&force=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Review homepage copy overdue/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/tomorrow?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Tomorrow - 2026-08-01/);
+    assert.match(response.json().message, /Write YouTube script/);
+    assert.doesNotMatch(response.json().message, /Control impulsive betting.*Log progress/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${loopUserId}/conversation/multi-intent`,
+      payload: {
+        text: "trained 30 min, move homepage copy to tomorrow morning",
+        now
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Logged 30 min training/);
+    assert.match(response.json().reply, /Action rescheduled: Review homepage copy/);
+    assert.equal(await prisma.event.count({ where: { userId: loopUserId, type: "health.workout_completed" } }), 1);
+    const updatedHomepage = await prisma.actionItem.findUniqueOrThrow({ where: { id: homepage.id } });
+    assert.ok(updatedHomepage.dueAt);
+    assert.equal(localDate(updatedHomepage.dueAt), "2026-08-01");
+    assert.equal(localMinutes(updatedHomepage.dueAt), 540);
+    assert.equal(await prisma.actionItem.count({ where: { userId: loopUserId, title: "Review homepage copy" } }), 1);
+
+    response = await server.inject({
+      method: "PATCH",
+      url: `/users/${loopUserId}/notification-settings`,
+      payload: {
+        dailyLoopEnabled: false,
+        morningTimeMinutes: 600,
+        eveningTimeMinutes: 1320
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().notificationSettings.dailyLoopEnabled, false);
+    assert.equal(response.json().notificationSettings.morningTimeMinutes, 600);
+    assert.equal(response.json().notificationSettings.eveningTimeMinutes, 1320);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: loopUserId } });
+  }
+});
+
+test("daily operating loop filters start-day today actions by local due date", async () => {
+  const server = buildServer();
+  const loopUserId = `daily-loop-local-due-${randomUUID()}`;
+  const now = "2026-08-04T14:43:00+02:00";
+  await prisma.user.create({ data: { id: loopUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: loopUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345",
+      dailyLoopEnabled: true
+    }
+  });
+  await prisma.actionItem.createMany({
+    data: [
+      {
+        userId: loopUserId,
+        source: "manual",
+        title: "Overdue launch notes",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-01T14:30:00.000Z")
+      },
+      {
+        userId: loopUserId,
+        source: "manual",
+        title: "Call supplier",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-04T16:00:00.000Z")
+      },
+      {
+        userId: loopUserId,
+        source: "manual",
+        title: "Review homepage",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-05T07:00:00.000Z")
+      }
+    ]
+  });
+
+  try {
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/start-day?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Today - 2026-08-04/);
+    assert.match(response.json().message, /Overdue: Overdue launch notes/);
+    assert.match(response.json().message, /Also today: Call supplier/);
+    assert.doesNotMatch(response.json().message, /Also today: .*Review homepage/);
+    assert.equal((response.json().message.match(/Overdue launch notes/g) ?? []).length, 2);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${loopUserId}/daily-loop/tomorrow?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Tomorrow - 2026-08-05/);
+    assert.match(response.json().message, /Review homepage/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: loopUserId } });
+  }
+});
+
 test("/today shows open, completed, overdue action items and picks overdue first", async () => {
   const server = buildServer();
   const briefUserId = `brief-actions-${randomUUID()}`;
@@ -2769,7 +3044,10 @@ test("same manual task dedupes by local due date and time", async () => {
     const response = await server.inject({
       method: "POST",
       url: `/users/${actionUserId}/actions/manual`,
-      payload: { text: "I need to review the homepage copy 2026-08-03" }
+      payload: {
+        text: "I need to review the homepage copy 2026-08-03",
+        now: "2026-07-30T11:00:00+02:00"
+      }
     });
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().duplicate, true);

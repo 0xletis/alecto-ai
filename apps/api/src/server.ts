@@ -26,6 +26,7 @@ import {
   DailyCoachValidationError,
   selectedDailyCoachActionTitle,
   extractEvents,
+  classifyDueWindow,
   findGoalDuplicateWarnings,
   getLocalTodayRange,
   isRiskControlGoal,
@@ -104,6 +105,7 @@ import {
   createEmailSignalRule,
   createActionItem,
   createActionItemIfNotExists,
+  createNotificationLog,
   createMemory,
   createMemoryFromPendingPayload,
   createPendingAction,
@@ -117,6 +119,7 @@ import {
   getEventsSince,
   getGoals,
   getLatestPendingAction,
+  getOrCreateDailyLoopState,
   getOrCreateNotificationSettings,
   getPendingActions,
   getOrCreateUserOperatingProfile,
@@ -155,6 +158,8 @@ import {
   reopenSnoozedActionItem,
   forceActionItemDue,
   forceActionItemSnoozedDue,
+  markDailyLoopEveningSent,
+  markDailyLoopMorningSent,
   snoozeActionItem,
   undoLastEvents,
   archiveEmailSignalRule,
@@ -722,6 +727,81 @@ export function buildServer() {
   server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/today", async (request) => ({
     brief: await generateDailyOperatorBrief(request.params.userId, { now: parseOptionalNow(request.query.now) })
   }));
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string; markSent?: string; force?: string } }>(
+    "/users/:userId/daily-loop/start-day",
+    async (request) => {
+      const now = parseOptionalNow(request.query.now) ?? new Date();
+      const input = await dailyLoopStateInput(request.params.userId, now);
+      const existingState = await getOrCreateDailyLoopState(request.params.userId, input);
+      const markSent = request.query.markSent === "true";
+      const force = request.query.force === "true";
+
+      if (markSent && existingState.morningBriefSentAt && !force) {
+        return {
+          message: "Morning brief already sent today. Use /debug_send_start_day force to resend.",
+          state: existingState,
+          alreadySent: true
+        };
+      }
+
+      const message = await buildStartDayMessage(request.params.userId, now);
+      const state = markSent
+        ? await markDailyLoopMorningSent(request.params.userId, input)
+        : existingState;
+
+      if (markSent) {
+        await createNotificationLog({
+          userId: request.params.userId,
+          type: "daily_loop_morning",
+          sentForDate: input.localDate
+        });
+      }
+
+      return { message, state, alreadySent: false };
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string; markSent?: string; force?: string } }>(
+    "/users/:userId/daily-loop/end-day",
+    async (request) => {
+      const now = parseOptionalNow(request.query.now) ?? new Date();
+      const input = await dailyLoopStateInput(request.params.userId, now);
+      const existingState = await getOrCreateDailyLoopState(request.params.userId, input);
+      const markSent = request.query.markSent === "true";
+      const force = request.query.force === "true";
+
+      if (markSent && existingState.eveningReviewSentAt && !force) {
+        return {
+          message: "Evening review already sent today. Use /debug_send_end_day force to resend.",
+          state: existingState,
+          alreadySent: true
+        };
+      }
+
+      const message = await buildEndDayMessage(request.params.userId, now);
+      const state = markSent
+        ? await markDailyLoopEveningSent(request.params.userId, input)
+        : existingState;
+
+      if (markSent) {
+        await createNotificationLog({
+          userId: request.params.userId,
+          type: "daily_loop_evening",
+          sentForDate: input.localDate
+        });
+      }
+
+      return { message, state, alreadySent: false };
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>(
+    "/users/:userId/daily-loop/tomorrow",
+    async (request) => ({
+      message: await buildTomorrowPrepMessage(request.params.userId, parseOptionalNow(request.query.now) ?? new Date())
+    })
+  );
 
   server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/today/debug-priorities", async (request) => {
     const brief = await generateDailyOperatorBrief(request.params.userId, { now: parseOptionalNow(request.query.now) });
@@ -1303,7 +1383,8 @@ export function buildServer() {
         return reply.status(400).send({ error: "Action text is required." });
       }
 
-      const result = await maybeCreateManualActionFromText(request.params.userId, text, { forceActionIntent: true });
+      const now = typeof body.now === "string" ? parseOptionalNow(body.now) : undefined;
+      const result = await maybeCreateManualActionFromText(request.params.userId, text, { forceActionIntent: true, now });
 
       if (!result.extraction.shouldCreateAction) {
         if (result.extraction.reason === "past_explicit_time") {
@@ -1861,7 +1942,7 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
   const todayRange = getLocalTodayRange(now, timezone);
   const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
   const [actions, activeGoals, todayEvents, recentEvents, recentReviews, userOperatingProfile] = await Promise.all([
-    getRecentActionItems(userId, 50),
+    getActionItems(userId, { status: "all", limit: 100 }),
     getActiveGoals(userId),
     getEventsBetween(userId, todayRange.start, todayRange.end),
     getEventsSince(userId, last24h),
@@ -1942,6 +2023,124 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     suggestedNextStep,
     priorityDebug
   };
+}
+
+async function buildStartDayMessage(userId: string, now: Date): Promise<string> {
+  const brief = await generateDailyOperatorBrief(userId, { now });
+  const timezone = await getUserTimezone(userId);
+  const topAction = firstRealPriority(brief);
+  const overdue = brief.overdueActions.slice(0, 3).map((action) => action.title);
+  const overdueIds = new Set(brief.overdueActions.map((action) => action.id));
+  const alsoToday = brief.openActions
+    .filter((action) => action.title !== topAction)
+    .filter((action) => !overdueIds.has(action.id))
+    .filter((action) => classifyDueWindow(action.dueAt ? new Date(action.dueAt) : undefined, now, timezone).startsWith("due today"))
+    .slice(0, 3)
+    .map((action) => action.title);
+  const guardrail = brief.risks.find((risk) => /risk-control|guardrail|betting|trading|impulsive/i.test(risk));
+
+  return [
+    `Today - ${brief.date}`,
+    `First move: ${topAction ?? "Log one meaningful action."}`,
+    overdue.length > 0 ? `Overdue: ${overdue.join(", ")}.` : undefined,
+    alsoToday.length > 0 ? `Also today: ${alsoToday.join(", ")}.` : undefined,
+    guardrail ? `Guardrail: ${formatLoopGuardrail(guardrail)}` : undefined,
+    "Reply naturally with updates."
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function buildEndDayMessage(userId: string, now: Date): Promise<string> {
+  const brief = await generateDailyOperatorBrief(userId, { now });
+  const completed = brief.recentWins.filter((win) => !/email review/i.test(win)).slice(0, 5);
+  const stillOpen = [...brief.overdueActions, ...brief.openActions]
+    .filter((action, index, actions) => actions.findIndex((item) => item.id === action.id) === index)
+    .slice(0, 5)
+    .map((action) => `${action.title}${action.dueAt && new Date(action.dueAt) < now ? " overdue" : action.dueAt ? ` due ${formatLocalDateTime(new Date(action.dueAt))}` : ""}`);
+
+  return [
+    "Evening review:",
+    "Completed today:",
+    completed.length > 0 ? completed.map((item) => `- ${item}`).join("\n") : "- Nothing completed is logged yet.",
+    "",
+    "Still open:",
+    stillOpen.length > 0 ? stillOpen.map((item) => `- ${item}`).join("\n") : "- No open action items.",
+    "",
+    "Reply with what happened, what moved, or what to drop.",
+    'Example: trained 30 min, move homepage to tomorrow morning.'
+  ].join("\n");
+}
+
+async function buildTomorrowPrepMessage(userId: string, now: Date): Promise<string> {
+  const timezone = await getUserTimezone(userId);
+  const tomorrow = addDaysToLocalDateString(getLocalTodayRange(now, timezone).date, 1);
+  const [actions, activeGoals, brief] = await Promise.all([
+    getActionItems(userId, { status: "all", limit: 100 }),
+    getActiveGoals(userId),
+    generateDailyOperatorBrief(userId, { now })
+  ]);
+  const tomorrowActions = actions
+    .filter((action) => (action.status === "open" || action.status === "snoozed") && action.dueAt && formatDateInTimezone(action.dueAt, timezone) === tomorrow)
+    .slice(0, 10);
+  const gaps = brief.goalStatus
+    .filter((goal) => !isRiskControlGoalStatus(goal) && /no progress logged/i.test(goal.note))
+    .slice(0, 3)
+    .map((goal) => goal.title);
+  const firstMove = tomorrowActions[0]?.title ?? gaps[0] ?? activeGoals.find((goal) => !isRiskControlGoal(goal))?.title;
+
+  return [
+    `Tomorrow - ${tomorrow}`,
+    "Actions due tomorrow:",
+    tomorrowActions.length > 0 ? tomorrowActions.map((action) => `- ${action.title}`).join("\n") : "- No actions due tomorrow.",
+    "",
+    "Goal gaps:",
+    gaps.length > 0 ? gaps.map((gap) => `- ${gap}`).join("\n") : "- No obvious goal gaps from today's logs.",
+    "",
+    `Suggested first move tomorrow: ${firstMove ? firstMove : "Log one meaningful action."}`
+  ].join("\n");
+}
+
+async function dailyLoopStateInput(userId: string, now: Date): Promise<{ localDate: string; timezone: string; sentAt: Date }> {
+  const timezone = await getUserTimezone(userId);
+  const today = getLocalTodayRange(now, timezone);
+
+  return {
+    localDate: today.date,
+    timezone,
+    sentAt: now
+  };
+}
+
+function firstRealPriority(brief: DailyOperatorBrief): string | undefined {
+  const openTitles = new Set(brief.openActions.map((action) => action.title));
+  const priority = brief.topPriorities.find((item) => {
+    const normalized = item.replace(/^Due soon:\s*/i, "").replace(/^Overdue:\s*/i, "").trim();
+    return openTitles.has(normalized);
+  });
+
+  return priority?.replace(/^Due soon:\s*/i, "").replace(/^Overdue:\s*/i, "").trim() ?? brief.openActions[0]?.title;
+}
+
+function formatLoopGuardrail(risk: string): string {
+  const match = risk.match(/Risk-control goal active:\s*(.+?)\./i);
+  return match ? `Keep ${match[1]} locked today.` : risk;
+}
+
+function addDaysToLocalDateString(date: string, days: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days, 12, 0, 0, 0)).toISOString().slice(0, 10);
+}
+
+function formatDateInTimezone(date: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+
+  return `${getDateTimePart(parts, "year")}-${getDateTimePart(parts, "month")}-${getDateTimePart(parts, "day")}`;
 }
 
 function buildOperatorSummary(input: {
@@ -2188,7 +2387,7 @@ class DailyCoachTimeoutError extends Error {
 }
 
 async function buildConversationControlDebugForUser(userId: string, text: string) {
-  const [actions, goals] = await Promise.all([getRecentActionItems(userId, 50), getActiveGoals(userId)]);
+  const [actions, goals] = await Promise.all([getActionItems(userId, { status: "all", limit: 100 }), getActiveGoals(userId)]);
 
   return buildConversationControlDebug({
     text,
@@ -2267,7 +2466,7 @@ async function handleConversationControl(
     };
   }
 
-  const actions = await getRecentActionItems(userId, 50);
+  const actions = await getActionItems(userId, { status: "all", limit: 100 });
   const actionResolution = resolveActionReference(userId, detection.targetText ?? "", actions.map(toActionSummary));
 
   if (!actionResolution.actionId || actionResolution.confidence < 0.8 || actionResolution.ambiguousMatches.length > 0) {
@@ -2690,6 +2889,8 @@ function toActionSummary(action: ActionItem) {
     snoozedUntil: action.snoozedUntil,
     goalId: action.goalId,
     goalTitleSnapshot: action.goalTitleSnapshot,
+    project: action.project,
+    actionType: action.actionType,
     evidence: action.evidence
   };
 }
@@ -3198,7 +3399,7 @@ function getDateTimePart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFo
 async function maybeCreateManualActionFromText(
   userId: string,
   text: string,
-  options: { forceActionIntent?: boolean } = {}
+  options: { forceActionIntent?: boolean; now?: Date } = {}
 ): Promise<{
   extraction: ReturnType<typeof extractManualAction>;
   action?: ActionItem;
@@ -3209,6 +3410,7 @@ async function maybeCreateManualActionFromText(
     { text },
     {
       forceActionIntent: options.forceActionIntent,
+      now: options.now,
       timezone: settings.timezone,
       reminderPreferences: settings
     }
