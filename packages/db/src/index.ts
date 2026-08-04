@@ -92,6 +92,7 @@ export type PendingActionType =
   | "goal_create"
   | "goal_archive"
   | "action_archive"
+  | "action_hygiene"
   | "action_target_clarification"
   | "goal_progress_log"
   | "memory_create"

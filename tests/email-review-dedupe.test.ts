@@ -3360,7 +3360,7 @@ test("/today ranks goal-linked priorities above same-window chores and exposes d
     const brief = response.json().brief;
     assert.equal(brief.openActions[0].title, "Apply to 2 jobs");
     assert.match(brief.topPriorities[0], /Apply to 2 jobs/);
-    assert.equal(brief.suggestedNextStep, "Handle due action: Apply to 2 jobs.");
+    assert.equal(brief.suggestedNextStep, "Next upcoming action: Apply to 2 jobs.");
     assert.ok(brief.risks.some((risk: string) => risk.includes("Betting impulse detected")));
 
     const debug = await server.inject({
@@ -3723,7 +3723,7 @@ test("daily coach debug reports disabled, llm, invalid, error, and timeout sourc
     assert.equal(response.json().validationStatus, "passed");
     assert.deepEqual(response.json().validationFailureCodes, []);
     assert.equal(response.json().schemaValidationPassed, true);
-    assert.equal(response.json().selectedNextMove, "Handle due action: Apply to 2 jobs.");
+    assert.equal(response.json().selectedNextMove, "Next upcoming action: Apply to 2 jobs.");
     assert.equal(response.json().selectedActionTitle, "Apply to 2 jobs");
     assert.equal(response.json().topPriorities[0].title, "Apply to 2 jobs");
     assert.equal(
@@ -3777,7 +3777,7 @@ test("daily coach debug reports disabled, llm, invalid, error, and timeout sourc
     const todayAfterInvalid = await server.inject({ method: "GET", url: `/users/${actionUserId}/today?now=${encodeURIComponent("2026-07-30T23:40:00.000Z")}` });
     assert.equal(todayAfterInvalid.statusCode, 200);
     assert.equal(todayAfterInvalid.json().brief.coachDebug.source, "fallback_invalid");
-    assert.equal(todayAfterInvalid.json().brief.coach.nextMove, "Handle due action: Apply to 2 jobs.");
+    assert.equal(todayAfterInvalid.json().brief.coach.nextMove, "Next upcoming action: Apply to 2 jobs.");
 
     clearMockEnv();
     process.env.DAILY_COACH_LLM_ENABLED = "true";
@@ -4012,7 +4012,7 @@ test("/goal priorities routes list, update, backfill, and /today uses weighted s
     });
     assert.equal(today.statusCode, 200);
     assert.equal(today.json().brief.openActions[0].title, "Apply to 2 jobs");
-    assert.equal(today.json().brief.suggestedNextStep, "Handle due action: Apply to 2 jobs.");
+    assert.equal(today.json().brief.suggestedNextStep, "Next upcoming action: Apply to 2 jobs.");
 
     const debug = await server.inject({
       method: "GET",
@@ -4626,6 +4626,320 @@ test("debug force snoozed due action makes snoozed action remind once", async ()
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: reminderUserId } });
+  }
+});
+
+test("action hygiene detects stale actions and routes cleanup replies safely", async () => {
+  const server = buildServer();
+  const hygieneUserId = `action-hygiene-${randomUUID()}`;
+  const now = "2026-08-04T14:43:00+02:00";
+  await prisma.user.create({ data: { id: hygieneUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: hygieneUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  const criticalGoal = await prisma.goal.create({
+    data: {
+      userId: hygieneUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  const riskGoal = await prisma.goal.create({
+    data: {
+      userId: hygieneUserId,
+      title: "Control impulsive betting",
+      category: "finance",
+      templateId: "finance.control_betting_trading",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  const staleUnlinked = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Review homepage",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T14:30:00.000Z")
+    }
+  });
+  const criticalLinked = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Send recruiter follow-up",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T07:00:00.000Z"),
+      goalId: criticalGoal.id,
+      goalTitleSnapshot: criticalGoal.title
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Review betting thesis",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T07:00:00.000Z"),
+      goalId: riskGoal.id,
+      goalTitleSnapshot: riskGoal.title
+    }
+  });
+  const lowStale = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Clean old notes",
+      priority: "low",
+      status: "open",
+      updatedAt: new Date("2026-07-20T10:00:00.000Z")
+    }
+  });
+  const homepageSecond = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Update homepage hero",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T07:00:00.000Z")
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Action hygiene/);
+    assert.match(response.json().message, /Review homepage/);
+    assert.match(response.json().message, /Clean old notes/);
+    assert.doesNotMatch(response.json().message, /Review betting thesis/);
+    const report = response.json().report;
+    assert.ok(report.overdueActions.some((action: { title: string }) => action.title === "Review homepage"));
+    assert.ok(report.staleActions.some((action: { title: string }) => action.title === "Review homepage"));
+    assert.ok(report.lowPriorityStaleActions.some((action: { title: string }) => action.title === "Clean old notes"));
+    const critical = report.suggestedCleanupCandidates.find((action: { title: string }) => action.title === "Send recruiter follow-up");
+    assert.ok(critical);
+    assert.equal(critical.recommendedOptions.includes("archive"), false);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/daily-loop/start-day?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Hygiene: \d+ actions? needs? (?:a cleanup decision|cleanup decisions)\. Run \/action_hygiene/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/daily-loop/end-day?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Cleanup:\nReview overdue actions before tomorrow: \/action_hygiene/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.ok(response.json().brief.actionHygiene);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "snooze Review homepage tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action snoozed until/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: staleUnlinked.id } })).status, "snoozed");
+
+    await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "complete Send recruiter follow-up" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action completed: Send recruiter follow-up/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: criticalLinked.id } })).status, "completed");
+
+    await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "archive homepage" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm archive action: Update homepage hero/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: homepageSecond.id } })).status, "open");
+
+    await prisma.pendingAction.updateMany({
+      where: { userId: hygieneUserId, status: "pending" },
+      data: { status: "cancelled" }
+    });
+    await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${hygieneUserId}/actions/hygiene/reply`,
+      payload: { message: "archive all unlinked stale tasks", now }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Confirm archive \d+ unlinked stale action/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: lowStale.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: lowStale.id } })).status, "open");
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}&debug=true`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Action hygiene debug/);
+    assert.equal(await prisma.pendingAction.count({ where: { userId: hygieneUserId, status: "pending" } }), 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: hygieneUserId } });
+  }
+});
+
+test("action hygiene ignores future snoozed actions and updates daily loop hygiene", async () => {
+  const server = buildServer();
+  const hygieneUserId = `action-hygiene-snooze-${randomUUID()}`;
+  const now = "2026-08-04T15:08:00+02:00";
+  await prisma.user.create({ data: { id: hygieneUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: hygieneUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  const action = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T14:30:00.000Z")
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /1 action needs a cleanup decision/);
+    assert.match(response.json().message, /Write YouTube script/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "snooze 1 tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action snoozed until 05\/08\/2026, 09:00: Write YouTube script/);
+    const snoozed = await prisma.actionItem.findUniqueOrThrow({ where: { id: action.id } });
+    assert.equal(snoozed.status, "snoozed");
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Action list is clean enough/);
+    assert.equal(response.json().report.suggestedCleanupCandidates.length, 0);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/daily-loop/start-day?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.doesNotMatch(response.json().message, /Hygiene:/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/daily-loop/end-day?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.doesNotMatch(response.json().message, /Cleanup:/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().brief.actionHygiene, undefined);
+
+    await prisma.actionItem.update({
+      where: { id: action.id },
+      data: {
+        snoozedUntil: new Date("2026-08-04T12:00:00.000Z")
+      }
+    });
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /1 action needs a cleanup decision/);
+
+    await prisma.actionItem.update({
+      where: { id: action.id },
+      data: {
+        status: "archived"
+      }
+    });
+    const futureAction = await prisma.actionItem.create({
+      data: {
+        userId: hygieneUserId,
+        source: "manual",
+        title: "Review homepage",
+        priority: "medium",
+        status: "open",
+        dueAt: new Date("2026-08-05T07:00:00.000Z")
+      }
+    });
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().brief.suggestedNextStep, "Next upcoming action: Review homepage.");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: futureAction.id } })).status, "open");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: hygieneUserId } });
   }
 });
 

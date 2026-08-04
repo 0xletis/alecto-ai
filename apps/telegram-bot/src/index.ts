@@ -947,6 +947,32 @@ bot.command("actions", async (ctx) => {
   }
 });
 
+bot.command("action_hygiene", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<ActionHygieneResponse>(`/users/${getTelegramUserId(ctx)}/actions/hygiene`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not analyze action hygiene right now.");
+  }
+});
+
+bot.command("debug_action_hygiene", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<ActionHygieneResponse>(`/users/${getTelegramUserId(ctx)}/actions/hygiene?debug=true`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not analyze action hygiene right now.");
+  }
+});
+
 bot.command("complete_action", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -3132,6 +3158,7 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
       ? `Goals:\n${brief.goalStatus.map((goal) => `- ${goal.title}: ${goal.note}`).join("\n")}`
       : undefined,
     brief.risks.length > 0 ? `Risks / watchouts:\n${brief.risks.map((risk) => `- ${risk}`).join("\n")}` : undefined,
+    brief.actionHygiene ? `Action hygiene:\n- ${formatCleanupDecisionGrammar(brief.actionHygiene.needsDecision)} Run /action_hygiene.` : undefined,
     "",
     "Next move:",
     brief.suggestedNextStep
@@ -3150,6 +3177,10 @@ function formatDailyCoach(coach: DailyCoachResponse): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatCleanupDecisionGrammar(count: number): string {
+  return count === 1 ? "1 action needs a cleanup decision." : `${count} actions need cleanup decisions.`;
 }
 
 function formatDailyPriorityDebug(priorities: DailyOperatorBriefPriorityDebug[]): string {
@@ -4457,8 +4488,17 @@ interface DailyOperatorBrief {
   goalStatus: DailyOperatorBriefGoalStatus[];
   recentWins: string[];
   risks: string[];
+  actionHygiene?: {
+    summary: string;
+    needsDecision: number;
+  };
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+interface ActionHygieneResponse {
+  message: string;
+  report: unknown;
 }
 
 interface DailyCoachResponse {

@@ -1373,6 +1373,65 @@ export function buildServer() {
     }
   );
 
+  server.get<{ Params: { userId: string }; Querystring: { now?: string; debug?: string } }>(
+    "/users/:userId/actions/hygiene",
+    async (request) => {
+      const now = parseOptionalNow(request.query.now) ?? new Date();
+      const timezone = await getUserTimezone(request.params.userId);
+      const report = await analyzeActionHygiene(request.params.userId, now, timezone);
+
+      if (request.query.debug !== "true") {
+        await replacePendingAction(request.params.userId, {
+          type: "action_hygiene",
+          summary: report.summary,
+          payload: {
+            originalText: "/action_hygiene",
+            candidates: report.suggestedCleanupCandidates.map((candidate) => candidate.actionId),
+            candidateActions: report.suggestedCleanupCandidates.map((candidate) => ({
+              ...toPendingActionCandidate({
+                id: candidate.actionId,
+                title: candidate.title,
+                status: "open",
+                dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
+                goalTitleSnapshot: candidate.linkedGoalTitle
+              }),
+              recommendedOptions: candidate.recommendedOptions
+            }))
+          },
+          expiresAt: pendingDecisionExpiry()
+        });
+      }
+
+      return {
+        report,
+        message: request.query.debug === "true" ? formatActionHygieneDebug(report) : formatActionHygieneReport(report)
+      };
+    }
+  );
+
+  server.post<{ Params: { userId: string }; Body: { message?: string; now?: string } }>(
+    "/users/:userId/actions/hygiene/reply",
+    async (request) => {
+      const body = isRecord(request.body) ? request.body : {};
+      const message = typeof body.message === "string" ? body.message : "";
+      const pending = await getLatestPendingAction(request.params.userId);
+
+      if (!pending || pending.type !== "action_hygiene") {
+        return {
+          handled: false,
+          message: "No active action hygiene session. Run /action_hygiene first."
+        };
+      }
+
+      const reply = await resolveActionHygieneReply(request.params.userId, pending, message, parseOptionalNow(typeof body.now === "string" ? body.now : undefined));
+
+      return {
+        handled: true,
+        message: reply
+      };
+    }
+  );
+
   server.post<{ Params: { userId: string } }>(
     "/users/:userId/actions/manual",
     async (request, reply) => {
@@ -1980,6 +2039,7 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
   const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, rankedActions, completedToday));
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews, todayRange);
   const risks = uniqueStrings([...buildOperatorRisks(recentEvents), ...buildOperatorGuardrailWatchouts(activeGoals)]);
+  const hygiene = await analyzeActionHygiene(userId, now, timezone);
   const topPriorities = buildOperatorTopPriorities({
     overdueActions,
     dueSoonActions,
@@ -1992,7 +2052,8 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     overdueActions,
     dueSoonActions,
     openActions: rankedActions,
-    goalStatus
+    goalStatus,
+    now
   });
   const briefContext = buildDailyBriefContext({
     date: todayRange.date,
@@ -2020,6 +2081,10 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     goalStatus,
     recentWins,
     risks,
+    actionHygiene: hygiene.suggestedCleanupCandidates.length > 0 ? {
+      summary: hygiene.summary,
+      needsDecision: hygiene.suggestedCleanupCandidates.length
+    } : undefined,
     suggestedNextStep,
     priorityDebug
   };
@@ -2038,12 +2103,14 @@ async function buildStartDayMessage(userId: string, now: Date): Promise<string> 
     .slice(0, 3)
     .map((action) => action.title);
   const guardrail = brief.risks.find((risk) => /risk-control|guardrail|betting|trading|impulsive/i.test(risk));
+  const hygiene = brief.actionHygiene;
 
   return [
     `Today - ${brief.date}`,
     `First move: ${topAction ?? "Log one meaningful action."}`,
     overdue.length > 0 ? `Overdue: ${overdue.join(", ")}.` : undefined,
     alsoToday.length > 0 ? `Also today: ${alsoToday.join(", ")}.` : undefined,
+    hygiene ? `Hygiene: ${cleanupDecisionGrammar(hygiene.needsDecision)} Run /action_hygiene.` : undefined,
     guardrail ? `Guardrail: ${formatLoopGuardrail(guardrail)}` : undefined,
     "Reply naturally with updates."
   ]
@@ -2054,6 +2121,7 @@ async function buildStartDayMessage(userId: string, now: Date): Promise<string> 
 async function buildEndDayMessage(userId: string, now: Date): Promise<string> {
   const brief = await generateDailyOperatorBrief(userId, { now });
   const completed = brief.recentWins.filter((win) => !/email review/i.test(win)).slice(0, 5);
+  const hygiene = brief.actionHygiene;
   const stillOpen = [...brief.overdueActions, ...brief.openActions]
     .filter((action, index, actions) => actions.findIndex((item) => item.id === action.id) === index)
     .slice(0, 5)
@@ -2066,6 +2134,7 @@ async function buildEndDayMessage(userId: string, now: Date): Promise<string> {
     "",
     "Still open:",
     stillOpen.length > 0 ? stillOpen.map((item) => `- ${item}`).join("\n") : "- No open action items.",
+    hygiene ? "\nCleanup:\nReview overdue actions before tomorrow: /action_hygiene" : undefined,
     "",
     "Reply with what happened, what moved, or what to drop.",
     'Example: trained 30 min, move homepage to tomorrow morning.'
@@ -2141,6 +2210,182 @@ function formatDateInTimezone(date: Date, timezone: string): string {
   }).formatToParts(date);
 
   return `${getDateTimePart(parts, "year")}-${getDateTimePart(parts, "month")}-${getDateTimePart(parts, "day")}`;
+}
+
+async function analyzeActionHygiene(userId: string, now: Date, timezone: string): Promise<ActionHygieneReport> {
+  const [actions, goals] = await Promise.all([
+    getActionItems(userId, { status: "all", limit: 200 }),
+    getActiveGoals(userId)
+  ]);
+  const today = getLocalTodayRange(now, timezone);
+  const goalsById = new Map(goals.map((goal) => [goal.id, goal]));
+  const openActions = actions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
+  const analyzed = openActions
+    .map((action) => analyzeActionHygieneItem(action, goalsById.get(action.goalId ?? ""), today, now, timezone))
+    .filter(Boolean) as ActionHygieneAction[];
+  const overdueActions = analyzed.filter((action) => action.daysOverdue !== undefined && action.daysOverdue >= 1);
+  const staleActions = analyzed.filter((action) => action.daysOverdue !== undefined && action.daysOverdue >= 3);
+  const lowPriorityStaleActions = analyzed.filter(
+    (action) => action.priority === "low" && action.lastTouchedAt && daysBetween(new Date(action.lastTouchedAt), now) >= 7
+  );
+  const repeatedlySnoozedActions: ActionHygieneAction[] = [];
+  const suggestedCleanupCandidates = uniqueHygieneActions([
+    ...staleActions,
+    ...overdueActions.filter((action) => !action.linkedGoalTitle || (action.daysOverdue ?? 0) >= 2),
+    ...lowPriorityStaleActions
+  ]).slice(0, 10);
+
+  return {
+    staleActions,
+    overdueActions,
+    repeatedlySnoozedActions,
+    lowPriorityStaleActions,
+    suggestedCleanupCandidates,
+    summary:
+      suggestedCleanupCandidates.length > 0
+        ? cleanupDecisionGrammar(suggestedCleanupCandidates.length)
+        : "Action list is clean enough."
+  };
+}
+
+function analyzeActionHygieneItem(
+  action: ActionItem,
+  goal: Goal | undefined,
+  today: ReturnType<typeof getLocalTodayRange>,
+  now: Date,
+  timezone: string
+): ActionHygieneAction | undefined {
+  if (goal && isRiskControlGoal(goal)) {
+    return undefined;
+  }
+
+  const dueAt = action.dueAt;
+  const daysOverdue = dueAt && dueAt < now ? daysBetweenLocalDates(formatDateInTimezone(dueAt, timezone), today.date) : undefined;
+  const untouchedDays = daysBetween(action.updatedAt, now);
+  const reasons: string[] = [];
+
+  if (daysOverdue !== undefined && daysOverdue >= 1) {
+    reasons.push(daysOverdue >= 3 ? `overdue ${daysOverdue} days` : `overdue ${daysOverdue} day${daysOverdue === 1 ? "" : "s"}`);
+  }
+
+  if (action.priority === "low" && untouchedDays >= 7) {
+    reasons.push(`low priority and untouched ${untouchedDays} days`);
+  }
+
+  if (reasons.length === 0) {
+    return undefined;
+  }
+
+  const goalPriority = goalPriorityRank(goal);
+  const recommendedOptions = goalPriority >= 45
+    ? ["complete", "snooze", "keep"] as ActionHygieneOption[]
+    : action.goalId
+      ? ["complete", "snooze", "archive", "keep"] as ActionHygieneOption[]
+      : ["complete", "snooze", "archive", "keep"] as ActionHygieneOption[];
+
+  return {
+    actionId: action.id,
+    title: action.title,
+    dueAt: action.dueAt?.toISOString(),
+    linkedGoalTitle: action.goalTitleSnapshot,
+    priority: action.priority,
+    daysOverdue,
+    snoozeCount: undefined,
+    lastTouchedAt: action.updatedAt.toISOString(),
+    reason: reasons.join("; "),
+    recommendedOptions
+  };
+}
+
+function formatActionHygieneReport(report: ActionHygieneReport): string {
+  if (report.suggestedCleanupCandidates.length === 0 && report.overdueActions.length === 0) {
+    return `Action hygiene:\n${report.summary}`;
+  }
+
+  const candidates = report.suggestedCleanupCandidates.length > 0 ? report.suggestedCleanupCandidates : report.overdueActions;
+
+  return [
+    "Action hygiene:",
+    report.summary,
+    report.overdueActions.length > 0
+      ? ["Overdue:", ...report.overdueActions.slice(0, 10).map((action, index) => `${index + 1}. ${formatHygieneActionLine(action)}`)].join("\n")
+      : undefined,
+    "",
+    "Suggested cleanup:",
+    ...candidates.slice(0, 10).map((action) => `- ${action.title}: ${action.recommendedOptions.join(", ")}?`),
+    "",
+    "Reply with:",
+    '- "snooze 1 tomorrow"',
+    '- "archive 2"',
+    '- "complete 1"',
+    '- "keep 1"'
+  ]
+    .filter((line) => line !== undefined)
+    .join("\n");
+}
+
+function formatActionHygieneDebug(report: ActionHygieneReport): string {
+  return [
+    "Action hygiene debug:",
+    `summary: ${report.summary}`,
+    `overdue: ${report.overdueActions.length}`,
+    ...report.overdueActions.map((action) => `- ${action.title}: ${action.reason}; options=${action.recommendedOptions.join("/")}`),
+    `stale: ${report.staleActions.length}`,
+    ...report.staleActions.map((action) => `- ${action.title}: ${action.reason}`),
+    `repeatedly snoozed: ${report.repeatedlySnoozedActions.length}`,
+    `low priority stale: ${report.lowPriorityStaleActions.length}`,
+    ...report.lowPriorityStaleActions.map((action) => `- ${action.title}: ${action.reason}`),
+    `suggested cleanup: ${report.suggestedCleanupCandidates.length}`,
+    ...report.suggestedCleanupCandidates.map((action) => `- ${action.title}: ${action.reason}`)
+  ].join("\n");
+}
+
+function formatHygieneActionLine(action: ActionHygieneAction): string {
+  return [
+    `${action.title} - overdue ${action.daysOverdue ?? 0} day${action.daysOverdue === 1 ? "" : "s"}`,
+    action.linkedGoalTitle ? `goal: ${action.linkedGoalTitle}` : undefined
+  ]
+    .filter(Boolean)
+    .join(" - ");
+}
+
+function cleanupDecisionGrammar(count: number): string {
+  return count === 1 ? "1 action needs a cleanup decision." : `${count} actions need cleanup decisions.`;
+}
+
+function uniqueHygieneActions(actions: ActionHygieneAction[]): ActionHygieneAction[] {
+  const seen = new Set<string>();
+  return actions.filter((action) => {
+    if (seen.has(action.actionId)) {
+      return false;
+    }
+    seen.add(action.actionId);
+    return true;
+  });
+}
+
+function goalPriorityRank(goal: Goal | undefined): number {
+  if (!goal) {
+    return 0;
+  }
+
+  if (typeof goal.importanceScore === "number") {
+    return goal.importanceScore;
+  }
+
+  return goal.priority === "critical" ? 70 : goal.priority === "high" ? 45 : goal.priority === "medium" ? 25 : 10;
+}
+
+function daysBetweenLocalDates(fromDate: string, toDate: string): number {
+  const [fromYear, fromMonth, fromDay] = fromDate.split("-").map(Number);
+  const [toYear, toMonth, toDay] = toDate.split("-").map(Number);
+  const from = Date.UTC(fromYear, fromMonth - 1, fromDay);
+  const to = Date.UTC(toYear, toMonth - 1, toDay);
+  return Math.max(0, Math.floor((to - from) / (24 * 60 * 60 * 1000)));
+}
+
+function daysBetween(from: Date, to: Date): number {
+  return Math.max(0, Math.floor((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)));
 }
 
 function buildOperatorSummary(input: {
@@ -3030,6 +3275,7 @@ function formatConversationTodayReply(brief: DailyOperatorBrief): string {
     "",
     "Top priorities:",
     brief.topPriorities.length > 0 ? brief.topPriorities.map((item, index) => `${index + 1}. ${item}`).join("\n") : "No clear priorities yet.",
+    brief.actionHygiene ? `\nAction hygiene:\n- ${cleanupDecisionGrammar(brief.actionHygiene.needsDecision)} Run /action_hygiene.` : undefined,
     "",
     "Next move:",
     brief.suggestedNextStep
@@ -3078,6 +3324,7 @@ function pickOperatorNextStep(input: {
   dueSoonActions: ActionItem[];
   openActions: ActionItem[];
   goalStatus: DailyOperatorBriefGoalStatus[];
+  now: Date;
 }): string {
   const topAction = input.openActions[0];
   if (topAction) {
@@ -3085,11 +3332,11 @@ function pickOperatorNextStep(input: {
       return `Handle overdue action: ${topAction.title}.`;
     }
 
-    if (input.dueSoonActions.some((action) => action.id === topAction.id)) {
+    if (topAction.dueAt && topAction.dueAt <= input.now) {
       return `Handle due action: ${topAction.title}.`;
     }
 
-    return `Do this first: ${topAction.title}.`;
+    return `Next upcoming action: ${topAction.title}.`;
   }
 
   const staleGoal = input.goalStatus.find((goal) => goal.status === "no_progress" && !isRiskControlGoalStatus(goal));
@@ -6919,10 +7166,149 @@ async function resolvePendingDecisionReply(
     return "I could not complete that pending decision. Please ask again.";
   }
 
+  if (pendingAction.type === "action_hygiene" && typeof pendingAction.payload.operation !== "string") {
+    return resolveActionHygieneReply(userId, pendingAction, message);
+  }
+
   if (isConfirmationMessage(message)) {
     const applied = await applyPendingAction(userId, pendingAction);
     await confirmPendingAction(userId, pendingAction.id);
     return applied.reply;
+  }
+
+  return undefined;
+}
+
+async function resolveActionHygieneReply(
+  userId: string,
+  pendingAction: PendingAction,
+  message: string,
+  now = new Date()
+): Promise<string | undefined> {
+  const parsed = parseActionHygieneReply(message);
+
+  if (!parsed) {
+    return undefined;
+  }
+
+  const candidates = readPendingActionCandidates(pendingAction.payload.candidateActions);
+
+  if (parsed.operation === "bulk_archive_unlinked_stale") {
+    const report = await analyzeActionHygiene(userId, now, await getUserTimezone(userId));
+    const bulkCandidates = report.suggestedCleanupCandidates.filter((candidate) => !candidate.linkedGoalTitle);
+
+    if (bulkCandidates.length === 0) {
+      return "No unlinked stale tasks matched for bulk archive.";
+    }
+
+    await replacePendingAction(userId, {
+      type: "action_hygiene",
+      summary: `Archive ${bulkCandidates.length} unlinked stale action${bulkCandidates.length === 1 ? "" : "s"}`,
+      payload: {
+        operation: "bulk_archive",
+        actionIds: bulkCandidates.map((candidate) => candidate.actionId),
+        candidateActions: bulkCandidates.map((candidate) => ({
+          id: candidate.actionId,
+          title: candidate.title,
+          dueAt: candidate.dueAt,
+          status: "open"
+        }))
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return [
+      `Confirm archive ${bulkCandidates.length} unlinked stale action${bulkCandidates.length === 1 ? "" : "s"}?`,
+      ...bulkCandidates.slice(0, 10).map((candidate) => `- ${candidate.title}`),
+      "Reply yes to confirm or no to cancel."
+    ].join("\n");
+  }
+
+  const selected = selectPendingActionCandidate(parsed.target, candidates);
+
+  if (!selected) {
+    return candidates.length > 0
+      ? `Reply with 1-${candidates.length}, the action title, or cancel.`
+      : "That hygiene session no longer has any options. Run /action_hygiene again.";
+  }
+
+  const action = await getActionItem(userId, selected.id);
+
+  if (!action || action.status === "archived") {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "I could not find that action anymore. Use /actions to check the exact task.";
+  }
+
+  if (parsed.operation === "keep") {
+    await confirmPendingAction(userId, pendingAction.id);
+    return `Kept for now: ${action.title}`;
+  }
+
+  if (parsed.operation === "complete") {
+    if (action.status === "completed") {
+      await confirmPendingAction(userId, pendingAction.id);
+      return `Action already completed: ${action.title}`;
+    }
+
+    const completed = await completeActionItem(userId, action.id);
+
+    if (!completed) {
+      await rejectPendingAction(userId, pendingAction.id);
+      return "I could not find that open action.";
+    }
+
+    const progressEvent = await createGoalProgressFromCompletedAction(userId, completed);
+    await confirmPendingAction(userId, pendingAction.id);
+
+    return [
+      `Action completed: ${completed.title}`,
+      progressEvent?.created ? `Goal progress logged: ${progressEvent.goalTitle}` : undefined
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (parsed.operation === "archive") {
+    await replacePendingAction(userId, {
+      type: "action_archive",
+      summary: `Archive action: ${action.title}`,
+      payload: {
+        originalText: message,
+        intendedOperation: "archive_action",
+        actionId: action.id,
+        candidateActions: [toPendingActionCandidate(action)]
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return `Confirm archive action: ${action.title}? Reply yes to confirm or no to cancel.`;
+  }
+
+  if (parsed.operation === "snooze") {
+    const settings = await getOrCreateNotificationSettings(userId);
+    const parsedTime = parseActionDueDate(parsed.timeText ?? "", {
+      now,
+      timezone: settings.timezone,
+      preferences: settings
+    });
+
+    if (parsedTime.invalidReason === "past_explicit_time") {
+      return "That snooze time has already passed.";
+    }
+
+    if (!parsedTime.dueAt) {
+      return "I could not parse the snooze time. Try: snooze 1 tomorrow.";
+    }
+
+    const updated = await snoozeActionItem(userId, action.id, parsedTime.dueAt);
+
+    if (!updated) {
+      await rejectPendingAction(userId, pendingAction.id);
+      return "I could not update that action.";
+    }
+
+    await confirmPendingAction(userId, pendingAction.id);
+    return `Action snoozed until ${formatLocalDateTime(updated.snoozedUntil, settings.timezone)}: ${updated.title}`;
   }
 
   return undefined;
@@ -6976,6 +7362,53 @@ function selectPendingActionCandidate(message: string, candidates: PendingAction
   return matches.length === 1 ? matches[0] : undefined;
 }
 
+function parseActionHygieneReply(message: string):
+  | { operation: "complete" | "archive" | "keep"; target: string }
+  | { operation: "snooze"; target: string; timeText: string }
+  | { operation: "bulk_archive_unlinked_stale"; target: string }
+  | undefined {
+  const trimmed = message.trim();
+
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (/^archive\s+all\s+unlinked\s+stale\s+tasks?$/i.test(trimmed)) {
+    return {
+      operation: "bulk_archive_unlinked_stale",
+      target: "all"
+    };
+  }
+
+  const snooze = trimmed.match(/^snooze\s+(.+?)\s+(?:to|until|for)?\s*(tomorrow.*|today.*|tonight.*|now|in\s+\d+\s+days?|next\s+\w+.*|\d{4}-\d{2}-\d{2}.*)$/i);
+
+  if (snooze) {
+    return {
+      operation: "snooze",
+      target: snooze[1].trim(),
+      timeText: snooze[2].trim()
+    };
+  }
+
+  const simple = trimmed.match(/^(complete|done|archive|delete|remove|keep)\s+(.+)$/i);
+
+  if (!simple) {
+    return undefined;
+  }
+
+  const verb = simple[1].toLowerCase();
+  const operation = verb === "done"
+    ? "complete"
+    : verb === "delete" || verb === "remove"
+      ? "archive"
+      : verb as "complete" | "archive" | "keep";
+
+  return {
+    operation,
+    target: simple[2].trim()
+  };
+}
+
 function ordinalSelectionIndex(text: string): number | undefined {
   const normalized = normalizeComparableText(text);
   const map: Record<string, number> = {
@@ -7010,6 +7443,7 @@ function looksLikePendingDecisionReply(message: string): boolean {
   return (
     isConfirmationMessage(trimmed) ||
     isRejectionMessage(trimmed) ||
+    Boolean(parseActionHygieneReply(trimmed)) ||
     /^#?\d+$/.test(trimmed) ||
     /^(the\s+)?(first|second|third|fourth|fifth)(\s+one)?$/i.test(trimmed) ||
     /^(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta)$/i.test(trimmed)
@@ -7124,6 +7558,34 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
 
     return {
       reply: `Action archived: ${action.title}`
+    };
+  }
+
+  if (pendingAction.type === "action_hygiene") {
+    if (pendingAction.payload.operation !== "bulk_archive" || !Array.isArray(pendingAction.payload.actionIds)) {
+      return {
+        reply: "Run /action_hygiene again and choose one action."
+      };
+    }
+
+    const archived: string[] = [];
+
+    for (const actionId of pendingAction.payload.actionIds) {
+      if (typeof actionId !== "string") {
+        continue;
+      }
+
+      const action = await archiveActionItem(userId, actionId);
+
+      if (action) {
+        archived.push(action.title);
+      }
+    }
+
+    return {
+      reply: archived.length > 0
+        ? [`Archived ${archived.length} action${archived.length === 1 ? "" : "s"}:`, ...archived.map((title) => `- ${title}`)].join("\n")
+        : "No matching actions were archived."
     };
   }
 
@@ -7303,8 +7765,36 @@ interface DailyOperatorBrief {
   goalStatus: DailyOperatorBriefGoalStatus[];
   recentWins: string[];
   risks: string[];
+  actionHygiene?: {
+    summary: string;
+    needsDecision: number;
+  };
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+type ActionHygieneOption = "complete" | "snooze" | "archive" | "keep";
+
+interface ActionHygieneAction {
+  actionId: string;
+  title: string;
+  dueAt?: string;
+  linkedGoalTitle?: string;
+  priority: ActionItem["priority"];
+  daysOverdue?: number;
+  snoozeCount?: number;
+  lastTouchedAt?: string;
+  reason: string;
+  recommendedOptions: ActionHygieneOption[];
+}
+
+interface ActionHygieneReport {
+  staleActions: ActionHygieneAction[];
+  overdueActions: ActionHygieneAction[];
+  repeatedlySnoozedActions: ActionHygieneAction[];
+  lowPriorityStaleActions: ActionHygieneAction[];
+  suggestedCleanupCandidates: ActionHygieneAction[];
+  summary: string;
 }
 
 type DailyCoachSource = "llm" | "fallback_disabled" | "fallback_invalid" | "fallback_error" | "fallback_timeout";
