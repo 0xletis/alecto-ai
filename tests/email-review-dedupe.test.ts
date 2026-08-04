@@ -4943,6 +4943,215 @@ test("action hygiene ignores future snoozed actions and updates daily loop hygie
   }
 });
 
+test("operator reflections are grounded, deduped, archived, and lightly shown in today", async () => {
+  const server = buildServer();
+  const reflectionUserId = `operator-reflection-${randomUUID()}`;
+  const now = "2026-08-04T15:08:00+02:00";
+  await prisma.user.create({ data: { id: reflectionUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: reflectionUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: reflectionUserId,
+      title: "Build a YouTube channel",
+      category: "creative",
+      priority: "medium",
+      importanceScore: 25
+    }
+  });
+  const jobGoal = await prisma.goal.create({
+    data: {
+      userId: reflectionUserId,
+      title: "Find a new developer job",
+      category: "career",
+      templateId: "career.job_search",
+      priority: "critical",
+      importanceScore: 70
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: reflectionUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      status: "open",
+      priority: "medium",
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title,
+      dueAt: new Date("2026-08-01T14:30:00.000Z")
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: reflectionUserId,
+      source: "manual",
+      title: "Draft YouTube outline",
+      status: "snoozed",
+      priority: "medium",
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title,
+      snoozedUntil: new Date("2026-08-05T07:00:00.000Z"),
+      updatedAt: new Date("2026-08-03T12:00:00.000Z")
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: reflectionUserId,
+      source: "manual",
+      title: "Edit YouTube intro",
+      status: "snoozed",
+      priority: "medium",
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title,
+      snoozedUntil: new Date("2026-08-05T07:00:00.000Z"),
+      updatedAt: new Date("2026-08-03T13:00:00.000Z")
+    }
+  });
+  await prisma.actionItem.create({
+    data: {
+      userId: reflectionUserId,
+      source: "manual",
+      title: "Send 2 CVs",
+      status: "completed",
+      priority: "medium",
+      goalId: jobGoal.id,
+      goalTitleSnapshot: jobGoal.title,
+      completedAt: new Date("2026-08-04T09:00:00.000Z"),
+      updatedAt: new Date("2026-08-04T09:00:00.000Z")
+    }
+  });
+  await prisma.event.createMany({
+    data: [
+      {
+        userId: reflectionUserId,
+        type: "finance.betting.cooldown_triggered",
+        timestamp: new Date("2026-08-03T10:00:00.000Z"),
+        source: "manual",
+        data: {},
+        confidence: 1
+      },
+      {
+        userId: reflectionUserId,
+        type: "finance.betting.cooldown_triggered",
+        timestamp: new Date("2026-08-04T10:00:00.000Z"),
+        source: "manual",
+        data: {},
+        confidence: 1
+      }
+    ]
+  });
+
+  const originalEnv = {
+    OPERATOR_REFLECTION_LLM_ENABLED: process.env.OPERATOR_REFLECTION_LLM_ENABLED,
+    OPERATOR_REFLECTION_LLM_MOCK_RESPONSE: process.env.OPERATOR_REFLECTION_LLM_MOCK_RESPONSE
+  };
+
+  try {
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${reflectionUserId}/reflections/context?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().context.counts.overdueActions, 1);
+    assert.equal(response.json().context.counts.snoozedOrRescheduledActions, 2);
+    assert.equal(response.json().context.counts.guardrailTriggers, 2);
+    assert.doesNotMatch(response.json().message, /accessToken|refreshToken|raw email/i);
+
+    process.env.OPERATOR_REFLECTION_LLM_ENABLED = "true";
+    process.env.OPERATOR_REFLECTION_LLM_MOCK_RESPONSE = "{bad json";
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reflectionUserId}/reflections/generate?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Operator reflections/);
+    assert.ok(response.json().reflections.some((memory: { data?: { reflectionType?: string } }) => memory.data?.reflectionType === "stale_goal"));
+    assert.ok(response.json().reflections.some((memory: { data?: { reflectionType?: string } }) => memory.data?.reflectionType === "friction"));
+    assert.ok(response.json().reflections.some((memory: { data?: { reflectionType?: string } }) => memory.data?.reflectionType === "guardrail_pattern"));
+    const initialCount = await prisma.memoryEntry.count({
+      where: {
+        userId: reflectionUserId,
+        status: "active",
+        data: { path: ["kind"], equals: "operator_reflection" }
+      }
+    });
+    assert.ok(initialCount >= 3);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reflectionUserId}/reflections/generate?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    const secondCount = await prisma.memoryEntry.count({
+      where: {
+        userId: reflectionUserId,
+        status: "active",
+        data: { path: ["kind"], equals: "operator_reflection" }
+      }
+    });
+    assert.equal(secondCount, initialCount);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${reflectionUserId}/reflections`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Operator reflections/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${reflectionUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(typeof response.json().brief.operatorReflection, "string");
+    assert.equal((response.json().brief.operatorReflection.match(/\\n/g) ?? []).length, 0);
+
+    response = await server.inject({
+      method: "PATCH",
+      url: `/users/${reflectionUserId}/reflections/1/archive`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reflection.status, "archived");
+
+    const lowEvidenceUserId = `${reflectionUserId}-low`;
+    await prisma.user.create({ data: { id: lowEvidenceUserId } });
+    process.env.OPERATOR_REFLECTION_LLM_ENABLED = "true";
+    process.env.OPERATOR_REFLECTION_LLM_MOCK_RESPONSE = JSON.stringify({
+      candidates: [
+        {
+          type: "pattern",
+          title: "Unsupported claim",
+          summary: "The user is lazy.",
+          evidence: {},
+          confidence: 0.95
+        }
+      ]
+    });
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${lowEvidenceUserId}/reflections/generate?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reflections.length, 0);
+    await prisma.user.deleteMany({ where: { id: lowEvidenceUserId } });
+  } finally {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reflectionUserId } });
+  }
+});
+
 async function createReview(input: {
   subject: string;
   from: string;

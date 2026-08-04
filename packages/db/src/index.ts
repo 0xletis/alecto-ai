@@ -2185,6 +2185,37 @@ export async function archiveMemory(userId: string, memoryId: string): Promise<M
   return toMemoryEntry(memory);
 }
 
+export async function updateMemory(
+  userId: string,
+  memoryId: string,
+  input: Partial<Pick<CreateMemoryInput, "summary" | "data" | "evidence" | "confidence">>
+): Promise<MemoryEntry | undefined> {
+  await ensureUser(userId);
+
+  const existingMemory = await prisma.memoryEntry.findFirst({
+    where: {
+      id: memoryId,
+      userId
+    }
+  });
+
+  if (!existingMemory) {
+    return undefined;
+  }
+
+  const memory = await prisma.memoryEntry.update({
+    where: { id: memoryId },
+    data: {
+      ...(input.summary ? { summary: input.summary } : {}),
+      ...(input.data ? { data: toJsonObject(input.data) } : {}),
+      ...(input.evidence ? { evidence: toJsonObject(input.evidence) } : {}),
+      ...(typeof input.confidence === "number" ? { confidence: input.confidence } : {})
+    }
+  });
+
+  return toMemoryEntry(memory);
+}
+
 export async function getRelevantMemories(
   userId: string,
   options: GetRelevantMemoriesOptions = {}

@@ -553,14 +553,19 @@ function withDuplicateGoalPattern(patterns: string[], hasDuplicateGoals: boolean
 }
 
 function relevantMemorySignals(memories: MemoryEntry[], risks: string[]): string[] {
-  if (risks.length === 0) {
-    return [];
-  }
+  const operatorReflections = memories
+    .filter((memory) => memory.status === "active" && memory.data?.kind === "operator_reflection")
+    .slice(0, 2)
+    .map((memory) => memory.summary);
 
-  return memories
+  const riskSignals = risks.length === 0
+    ? []
+    : memories
     .filter((memory) => memory.status === "active" && memory.type === "risk_pattern")
     .slice(0, 3)
     .map((memory) => memory.summary);
+
+  return [...operatorReflections, ...riskSignals].slice(0, 3);
 }
 
 function recommendDailyActions(activeGoals: Goal[], metrics: ReturnType<typeof summarizeMetrics>, events: StoredEvent[]): string[] {

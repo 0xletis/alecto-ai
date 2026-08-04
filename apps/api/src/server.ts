@@ -178,6 +178,7 @@ import {
   updateIntegrationConnectionSyncState,
   updateEmailSignalRule,
   updateEmailSignalRuleSyncState,
+  updateMemory,
   updateNotificationSettings,
   updateUserOperatingProfile
 } from "@operator-agent/db";
@@ -624,6 +625,54 @@ export function buildServer() {
       return { memory };
     }
   );
+
+  server.post<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/reflections/generate", async (request) => {
+    const timezone = await getUserTimezone(request.params.userId);
+    const now = parseOptionalNow(request.query.now) ?? new Date();
+    const context = await buildOperatorReflectionContext(request.params.userId, { now, timezone });
+    const result = await generateAndSaveOperatorReflections(request.params.userId, context);
+
+    return {
+      ...result,
+      message: formatOperatorReflectionGeneration(result.reflections)
+    };
+  });
+
+  server.get<{ Params: { userId: string } }>("/users/:userId/reflections", async (request) => {
+    const reflections = await getActiveOperatorReflections(request.params.userId);
+
+    return {
+      reflections,
+      message: formatOperatorReflections(reflections)
+    };
+  });
+
+  server.patch<{ Params: { userId: string; reflectionId: string } }>(
+    "/users/:userId/reflections/:reflectionId/archive",
+    async (request, reply) => {
+      const reflection = await archiveOperatorReflection(request.params.userId, request.params.reflectionId);
+
+      if (!reflection) {
+        return reply.status(404).send({ error: "Reflection not found" });
+      }
+
+      return {
+        reflection,
+        message: "Archived reflection."
+      };
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/reflections/context", async (request) => {
+    const timezone = await getUserTimezone(request.params.userId);
+    const now = parseOptionalNow(request.query.now) ?? new Date();
+    const context = await buildOperatorReflectionContext(request.params.userId, { now, timezone });
+
+    return {
+      context: summarizeOperatorReflectionContext(context),
+      message: formatOperatorReflectionContextDebug(context)
+    };
+  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/notification-settings", async (request) => ({
     notificationSettings: await getOrCreateNotificationSettings(request.params.userId)
@@ -2069,6 +2118,12 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     completedToday
   });
   const coachResult = await maybeGenerateDailyCoach(briefContext);
+  const briefOpenActions = rankedActions.slice(0, 10).map(toBriefAction);
+  const activeReflections = await getActiveOperatorReflections(userId);
+  const operatorReflection = selectRelevantOperatorReflection(activeReflections, {
+    openActions: briefOpenActions,
+    topPriorities
+  });
 
   return {
     date: todayRange.date,
@@ -2076,7 +2131,7 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     coach: coachResult.coach,
     coachDebug: coachResult.debug,
     topPriorities,
-    openActions: rankedActions.slice(0, 10).map(toBriefAction),
+    openActions: briefOpenActions,
     overdueActions: overdueActions.slice(0, 10).map(toBriefAction),
     goalStatus,
     recentWins,
@@ -2085,6 +2140,7 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
       summary: hygiene.summary,
       needsDecision: hygiene.suggestedCleanupCandidates.length
     } : undefined,
+    operatorReflection: operatorReflection ? formatOperatorReflectionForBrief(operatorReflection) : undefined,
     suggestedNextStep,
     priorityDebug
   };
@@ -2111,6 +2167,7 @@ async function buildStartDayMessage(userId: string, now: Date): Promise<string> 
     overdue.length > 0 ? `Overdue: ${overdue.join(", ")}.` : undefined,
     alsoToday.length > 0 ? `Also today: ${alsoToday.join(", ")}.` : undefined,
     hygiene ? `Hygiene: ${cleanupDecisionGrammar(hygiene.needsDecision)} Run /action_hygiene.` : undefined,
+    brief.operatorReflection ? `Pattern: ${brief.operatorReflection}` : undefined,
     guardrail ? `Guardrail: ${formatLoopGuardrail(guardrail)}` : undefined,
     "Reply naturally with updates."
   ]
@@ -2386,6 +2443,509 @@ function daysBetweenLocalDates(fromDate: string, toDate: string): number {
 
 function daysBetween(from: Date, to: Date): number {
   return Math.max(0, Math.floor((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)));
+}
+
+async function buildOperatorReflectionContext(
+  userId: string,
+  input: { now: Date; timezone: string; days?: number }
+): Promise<OperatorReflectionContext> {
+  const days = input.days ?? 7;
+  const since = new Date(input.now.getTime() - days * 24 * 60 * 60 * 1000);
+  const [activeGoals, actions, events, memories] = await Promise.all([
+    getActiveGoals(userId),
+    getActionItems(userId, { status: "all", limit: 200 }),
+    getEventsSince(userId, since),
+    getActiveMemories(userId)
+  ]);
+  const dateRange = {
+    start: formatDateInTimezone(since, input.timezone),
+    end: formatDateInTimezone(input.now, input.timezone),
+    since,
+    until: input.now
+  };
+  const inRangeActions = actions.filter((action) => action.updatedAt >= since || (action.completedAt && action.completedAt >= since));
+  const completedActions = inRangeActions.filter((action) => action.status === "completed" && action.completedAt && action.completedAt >= since);
+  const overdueActions = actions.filter((action) => action.status === "open" && action.dueAt && action.dueAt < input.now);
+  const snoozedOrRescheduledActions = inRangeActions.filter((action) => action.status === "snoozed" || Boolean(action.snoozedUntil));
+  const archivedActions = inRangeActions.filter((action) => action.status === "archived");
+  const guardrailEvents = events.filter((event) => isGuardrailEvent(event));
+  const existingReflections = memories.filter(isOperatorReflectionMemory);
+  const goalsWithProgress = new Set<string>();
+
+  for (const action of completedActions) {
+    if (action.goalId) {
+      goalsWithProgress.add(action.goalId);
+    }
+  }
+
+  for (const event of events) {
+    const goalId = stringFromRecord(event.data, "goalId");
+    if (goalId) {
+      goalsWithProgress.add(goalId);
+    }
+  }
+
+  return {
+    userId,
+    timezone: input.timezone,
+    dateRange,
+    activeGoals,
+    completedActions,
+    overdueActions,
+    snoozedOrRescheduledActions,
+    archivedActions,
+    events,
+    guardrailEvents,
+    existingReflections,
+    goalsWithoutProgress: activeGoals.filter((goal) => !goalsWithProgress.has(goal.id)),
+    counts: {
+      completedActions: completedActions.length,
+      overdueActions: overdueActions.length,
+      snoozedOrRescheduledActions: snoozedOrRescheduledActions.length,
+      archivedActions: archivedActions.length,
+      events: events.length,
+      guardrailTriggers: guardrailEvents.length,
+      activeGoals: activeGoals.length,
+      existingReflections: existingReflections.length
+    }
+  };
+}
+
+async function generateAndSaveOperatorReflections(userId: string, context: OperatorReflectionContext) {
+  const candidates = mergeReflectionCandidates([
+    ...generateDeterministicOperatorReflectionCandidates(context),
+    ...await maybeGenerateLlmOperatorReflectionCandidates(context)
+  ]);
+  const saved: MemoryEntry[] = [];
+
+  for (const candidate of candidates.slice(0, 5)) {
+    if (!isSafeOperatorReflectionCandidate(candidate)) {
+      continue;
+    }
+
+    saved.push(await upsertOperatorReflection(userId, candidate, context));
+  }
+
+  return {
+    reflections: saved,
+    candidatesGenerated: candidates.length,
+    saved: saved.length
+  };
+}
+
+function generateDeterministicOperatorReflectionCandidates(context: OperatorReflectionContext): OperatorReflectionCandidate[] {
+  const candidates: OperatorReflectionCandidate[] = [];
+  const stale = context.overdueActions.find((action) => daysOverdueForAction(action, context) >= 3);
+
+  if (stale) {
+    candidates.push({
+      type: "stale_goal",
+      title: `${stale.title} has become stale`,
+      summary: `${stale.title} has been overdue for ${daysOverdueForAction(stale, context)} days and needs a decision: complete, snooze, archive, or make smaller.`,
+      evidence: {
+        actionIds: [stale.id],
+        goalIds: stale.goalId ? [stale.goalId] : [],
+        eventIds: [],
+        dateRange: reflectionDateRangeEvidence(context),
+        counts: { daysOverdue: daysOverdueForAction(stale, context), overdueActions: context.overdueActions.length }
+      },
+      confidence: 0.82,
+      source: "daily_reflection"
+    });
+  }
+
+  const snoozeGroups = groupActionsByGoalOrKeyword(context.snoozedOrRescheduledActions);
+  const repeated = [...snoozeGroups.entries()].find(([, actions]) => actions.length >= 2);
+
+  if (repeated) {
+    const [label, actions] = repeated;
+    candidates.push({
+      type: "friction",
+      title: `${label} tasks may be too broad`,
+      summary: `${label} actions were snoozed or rescheduled ${actions.length} times in the last 7 days. The next action should be smaller and more concrete.`,
+      evidence: {
+        actionIds: actions.map((action) => action.id),
+        goalIds: uniqueStrings(actions.map((action) => action.goalId).filter((value): value is string => Boolean(value))),
+        eventIds: [],
+        dateRange: reflectionDateRangeEvidence(context),
+        counts: { snoozedOrRescheduledActions: actions.length }
+      },
+      confidence: 0.8,
+      source: "daily_reflection"
+    });
+  }
+
+  const criticalProgress = context.completedActions.find((action) => {
+    const goal = context.activeGoals.find((item) => item.id === action.goalId);
+    return goal && goalPriorityRank(goal) >= 70;
+  });
+  const mediumSnoozes = context.snoozedOrRescheduledActions.filter((action) => {
+    const goal = context.activeGoals.find((item) => item.id === action.goalId);
+    return goal && goalPriorityRank(goal) <= 25;
+  });
+
+  if (criticalProgress && mediumSnoozes.length >= 2) {
+    candidates.push({
+      type: "goal_strategy",
+      title: "Concrete critical-goal actions are moving better than broad lower-priority tasks",
+      summary: "Completed critical-goal work is showing up, while lower-priority tasks are being moved. Keep critical actions concrete and break broad creative tasks into smaller pieces.",
+      evidence: {
+        actionIds: [criticalProgress.id, ...mediumSnoozes.slice(0, 3).map((action) => action.id)],
+        goalIds: uniqueStrings([criticalProgress.goalId, ...mediumSnoozes.map((action) => action.goalId)].filter((value): value is string => Boolean(value))),
+        eventIds: [],
+        dateRange: reflectionDateRangeEvidence(context),
+        counts: { completedCriticalActions: 1, movedLowerPriorityActions: mediumSnoozes.length }
+      },
+      confidence: 0.78,
+      source: "weekly_reflection"
+    });
+  }
+
+  if (context.guardrailEvents.length >= 2) {
+    candidates.push({
+      type: "guardrail_pattern",
+      title: "Guardrail has been active recently",
+      summary: "Guardrail events appeared repeatedly in the last 7 days. Keep betting/trading intent out of task creation and let the guardrail stop those loops.",
+      evidence: {
+        actionIds: [],
+        goalIds: context.activeGoals.filter(isRiskControlGoal).map((goal) => goal.id),
+        eventIds: context.guardrailEvents.map((event) => event.id),
+        dateRange: reflectionDateRangeEvidence(context),
+        counts: { guardrailTriggers: context.guardrailEvents.length }
+      },
+      confidence: 0.86,
+      source: "weekly_reflection"
+    });
+  }
+
+  return candidates;
+}
+
+async function maybeGenerateLlmOperatorReflectionCandidates(context: OperatorReflectionContext): Promise<OperatorReflectionCandidate[]> {
+  if (process.env.OPERATOR_REFLECTION_LLM_ENABLED !== "true") {
+    return [];
+  }
+
+  const mock = process.env.OPERATOR_REFLECTION_LLM_MOCK_RESPONSE;
+
+  if (!mock) {
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(mock) as unknown;
+    const candidates = Array.isArray(parsed)
+      ? parsed
+      : isRecord(parsed) && Array.isArray(parsed.candidates)
+        ? parsed.candidates
+        : [];
+
+    return candidates
+      .map(parseOperatorReflectionCandidate)
+      .filter((candidate): candidate is OperatorReflectionCandidate => Boolean(candidate));
+  } catch {
+    return [];
+  }
+}
+
+function parseOperatorReflectionCandidate(value: unknown): OperatorReflectionCandidate | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const type = typeof value.type === "string" && isOperatorReflectionType(value.type) ? value.type : undefined;
+  const title = typeof value.title === "string" ? value.title.trim() : "";
+  const summary = typeof value.summary === "string" ? value.summary.trim() : "";
+  const evidence = isRecord(value.evidence) ? value.evidence : {};
+  const confidence = typeof value.confidence === "number" ? value.confidence : 0;
+
+  if (!type || !title || !summary) {
+    return undefined;
+  }
+
+  return {
+    type,
+    title: title.slice(0, 120),
+    summary: summary.slice(0, 360),
+    evidence,
+    confidence,
+    source: "weekly_reflection"
+  };
+}
+
+function isSafeOperatorReflectionCandidate(candidate: OperatorReflectionCandidate): boolean {
+  if (candidate.confidence < 0.7) {
+    return false;
+  }
+
+  if (containsUnsafeReflectionLanguage(`${candidate.title} ${candidate.summary}`)) {
+    return false;
+  }
+
+  const actionIds = arrayOfStrings(candidate.evidence.actionIds);
+  const eventIds = arrayOfStrings(candidate.evidence.eventIds);
+  const goalIds = arrayOfStrings(candidate.evidence.goalIds);
+  const evidenceCount = actionIds.length + eventIds.length + goalIds.length;
+
+  if (candidate.type === "guardrail_pattern" && eventIds.length >= 1) {
+    return true;
+  }
+
+  return evidenceCount >= 2 || (actionIds.length >= 1 && typeof candidate.evidence.counts === "object");
+}
+
+async function upsertOperatorReflection(
+  userId: string,
+  candidate: OperatorReflectionCandidate,
+  context: OperatorReflectionContext
+): Promise<MemoryEntry> {
+  const existing = findSimilarOperatorReflection(context.existingReflections, candidate);
+  const data = operatorReflectionData(candidate, existing);
+  const evidence = sanitizeOperatorReflectionEvidence(candidate.evidence);
+
+  if (existing) {
+    const updated = await updateMemory(userId, existing.id, {
+      summary: candidate.summary,
+      data,
+      evidence,
+      confidence: Math.max(existing.confidence, candidate.confidence)
+    });
+
+    return updated ?? existing;
+  }
+
+  return createMemory(userId, {
+    type: candidate.type === "guardrail_pattern" ? "risk_pattern" : candidate.type === "preference" ? "preference" : "pattern",
+    summary: candidate.summary,
+    data,
+    evidence,
+    source: "system_inferred",
+    confidence: candidate.confidence
+  });
+}
+
+function operatorReflectionData(candidate: OperatorReflectionCandidate, existing?: MemoryEntry): Record<string, unknown> {
+  const previousCount = typeof existing?.data?.observationCount === "number" ? existing.data.observationCount : 0;
+
+  return {
+    kind: "operator_reflection",
+    reflectionType: candidate.type,
+    title: candidate.title,
+    source: candidate.source,
+    lastObservedAt: new Date().toISOString(),
+    observationCount: previousCount + 1
+  };
+}
+
+function findSimilarOperatorReflection(reflections: MemoryEntry[], candidate: OperatorReflectionCandidate): MemoryEntry | undefined {
+  const titleKey = normalizeForComparison(candidate.title);
+
+  return reflections.find((reflection) => {
+    const data = reflection.data ?? {};
+    const reflectionType = typeof data.reflectionType === "string" ? data.reflectionType : "";
+    const reflectionTitle = typeof data.title === "string" ? data.title : reflection.summary;
+
+    return reflectionType === candidate.type && normalizeForComparison(reflectionTitle) === titleKey;
+  });
+}
+
+async function getActiveOperatorReflections(userId: string): Promise<MemoryEntry[]> {
+  return (await getActiveMemories(userId))
+    .filter(isOperatorReflectionMemory)
+    .sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime());
+}
+
+async function archiveOperatorReflection(userId: string, reflectionIdOrNumber: string): Promise<MemoryEntry | undefined> {
+  const reflections = await getActiveOperatorReflections(userId);
+  const index = Number.parseInt(reflectionIdOrNumber, 10);
+  const reflection = Number.isInteger(index) && index > 0
+    ? reflections[index - 1]
+    : reflections.find((item) => item.id === reflectionIdOrNumber);
+
+  if (!reflection) {
+    return undefined;
+  }
+
+  return archiveMemory(userId, reflection.id);
+}
+
+function isOperatorReflectionMemory(memory: MemoryEntry): boolean {
+  return memory.status === "active" && memory.data?.kind === "operator_reflection";
+}
+
+function selectRelevantOperatorReflection(reflections: MemoryEntry[], brief: { openActions: DailyOperatorBriefAction[]; topPriorities: string[] }): MemoryEntry | undefined {
+  const topText = normalizeForComparison([brief.openActions[0]?.title, brief.topPriorities[0]].filter(Boolean).join(" "));
+
+  return reflections.find((reflection) => {
+    const title = typeof reflection.data?.title === "string" ? reflection.data.title : reflection.summary;
+    return sharesMeaningfulToken(topText, normalizeForComparison(`${title} ${reflection.summary}`));
+  }) ?? reflections[0];
+}
+
+function formatOperatorReflectionGeneration(reflections: MemoryEntry[]): string {
+  if (reflections.length === 0) {
+    return "Operator reflections:\nNo new grounded reflections found.";
+  }
+
+  return ["Operator reflections:", ...reflections.map((reflection, index) => formatOperatorReflectionLine(reflection, index))].join("\n\n");
+}
+
+function formatOperatorReflections(reflections: MemoryEntry[]): string {
+  if (reflections.length === 0) {
+    return "No active operator reflections.";
+  }
+
+  return ["Operator reflections:", ...reflections.map((reflection, index) => formatOperatorReflectionLine(reflection, index))].join("\n\n");
+}
+
+function formatOperatorReflectionLine(reflection: MemoryEntry, index: number): string {
+  const title = typeof reflection.data?.title === "string" ? reflection.data.title : reflection.summary;
+  const evidence = reflection.evidence ?? {};
+  const counts = isRecord(evidence.counts) ? evidence.counts : {};
+  const countText = Object.entries(counts)
+    .slice(0, 2)
+    .map(([key, value]) => `${key}: ${String(value)}`)
+    .join(", ");
+
+  return [
+    `${index + 1}. ${title}`,
+    reflection.summary,
+    countText ? `Evidence: ${countText}` : undefined,
+    `id: ${reflection.id}`
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatOperatorReflectionForBrief(reflection: MemoryEntry): string {
+  const title = typeof reflection.data?.title === "string" ? reflection.data.title : reflection.summary;
+  return `${title}.`;
+}
+
+function formatOperatorReflectionContextDebug(context: OperatorReflectionContext): string {
+  const summary = summarizeOperatorReflectionContext(context);
+
+  return [
+    "Operator reflection context:",
+    `dateRange: ${summary.dateRange.start} to ${summary.dateRange.end}`,
+    `completed actions: ${summary.counts.completedActions}`,
+    `overdue actions: ${summary.counts.overdueActions}`,
+    `snoozed/rescheduled actions: ${summary.counts.snoozedOrRescheduledActions}`,
+    `archived actions: ${summary.counts.archivedActions}`,
+    `guardrail triggers: ${summary.counts.guardrailTriggers}`,
+    `active goals: ${summary.counts.activeGoals}`,
+    `goals without progress: ${summary.goalsWithoutProgress.length}`,
+    `existing reflections: ${summary.counts.existingReflections}`
+  ].join("\n");
+}
+
+function summarizeOperatorReflectionContext(context: OperatorReflectionContext) {
+  return {
+    dateRange: {
+      start: context.dateRange.start,
+      end: context.dateRange.end
+    },
+    counts: context.counts,
+    completedActions: context.completedActions.map((action) => ({ id: action.id, title: action.title, goalId: action.goalId })),
+    overdueActions: context.overdueActions.map((action) => ({ id: action.id, title: action.title, dueAt: action.dueAt?.toISOString() })),
+    snoozedOrRescheduledActions: context.snoozedOrRescheduledActions.map((action) => ({ id: action.id, title: action.title, snoozedUntil: action.snoozedUntil?.toISOString() })),
+    guardrailEvents: context.guardrailEvents.map((event) => ({ id: event.id, type: event.type, timestamp: event.timestamp.toISOString() })),
+    goalsWithoutProgress: context.goalsWithoutProgress.map((goal) => ({ id: goal.id, title: goal.title, priority: goal.priority }))
+  };
+}
+
+function groupActionsByGoalOrKeyword(actions: ActionItem[]): Map<string, ActionItem[]> {
+  const groups = new Map<string, ActionItem[]>();
+
+  for (const action of actions) {
+    const key = action.goalTitleSnapshot ?? firstMeaningfulActionToken(action.title) ?? action.title;
+    const existing = groups.get(key) ?? [];
+    groups.set(key, [...existing, action]);
+  }
+
+  return groups;
+}
+
+function firstMeaningfulActionToken(title: string): string | undefined {
+  return normalizeForComparison(title)
+    .split(" ")
+    .find((token) => token.length >= 4 && !["write", "review", "check", "send", "call", "make"].includes(token));
+}
+
+function daysOverdueForAction(action: ActionItem, context: OperatorReflectionContext): number {
+  if (!action.dueAt) {
+    return 0;
+  }
+
+  return daysBetweenLocalDates(formatDateInTimezone(action.dueAt, context.timezone), context.dateRange.end);
+}
+
+function reflectionDateRangeEvidence(context: OperatorReflectionContext) {
+  return {
+    start: context.dateRange.start,
+    end: context.dateRange.end
+  };
+}
+
+function sanitizeOperatorReflectionEvidence(evidence: Record<string, unknown>): Record<string, unknown> {
+  return {
+    actionIds: arrayOfStrings(evidence.actionIds).slice(0, 10),
+    eventIds: arrayOfStrings(evidence.eventIds).slice(0, 20),
+    goalIds: arrayOfStrings(evidence.goalIds).slice(0, 10),
+    dateRange: isRecord(evidence.dateRange) ? evidence.dateRange : undefined,
+    counts: isRecord(evidence.counts) ? evidence.counts : undefined
+  };
+}
+
+function mergeReflectionCandidates(candidates: OperatorReflectionCandidate[]): OperatorReflectionCandidate[] {
+  const seen = new Set<string>();
+  const merged: OperatorReflectionCandidate[] = [];
+
+  for (const candidate of candidates) {
+    const key = `${candidate.type}:${normalizeForComparison(candidate.title)}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    merged.push(candidate);
+  }
+
+  return merged;
+}
+
+function containsUnsafeReflectionLanguage(text: string): boolean {
+  return /\b(lazy|addict|addicted|undisciplined|diagnosis|disorder|pathological|hopeless|failure)\b/i.test(text);
+}
+
+function isOperatorReflectionType(value: string): value is OperatorReflectionType {
+  return ["pattern", "preference", "friction", "guardrail_pattern", "goal_strategy", "stale_goal"].includes(value);
+}
+
+function isGuardrailEvent(event: StoredEvent): boolean {
+  return /finance\.betting|finance\.trading|cooldown|large_bet|large_loss/i.test(event.type);
+}
+
+function arrayOfStrings(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function stringFromRecord(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function sharesMeaningfulToken(left: string, right: string): boolean {
+  const rightTokens = new Set(right.split(" ").filter((token) => token.length >= 4));
+  return left.split(" ").some((token) => token.length >= 4 && rightTokens.has(token));
+}
+
+function normalizeForComparison(value: string): string {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ");
 }
 
 function buildOperatorSummary(input: {
@@ -3276,6 +3836,7 @@ function formatConversationTodayReply(brief: DailyOperatorBrief): string {
     "Top priorities:",
     brief.topPriorities.length > 0 ? brief.topPriorities.map((item, index) => `${index + 1}. ${item}`).join("\n") : "No clear priorities yet.",
     brief.actionHygiene ? `\nAction hygiene:\n- ${cleanupDecisionGrammar(brief.actionHygiene.needsDecision)} Run /action_hygiene.` : undefined,
+    brief.operatorReflection ? `\nPattern:\n${brief.operatorReflection}` : undefined,
     "",
     "Next move:",
     brief.suggestedNextStep
@@ -7769,8 +8330,51 @@ interface DailyOperatorBrief {
     summary: string;
     needsDecision: number;
   };
+  operatorReflection?: string;
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+type OperatorReflectionType = "pattern" | "preference" | "friction" | "guardrail_pattern" | "goal_strategy" | "stale_goal";
+type OperatorReflectionSource = "daily_reflection" | "weekly_reflection" | "manual_debug";
+
+interface OperatorReflectionCandidate {
+  type: OperatorReflectionType;
+  title: string;
+  summary: string;
+  evidence: Record<string, unknown>;
+  confidence: number;
+  source: OperatorReflectionSource;
+}
+
+interface OperatorReflectionContext {
+  userId: string;
+  timezone: string;
+  dateRange: {
+    start: string;
+    end: string;
+    since: Date;
+    until: Date;
+  };
+  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>;
+  completedActions: ActionItem[];
+  overdueActions: ActionItem[];
+  snoozedOrRescheduledActions: ActionItem[];
+  archivedActions: ActionItem[];
+  events: StoredEvent[];
+  guardrailEvents: StoredEvent[];
+  existingReflections: MemoryEntry[];
+  goalsWithoutProgress: Awaited<ReturnType<typeof getActiveGoals>>;
+  counts: {
+    completedActions: number;
+    overdueActions: number;
+    snoozedOrRescheduledActions: number;
+    archivedActions: number;
+    events: number;
+    guardrailTriggers: number;
+    activeGoals: number;
+    existingReflections: number;
+  };
 }
 
 type ActionHygieneOption = "complete" | "snooze" | "archive" | "keep";

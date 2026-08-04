@@ -279,6 +279,65 @@ bot.command("forget_memory", async (ctx) => {
   }
 });
 
+bot.command("reflect", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiPost<OperatorReflectionsResponse>(`/users/${getTelegramUserId(ctx)}/reflections/generate`, {});
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not generate operator reflections right now.");
+  }
+});
+
+bot.command("reflections", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<OperatorReflectionsResponse>(`/users/${getTelegramUserId(ctx)}/reflections`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not fetch operator reflections right now.");
+  }
+});
+
+bot.command("forget_reflection", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  const reflectionId = getCommandText(ctx);
+
+  if (!reflectionId) {
+    await ctx.reply("Usage: /forget_reflection <reflectionIdOrNumber>");
+    return;
+  }
+
+  try {
+    const response = await apiPatch<OperatorReflectionResponse>(`/users/${getTelegramUserId(ctx)}/reflections/${encodeURIComponent(reflectionId)}/archive`, {});
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not archive that reflection. Check the ID and try again.");
+  }
+});
+
+bot.command("debug_reflection_context", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<OperatorReflectionContextResponse>(`/users/${getTelegramUserId(ctx)}/reflections/context`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not build reflection context right now.");
+  }
+});
+
 bot.command("notifications", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
     return;
@@ -3159,6 +3218,7 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
       : undefined,
     brief.risks.length > 0 ? `Risks / watchouts:\n${brief.risks.map((risk) => `- ${risk}`).join("\n")}` : undefined,
     brief.actionHygiene ? `Action hygiene:\n- ${formatCleanupDecisionGrammar(brief.actionHygiene.needsDecision)} Run /action_hygiene.` : undefined,
+    brief.operatorReflection ? `Pattern:\n${brief.operatorReflection}` : undefined,
     "",
     "Next move:",
     brief.suggestedNextStep
@@ -4492,8 +4552,24 @@ interface DailyOperatorBrief {
     summary: string;
     needsDecision: number;
   };
+  operatorReflection?: string;
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+interface OperatorReflectionsResponse {
+  reflections: MemoryEntry[];
+  message: string;
+}
+
+interface OperatorReflectionResponse {
+  reflection: MemoryEntry;
+  message: string;
+}
+
+interface OperatorReflectionContextResponse {
+  context: unknown;
+  message: string;
 }
 
 interface ActionHygieneResponse {
