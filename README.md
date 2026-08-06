@@ -2,6 +2,22 @@
 
 Adaptive personal AI agent with goals, structured events, user operating profiles, risk states, intent routing, event extraction, and a Telegram-first MVP path.
 
+## Documentation And Handoff
+
+For orchestrator handoff, read:
+
+- `docs/00-product-vision.md`
+- `docs/01-system-architecture.md`
+- `docs/05-agent-behavior.md`
+- `docs/06-mvp-roadmap.md`
+- `docs/07-implementation-status.md`
+- `docs/08-product-capability-audit.md`
+
+`docs/07-implementation-status.md` is the current implemented/partial/not-implemented ledger.
+`docs/08-product-capability-audit.md` is the product capability and command-surface map.
+
+After every implementation pass, update `README.md` and the relevant `docs/*.md` files before handing off. If a feature moves from planned to implemented, partial, or intentionally deferred, update `docs/07-implementation-status.md` too.
+
 ## Setup
 
 ```bash
@@ -96,18 +112,62 @@ Both the Telegram bot and worker need `TELEGRAM_BOT_TOKEN`. For local dev, remin
 
 Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each Telegram account has separate goals, events, and profile.
 
+## Product Surfaces
+
+Normal user commands:
+- `/today`, `/start_day`, `/end_day`, `/tomorrow`
+- `/actions`, `/action`, `/complete_action`, `/snooze_action`, `/archive_action`
+- `/action_hygiene`, `/goals`, `/goal_priorities`, `/memory`, `/remember`
+
+Review commands:
+- `/review`: factual daily event summary
+- `/insight` or `/daily_insight`: interpretive daily coaching
+- `/weekly`: saved weekly operator review
+- `/weekly_insight`: interpretive weekly coaching
+- `/weekly_last`: latest saved weekly operator review
+- `/plan_next_week`: placeholder; not implemented as a real planning flow yet
+
+Setup and settings commands:
+- `/setup`, `/whoami`, `/profile`, `/set_style`
+- `/notifications`, `/reminder_settings`, `/set_reminder_time`
+- `/daily_loop_settings`, `/set_daily_loop`
+- `/enable_checkin`, `/enable_daily_insight`, `/enable_weekly_insight`
+
+Integration commands:
+- `/integrations`, `/my_integrations`
+- `/connect_github`, `/sync_integrations`, `/sync_integration`
+- `/connect_gmail`, `/my_email_rules`, `/enable_email_rule`, `/sync_gmail`
+- `/email_reviews`, `/approve_email_review`, `/reject_email_review`
+
+Debug/dev commands:
+- all `/debug_*` commands
+- `/trigger_action_reminders`
+- `/send_checkin_now`, `/send_daily_insight_now`, `/send_weekly_insight_now`
+- cleanup helpers such as `/cleanup_gmail_rule_events` and `/cleanup_email_reviews`
+
+For the full command taxonomy and capability matrix, see `docs/08-product-capability-audit.md`.
+
 Telegram commands:
 
 - `/start`: short intro
 - `/whoami`: show Telegram ID and derived agent userId
 - `/setup`: setup checklist
+- `/debug_route <message>`: allowlist-only route debug; no side effects
+- `/debug_conversation_intent <message>`: allowlist-only conversational control debug
+- `/debug_intent_plan <message>`: allowlist-only multi-intent plan debug
 - `/profile`: show operating profile
 - `/memory`: show active user-visible memories
 - `/remember <text>`: save a visible memory immediately
 - `/forget_memory <memoryId>`: archive a memory
+- `/reflect`: generate an operator reflection
+- `/reflections`: show active operator reflections
+- `/forget_reflection REFLECTION_ID`: archive an operator reflection
+- `/debug_reflection_context`: allowlist-only reflection context debug
 - `/notifications`: show notification settings
 - `/reminder_settings`: show action reminder default times
 - `/set_reminder_time default 09:00`: set the default action due time; also supports `morning`, `afternoon`, `evening`, and `tonight`
+- `/daily_loop_settings`: show daily operating loop settings
+- `/set_daily_loop morning=09:00 evening=21:30 enabled=true`: update daily loop settings
 - `/enable_checkin 09:00`: enable daily check-in reminders at local time
 - `/disable_checkin`: disable daily check-in reminders
 - `/send_checkin_now`: preview the same goal-aware daily check-in prompt the worker sends
@@ -143,6 +203,7 @@ Telegram commands:
 - `/email_reviews all`: show recent pending/approved/rejected email review items
 - `/approve_email_review REVIEW_ID`: approve a pending email review item; core career reviews create events, work-action reviews create action items
 - `/reject_email_review REVIEW_ID`: reject a pending email review item
+- `/cleanup_email_reviews RULE_ID`: archive pending email review items for one rule
 - `/action_help`: show manual action examples
 - `/action review homepage copy tomorrow`: create a manual action item
 - `/todo apply to 2 jobs tonight`: create a manual action item
@@ -152,10 +213,13 @@ Telegram commands:
 - `/complete_action ACTION_ID`: mark an action item completed
 - `/snooze_action ACTION_ID tomorrow afternoon`: snooze an action item; also supports `3d`, `YYYY-MM-DD`, `tomorrow at 6pm`, and similar simple times
 - `/archive_action ACTION_ID`: archive an action item
+- `/action_hygiene`: review stale/overdue actions and choose cleanup decisions
+- `/debug_action_hygiene`: allowlist-only detailed action hygiene report
 - Multi-line batches of safe read-only commands like `/actions` and `/today`, plus `/archive_action`, `/complete_action`, and `/snooze_action`, are handled one command per line. Pasted logs/examples with slash commands are treated as reference text and are not executed.
 - `/trigger_action_reminders`: dev helper that sends due/snoozed action reminders now
 - `/debug_make_action_due ACTION_ID`: allowlist-only dev helper that forces an action due for reminder testing
 - `/debug_make_snoozed_due ACTION_ID`: allowlist-only dev helper that forces a snoozed action due for reminder testing
+- `/debug_link_actions_to_goals`: allowlist-only helper that links clear existing actions to active goals
 - `/debug_daily_coach`: allowlist-only dev helper that shows whether `/today` used LLM coach text or deterministic fallback, without secrets or raw provider errors
 - `/sync_gmail`: manually sync active Gmail rules
 - `/sync_gmail_debug`: manually sync Gmail and show safe per-rule counters
@@ -166,6 +230,12 @@ Telegram commands:
 - `/checkin_natural`: show natural-language daily check-in examples
 - `/review`: daily review
 - `/today`: concise daily operator brief with a Coach section, actions, goals, wins, risks, and one deterministic next move
+- `/start_day`: morning operating brief
+- `/end_day`: evening review with completed/open/overdue actions
+- `/tomorrow`: tomorrow prep view
+- `/debug_send_start_day [force]`: allowlist-only worker-style morning brief send test
+- `/debug_send_end_day [force]`: allowlist-only worker-style evening review send test
+- `/debug_daily_priorities`: allowlist-only daily priority scoring debug
 - `/insight`: daily interpretive coaching insight
 - `/daily_insight`: alias of `/insight`
 - `/weekly`: generate and save the current weekly operator review
@@ -175,6 +245,9 @@ Telegram commands:
 - `/weekly_insight`: weekly interpretive coaching insight
 - `/plan_next_week`: placeholder for next-week planning
 - `/goals`: active goals
+- `/goal_priorities`: show active goal priority weights
+- `/set_goal_priority GOAL_ID_OR_NUMBER low|medium|high|critical`: update one goal priority
+- `/debug_backfill_goal_priorities [force]`: allowlist-only helper to apply default goal priorities
 - `/events [limit]`: recent active events with ids, defaults to 5 and caps at 20
 - `/events_archived [limit]`: recent events including archived/corrected status, defaults to 5 and caps at 20
 - `/undo_last_event`: archive the latest logged event group
@@ -182,7 +255,7 @@ Telegram commands:
 - `/correct_event EVENT_ID | {"duration_minutes":30}`: correct one event while preserving history
 - `/ingest <text>`: route pasted text through the generic ingestion framework
 - `/ingest_job <text>`: ingest pasted job-search/recruiter text with a career domain hint
-- `/pending`: show pending profile/goal changes
+- `/pending`: show current pending profile/goal/action/hygiene decision
 - `/confirm`: confirm the latest pending change
 - `/cancel`: cancel the latest pending change
 
@@ -594,11 +667,18 @@ Manual insight tests:
 - `POST /users/:userId/events/:eventId/correct`
 - `POST /users/:userId/events/undo-last`
 - `GET /users/:userId/goals`
+- `GET /users/:userId/goals/priorities`
+- `PATCH /users/:userId/goals/priorities`
+- `POST /users/:userId/goals/priorities/backfill`
 - `GET /users/:userId/profile`
 - `PATCH /users/:userId/profile`
 - `GET /users/:userId/memory`
 - `POST /users/:userId/memory`
 - `PATCH /users/:userId/memory/:memoryId/archive`
+- `POST /users/:userId/reflections/generate`
+- `GET /users/:userId/reflections`
+- `PATCH /users/:userId/reflections/:reflectionId/archive`
+- `GET /users/:userId/reflections/context`
 - `GET /users/:userId/notification-settings`
 - `PATCH /users/:userId/notification-settings`
 - `GET /users/:userId/pending-actions`
@@ -633,6 +713,9 @@ Manual insight tests:
 - `POST /users/:userId/email-reviews/:reviewId/reject`
 - `GET /users/:userId/actions`
 - `GET /users/:userId/actions?status=all`
+- `GET /users/:userId/actions/hygiene`
+- `POST /users/:userId/actions/hygiene/reply`
+- `POST /users/:userId/actions/debug-link-goals`
 - `POST /users/:userId/actions/manual`
 - `PATCH /users/:userId/actions/:actionId/complete`
 - `PATCH /users/:userId/actions/:actionId/snooze`
@@ -642,6 +725,13 @@ Manual insight tests:
 - `PATCH /users/:userId/actions/:actionId/debug-force-snoozed-due`
 - `GET /users/:userId/review/daily`
 - `GET /users/:userId/today`
+- `GET /users/:userId/daily-loop/start-day`
+- `GET /users/:userId/daily-loop/end-day`
+- `GET /users/:userId/daily-loop/tomorrow`
+- `GET /users/:userId/today/debug-priorities`
+- `GET /users/:userId/today/debug-daily-coach`
+- `POST /users/:userId/conversation/control`
+- `POST /users/:userId/conversation/multi-intent`
 - `GET /users/:userId/insights/daily`
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`
 - `GET /users/:userId/insights/weekly`
@@ -654,10 +744,11 @@ Manual insight tests:
 
 - `packages/core`: shared domain types, Zod schemas, risk states, user operating profile, ingestion registry/adapters, and the initial event registry.
 - `packages/llm`: optional OpenAI structured message analyzer plus analysis result schemas.
-- `packages/db`: Prisma schema, client export, and repository functions for users, goals, and events.
-- `apps/api`: Fastify API exposing health, event type, message processing, persisted event, and persisted goal routes.
-- `apps/telegram-bot`: Telegram channel adapter that forwards messages to the API.
+- `packages/db`: Prisma schema, client export, and repository functions for users, goals, events, memories, integrations, email rules/reviews, notifications, and action items.
+- `apps/api`: Fastify API and main orchestration layer for messages, goals, events, actions, integrations, insights, daily loop, and weekly review.
+- `apps/telegram-bot`: Telegram channel adapter that normalizes inbound messages and forwards business work to the API.
+- `apps/worker`: interval worker for daily check-ins, insights, daily loop briefs, action reminders, and optional scheduled integration sync.
 
 ## Current Scope
 
-This skeleton intentionally does not include UI, OpenClaw integration, WhatsApp, wallet/private-key functionality, or general app auth. Gmail has a minimal readonly OAuth flow for local MVP email ingestion.
+This local MVP intentionally does not include UI, OpenClaw integration, WhatsApp, wallet/private-key functionality, private GitHub, vector DB/embeddings, or general app auth. Gmail has a minimal readonly OAuth flow for local MVP email ingestion; tokens must be encrypted before production.

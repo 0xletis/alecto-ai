@@ -1,54 +1,94 @@
 # MVP Roadmap
 
-## MVP 0 — Personal prototype
+Status labels:
+- `[x]` implemented
+- `[~]` partial/local-MVP
+- `[ ]` not implemented
+
+For a full current inventory, read `docs/07-implementation-status.md`.
+For the product capability audit and command-surface map, read `docs/08-product-capability-audit.md`.
+
+## MVP 0 - Personal Prototype
 
 Goal:
 Build a working personal agent over Telegram with structured goals/events and basic guardian mode.
 
-Features:
-- Telegram bot
-- OpenAI LLM response
-- Postgres DB
-- Prisma schema
-- user profile
-- goal CRUD
-- event registry
-- event extraction from chat
-- manual check-ins
-- basic risk engine
-- daily review
-- weekly review
+Status:
+- [x] Telegram bot
+- [x] Fastify API
+- [x] Postgres DB
+- [x] Prisma schema
+- [x] user operating profile
+- [x] goal CRUD and archive
+- [x] goal templates
+- [x] event registry
+- [x] event extraction from chat
+- [x] structured and natural manual check-ins
+- [x] basic risk engine
+- [x] factual daily review
+- [x] daily insight
+- [x] weekly insight
+- [x] weekly operator review
+- [x] action items and reminders
+- [x] daily operator brief and daily operating loop
+- [x] inbound routing hardening and command batching
 
-No:
-- WhatsApp
-- full OpenClaw integration
-- mobile app
-- complex OAuth
-- automatic health data
-- trading execution
-- private keys
-- withdrawals
-- full dashboard
+Explicitly out of MVP 0:
+- [ ] WhatsApp
+- [ ] OpenClaw integration
+- [ ] mobile app
+- [ ] full dashboard
+- [ ] private keys
+- [ ] withdrawals
+- [ ] trading execution
 
-## MVP 1 — Technical alpha
+## MVP 1 - Technical Alpha
 
-Add:
-- GitHub fetcher
-- Gmail fetcher
-- wallet public-address fetcher
-- integration registry
-- memory viewer
-- basic web settings page
-- custom event types
-- templates for goals
+Goal:
+Add practical external signals and make the operator loop usable day to day.
 
-## MVP 2 — Product alpha
+Status:
+- [x] integration registry
+- [x] public GitHub fetcher
+- [x] GitHub lifecycle controls
+- [x] scheduled integration sync
+- [x] Gmail readonly fetcher
+- [x] Gmail OAuth local MVP
+- [x] email signal rules
+- [x] email review queue
+- [x] `job_search_email` adapter
+- [x] `work_action_email` adapter
+- [x] memory viewer through Telegram/API
+- [x] templates for goals
+- [~] OpenAI analysis/composition is optional and has deterministic fallback
+- [~] Gmail token storage is local-MVP only; encrypt before production
+- [ ] wallet public-address fetcher
+- [ ] basic web settings page
+- [ ] production OAuth/account management
+- [ ] custom event type approval workflow
 
-Add:
-- WhatsApp/OpenClaw channel adapter
-- OAuth flows
-- health integrations
-- dashboard
-- billing
-- multi-user isolation
-- enterprise/fund version
+## MVP 2 - Product Alpha
+
+Goal:
+Make the system product-ready beyond the Telegram personal prototype.
+
+Status:
+- [ ] WhatsApp channel adapter
+- [ ] OpenClaw gateway adapter
+- [ ] web app/dashboard
+- [ ] mobile app
+- [ ] production OAuth flows
+- [ ] health integrations
+- [ ] calendar integrations
+- [ ] billing
+- [ ] hardened multi-user auth/isolation beyond Telegram user mapping
+- [ ] enterprise/fund version
+- [ ] vector DB/embeddings
+
+## Current Next Useful Work
+
+Likely high-leverage next items:
+- build `/plan_next_week` v1 to turn weekly review into confirmed next-week ActionItems
+- harden tests around the daily operating loop and multi-intent routing as new behavior is added
+- keep Gmail token storage clearly marked as local-MVP until encryption is implemented
+- defer new integrations until the operator loop and onboarding are easier to use
