@@ -5152,6 +5152,411 @@ test("operator reflections are grounded, deduped, archived, and lightly shown in
   }
 });
 
+test("weekly review builds grounded context, saves memory, falls back safely, and prompts only when due", async () => {
+  const server = buildServer();
+  const reviewUserId = `weekly-review-${randomUUID()}`;
+  const promptUserId = `${reviewUserId}-prompt`;
+  const now = "2026-08-09T20:00:00+02:00";
+  const originalEnv = {
+    WEEKLY_REVIEW_LLM_ENABLED: process.env.WEEKLY_REVIEW_LLM_ENABLED,
+    WEEKLY_REVIEW_LLM_MOCK_RESPONSE: process.env.WEEKLY_REVIEW_LLM_MOCK_RESPONSE
+  };
+
+  try {
+    await prisma.user.createMany({
+      data: [{ id: reviewUserId }, { id: promptUserId }]
+    });
+    await prisma.notificationSettings.createMany({
+      data: [
+        { userId: reviewUserId, timezone: "Europe/Madrid", telegramUserId: "12345" },
+        { userId: promptUserId, timezone: "Europe/Madrid", telegramUserId: "67890" }
+      ]
+    });
+    const jobGoal = await prisma.goal.create({
+      data: {
+        userId: reviewUserId,
+        title: "Find a new developer job",
+        category: "career",
+        templateId: "career.job_search",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: reviewUserId,
+        title: "Read more",
+        category: "learning",
+        templateId: "learning.reading_more",
+        priority: "low",
+        importanceScore: 10
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: reviewUserId,
+        source: "manual",
+        title: "Send CV follow-up",
+        status: "completed",
+        priority: "medium",
+        goalId: jobGoal.id,
+        goalTitleSnapshot: jobGoal.title,
+        completedAt: new Date("2026-08-05T09:00:00.000Z"),
+        updatedAt: new Date("2026-08-05T09:00:00.000Z")
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: reviewUserId,
+        source: "manual",
+        title: "Review stale homepage copy",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-04T07:00:00.000Z")
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: reviewUserId,
+        source: "manual",
+        title: "Draft YouTube outline",
+        status: "snoozed",
+        priority: "medium",
+        snoozedUntil: new Date("2026-08-10T07:00:00.000Z"),
+        updatedAt: new Date("2026-08-06T12:00:00.000Z")
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: reviewUserId,
+        source: "manual",
+        title: "Old test task",
+        status: "archived",
+        priority: "low",
+        updatedAt: new Date("2026-08-07T12:00:00.000Z")
+      }
+    });
+    await prisma.event.createMany({
+      data: [
+        {
+          userId: reviewUserId,
+          type: "career.application_sent",
+          timestamp: new Date("2026-08-05T10:00:00.000Z"),
+          source: "manual",
+          data: { count: 2, goalId: jobGoal.id },
+          confidence: 1
+        },
+        {
+          userId: reviewUserId,
+          type: "health.workout_completed",
+          timestamp: new Date("2026-08-06T10:00:00.000Z"),
+          source: "manual",
+          data: { duration_minutes: 30 },
+          confidence: 1
+        },
+        {
+          userId: reviewUserId,
+          type: "finance.betting.cooldown_triggered",
+          timestamp: new Date("2026-08-07T10:00:00.000Z"),
+          source: "system",
+          data: { riskState: "RED" },
+          confidence: 1
+        },
+        {
+          userId: reviewUserId,
+          type: "health.workout_completed",
+          timestamp: new Date("2026-08-02T10:00:00.000Z"),
+          source: "manual",
+          data: { duration_minutes: 20 },
+          confidence: 1
+        }
+      ]
+    });
+    await prisma.memoryEntry.create({
+      data: {
+        userId: reviewUserId,
+        type: "pattern",
+        summary: "You tend to recover momentum after a concrete first task.",
+        data: {
+          kind: "operator_reflection",
+          title: "Concrete first task helps",
+          type: "pattern",
+          status: "active"
+        },
+        source: "system_inferred",
+        confidence: 0.8
+      }
+    });
+    await prisma.dailyLoopState.create({
+      data: {
+        userId: reviewUserId,
+        localDate: "2026-08-05",
+        timezone: "Europe/Madrid",
+        morningBriefSentAt: new Date("2026-08-05T06:00:00.000Z"),
+        eveningReviewCompletedAt: new Date("2026-08-05T20:00:00.000Z")
+      }
+    });
+
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${reviewUserId}/weekly-review/context?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().context.dateRange.start, "2026-08-03");
+    assert.equal(response.json().context.dateRange.end, "2026-08-09");
+    assert.equal(response.json().context.counts.completedActions, 1);
+    assert.equal(response.json().context.counts.guardrailTriggers, 1);
+    assert.equal(response.json().context.eventsByType["career.application_sent"], 1);
+    assert.match(response.json().message, /active reflections: 1/);
+    assert.doesNotMatch(response.json().message, /accessToken|refreshToken|raw provider/i);
+    assert.equal(
+      await prisma.memoryEntry.count({
+        where: {
+          userId: reviewUserId,
+          data: {
+            path: ["kind"],
+            equals: "weekly_review"
+          }
+        }
+      }),
+      0
+    );
+
+    const beforeActionCount = await prisma.actionItem.count({ where: { userId: reviewUserId } });
+    process.env.WEEKLY_REVIEW_LLM_ENABLED = "true";
+    process.env.WEEKLY_REVIEW_LLM_MOCK_RESPONSE = "{bad json";
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reviewUserId}/weekly-review`,
+      payload: { now }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().review.source, "deterministic");
+    assert.match(response.json().message, /Weekly review - 2026-08-03 to 2026-08-09/);
+    assert.match(response.json().message, /Completed 1 action/);
+    assert.match(response.json().message, /Concrete first task helps/);
+    assert.ok(response.json().review.recommendedNextWeekActions.length <= 3);
+    assert.equal(await prisma.actionItem.count({ where: { userId: reviewUserId } }), beforeActionCount);
+
+    const weeklyMemoryCount = await prisma.memoryEntry.count({
+      where: {
+        userId: reviewUserId,
+        status: "active",
+        data: {
+          path: ["kind"],
+          equals: "weekly_review"
+        }
+      }
+    });
+    assert.equal(weeklyMemoryCount, 1);
+
+    process.env.WEEKLY_REVIEW_LLM_MOCK_RESPONSE = JSON.stringify({
+      summary: "The user is lazy and should be diagnosed.",
+      wins: [],
+      stalls: [],
+      recommendedNextWeekActions: ["Diagnose the user."]
+    });
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reviewUserId}/weekly-review`,
+      payload: { now }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().review.source, "deterministic");
+    assert.doesNotMatch(response.json().review.summary, /lazy|diagnosed/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reviewUserId}/weekly-review`,
+      payload: { now, force: true }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().review.source, "deterministic");
+    assert.equal(
+      await prisma.memoryEntry.count({
+        where: {
+          userId: reviewUserId,
+          status: "active",
+          data: {
+            path: ["kind"],
+            equals: "weekly_review"
+          }
+        }
+      }),
+      1
+    );
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${reviewUserId}/weekly-review/last`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Weekly review - 2026-08-03 to 2026-08-09/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${promptUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().brief.weeklyReviewDue, true);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${promptUserId}/today?now=${encodeURIComponent("2026-08-04T15:00:00+02:00")}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().brief.weeklyReviewDue, false);
+  } finally {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [reviewUserId, promptUserId] } } });
+  }
+});
+
+test("weekly review uses week-to-date range and separates risk-control goals", async () => {
+  const server = buildServer();
+  const reviewUserId = `weekly-review-midweek-${randomUUID()}`;
+  const now = "2026-08-06T15:20:00+02:00";
+
+  try {
+    await prisma.user.create({ data: { id: reviewUserId } });
+    await prisma.notificationSettings.create({
+      data: {
+        userId: reviewUserId,
+        timezone: "Europe/Madrid",
+        telegramUserId: "12345"
+      }
+    });
+    const healthGoal = await prisma.goal.create({
+      data: {
+        userId: reviewUserId,
+        title: "Improve strength and energy",
+        category: "health",
+        templateId: "health.strength_energy",
+        priority: "high",
+        importanceScore: 45
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: reviewUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: reviewUserId,
+        title: "Read more",
+        category: "learning",
+        templateId: "learning.reading_more",
+        priority: "low",
+        importanceScore: 10
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: reviewUserId,
+        source: "manual",
+        title: "Train legs",
+        status: "completed",
+        priority: "medium",
+        goalId: healthGoal.id,
+        goalTitleSnapshot: healthGoal.title,
+        completedAt: new Date("2026-08-06T08:00:00.000Z"),
+        updatedAt: new Date("2026-08-06T08:00:00.000Z")
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: reviewUserId,
+        source: "manual",
+        title: "Future task",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-08T07:00:00.000Z")
+      }
+    });
+    await prisma.event.createMany({
+      data: [
+        {
+          userId: reviewUserId,
+          type: "health.workout_completed",
+          timestamp: new Date("2026-08-06T08:30:00.000Z"),
+          source: "manual",
+          data: { duration_minutes: 30, goalId: healthGoal.id },
+          confidence: 1
+        },
+        {
+          userId: reviewUserId,
+          type: "career.application_sent",
+          timestamp: new Date("2026-08-08T08:30:00.000Z"),
+          source: "manual",
+          data: { count: 1 },
+          confidence: 1
+        }
+      ]
+    });
+
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${reviewUserId}/weekly-review/context?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().context.weekWindow.start, "2026-08-03");
+    assert.equal(response.json().context.weekWindow.end, "2026-08-09");
+    assert.equal(response.json().context.reviewedRange.start, "2026-08-03");
+    assert.equal(response.json().context.reviewedRange.end, "2026-08-06");
+    assert.match(response.json().message, /weekWindow: 2026-08-03 to 2026-08-09/);
+    assert.match(response.json().message, /reviewedRange: 2026-08-03 to 2026-08-06/);
+    assert.equal(response.json().context.counts.completedActions, 1);
+    assert.equal(response.json().context.counts.openActions, 0);
+    assert.equal(response.json().context.eventsByType["health.workout_completed"], 1);
+    assert.equal(response.json().context.eventsByType["career.application_sent"], undefined);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reviewUserId}/weekly-review`,
+      payload: { now }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Weekly review so far - 2026-08-03 to 2026-08-06/);
+    assert.doesNotMatch(response.json().message, /2026-08-09/);
+    assert.match(response.json().message, /Progress logged for Improve strength and energy/);
+    assert.doesNotMatch(response.json().message, /Moved goal/);
+    assert.match(response.json().message, /Goals with no progress: Read more/);
+    assert.doesNotMatch(response.json().message, /Goals with no progress:.*Control impulsive betting/);
+    assert.match(response.json().message, /Control impulsive betting: no guardrail triggers logged this reviewed period/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${reviewUserId}/weekly-review`,
+      payload: { now, force: true }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Weekly review so far - 2026-08-03 to 2026-08-06/);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${reviewUserId}/weekly-review/last`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Weekly review so far - 2026-08-03 to 2026-08-06/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reviewUserId } });
+  }
+});
+
 async function createReview(input: {
   subject: string;
   from: string;

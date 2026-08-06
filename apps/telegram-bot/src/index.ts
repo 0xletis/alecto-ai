@@ -1586,11 +1586,45 @@ bot.command("daily_insight", async (ctx) => {
 });
 
 bot.command("weekly", async (ctx) => {
-  await sendInsight(ctx, "weekly");
+  await sendWeeklyReview(ctx);
 });
 
 bot.command("weekly_insight", async (ctx) => {
   await sendInsight(ctx, "weekly");
+});
+
+bot.command("weekly_last", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<WeeklyReviewResponse>(`/users/${getTelegramUserId(ctx)}/weekly-review/last`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not fetch your last weekly review right now.");
+  }
+});
+
+bot.command("debug_weekly_context", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<WeeklyReviewContextResponse>(`/users/${getTelegramUserId(ctx)}/weekly-review/context`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not debug the weekly review context right now.");
+  }
+});
+
+bot.command("plan_next_week", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  await ctx.reply("Next-week planning is not implemented yet. Run /weekly first.");
 });
 
 bot.command("goals", async (ctx) => {
@@ -2142,6 +2176,26 @@ async function executeBatchCommandLine(ctx: Context, commandLine: string): Promi
       return `/${parsed.name}: ${formatDailyCoachDebug(response)}`;
     }
 
+    if (parsed.name === "weekly") {
+      const force = parsed.args.trim().toLowerCase() === "force";
+      const response = await apiPost<WeeklyReviewResponse>(`/users/${getTelegramUserId(ctx)}/weekly-review`, { force });
+      return `/${parsed.name}: ${response.message}`;
+    }
+
+    if (parsed.name === "weekly_last") {
+      const response = await apiGet<WeeklyReviewResponse>(`/users/${getTelegramUserId(ctx)}/weekly-review/last`);
+      return `/${parsed.name}: ${response.message}`;
+    }
+
+    if (parsed.name === "debug_weekly_context") {
+      if (!isDebugAllowedUser(ctx)) {
+        return `/${parsed.name}: Debug commands are only available to allowlisted users.`;
+      }
+
+      const response = await apiGet<WeeklyReviewContextResponse>(`/users/${getTelegramUserId(ctx)}/weekly-review/context`);
+      return `/${parsed.name}: ${response.message}`;
+    }
+
     if (parsed.name === "events") {
       const limit = parseEventLimit(parsed.args);
       const response = await apiGet<EventsResponse>(`/users/${getTelegramUserId(ctx)}/events`);
@@ -2657,6 +2711,20 @@ async function sendInsight(ctx: Context, periodType: "daily" | "weekly") {
         ? "I could not fetch your daily insight right now."
         : "I could not fetch your weekly insight right now."
     );
+  }
+}
+
+async function sendWeeklyReview(ctx: Context) {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const force = getCommandText(ctx).trim().toLowerCase() === "force";
+    const response = await apiPost<WeeklyReviewResponse>(`/users/${getTelegramUserId(ctx)}/weekly-review`, { force });
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not generate your weekly review right now.");
   }
 }
 
@@ -3218,6 +3286,7 @@ function formatDailyOperatorBrief(brief: DailyOperatorBrief): string {
       : undefined,
     brief.risks.length > 0 ? `Risks / watchouts:\n${brief.risks.map((risk) => `- ${risk}`).join("\n")}` : undefined,
     brief.actionHygiene ? `Action hygiene:\n- ${formatCleanupDecisionGrammar(brief.actionHygiene.needsDecision)} Run /action_hygiene.` : undefined,
+    brief.weeklyReviewDue ? "Weekly review:\n- Weekly review due. Run /weekly." : undefined,
     brief.operatorReflection ? `Pattern:\n${brief.operatorReflection}` : undefined,
     "",
     "Next move:",
@@ -4096,6 +4165,16 @@ interface DailyOperatorBriefResponse {
   brief: DailyOperatorBrief;
 }
 
+interface WeeklyReviewResponse {
+  review: unknown;
+  message: string;
+}
+
+interface WeeklyReviewContextResponse {
+  context: unknown;
+  message: string;
+}
+
 interface DailyLoopMessageResponse {
   message: string;
 }
@@ -4553,6 +4632,7 @@ interface DailyOperatorBrief {
     needsDecision: number;
   };
   operatorReflection?: string;
+  weeklyReviewDue?: boolean;
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
 }

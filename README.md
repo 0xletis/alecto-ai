@@ -168,8 +168,12 @@ Telegram commands:
 - `/today`: concise daily operator brief with a Coach section, actions, goals, wins, risks, and one deterministic next move
 - `/insight`: daily interpretive coaching insight
 - `/daily_insight`: alias of `/insight`
-- `/weekly`: weekly interpretive coaching insight
-- `/weekly_insight`: alias of `/weekly`
+- `/weekly`: generate and save the current weekly operator review
+- `/weekly force`: regenerate the current weekly operator review with deterministic fallback
+- `/weekly_last`: show the latest saved weekly operator review
+- `/debug_weekly_context`: allowlist-only dev helper for the weekly review context
+- `/weekly_insight`: weekly interpretive coaching insight
+- `/plan_next_week`: placeholder for next-week planning
 - `/goals`: active goals
 - `/events [limit]`: recent active events with ids, defaults to 5 and caps at 20
 - `/events_archived [limit]`: recent events including archived/corrected status, defaults to 5 and caps at 20
@@ -470,9 +474,10 @@ Expected:
 - Custom goals with check-in config add up to two goal-specific lines to the daily check-in prompt.
 - `/send_checkin_now` previews the same goal-aware prompt the worker sends.
 - `/enable_daily_insight 21:30` sends `/insight` output once per day at the configured local time.
-- `/enable_weekly_insight sunday 20:00` sends `/weekly` output once for that week at the configured local weekday/time.
+- `/enable_weekly_insight sunday 20:00` sends weekly insight output once for that week at the configured local weekday/time.
 - Daily review sums progress metrics like applications, workout minutes, and reading minutes, but uses the latest state metrics for sleep, energy, anxiety, focus, and impulse.
-- `/review` is factual. `/insight` and `/weekly` are interpretive coaching reports built from active events, goals, memories, profile, and risk signals.
+- `/review` is factual. `/insight` and `/weekly_insight` are interpretive coaching reports built from active events, goals, memories, profile, and risk signals.
+- `/weekly` is a saved operator review for the current local Monday-Sunday week. It uses actions, events, goals, guardrails, action hygiene, daily-loop state, and active operator reflections; it stores one `weekly_review` memory per week and updates it on reruns.
 - Daily insight identifies meaningful progress, gaps, risk state, relevant memory signals, and 1-3 recommended next actions.
 - Weekly insight aggregates the last 7 days by default and looks for repeated patterns such as cooldowns, low sleep, high anxiety, and clustered progress.
 - When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
@@ -570,7 +575,8 @@ Manual insight tests:
 - Normal progress day: log applications, workout, reading, and a stable check-in. `/insight` should show real wins and simple next actions.
 - High-risk day: log sleep below 6h, anxiety 7+, gambling impulse 6+, or trigger a betting cooldown. `/insight` should include risks and hard guardian wording for direct/hard profiles.
 - Low activity day: run `/insight` before logging events. It should say the signal is low and recommend one concrete action.
-- Weekly summary: log events across multiple days, then run `/weekly`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
+- Weekly insight summary: log events across multiple days, then run `/weekly_insight`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
+- Weekly operator review: complete or snooze actions, trigger a guardrail if relevant, add/refine an operator reflection, then run `/weekly`. It should save one weekly review memory and `/weekly_last` should show it.
 
 ## API Routes
 
@@ -640,6 +646,9 @@ Manual insight tests:
 - `GET /users/:userId/insights/daily?date=YYYY-MM-DD`
 - `GET /users/:userId/insights/weekly`
 - `GET /users/:userId/insights/weekly?weekStart=YYYY-MM-DD`
+- `POST /users/:userId/weekly-review`
+- `GET /users/:userId/weekly-review/last`
+- `GET /users/:userId/weekly-review/context`
 
 ## Packages
 
