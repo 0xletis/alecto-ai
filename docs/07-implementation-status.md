@@ -122,7 +122,10 @@ After every implementation pass:
 - [x] Weekly operator review: `/weekly`, `/weekly force`, `/weekly_last`, `/debug_weekly_context`
 - [x] Week-to-date weekly review display for current week
 - [x] Weekly review stored as `MemoryEntry` with `data.kind="weekly_review"`
-- [~] `/plan_next_week` exists as a placeholder
+- [x] `/plan_next_week` proposes 3-7 next-week ActionItems and creates only explicitly selected items
+- [x] Plan-next-week output distinguishes ActionItem priority from linked goal priority
+- [x] Plan-next-week cleanup suggestions are non-creatable and point back to `/action_hygiene` or natural action control instead of creating meta cleanup tasks
+- [x] `/debug_next_week_plan_context` shows next-week planning context without side effects
 
 ## Insights
 
@@ -182,7 +185,6 @@ After every implementation pass:
 
 ## Known Stubs Or Deferred Work
 
-- [~] `/plan_next_week` is a placeholder
 - [~] LLM weekly review support exists as guarded/fallback behavior; deterministic weekly review is the reliable path
 - [ ] WhatsApp, OpenClaw, web UI, dashboard, mobile app
 - [ ] Private GitHub support

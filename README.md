@@ -54,6 +54,7 @@ You can also put these values in `.env` or your shell:
 ```bash
 USE_OPENAI_ANALYSIS=true
 DAILY_COACH_LLM_ENABLED=false
+NEXT_WEEK_PLAN_LLM_ENABLED=false
 OPENAI_MODEL=gpt-4o-mini
 OPENAI_API_KEY=sk-...
 ```
@@ -64,6 +65,7 @@ After intent, event extraction, and risk are finalized, `/messages/process` runs
 The composer uses mode, risk state, profile, active goals, recent events, memories, and today's summary to produce the final reply.
 If OpenAI is enabled, it may rewrite the deterministic fallback for tone, but it cannot create DB changes, invent facts, or override RED risk policy.
 `/today` always builds its facts deterministically first. If `DAILY_COACH_LLM_ENABLED=true` and `OPENAI_API_KEY` is set, Alecto adds a compact LLM-written Coach section from the verified daily brief context only; if the LLM fails validation, the deterministic coach text is used.
+`/plan_next_week` is deterministic by default. If `NEXT_WEEK_PLAN_LLM_ENABLED=true` and `OPENAI_API_KEY` is set, Alecto may merge in strictly validated JSON suggestions, but it still waits for explicit user confirmation before creating actions.
 
 Start with your current environment:
 
@@ -125,7 +127,7 @@ Review commands:
 - `/weekly`: saved weekly operator review
 - `/weekly_insight`: interpretive weekly coaching
 - `/weekly_last`: latest saved weekly operator review
-- `/plan_next_week`: placeholder; not implemented as a real planning flow yet
+- `/plan_next_week`: propose confirmed next-week actions from weekly review, goals, hygiene, and priorities
 
 Setup and settings commands:
 - `/setup`, `/whoami`, `/profile`, `/set_style`
@@ -243,7 +245,8 @@ Telegram commands:
 - `/weekly_last`: show the latest saved weekly operator review
 - `/debug_weekly_context`: allowlist-only dev helper for the weekly review context
 - `/weekly_insight`: weekly interpretive coaching insight
-- `/plan_next_week`: placeholder for next-week planning
+- `/plan_next_week`: propose next-week ActionItems with separate action/goal priorities; cleanup items are shown as non-creatable; reply `create 1`, `create all`, `edit 2 to Friday morning`, or `skip`
+- `/debug_next_week_plan_context`: allowlist-only dev helper for next-week plan context
 - `/goals`: active goals
 - `/goal_priorities`: show active goal priority weights
 - `/set_goal_priority GOAL_ID_OR_NUMBER low|medium|high|critical`: update one goal priority
@@ -650,6 +653,7 @@ Manual insight tests:
 - Low activity day: run `/insight` before logging events. It should say the signal is low and recommend one concrete action.
 - Weekly insight summary: log events across multiple days, then run `/weekly_insight`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
 - Weekly operator review: complete or snooze actions, trigger a guardrail if relevant, add/refine an operator reflection, then run `/weekly`. It should save one weekly review memory and `/weekly_last` should show it.
+- Next-week planning: run `/weekly`, then `/plan_next_week`. It should propose safe goal-linked actions, display action priority separately from goal priority, and create none until the user replies `create 1`, `create all`, or another explicit selection. Stale cleanup suggestions should be marked non-creatable and skipped by `create all`.
 
 ## API Routes
 
@@ -739,6 +743,9 @@ Manual insight tests:
 - `POST /users/:userId/weekly-review`
 - `GET /users/:userId/weekly-review/last`
 - `GET /users/:userId/weekly-review/context`
+- `GET /users/:userId/next-week-plan/context`
+- `POST /users/:userId/next-week-plan`
+- `POST /users/:userId/next-week-plan/reply`
 
 ## Packages
 

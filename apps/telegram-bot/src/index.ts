@@ -1624,7 +1624,25 @@ bot.command("plan_next_week", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Next-week planning is not implemented yet. Run /weekly first.");
+  try {
+    const response = await apiPost<NextWeekPlanResponse>(`/users/${getTelegramUserId(ctx)}/next-week-plan`, {});
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not build next week's plan right now.");
+  }
+});
+
+bot.command("debug_next_week_plan_context", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const response = await apiGet<NextWeekPlanContextResponse>(`/users/${getTelegramUserId(ctx)}/next-week-plan/context`);
+    await ctx.reply(response.message);
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not debug the next-week plan context right now.");
+  }
 });
 
 bot.command("goals", async (ctx) => {
@@ -4171,6 +4189,17 @@ interface WeeklyReviewResponse {
 }
 
 interface WeeklyReviewContextResponse {
+  context: unknown;
+  message: string;
+}
+
+interface NextWeekPlanResponse {
+  context: unknown;
+  suggestions: unknown[];
+  message: string;
+}
+
+interface NextWeekPlanContextResponse {
   context: unknown;
   message: string;
 }

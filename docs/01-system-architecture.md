@@ -47,7 +47,7 @@ The same core route should be usable later by WhatsApp, web, or API clients afte
 - [x] `Event`
 - [x] `MemoryEntry`
 - [x] `UserOperatingProfile`
-- [x] `PendingAction` for confirmations/clarifications/pending decisions
+- [x] `PendingAction` for confirmations/clarifications/pending decisions, including confirmed next-week planning suggestions
 - [x] `NotificationSettings`
 - [x] `NotificationLog`
 - [x] `DailyLoopState`

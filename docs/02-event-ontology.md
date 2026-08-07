@@ -2,6 +2,8 @@
 
 The event ontology is the shared language of the system.
 
+Status: implemented in `packages/core`; this document describes the approved core names. Runtime event reads ignore archived/corrected events by default and keep historical audit data available through archived views.
+
 Rules:
 - Keep the core small.
 - Do not let the LLM freely invent event type names.
@@ -120,8 +122,31 @@ Rules:
 - system.user_confirmed_change
 - system.user_rejected_change
 
+### Action Items
+
+ActionItems are not Events.
+
+Implemented behavior:
+- Completing a goal-linked ActionItem can create `custom.goal_progress_logged` as generic evidence.
+- The system does not invent domain-specific events such as `career.application_sent` or `health.workout_completed` from action completion alone.
+- Work-action email approvals create ActionItems, not Events.
+
 ### Custom
 
 - custom.goal_progress_logged
   - Generic progress event for non-template goals.
   - Data: goalId, metricKey optional, value optional, unit optional, note optional.
+  - Also used as safe generic evidence for completed goal-linked ActionItems.
+
+## Source Semantics
+
+- `coding.commit_created` means a personal commit by the user. For GitHub events, this only counts as personal progress when `source=github` and `data.isPersonal=true`.
+- `coding.repo_activity_detected` means external repo activity/context. It does not count as a personal win or goal progress.
+- Gmail `job_search_email` and pasted `job_search_text` produce approved career event types only after classification and dedupe.
+- Gmail `work_action_email` creates review items first. Approval creates ActionItems for work-action types instead of adding new core Event types.
+
+## Current Gaps
+
+- [ ] No new core event type exists yet for application verification/action-required emails.
+- [ ] No dedicated ActionItem completion event type exists; `custom.goal_progress_logged` is the safe MVP evidence path.
+- [ ] Custom event type approval workflow is not implemented.

@@ -88,7 +88,8 @@ Status:
 ## Current Next Useful Work
 
 Likely high-leverage next items:
-- build `/plan_next_week` v1 to turn weekly review into confirmed next-week ActionItems
+- simplify onboarding/setup and the command surface now that `/weekly` and `/plan_next_week` are both implemented
+- keep `/plan_next_week` regression-tested as the bridge from weekly review into confirmed next-week ActionItems
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until encryption is implemented
 - defer new integrations until the operator loop and onboarding are easier to use

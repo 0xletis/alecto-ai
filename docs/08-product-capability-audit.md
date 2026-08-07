@@ -27,7 +27,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | Multi-intent orchestration | implemented | natural multi-part messages | message segments + services | no required LLM | no | more regression tests |
 | Daily loop | implemented | `/today`, `/start_day`, `/end_day`, `/tomorrow` | actions/goals/events/risks | optional Daily Coach | yes | UX consolidation |
 | Action hygiene | implemented | `/action_hygiene` | ActionItems | none | surfaced in daily loop | history/snooze analytics |
-| Weekly review | implemented | `/weekly`, `/weekly_last` | actions/events/goals/reflections | optional guarded draft | no | `/plan_next_week` not built |
+| Weekly review/planning | implemented | `/weekly`, `/weekly_last`, `/plan_next_week` | actions/events/goals/reflections/hygiene | optional guarded draft for review; plan is deterministic with optional mock-gated suggestions | no | planning UX consolidation |
 | Weekly insight | implemented | `/weekly_insight` | active events/goals/memory/profile | optional polish | scheduled delivery available | overlaps with weekly review |
 | Gmail readonly | partial | `/connect_gmail`, `/sync_gmail` | Gmail API | optional classifier | scheduled sync available | token encryption/OAuth production |
 | Gmail review queue | implemented | `/email_reviews`, approve/reject | EmailReviewItem | optional classifier | no direct push yet | reviewer UX |
@@ -94,7 +94,7 @@ Expected natural alternatives:
 - `/weekly force`: regenerates the weekly operator review.
 - `/weekly_last`: shows the latest saved weekly operator review.
 - `/weekly_insight`: interpretive weekly insight report. Separate from saved `/weekly`.
-- `/plan_next_week`: placeholder/stub; not implemented as a real planning flow.
+- `/plan_next_week`: proposes next-week ActionItems from the latest weekly review, active goals, hygiene, priorities, guardrails, and existing future actions. It displays ActionItem priority separately from linked goal priority, because critical goals create high-priority actions when the ActionItem model does not support `critical`. Cleanup suggestions for stale existing actions are shown as non-creatable and point to `/action_hygiene` or natural action control. It creates no actions until the user replies with `create 1`, `create all`, or another explicit selection.
 
 ### 4. Integration Setup Commands
 
@@ -177,9 +177,7 @@ Expected natural alternatives:
 
 ### 7. Deprecated, Stub, Or Placeholder Commands
 
-- `/plan_next_week`: placeholder only. Do not treat as implemented planning.
-
-No commands are currently removed or deprecated at runtime.
+No commands are currently removed or deprecated at runtime. There are no known user-facing placeholder commands in the main operator loop.
 
 ## Review Surface Distinction
 
@@ -193,6 +191,7 @@ No commands are currently removed or deprecated at runtime.
 | `/end_day` | evening review | completed/open actions/events/risks | can mark sent in worker/debug path | deterministic | close the day |
 | `/tomorrow` | next-day prep | tomorrow actions and open priorities | no | deterministic | prepare tomorrow |
 | `/weekly` | saved weekly operator review | actions/events/goals/reflections/guardrails | yes, `MemoryEntry` weekly review | deterministic with guarded optional LLM draft | create durable weekly record |
+| `/plan_next_week` | confirmed next-week planning | weekly review/goals/actions/hygiene/guardrails | yes, selected `ActionItem`s only after explicit user reply | deterministic with optional mock-gated suggestion parse | turn review into next-week execution |
 | `/weekly_insight` | interpretive weekly insight | active weekly events/goals/memory/profile | no | deterministic with optional polish | quick weekly coaching read |
 
 ## Message-First Happy Path
@@ -205,7 +204,7 @@ The target product should work mostly without command memorization:
 4. Due actions and snoozed actions resurface automatically through reminders.
 5. Email/GitHub sync quietly gathers approved signals; Gmail review items wait for user approval before becoming events or actions.
 6. Evening: Alecto sends an `/end_day`-style review and asks for remaining cleanup.
-7. Weekly: Alecto creates a `/weekly` operator review and eventually should turn it into a next-week plan.
+7. Weekly: Alecto creates a `/weekly` operator review, then `/plan_next_week` proposes a confirmed next-week action plan.
 8. The user approves selected actions; Alecto does not silently invent plans or mutate state.
 
 ## Current Autonomy Level
@@ -250,7 +249,7 @@ The target product should work mostly without command memorization:
 
 - [ ] semantic memory/vector search
 - [ ] better reflection relevance/ranking
-- [ ] better review-to-plan flow
+- [~] better review-to-plan flow; `/plan_next_week` exists, but the UX can still be consolidated
 - [ ] broader guardrails beyond betting/trading
 - [ ] eval set for routing, action control, and LLM coach validation
 
@@ -264,19 +263,21 @@ The target product should work mostly without command memorization:
 
 ## Recommended Next Build Choices
 
-### 1. Plan Next Week v1 - Recommended
+### 1. User Onboarding + Setup Simplification v1 - Recommended
 
 Why:
-- It completes the loop already implied by `/weekly`.
-- The data already exists: goals, actions, hygiene, weekly reviews, reflections, and priority weights.
-- It would convert reflection into concrete next-week ActionItems without requiring new integrations.
-- It reduces command surface confusion by making `/weekly` lead naturally into planning.
+- The command surface is powerful but heavy.
+- A technical alpha user should not need to read the whole README.
+- Better setup would reduce manual state repair and debug-command dependency.
+- It can stay Telegram-first and avoid new integrations.
 
 Suggested scope:
-- `/plan_next_week` reads the latest weekly review and active goals.
-- It proposes 3-7 actions for next week.
-- It requires confirmation before creating ActionItems.
-- It uses goal priorities and guardrails.
+- A guided `/setup` flow that checks profile, goals, notifications, Gmail/GitHub status, and daily loop settings.
+- A compact `/help` organized by daily use, planning, integrations, and debug commands.
+- A "current state" handoff command for orchestrator/debug sessions.
+
+Risk:
+- It may drift into dashboard/UI work. Keep v1 Telegram-first.
 
 ### 2. Gmail Autonomy v1
 
@@ -289,18 +290,17 @@ Risk:
 - More email automation increases privacy/security expectations.
 - Token encryption should come first or be part of the milestone.
 
-### 3. User Onboarding + Setup Simplification v1
+### 3. Planning UX Consolidation v1
 
 Why:
-- The command surface is powerful but heavy.
-- A technical alpha user should not need to read the whole README.
-- Better setup would reduce manual state repair and debug-command dependency.
+- `/weekly` and `/plan_next_week` now work, but the user still has to know when to chain them.
+- The planning loop can become smoother by suggesting `/plan_next_week` after a weekly review and showing existing future actions clearly.
 
 Risk:
-- It may become UI/product work. Keep it Telegram-first if tackled next.
+- Avoid auto-creating actions. Keep confirmation explicit.
 
 ## Recommendation
 
-Build **Plan Next Week v1** next.
+Build **User Onboarding + Setup Simplification v1** next.
 
-It is the most architecture-consistent next step: no new integrations, no OAuth, no dashboard, and it closes the operator loop from weekly review to concrete action. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.
+It is the most useful next step after Plan Next Week v1: no new integrations, no OAuth, no dashboard, and it makes the current alpha easier to operate. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.

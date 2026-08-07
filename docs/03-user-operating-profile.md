@@ -4,6 +4,8 @@ Each user needs a personalized communication and accountability profile.
 
 The agent should not use one fixed personality for everyone.
 
+Status: implemented as `UserOperatingProfile` with Telegram commands for viewing and style presets.
+
 ## Profile dimensions
 
 - directness
@@ -48,3 +50,20 @@ User Operating Profile
 
 The agent should not be hard all the time.
 It should be loyal to the user's long-term goals, not to the user's current mood.
+
+## Current Implementation
+
+- [x] Profile persistence in Prisma
+- [x] `/profile`
+- [x] `/set_style hard_guardian`
+- [x] `/set_style balanced`
+- [x] Profile-aware response composition
+- [x] Profile-aware daily check-in prompt tone
+- [x] Profile-aware daily insight and daily coach tone
+- [x] Hard guardian behavior for betting/trading risk
+- [~] Profile changes inferred from natural conversation are confirmed before durable mutation
+
+Not implemented:
+- [ ] Profile editor UI
+- [ ] Cross-channel profile sync beyond shared userId mapping
+- [ ] Learned profile dimensions from embeddings/vector memory

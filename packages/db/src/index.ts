@@ -94,6 +94,7 @@ export type PendingActionType =
   | "action_archive"
   | "action_hygiene"
   | "action_target_clarification"
+  | "next_week_plan"
   | "goal_progress_log"
   | "memory_create"
   | "event_undo_last";
