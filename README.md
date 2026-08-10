@@ -116,7 +116,9 @@ Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each T
 
 ## Product Surfaces
 
-Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
+Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what is missing`, `set up goals`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
+
+Onboarding is conversation-first and shared through the API. `/start` gives a first-run intro, `/setup` shows the same safe setup overview used by natural setup messages, and neither command mutates state. Gmail remains readonly local-MVP and does not scan until the user connects Gmail and explicitly enables an email rule.
 
 Normal user commands:
 - `/today`, `/start_day`, `/end_day`, `/tomorrow`
@@ -153,9 +155,9 @@ For the full command taxonomy and capability matrix, see `docs/08-product-capabi
 
 Telegram commands:
 
-- `/start`: short intro
+- `/start`: API-backed first-run intro
 - `/whoami`: show Telegram ID and derived agent userId
-- `/setup`: setup checklist
+- `/setup`: API-backed setup overview with goals, actions, daily loop, integrations, missing items, and best next step
 - `/debug_route <message>`: allowlist-only route debug; no side effects
 - `/debug_conversation_intent <message>`: allowlist-only conversational control debug
 - `/debug_intent_plan <message>`: allowlist-only multi-intent plan debug
@@ -682,6 +684,9 @@ Manual insight tests:
 - `POST /users/:userId/goals/priorities/backfill`
 - `GET /users/:userId/profile`
 - `PATCH /users/:userId/profile`
+- `GET /users/:userId/onboarding/state`
+- `GET /users/:userId/onboarding/start`
+- `GET /users/:userId/onboarding/setup`
 - `GET /users/:userId/memory`
 - `POST /users/:userId/memory`
 - `PATCH /users/:userId/memory/:memoryId/archive`

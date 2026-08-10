@@ -493,6 +493,25 @@ test("conversation-first surface routes natural operator requests without leakin
     });
 
     let response = await server.inject({
+      method: "GET",
+      url: `/users/${uxUserId}/onboarding/start`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Hey, I'm Alecto/);
+    assert.match(response.json().message, /You can talk normally/);
+    assert.doesNotMatch(response.json().message, /secret-access-token|secret-refresh-token|raw email/i);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${uxUserId}/onboarding/setup`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Alecto setup/);
+    assert.match(response.json().message, /Goals: 2 active/);
+    assert.match(response.json().message, /Actions: 2 open/);
+    assert.doesNotMatch(response.json().message, /secret-access-token|secret-refresh-token|raw email/i);
+
+    response = await server.inject({
       method: "POST",
       url: "/messages/process",
       payload: { userId: uxUserId, message: "what can you do" }
@@ -507,10 +526,58 @@ test("conversation-first surface routes natural operator requests without leakin
       payload: { userId: uxUserId, message: "help me set up" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Setup state:/);
-    assert.match(response.json().reply, /active goals: 2/);
-    assert.match(response.json().reply, /open actions: 2/);
+    assert.match(response.json().reply, /Alecto setup/);
+    assert.match(response.json().reply, /Goals: 2 active/);
+    assert.match(response.json().reply, /Actions: 2 open/);
     assert.doesNotMatch(response.json().reply, /secret-access-token|secret-refresh-token/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "how do I start" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Quickstart:/);
+    assert.match(response.json().reply, /what should I do today/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "what is missing" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Missing:/);
+
+    const beforeOnboardingActions = await prisma.actionItem.count({ where: { userId: uxUserId } });
+    const beforeOnboardingGoals = await prisma.goal.count({ where: { userId: uxUserId } });
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "set up goals" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Goal setup:/);
+    assert.match(response.json().reply, /I want to find a new developer job/);
+    assert.equal(await prisma.goal.count({ where: { userId: uxUserId } }), beforeOnboardingGoals);
+    assert.equal(await prisma.actionItem.count({ where: { userId: uxUserId } }), beforeOnboardingActions);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "set up daily loop" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Daily loop setup:/);
+    assert.match(response.json().reply, /turn on morning brief at 9/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "set up integrations" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Integration setup:/);
+    assert.match(response.json().reply, /Gmail is readonly/);
 
     response = await server.inject({
       method: "POST",
@@ -601,11 +668,29 @@ test("conversation-first surface routes natural operator requests without leakin
     response = await server.inject({
       method: "POST",
       url: "/messages/process",
+      payload: { userId: uxUserId, message: "connect GitHub" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /public/i);
+    assert.match(response.json().reply, /author=LOGIN/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
       payload: { userId: uxUserId, message: "turn on morning brief at 9" }
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Daily loop updated/);
     assert.match(response.json().reply, /Morning brief: 09:00/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "turn on morning brief at 9 and evening review at 21:30" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Morning brief: 09:00/);
+    assert.match(response.json().reply, /Evening review: 21:30/);
 
     response = await server.inject({
       method: "POST",

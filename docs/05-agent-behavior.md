@@ -45,6 +45,7 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] Pending decision replies such as `yes`, `no`, `1`, or `second one` resolve before normal routing.
 - [x] Guardrail/risk intent wins before action creation or generic chat.
 - [x] Conversation-first surface routing maps natural operator requests to existing services: help/capabilities, setup state, daily operator brief, daily review, weekly review, next-week planning, action hygiene, goals, actions, memories, and integration guidance.
+- [x] Onboarding/setup routing is conversation-first: `/start`, `/setup`, `help me set up`, `how do I start`, `what is missing`, `set up goals`, `set up daily loop`, and `set up integrations` use shared API onboarding composers.
 - [x] Explicit memory phrases create memory through the message processor.
 - [x] Natural daily check-ins require state/progress signals.
 - [x] Pasted job-search emails route through generic ingestion.
@@ -60,6 +61,7 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] `/insight` and `/weekly_insight` provide interpretive coaching reports.
 - [x] `/action_hygiene` asks the user to decide on stale/overdue tasks; it never archives automatically.
 - [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, and `connect Gmail` use the same underlying services as command shortcuts.
+- [x] Onboarding replies explain that users can talk normally, commands are optional shortcuts, and Gmail/GitHub signals require explicit setup.
 - [x] `/debug_route`, `/debug_conversation_intent`, `/debug_daily_priorities`, `/debug_daily_coach`, `/debug_action_hygiene`, and `/debug_weekly_context` expose safe debugging views.
 
 ## Side-Effect Rule

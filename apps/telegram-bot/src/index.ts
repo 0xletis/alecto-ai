@@ -114,9 +114,8 @@ bot.command("start", async (ctx) => {
     return;
   }
 
-  await ctx.reply(
-    "I am your private operator agent. Tell me what you did, what you're thinking, or what you're about to do, and I'll help you track it or think clearly."
-  );
+  const response = await apiGet<OnboardingResponse>(`/users/${getTelegramUserId(ctx)}/onboarding/start`);
+  await ctx.reply(response.message);
 });
 
 bot.command("setup", async (ctx) => {
@@ -124,16 +123,8 @@ bot.command("setup", async (ctx) => {
     return;
   }
 
-  await ctx.reply(
-    [
-      "Setup checklist:",
-      "1. Run /whoami if owner needs your ID",
-      "2. Run /set_style hard_guardian or /set_style balanced",
-      "3. Create a goal with /create_goal category | title | why",
-      "4. Send normal messages like \"today I sent 2 CVs and trained 45 minutes\"",
-      "5. Use /review to check the day"
-    ].join("\n")
-  );
+  const response = await apiGet<OnboardingResponse>(`/users/${getTelegramUserId(ctx)}/onboarding/setup`);
+  await ctx.reply(response.message);
 });
 
 bot.command("help", async (ctx) => {
@@ -141,7 +132,11 @@ bot.command("help", async (ctx) => {
     return;
   }
 
-  await ctx.reply("Try /today, /actions, /goals, /events, /insight, /action_help, or /debug_route <message>.");
+  const response = await apiPost<ProcessMessageResponse>("/messages/process", {
+    userId: getTelegramUserId(ctx),
+    message: "what can you do"
+  });
+  await ctx.reply(response.reply);
 });
 
 bot.command("debug_route", async (ctx) => {
@@ -4958,6 +4953,11 @@ interface ReminderTimePatch {
   afternoonTimeMinutes?: number;
   eveningTimeMinutes?: number;
   tonightTimeMinutes?: number;
+}
+
+interface OnboardingResponse {
+  message: string;
+  state?: Record<string, unknown>;
 }
 
 interface PendingAction {

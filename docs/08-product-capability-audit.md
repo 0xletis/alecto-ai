@@ -1,6 +1,6 @@
 # Product Capability Audit
 
-Last updated: 2026-08-06
+Last updated: 2026-08-10
 
 This is a product/architecture checkpoint. The implementation ledger remains `docs/07-implementation-status.md`.
 
@@ -8,7 +8,7 @@ This is a product/architecture checkpoint. The implementation ledger remains `do
 
 Alecto is a **local technical alpha**.
 
-It is usable by the founder over Telegram, with real local persistence, proactive worker jobs, Gmail/GitHub signal ingestion, ActionItems, daily/weekly operator loops, and deterministic guardrails. It is not product-ready for non-technical users because onboarding, auth, token encryption, settings UI, production scheduling, and cross-channel UX are not ready.
+It is usable by the founder over Telegram, with real local persistence, proactive worker jobs, Gmail/GitHub signal ingestion, ActionItems, daily/weekly operator loops, deterministic guardrails, and a conversation-first onboarding/setup flow. It is not product-ready for non-technical users because auth, token encryption, settings UI, production scheduling, cross-channel UX, and broader product packaging are not ready.
 
 ## Capability Matrix
 
@@ -17,6 +17,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | Telegram chat | implemented | Telegram bot | Telegram messages | optional response/analysis | yes, via worker | operational hardening |
 | Normal message routing | implemented | natural text, slash commands | `NormalizedInboundMessage` | optional fallback only | no | more channel tests |
 | Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts | existing services | none required | no | richer onboarding language |
+| User onboarding/setup v1 | implemented | `/start`, `/setup`, natural setup/quickstart messages | onboarding state from goals/actions/settings/integrations | none | no | full guided wizard/settings UI |
 | Goals | implemented | `/goals`, `/create_goal`, natural goal creation | Postgres `Goal` | optional classification | no | simpler onboarding |
 | Events/check-ins | implemented | `/checkin`, natural logs, `/events`, `/review` | Postgres `Event` | optional extraction | daily check-in reminder | broader parser coverage |
 | Memories | implemented | `/memory`, `/remember`, `/forget_memory` | Postgres `MemoryEntry` | optional inference | no | semantic retrieval missing |
@@ -242,7 +243,8 @@ The target product should work mostly without command memorization:
 
 ### Product UX
 
-- [ ] onboarding flow
+- [x] local alpha conversation-first onboarding/setup flow
+- [ ] production onboarding wizard/settings UI
 - [ ] simplified command surface
 - [ ] user settings UI
 - [ ] dashboard/web/mobile/WhatsApp/OpenClaw surfaces
@@ -274,21 +276,19 @@ The target product should work mostly without command memorization:
 
 ## Recommended Next Build Choices
 
-### 1. User Onboarding + Setup Simplification v1 - Recommended
+### 1. Planning UX Consolidation v1 - Recommended
 
 Why:
-- The command surface is powerful but heavy.
-- A technical alpha user should not need to read the whole README.
-- Better setup would reduce manual state repair and debug-command dependency.
-- It can stay Telegram-first and avoid new integrations.
+- `/weekly` and `/plan_next_week` now work, but the user still has to know when to chain them.
+- The planning loop can become smoother by suggesting `/plan_next_week` after a weekly review and showing existing future actions clearly.
 
 Suggested scope:
-- A guided `/setup` flow that checks profile, goals, notifications, Gmail/GitHub status, and daily loop settings.
-- A compact `/help` organized by daily use, planning, integrations, and debug commands.
-- A "current state" handoff command for orchestrator/debug sessions.
+- Keep confirmation explicit.
+- Reduce overlap between `/weekly`, `/weekly_insight`, and `/plan_next_week`.
+- Surface existing future actions clearly before creating new ones.
 
 Risk:
-- It may drift into dashboard/UI work. Keep v1 Telegram-first.
+- Avoid auto-creating actions. Keep confirmation explicit.
 
 ### 2. Gmail Autonomy v1
 
@@ -301,17 +301,16 @@ Risk:
 - More email automation increases privacy/security expectations.
 - Token encryption should come first or be part of the milestone.
 
-### 3. Planning UX Consolidation v1
+### 3. Production Onboarding And Settings UX
 
 Why:
-- `/weekly` and `/plan_next_week` now work, but the user still has to know when to chain them.
-- The planning loop can become smoother by suggesting `/plan_next_week` after a weekly review and showing existing future actions clearly.
+- Local alpha onboarding exists, but production users still need account/auth, secure settings, and a cleaner guided setup surface.
 
 Risk:
-- Avoid auto-creating actions. Keep confirmation explicit.
+- Do not mark production OAuth/token encryption complete until it is actually implemented.
 
 ## Recommendation
 
-Build **User Onboarding + Setup Simplification v1** next.
+Build **Planning UX Consolidation v1** next.
 
-It is the most useful next step after Plan Next Week v1: no new integrations, no OAuth, no dashboard, and it makes the current alpha easier to operate. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.
+Onboarding v1 is now implemented for the local alpha. The next high-leverage work is smoothing the weekly-review-to-plan loop without adding new integrations or auto-creating actions. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.

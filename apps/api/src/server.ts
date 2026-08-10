@@ -644,6 +644,54 @@ export function buildServer() {
     profile: await getOrCreateUserOperatingProfile(request.params.userId)
   }));
 
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>(
+    "/users/:userId/onboarding/state",
+    async (request) => {
+      const timezone = await getUserTimezone(request.params.userId);
+      const state = await buildOnboardingState(
+        request.params.userId,
+        parseOptionalNow(request.query.now) ?? new Date(),
+        timezone
+      );
+
+      return { state };
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>(
+    "/users/:userId/onboarding/start",
+    async (request) => {
+      const timezone = await getUserTimezone(request.params.userId);
+      const state = await buildOnboardingState(
+        request.params.userId,
+        parseOptionalNow(request.query.now) ?? new Date(),
+        timezone
+      );
+
+      return {
+        state,
+        message: composeOnboardingReply(state, "first_run_intro")
+      };
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>(
+    "/users/:userId/onboarding/setup",
+    async (request) => {
+      const timezone = await getUserTimezone(request.params.userId);
+      const state = await buildOnboardingState(
+        request.params.userId,
+        parseOptionalNow(request.query.now) ?? new Date(),
+        timezone
+      );
+
+      return {
+        state,
+        message: composeOnboardingReply(state, "setup_overview")
+      };
+    }
+  );
+
   server.get<{ Params: { userId: string }; Querystring: { includeArchived?: string } }>(
     "/users/:userId/memory",
     async (request) => ({
@@ -4826,6 +4874,10 @@ class DailyCoachTimeoutError extends Error {
 type ConversationSurfaceIntent =
   | "capability_help"
   | "setup_state"
+  | "quickstart"
+  | "configure_goals"
+  | "configure_daily_loop"
+  | "configure_integrations"
   | "daily_operator"
   | "start_day"
   | "daily_review"
@@ -4846,11 +4898,27 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
   }
 
   if (intent === "capability_help") {
-    return formatCapabilityHelpReply();
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "explain_capabilities");
   }
 
   if (intent === "setup_state") {
-    return formatSetupStateReply(await buildSetupState(userId));
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "setup_overview");
+  }
+
+  if (intent === "quickstart") {
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "quickstart");
+  }
+
+  if (intent === "configure_goals") {
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_goals");
+  }
+
+  if (intent === "configure_daily_loop") {
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_daily_loop");
+  }
+
+  if (intent === "configure_integrations") {
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_integrations");
   }
 
   if (intent === "daily_operator") {
@@ -4936,12 +5004,24 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return undefined;
   }
 
-  if (/^(help|what can you do|how do you work|how do i use this|how to use this)$/.test(text)) {
+  if (/^(help|what can you do|how do you work|how do i use this|how to use this|what do you help with)$/.test(text)) {
     return "capability_help";
   }
 
-  if (/^(help me set up|how do i start|what should i configure|setup|show setup|set me up)$/.test(text)) {
+  if (/^(how do i start|how should i start|where do i start|start using alecto)$/.test(text)) {
+    return "quickstart";
+  }
+
+  if (/^(help me set up|what should i configure|what is missing|setup|show setup|set me up)$/.test(text)) {
     return "setup_state";
+  }
+
+  if (/\b(set up goals|setup goals|help me choose goals|i want to set a goal|configure goals)\b/.test(text)) {
+    return "configure_goals";
+  }
+
+  if (/\b(set up daily loop|setup daily loop|configure daily loop|set up reminders|configure reminders)\b/.test(text)) {
+    return "configure_daily_loop";
   }
 
   if (/\b(turn on|enable|set)\b.*\b(morning brief|evening review|daily loop|morning|evening)\b/.test(text) || /\bremind me every morning\b/.test(text)) {
@@ -4984,76 +5064,223 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "show_memory";
   }
 
-  if (/\b(connect gmail|set up gmail|setup gmail|connect github|set up github|setup github|set up integrations|setup integrations|connect integrations)\b/.test(text)) {
+  if (/\b(set up integrations|setup integrations|connect integrations)\b/.test(text)) {
+    return "configure_integrations";
+  }
+
+  if (/\b(connect gmail|connect email|set up gmail|setup gmail|set up email|setup email|connect github|set up github|setup github)\b/.test(text)) {
     return "integration_guidance";
   }
 
   return undefined;
 }
 
-function formatCapabilityHelpReply(): string {
-  return [
-    "I help you operate from evidence, not vibes.",
-    "",
-    "- Daily planning: what to do today, start/end day, tomorrow prep.",
-    "- Goals: track active goals, priorities, and progress evidence.",
-    "- Actions/reminders: create, complete, snooze, archive, and get due reminders.",
-    "- Check-ins/events: log sleep, energy, anxiety, focus, training, reading, applications, and other approved events.",
-    "- Memory: remember preferences and recurring patterns.",
-    "- Guardrails: hard-stop betting/trading risk before it becomes a task or rationalization.",
-    "- Weekly review/planning: review the week and propose next-week actions only after confirmation.",
-    "- Signals: Gmail/GitHub can add context after explicit connection and approved rules.",
-    "",
-    "You can talk naturally. Commands like /today, /actions, /weekly, and /plan_next_week are shortcuts."
-  ].join("\n");
+type OnboardingIntent =
+  | "first_run_intro"
+  | "setup_overview"
+  | "quickstart"
+  | "configure_goals"
+  | "configure_daily_loop"
+  | "configure_reminders"
+  | "configure_integrations"
+  | "explain_capabilities"
+  | "missing_setup";
+
+interface OnboardingState {
+  userId: string;
+  profileSummary: string;
+  goalsCount: number;
+  topGoals: string[];
+  openActionsCount: number;
+  overdueOrStaleActionsCount: number;
+  dailyLoopEnabled: boolean;
+  morningTime: string;
+  eveningTime: string;
+  actionReminderDefaultTime: string;
+  notificationSummary: string;
+  connectedIntegrationsCount: number;
+  gmailStatus: "connected" | "not_connected";
+  activeEmailRulesCount: number;
+  githubConnectionCount: number;
+  dailyBriefUsable: boolean;
+  missingSetupItems: string[];
+  recommendedNextStep: string;
+  timezone: string;
 }
 
-async function buildSetupState(userId: string) {
-  const [goals, actions, settings, connections, emailRules] = await Promise.all([
+async function buildOnboardingState(userId: string, now: Date, timezone: string): Promise<OnboardingState> {
+  const [goals, actions, settings, connections, emailRules, profile, hygiene] = await Promise.all([
     getActiveGoals(userId),
     getActionItems(userId, { status: "open", limit: 100 }),
     getOrCreateNotificationSettings(userId),
     getIntegrationConnections(userId),
-    getEmailSignalRules(userId)
+    getEmailSignalRules(userId),
+    getOrCreateUserOperatingProfile(userId),
+    analyzeActionHygiene(userId, now, timezone)
   ]);
   const activeConnections = connections.filter((connection) => connection.status === "active");
   const activeEmailRules = emailRules.filter((rule) => rule.status === "active");
   const gmailConnected = activeConnections.some((connection) => connection.integrationId === "gmail");
-  const githubConnected = activeConnections.some((connection) => connection.integrationId === "github_public");
-  const bestNextStep =
+  const githubConnectionCount = activeConnections.filter((connection) => connection.integrationId === "github_public").length;
+  const missingSetupItems = [
+    goals.length === 0 ? "goals" : undefined,
+    !settings.dailyLoopEnabled ? "daily loop" : undefined,
+    actions.length === 0 ? "first action" : undefined,
+    !gmailConnected ? "Gmail optional" : activeEmailRules.length === 0 ? "email rules optional" : undefined,
+    githubConnectionCount === 0 ? "GitHub optional" : undefined
+  ].filter((item): item is string => Boolean(item));
+  const recommendedNextStep =
     goals.length === 0
-      ? "Create one active goal."
+      ? "Tell me a real goal, for example: I want to find a new developer job."
       : !settings.dailyLoopEnabled
-        ? "Turn on the daily loop when you want proactive morning/evening briefs."
+        ? "Say: turn on morning brief at 9 and evening review at 21:30."
         : actions.length === 0
-          ? "Create one concrete next action."
-          : gmailConnected && activeEmailRules.length === 0
-            ? "Enable an email rule only if you want Gmail scanning."
-            : "Use /today or ask what to do today.";
+          ? "Create one concrete next action, for example: remind me to apply tomorrow."
+          : hygiene.suggestedCleanupCandidates.length > 0
+            ? "Run /action_hygiene or say: clean up my tasks."
+            : "Ask: what should I do today.";
 
   return {
+    userId,
+    profileSummary: `${profile.motivationalStyle}, directness ${profile.directness}/5, guardrails ${profile.gamblingGuardrails}`,
     goalsCount: goals.length,
+    topGoals: sortGoalsForDisplay(goals).slice(0, 3).map((goal) => goal.title),
     openActionsCount: actions.length,
+    overdueOrStaleActionsCount: hygiene.suggestedCleanupCandidates.length,
     dailyLoopEnabled: settings.dailyLoopEnabled,
+    morningTime: formatMinutesOfDay(settings.morningTimeMinutes),
+    eveningTime: formatMinutesOfDay(settings.eveningTimeMinutes),
+    actionReminderDefaultTime: formatMinutesOfDay(settings.defaultActionTimeMinutes),
+    notificationSummary: `timezone ${settings.timezone}, default action time ${formatMinutesOfDay(settings.defaultActionTimeMinutes)}`,
     timezone: settings.timezone,
-    gmailConnected,
-    githubConnected,
+    connectedIntegrationsCount: activeConnections.length,
+    gmailStatus: gmailConnected ? "connected" : "not_connected",
+    githubConnectionCount,
     activeEmailRulesCount: activeEmailRules.length,
-    bestNextStep
+    dailyBriefUsable: goals.length > 0 || actions.length > 0,
+    missingSetupItems,
+    recommendedNextStep
   };
 }
 
-function formatSetupStateReply(state: Awaited<ReturnType<typeof buildSetupState>>): string {
+function composeOnboardingReply(state: OnboardingState, intent: OnboardingIntent): string {
+  if (intent === "first_run_intro") {
+    return [
+      "Hey, I'm Alecto. You can talk normally.",
+      "",
+      "I can help with:",
+      "- deciding what to do today",
+      "- tracking goals and actions",
+      "- remembering preferences",
+      "- reviewing your week",
+      "- keeping guardrails around risky patterns",
+      "",
+      "Try:",
+      '- "I want to find a new job"',
+      '- "remind me to apply tomorrow"',
+      '- "what should I do today"',
+      '- "help me set up"',
+      "",
+      "Commands are optional shortcuts."
+    ].join("\n");
+  }
+
+  if (intent === "explain_capabilities") {
+    return [
+      "I help you operate from evidence, not vibes.",
+      "",
+      "- Daily planning: what to do today, start/end day, tomorrow prep.",
+      "- Goals: track active goals, priorities, and progress evidence.",
+      "- Actions/reminders: create, complete, snooze, archive, and get due reminders.",
+      "- Check-ins/events: log sleep, energy, anxiety, focus, training, reading, applications, and other approved events.",
+      "- Memory: remember preferences and recurring patterns.",
+      "- Guardrails: hard-stop betting/trading risk before it becomes a task or rationalization.",
+      "- Weekly review/planning: review the week and propose next-week actions only after confirmation.",
+      "- Signals: Gmail/GitHub can add context after explicit connection and approved rules.",
+      "",
+      "You can talk normally. Commands like /today, /actions, /weekly, and /plan_next_week are shortcuts."
+    ].join("\n");
+  }
+
+  if (intent === "quickstart") {
+    return [
+      "Quickstart:",
+      "1. Tell me one goal in normal language.",
+      "2. Create one next action.",
+      "3. Ask what to do today.",
+      "",
+      "Examples:",
+      '- "I want to find a new developer job"',
+      '- "remind me to apply tomorrow"',
+      '- "what should I do today"',
+      "",
+      `Best next step: ${state.recommendedNextStep}`
+    ].join("\n");
+  }
+
+  if (intent === "configure_goals") {
+    return [
+      "Goal setup:",
+      state.topGoals.length > 0 ? `Current goals: ${state.topGoals.join(", ")}${state.goalsCount > state.topGoals.length ? `, +${state.goalsCount - state.topGoals.length} more` : ""}.` : "No active goals yet.",
+      "",
+      "Tell me goals naturally:",
+      '- "I want to find a new developer job"',
+      '- "I want to improve strength and energy"',
+      '- "I want to read more"',
+      "",
+      "I will ask confirmation when creating a goal. Optional shortcut: /templates."
+    ].join("\n");
+  }
+
+  if (intent === "configure_daily_loop" || intent === "configure_reminders") {
+    return [
+      "Daily loop setup:",
+      `- status: ${state.dailyLoopEnabled ? "on" : "off"}`,
+      `- morning brief: ${state.morningTime} ${state.timezone}`,
+      `- evening review: ${state.eveningTime} ${state.timezone}`,
+      `- default action time: ${state.actionReminderDefaultTime}`,
+      "",
+      'Natural option: "turn on morning brief at 9 and evening review at 21:30".',
+      "Optional shortcut: /set_daily_loop morning=09:00 evening=21:30 enabled=true."
+    ].join("\n");
+  }
+
+  if (intent === "configure_integrations") {
+    return [
+      "Integration setup:",
+      `- Gmail: ${state.gmailStatus === "connected" ? "connected" : "not connected"}`,
+      `- active email rules: ${state.activeEmailRulesCount}`,
+      `- GitHub public connections: ${state.githubConnectionCount}`,
+      "",
+      "Gmail is readonly and local-MVP. It does not scan until you connect Gmail and explicitly enable a rule.",
+      "Optional shortcuts: /connect_gmail, /enable_email_rule job_search, /connect_github OWNER/REPO author=LOGIN."
+    ].join("\n");
+  }
+
+  const ready = [
+    `Goals: ${state.goalsCount} active${state.topGoals.length > 0 ? ` (${state.topGoals.join(", ")})` : ""}`,
+    `Actions: ${state.openActionsCount} open`,
+    `Daily brief: ${state.dailyLoopEnabled ? `enabled, ${state.morningTime}` : "disabled"}`,
+    `Evening review: ${state.dailyLoopEnabled ? `enabled, ${state.eveningTime}` : "disabled"}`
+  ];
+  const missing = state.missingSetupItems.length > 0 ? state.missingSetupItems : ["nothing required for local alpha"];
+
   return [
-    "Setup state:",
-    `- active goals: ${state.goalsCount}`,
-    `- daily loop: ${state.dailyLoopEnabled ? "on" : "off"} (${state.timezone})`,
-    `- open actions: ${state.openActionsCount}`,
-    `- integrations: Gmail ${state.gmailConnected ? "connected" : "not connected"}, GitHub ${state.githubConnected ? "connected" : "not connected"}`,
-    `- active email rules: ${state.activeEmailRulesCount}`,
+    "Alecto setup",
     "",
-    `Best next step: ${state.bestNextStep}`
-  ].join("\n");
+    "Ready:",
+    ...ready.map((item) => `- ${item}`),
+    "",
+    "Missing:",
+    ...missing.map((item) => `- ${item}`),
+    "",
+    `Profile: ${state.profileSummary}`,
+    `Notifications: ${state.notificationSummary}`,
+    `Integrations: ${state.connectedIntegrationsCount} connected; Gmail ${state.gmailStatus === "connected" ? "connected" : "not connected"}; GitHub ${state.githubConnectionCount}`,
+    state.overdueOrStaleActionsCount > 0 ? `Cleanup: ${cleanupDecisionGrammar(state.overdueOrStaleActionsCount)} Run /action_hygiene.` : undefined,
+    "",
+    `Best next step: ${state.recommendedNextStep}`
+  ].filter(Boolean).join("\n");
 }
 
 async function createGuardianGuardrailReply(
@@ -5249,6 +5476,22 @@ async function handleNaturalDailyLoopSettings(userId: string, message: string): 
 
 function parseNaturalDailyLoopSettings(message: string): { morningTimeMinutes?: number; eveningTimeMinutes?: number } | undefined {
   const text = message.trim();
+  const morningMatch = text.match(/\bmorning(?:\s+brief)?\s+(?:at|a las)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  const eveningMatch = text.match(/\b(?:evening|night)(?:\s+review)?\s+(?:at|a las)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  const parsed: { morningTimeMinutes?: number; eveningTimeMinutes?: number } = {};
+
+  if (morningMatch) {
+    parsed.morningTimeMinutes = parseNaturalTimeToMinutes(morningMatch[1], morningMatch[2], morningMatch[3]);
+  }
+
+  if (eveningMatch) {
+    parsed.eveningTimeMinutes = parseNaturalTimeToMinutes(eveningMatch[1], eveningMatch[2], eveningMatch[3]);
+  }
+
+  if (parsed.morningTimeMinutes !== undefined || parsed.eveningTimeMinutes !== undefined) {
+    return parsed;
+  }
+
   const timeMatch = text.match(/\b(?:at|a las)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
   const minutes = timeMatch ? parseNaturalTimeToMinutes(timeMatch[1], timeMatch[2], timeMatch[3]) : undefined;
 
@@ -9859,7 +10102,10 @@ async function resolveActionHygieneReply(
   message: string,
   now = new Date()
 ): Promise<string | undefined> {
-  if (/\s+\band\b\s+/i.test(message.trim())) {
+  if (
+    /\s+\band\b\s+/i.test(message.trim()) &&
+    /\b(?:complete|done|snooze|archive|delete|remove|keep)\b/i.test(message.trim())
+  ) {
     return "Handle one hygiene action at a time. Try: complete 1 or snooze 2 tomorrow.";
   }
 
