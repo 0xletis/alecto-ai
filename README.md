@@ -116,7 +116,7 @@ Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each T
 
 ## Product Surfaces
 
-Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
+Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
 
 First 5 Minutes Onboarding v1 is conversation-first and shared through the API. `/start` gives a short first-run intro with four natural examples. `/setup`, `help me set up`, and `what should I configure` show Ready, Needs attention, Optional, and Best next step sections. Goal, action/reminder, daily-loop, Gmail, and GitHub setup messages guide the next safe step without requiring command memorization. These guide replies do not mutate state. Gmail remains readonly local-MVP and does not scan until the user connects Gmail and explicitly enables an email rule.
 
@@ -131,7 +131,7 @@ Review commands:
 - `/weekly`: saved weekly operator review
 - `/weekly_insight`: interpretive weekly coaching
 - `/weekly_last`: latest saved weekly operator review
-- `/plan_next_week`: propose confirmed next-week actions from weekly review, goals, hygiene, and priorities
+- `/plan_next_week`: propose confirmed next-week actions from weekly review, goals, hygiene, and priorities; natural `plan this week` covers the remaining current week
 
 Setup and settings commands:
 - `/setup`, `/whoami`, `/profile`, `/set_style`
@@ -244,12 +244,12 @@ Telegram commands:
 - `/debug_daily_priorities`: allowlist-only daily priority scoring debug
 - `/insight`: daily interpretive coaching insight
 - `/daily_insight`: alias of `/insight`
-- `/weekly`: generate and save the current weekly operator review
+- `/weekly`: generate and save the current weekly operator review; it suggests saying `plan next week` as the next step
 - `/weekly force`: regenerate the current weekly operator review with deterministic fallback
 - `/weekly_last`: show the latest saved weekly operator review
 - `/debug_weekly_context`: allowlist-only dev helper for the weekly review context
 - `/weekly_insight`: weekly interpretive coaching insight
-- `/plan_next_week`: propose next-week ActionItems with separate action/goal priorities; cleanup items are shown as non-creatable; reply `create 1`, `create all`, `edit 2 to Friday morning`, or `skip`
+- `/plan_next_week`: propose next-week ActionItems with separate action/goal priorities; output is grouped into cleanup, already scheduled, and suggested new actions; reply examples only reference creatable suggestions, for example `create 3`, `create all new`, `edit 3 to Friday morning`, or `skip`
 - `/debug_next_week_plan_context`: allowlist-only dev helper for next-week plan context
 - `/goals`: active goals
 - `/goal_priorities`: show active goal priority weights
@@ -513,7 +513,7 @@ Expected:
 - `work_action_email` reviews are different: approving `work_action_required`, `work_deadline_detected`, `work_follow_up_requested`, or `work_project_update_detected` creates an ActionItem, not an Event.
 - ActionItems are things to do. Events are things that happened. Use `/action`, `/todo`, `/add_action`, `/actions`, `/complete_action`, `/snooze_action`, and `/archive_action` to manage open work items.
 - Natural concrete task messages such as `I need to review homepage copy tomorrow` or `remind me to call Alex Friday` create manual ActionItems. Vague reflections and betting/trading reminders do not create actions.
-- Conversation-first operator requests such as `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, and `connect GitHub` route to the same existing read-only or confirmation-first product surfaces.
+- Conversation-first operator requests such as `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, and `connect GitHub` route to the same existing read-only or confirmation-first product surfaces.
 - Hygiene-session replies are guarded against fake success: incomplete replies such as `snooze 2` ask for a time, and cleanup sessions remain active while other listed actions still need decisions.
 - Natural daily-loop settings such as `turn on morning brief at 9` update settings only after the database write succeeds. Ambiguous settings requests return a concrete example instead of pretending a change happened.
 - `/remember` still saves memory. If the remembered text clearly contains a concrete future task, Alecto also creates or reuses a manual ActionItem.
@@ -660,7 +660,8 @@ Manual insight tests:
 - Low activity day: run `/insight` before logging events. It should say the signal is low and recommend one concrete action.
 - Weekly insight summary: log events across multiple days, then run `/weekly_insight`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
 - Weekly operator review: complete or snooze actions, trigger a guardrail if relevant, add/refine an operator reflection, then run `/weekly`. It should save one weekly review memory and `/weekly_last` should show it.
-- Next-week planning: run `/weekly`, then `/plan_next_week`. It should propose safe goal-linked actions, display action priority separately from goal priority, and create none until the user replies `create 1`, `create all`, or another explicit selection. Stale cleanup suggestions should be marked non-creatable and skipped by `create all`.
+- Weekly planning: run `/weekly`, then say `plan next week` or run `/plan_next_week`. Natural `plan this week` and `plan my week` plan the remaining current local week. Plan output shows `Planning window`, `Needs cleanup`, `Already scheduled`, and `Suggested new actions`. It should propose safe goal-linked actions, display action priority separately from goal priority, and create none until the user replies with a shown creatable selection, `create all new`, or another explicit selection. Stale cleanup suggestions and already-covered items are non-creatable and skipped by `create all new`. Recurring system suggestions use semantic duplicate keys, so old and new guardrail-review titles are treated as the same plan item.
+- Planning UX smoke: `/weekly`, `plan next week`, `plan this week`, `plan my week`, `make a plan`, `create all new`, `/actions`, and `I need a plan to bet safely next week`. Pass if `/weekly` suggests planning next, the planning window is correct, cleanup is not creatable, already-covered/guardrail-review aliases are not recreated, reply examples only reference creatable suggestions, `create all new` creates only new actions, and betting/trading planning hits the hard guardrail.
 - First 5 Minutes Onboarding: send `/start`, `help me set up`, `how do I start`, `what should I configure`, `set up goals`, `how do reminders work`, `set up daily loop`, `connect Gmail`, and `connect GitHub`. The replies should feel like a guide, not documentation; show a clear next step; avoid command dumps; expose no tokens/raw email/provider errors; and create no goals/actions/integrations/email rules unless the user gives an explicit mutation request.
 - Conversation-first UX: send natural messages such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my tasks`, and `connect Gmail`. They should route to the existing surfaces without exposing tokens, raw email bodies, or creating actions unless explicit confirmation/selection is required.
 

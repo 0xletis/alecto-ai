@@ -130,6 +130,7 @@ After every implementation pass:
 - [x] `/plan_next_week` proposes 3-7 next-week ActionItems and creates only explicitly selected items
 - [x] Plan-next-week output distinguishes ActionItem priority from linked goal priority
 - [x] Plan-next-week cleanup suggestions are non-creatable and point back to `/action_hygiene` or natural action control instead of creating meta cleanup tasks
+- [x] Planning UX Consolidation v1: `/weekly` points to `plan next week`, natural `plan this week`/`plan my week` plan the remaining current local week, natural `plan next week` uses the next local week, ambiguous `make a plan` asks for this-vs-next-week unless there is active plan context, `create all new` creates only creatable suggestions, reply examples only reference creatable indexes, and recurring system suggestions use semantic duplicate keys such as guardrail-review aliases
 - [x] `/debug_next_week_plan_context` shows next-week planning context without side effects
 
 ## Insights

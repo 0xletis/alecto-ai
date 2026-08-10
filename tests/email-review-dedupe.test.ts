@@ -5952,6 +5952,7 @@ test("weekly review uses week-to-date range and separates risk-control goals", a
     assert.match(response.json().message, /Goals with no progress: Read more/);
     assert.doesNotMatch(response.json().message, /Goals with no progress:.*Control impulsive betting/);
     assert.match(response.json().message, /Control impulsive betting: no guardrail triggers logged this reviewed period/);
+    assert.match(response.json().message, /Next: say 'plan next week' to turn this into actions\./);
 
     response = await server.inject({
       method: "POST",
@@ -6023,7 +6024,11 @@ test("next-week plan proposes confirmed goal-linked actions and creates selected
 
     assert.equal(response.statusCode, 200);
     const payload = response.json();
-    assert.match(payload.message, /Next week plan - 2026-08-10 to 2026-08-16/);
+    assert.match(payload.message, /Next week plan/);
+    assert.match(payload.message, /Planning window: 2026-08-10 to 2026-08-16/);
+    assert.match(payload.message, /Needs cleanup:/);
+    assert.match(payload.message, /Already scheduled:/);
+    assert.match(payload.message, /Suggested new actions:/);
     assert.match(payload.message, /Apply to 3 developer jobs - action priority: high - goal priority: critical/);
     assert.ok(payload.suggestions.length >= 3);
     assert.ok(payload.suggestions.length <= 7);
@@ -6292,6 +6297,326 @@ test("next-week plan create all skips cleanup suggestions without creating meta 
     const actions = await prisma.actionItem.findMany({ where: { userId: planUserId } });
     assert.equal(actions.some((action) => /^Decide:|^Resolve stale action:/i.test(action.title)), false);
     assert.equal(actions.filter((action) => action.sourceProvider === "weekly_plan").length > 0, true);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: planUserId } });
+  }
+});
+
+test("next-week plan treats guardrail review aliases as already covered", async () => {
+  const server = buildServer();
+  const planUserId = `next-week-plan-guardrail-alias-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({
+      where: { id: planUserId },
+      update: {},
+      create: { id: planUserId }
+    });
+    await prisma.goal.createMany({
+      data: [
+        {
+          userId: planUserId,
+          title: "Find a new developer job",
+          category: "career",
+          templateId: "career.job_search",
+          priority: "critical",
+          importanceScore: 70
+        },
+        {
+          userId: planUserId,
+          title: "Control impulsive betting",
+          category: "finance",
+          templateId: "finance.control_betting_trading",
+          priority: "critical",
+          importanceScore: 70
+        }
+      ]
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: planUserId,
+        source: "system",
+        sourceProvider: "weekly_plan",
+        title: "Review Control impulsive betting guardrail rules",
+        status: "open",
+        priority: "high",
+        dueAt: new Date("2026-08-16T16:00:00.000Z"),
+        actionType: "generic",
+        evidence: "old guardrail review title"
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${planUserId}/next-week-plan`,
+      payload: { now: "2026-08-06T13:20:00.000Z" }
+    });
+
+    assert.equal(response.statusCode, 200);
+    const plan = response.json();
+    const guardrailSuggestion = plan.suggestions.find((suggestion: { title: string }) => suggestion.title === "Review betting/trading guardrail rules");
+    assert.ok(guardrailSuggestion);
+    assert.equal(guardrailSuggestion.duplicateRisk, true);
+    assert.equal(guardrailSuggestion.existingActionTitle, "Review Control impulsive betting guardrail rules");
+    assert.match(plan.message, /Already scheduled:/);
+    assert.match(plan.message, /Review betting\/trading guardrail rules .*already covered/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId: planUserId,
+        message: "create all new"
+      }
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Already covered:/);
+    assert.match(response.json().reply, /Review betting\/trading guardrail rules \(Review Control impulsive betting guardrail rules\)/);
+
+    const guardrailActions = await prisma.actionItem.findMany({
+      where: {
+        userId: planUserId,
+        title: {
+          contains: "guardrail rules"
+        }
+      }
+    });
+    assert.equal(guardrailActions.length, 1);
+    assert.equal(guardrailActions[0].title, "Review Control impulsive betting guardrail rules");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: planUserId } });
+  }
+});
+
+test("next-week plan reply examples only include creatable suggestion indexes", async () => {
+  const server = buildServer();
+  const planUserId = `next-week-plan-reply-examples-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({
+      where: { id: planUserId },
+      update: {},
+      create: { id: planUserId }
+    });
+    const jobGoal = await prisma.goal.create({
+      data: {
+        userId: planUserId,
+        title: "Find a new developer job",
+        category: "career",
+        templateId: "career.job_search",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: planUserId,
+        title: "Build a YouTube channel",
+        category: "creative",
+        priority: "high",
+        importanceScore: 45
+      }
+    });
+    await prisma.actionItem.createMany({
+      data: [
+        {
+          userId: planUserId,
+          source: "manual",
+          title: "Review homepage",
+          status: "open",
+          priority: "medium",
+          dueAt: new Date("2026-08-01T07:00:00.000Z"),
+          actionType: "deadline",
+          project: "homepage",
+          evidence: "review homepage"
+        },
+        {
+          userId: planUserId,
+          source: "manual",
+          goalId: jobGoal.id,
+          goalTitleSnapshot: jobGoal.title,
+          title: "Apply to 3 developer jobs",
+          status: "open",
+          priority: "medium",
+          dueAt: new Date("2026-08-11T07:00:00.000Z"),
+          actionType: "deadline",
+          evidence: "existing future action"
+        }
+      ]
+    });
+
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${planUserId}/next-week-plan`,
+      payload: { now: "2026-08-07T10:00:00+02:00" }
+    });
+
+    assert.equal(response.statusCode, 200);
+    const message = response.json().message as string;
+    assert.match(message, /1\. Resolve stale action: Review homepage/);
+    assert.match(message, /2\. Apply to 3 developer jobs .*already covered/);
+    assert.match(message, /3\. Write 5 bullets for the YouTube script/);
+    assert.match(message, /- create 3/);
+    assert.match(message, /- edit 3 to Friday morning/);
+    assert.doesNotMatch(message, /- create 1\b/);
+    assert.doesNotMatch(message, /- edit 1 to Friday morning/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: planUserId } });
+  }
+});
+
+test("next-week plan with no creatable suggestions says nothing new to create", async () => {
+  const server = buildServer();
+  const planUserId = `next-week-plan-no-new-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({
+      where: { id: planUserId },
+      update: {},
+      create: { id: planUserId }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: planUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    await prisma.actionItem.createMany({
+      data: [
+        {
+          userId: planUserId,
+          source: "system",
+          sourceProvider: "weekly_plan",
+          title: "Review Control impulsive betting guardrail rules",
+          status: "open",
+          priority: "high",
+          dueAt: new Date("2026-08-16T16:00:00.000Z"),
+          actionType: "generic",
+          evidence: "old guardrail review title"
+        },
+        {
+          userId: planUserId,
+          source: "system",
+          sourceProvider: "weekly_plan",
+          title: "Review open actions and pick one to finish",
+          status: "open",
+          priority: "medium",
+          dueAt: new Date("2026-08-10T07:00:00.000Z"),
+          actionType: "generic",
+          evidence: "existing fallback"
+        },
+        {
+          userId: planUserId,
+          source: "system",
+          sourceProvider: "weekly_plan",
+          title: "Log one meaningful progress action",
+          status: "open",
+          priority: "medium",
+          dueAt: new Date("2026-08-12T14:30:00.000Z"),
+          actionType: "generic",
+          evidence: "existing fallback"
+        },
+        {
+          userId: planUserId,
+          source: "system",
+          sourceProvider: "weekly_plan",
+          title: "Run weekly review before Sunday night",
+          status: "open",
+          priority: "low",
+          dueAt: new Date("2026-08-16T16:00:00.000Z"),
+          actionType: "generic",
+          evidence: "existing fallback"
+        }
+      ]
+    });
+
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${planUserId}/next-week-plan`,
+      payload: { now: "2026-08-06T13:20:00.000Z" }
+    });
+
+    assert.equal(response.statusCode, 200);
+    const message = response.json().message as string;
+    assert.match(message, /Nothing new to create\./);
+    assert.match(message, /\/action_hygiene|what should I do today/);
+    assert.doesNotMatch(message, /- create \d+/);
+    assert.doesNotMatch(message, /- edit \d+ to Friday morning/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: planUserId } });
+  }
+});
+
+test("natural planning routes this-week, next-week, ambiguous, and create all new safely", async () => {
+  const server = buildServer();
+  const planUserId = `planning-ux-${randomUUID()}`;
+
+  const send = async (message: string) => {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: planUserId, message }
+    });
+    assert.equal(response.statusCode, 200);
+    return response.json().reply as string;
+  };
+
+  try {
+    await prisma.user.upsert({
+      where: { id: planUserId },
+      update: {},
+      create: { id: planUserId }
+    });
+    await prisma.goal.createMany({
+      data: [
+        {
+          userId: planUserId,
+          title: "Find a new developer job",
+          category: "career",
+          templateId: "career.job_search",
+          priority: "critical",
+          importanceScore: 70
+        },
+        {
+          userId: planUserId,
+          title: "Build a YouTube channel",
+          category: "creative",
+          priority: "high",
+          importanceScore: 45
+        }
+      ]
+    });
+
+    let reply = await send("make a plan");
+    assert.match(reply, /Do you mean this week or next week\?/);
+    assert.equal(await prisma.pendingAction.count({ where: { userId: planUserId, type: "next_week_plan" } }), 0);
+
+    reply = await send("plan this week");
+    assert.match(reply, /This week plan/);
+    assert.match(reply, /Planning window:/);
+    assert.match(reply, /Suggested new actions:/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: planUserId } }), 0);
+
+    reply = await send("create all new");
+    assert.match(reply, /Created actions:/);
+    const currentWeekActions = await prisma.actionItem.count({ where: { userId: planUserId, sourceProvider: "weekly_plan" } });
+    assert.ok(currentWeekActions > 0);
+
+    reply = await send("plan next week");
+    assert.match(reply, /Next week plan/);
+    assert.match(reply, /Planning window:/);
+
+    reply = await send("I need a plan to bet safely next week");
+    assert.match(reply, /RED|cooldown|No betting|blocked|guardrail/i);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: planUserId } });

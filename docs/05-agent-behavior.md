@@ -44,7 +44,7 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] Pasted logs, code fences, Codex prompts, and debug output are treated as reference text and have no side effects.
 - [x] Pending decision replies such as `yes`, `no`, `1`, or `second one` resolve before normal routing.
 - [x] Guardrail/risk intent wins before action creation or generic chat.
-- [x] Conversation-first surface routing maps natural operator requests to existing services: help/capabilities, setup state, daily operator brief, daily review, weekly review, next-week planning, action hygiene, goals, actions, memories, and integration guidance.
+- [x] Conversation-first surface routing maps natural operator requests to existing services: help/capabilities, setup state, daily operator brief, daily review, weekly review, this-week/next-week planning, action hygiene, goals, actions, memories, and integration guidance.
 - [x] Onboarding/setup routing is conversation-first: `/start`, `/setup`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up daily loop`, and `set up integrations` use shared API onboarding composers.
 - [x] Explicit memory phrases create memory through the message processor.
 - [x] Natural daily check-ins require state/progress signals.
@@ -58,9 +58,10 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] `/start_day`, `/end_day`, and `/tomorrow` support the daily operating loop.
 - [x] `/weekly` creates a saved weekly operator review memory.
 - [x] `/plan_next_week` turns weekly review context into proposed next-week actions and waits for explicit create/skip/edit replies.
+- [x] Natural planning phrases distinguish current-week requests (`plan this week`, `plan my week`) from next-week requests (`plan next week`) and ask clarification for ambiguous `make a plan` when there is no active plan/recent review context.
 - [x] `/insight` and `/weekly_insight` provide interpretive coaching reports.
 - [x] `/action_hygiene` asks the user to decide on stale/overdue tasks; it never archives automatically.
-- [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, and `connect Gmail` use the same underlying services as command shortcuts.
+- [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan this week`, `plan next week`, `clean up my tasks`, `show my goals`, and `connect Gmail` use the same underlying services as command shortcuts.
 - [x] First 5 Minutes Onboarding v1 replies act like a guide: `/start` gives short natural examples, setup output separates Ready/Needs attention/Optional/Best next step, and goal/action/daily-loop/integration setup suggests one safe next step without command memorization.
 - [x] `/debug_route`, `/debug_conversation_intent`, `/debug_daily_priorities`, `/debug_daily_coach`, `/debug_action_hygiene`, and `/debug_weekly_context` expose safe debugging views.
 

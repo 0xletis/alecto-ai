@@ -35,6 +35,7 @@ Status:
 - [x] conversation-first UX parity for core operator surfaces
 - [x] conversation-first onboarding/setup v1 for `/start`, `/setup`, natural quickstart, goals, daily loop, and integration guidance
 - [x] First 5 Minutes Onboarding v1 with guide-style `/start`, setup overview, goals/actions/reminders/daily-loop guidance, and explicit Gmail/GitHub setup boundaries
+- [x] Planning UX Consolidation v1 with `/weekly` -> `plan next week` bridge, natural current-week/next-week planning, grouped plan output, and confirmation-only action creation
 
 Explicitly out of MVP 0:
 - [ ] WhatsApp
@@ -92,7 +93,8 @@ Status:
 
 Likely high-leverage next items:
 - refine first-run onboarding into a fuller guided setup session only after more real alpha usage
-- keep `/plan_next_week` regression-tested as the bridge from weekly review into confirmed next-week ActionItems
+- keep weekly planning regression-tested as the bridge from weekly review into confirmed current-week/next-week ActionItems
+- polish the planning loop from real Telegram usage now that Planning UX Consolidation v1 is implemented
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until encryption is implemented
 - defer new integrations until the operator loop and onboarding are easier to use

@@ -30,7 +30,7 @@ See `docs/07-implementation-status.md` for the current implementation ledger.
 As of 2026-08-06, the working product is a Telegram-first operator agent with:
 - structured goals, events, memories, check-ins, ActionItems, and user operating profiles
 - deterministic risk guardrails for betting/trading behavior
-- daily operator brief, daily/weekly insights, daily operating loop, weekly operator review, and confirmed next-week planning
+- daily operator brief, daily/weekly insights, daily operating loop, weekly operator review, and confirmed current-week/next-week planning
 - Gmail and GitHub public integrations through explicit user-approved connections/rules
 - worker-based proactive reminders, insights, loop briefs, action reminders, and integration sync
 

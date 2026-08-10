@@ -271,26 +271,9 @@ export function buildServer() {
       );
     }
 
-    if (looksLikeNextWeekPlanRequest(parsed.data.message)) {
-      const timezone = await getUserTimezone(parsed.data.userId);
-      const now = new Date();
-      const context = await buildNextWeekPlanContext(parsed.data.userId, now, timezone);
-      const suggestions = await generateNextWeekPlanSuggestions(context);
-
-      await replacePendingAction(parsed.data.userId, {
-        type: "next_week_plan",
-        summary: `Next week plan - ${context.nextWeekStartLocalDate} to ${context.nextWeekEndLocalDate}`,
-        payload: {
-          originalText: parsed.data.message,
-          nextWeekStartLocalDate: context.nextWeekStartLocalDate,
-          nextWeekEndLocalDate: context.nextWeekEndLocalDate,
-          timezone: context.timezone,
-          suggestions: suggestions.map(toPendingNextWeekPlanSuggestion)
-        },
-        expiresAt: pendingDecisionExpiry()
-      });
-
-      return replyOnly(parsed.data.userId, parsed.data.message, formatNextWeekPlanMessage(context, suggestions));
+    const planningRequest = detectPlanningRequestKind(parsed.data.message);
+    if (planningRequest) {
+      return replyOnly(parsed.data.userId, parsed.data.message, await createPlanForConversation(parsed.data.userId, parsed.data.message, planningRequest));
     }
 
     const explicitMemory = extractExplicitMemory(parsed.data.message);
@@ -798,7 +781,7 @@ export function buildServer() {
 
     return {
       review,
-      message: formatWeeklyReview(review)
+      message: appendWeeklyPlanningNextStep(formatWeeklyReview(review))
     };
   });
 
@@ -854,18 +837,7 @@ export function buildServer() {
       const context = await buildNextWeekPlanContext(request.params.userId, now, timezone);
       const suggestions = await generateNextWeekPlanSuggestions(context);
 
-      await replacePendingAction(request.params.userId, {
-        type: "next_week_plan",
-        summary: `Next week plan - ${context.nextWeekStartLocalDate} to ${context.nextWeekEndLocalDate}`,
-        payload: {
-          originalText: "/plan_next_week",
-          nextWeekStartLocalDate: context.nextWeekStartLocalDate,
-          nextWeekEndLocalDate: context.nextWeekEndLocalDate,
-          timezone: context.timezone,
-          suggestions: suggestions.map(toPendingNextWeekPlanSuggestion)
-        },
-        expiresAt: pendingDecisionExpiry()
-      });
+      await replacePendingPlan(request.params.userId, context, suggestions, "/plan_next_week");
 
       return {
         context: summarizeNextWeekPlanContext(context),
@@ -3606,6 +3578,10 @@ function formatWeeklyReview(review: WeeklyReviewMemory): string {
   ].join("\n");
 }
 
+function appendWeeklyPlanningNextStep(message: string): string {
+  return `${message}\n\nNext: say 'plan next week' to turn this into actions.`;
+}
+
 function summarizeWeeklyReviewContext(context: WeeklyReviewContext) {
   return {
     weekWindow: {
@@ -3648,13 +3624,23 @@ function formatWeeklyReviewContextDebug(context: WeeklyReviewContext): string {
   ].join("\n");
 }
 
-async function buildNextWeekPlanContext(userId: string, now: Date, timezone: string): Promise<NextWeekPlanContext> {
+type PlanWindowKind = "next_week" | "current_week";
+
+async function buildNextWeekPlanContext(
+  userId: string,
+  now: Date,
+  timezone: string,
+  planWindowKind: PlanWindowKind = "next_week"
+): Promise<NextWeekPlanContext> {
   const currentLocalDate = formatDateInTimezone(now, timezone);
   const currentWeekStart = startOfLocalWeek(currentLocalDate);
+  const currentWeekEnd = addDaysToLocalDateString(currentWeekStart, 6);
   const nextWeekStart = addDaysToLocalDateString(currentWeekStart, 7);
   const nextWeekEnd = addDaysToLocalDateString(nextWeekStart, 6);
-  const nextWeekRangeStart = localDateStartUtc(nextWeekStart, timezone);
-  const nextWeekRangeEnd = localDateStartUtc(addDaysToLocalDateString(nextWeekEnd, 1), timezone);
+  const planStartLocalDate = planWindowKind === "current_week" ? currentLocalDate : nextWeekStart;
+  const planEndLocalDate = planWindowKind === "current_week" ? currentWeekEnd : nextWeekEnd;
+  const planRangeStart = localDateStartUtc(planStartLocalDate, timezone);
+  const planRangeEnd = localDateStartUtc(addDaysToLocalDateString(planEndLocalDate, 1), timezone);
   const weeklyContext = await buildWeeklyReviewContext(userId, undefined, timezone, now);
   const [latestWeeklyReview, allActions, activeMemories] = await Promise.all([
     getLatestWeeklyReview(userId),
@@ -3663,18 +3649,21 @@ async function buildNextWeekPlanContext(userId: string, now: Date, timezone: str
   ]);
   const openActions = allActions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
   const futureActionsNextWeek = openActions.filter((action) =>
-    isDateInRange(action.dueAt, nextWeekRangeStart, nextWeekRangeEnd) ||
-    isDateInRange(action.snoozedUntil, nextWeekRangeStart, nextWeekRangeEnd)
+    isDateInRange(action.dueAt, planRangeStart, planRangeEnd) ||
+    isDateInRange(action.snoozedUntil, planRangeStart, planRangeEnd)
   );
 
   return {
     userId,
     timezone,
     now,
-    nextWeekStartLocalDate: nextWeekStart,
-    nextWeekEndLocalDate: nextWeekEnd,
-    nextWeekRangeStart,
-    nextWeekRangeEnd,
+    planWindowKind,
+    planStartLocalDate,
+    planEndLocalDate,
+    nextWeekStartLocalDate: planStartLocalDate,
+    nextWeekEndLocalDate: planEndLocalDate,
+    nextWeekRangeStart: planRangeStart,
+    nextWeekRangeEnd: planRangeEnd,
     latestWeeklyReview,
     activeGoals: weeklyContext.activeGoals,
     goalsWithNoProgress: weeklyContext.goalsWithoutProgress,
@@ -3723,6 +3712,7 @@ function generateDeterministicNextWeekPlanSuggestions(context: NextWeekPlanConte
       existingActionTitle: staleAction.title,
       planKind: "cleanup",
       creatable: false,
+      dedupeKey: `weekly_plan.cleanup.${staleAction.actionId}`,
       notCreatableReason: "Use /action_hygiene or say a natural cleanup command like snooze, complete, or archive."
     });
   }
@@ -3754,7 +3744,8 @@ function generateDeterministicNextWeekPlanSuggestions(context: NextWeekPlanConte
       suggestedDueAt: localPlanDate(context, 6, 18 * 60),
       actionType: "generic",
       source: "weekly_plan",
-      duplicateRisk: false
+      duplicateRisk: false,
+      dedupeKey: "weekly_plan.guardrail_review"
     });
   }
 
@@ -3769,7 +3760,8 @@ function generateDeterministicNextWeekPlanSuggestions(context: NextWeekPlanConte
         suggestedDueAt: localPlanDate(context, 0, 9 * 60),
         actionType: "generic",
         source: "weekly_plan",
-        duplicateRisk: false
+        duplicateRisk: false,
+        dedupeKey: "weekly_plan.review_open_actions"
       },
       {
         index: 0,
@@ -3780,7 +3772,8 @@ function generateDeterministicNextWeekPlanSuggestions(context: NextWeekPlanConte
         suggestedDueAt: localPlanDate(context, 2, 16 * 60 + 30),
         actionType: "generic",
         source: "weekly_plan",
-        duplicateRisk: false
+        duplicateRisk: false,
+        dedupeKey: "weekly_plan.progress_action"
       },
       {
         index: 0,
@@ -3791,7 +3784,8 @@ function generateDeterministicNextWeekPlanSuggestions(context: NextWeekPlanConte
         suggestedDueAt: localPlanDate(context, 6, 18 * 60),
         actionType: "generic",
         source: "weekly_plan",
-        duplicateRisk: false
+        duplicateRisk: false,
+        dedupeKey: "weekly_plan.run_weekly_review"
       }
     );
   }
@@ -3822,7 +3816,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
       ...base,
       title: "Apply to 3 developer jobs",
       reason,
-      suggestedDueAt: localPlanDate(context, 0, 9 * 60)
+      suggestedDueAt: localPlanDate(context, 0, 9 * 60),
+      dedupeKey: "weekly_plan.job_search_apply_3"
     };
   }
 
@@ -3831,7 +3826,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
       ...base,
       title: "Write 5 bullets for the YouTube script",
       reason,
-      suggestedDueAt: localPlanDate(context, 1, 16 * 60 + 30)
+      suggestedDueAt: localPlanDate(context, 1, 16 * 60 + 30),
+      dedupeKey: "weekly_plan.youtube_script_bullets"
     };
   }
 
@@ -3840,7 +3836,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
       ...base,
       title: "Do 2 strength sessions",
       reason,
-      suggestedDueAt: localPlanDate(context, 2, 18 * 60)
+      suggestedDueAt: localPlanDate(context, 2, 18 * 60),
+      dedupeKey: "weekly_plan.strength_sessions"
     };
   }
 
@@ -3849,7 +3846,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
       ...base,
       title: "Set sleep cutoff for 3 nights",
       reason,
-      suggestedDueAt: localPlanDate(context, 0, 20 * 60)
+      suggestedDueAt: localPlanDate(context, 0, 20 * 60),
+      dedupeKey: "weekly_plan.sleep_cutoff"
     };
   }
 
@@ -3858,7 +3856,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
       ...base,
       title: "Read 20 minutes on 3 days",
       reason,
-      suggestedDueAt: localPlanDate(context, 1, 20 * 60)
+      suggestedDueAt: localPlanDate(context, 1, 20 * 60),
+      dedupeKey: "weekly_plan.reading_20_min_3_days"
     };
   }
 
@@ -3867,7 +3866,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
       ...base,
       title: "Check cheap car listings twice",
       reason,
-      suggestedDueAt: localPlanDate(context, 3, 16 * 60 + 30)
+      suggestedDueAt: localPlanDate(context, 3, 16 * 60 + 30),
+      dedupeKey: "weekly_plan.car_listings_twice"
     };
   }
 
@@ -3875,7 +3875,8 @@ function suggestionForGoal(context: NextWeekPlanContext, goal: Goal): NextWeekPl
     ...base,
     title: `Do one concrete action for ${goal.title}`,
     reason,
-    suggestedDueAt: localPlanDate(context, 2, 16 * 60 + 30)
+    suggestedDueAt: localPlanDate(context, 2, 16 * 60 + 30),
+    dedupeKey: `weekly_plan.goal_action.${goal.id}`
   };
 }
 
@@ -3915,7 +3916,7 @@ async function maybeGenerateLlmNextWeekPlanSuggestions(
             {
               type: "input_text",
               text: [
-                "You are Alecto's next-week planning assistant.",
+                "You are Alecto's weekly planning assistant.",
                 "Code has already gathered verified context. You only propose small ActionItem suggestions.",
                 "Do not create, update, delete, or imply any database mutation.",
                 "Do not invent facts, goals, events, memories, due dates, or risk states.",
@@ -3977,9 +3978,10 @@ async function maybeGenerateLlmNextWeekPlanSuggestions(
 
 function compactNextWeekPlanLlmContext(context: NextWeekPlanContext, deterministic: NextWeekPlanSuggestion[]) {
   return {
-    nextWeek: {
-      startLocalDate: context.nextWeekStartLocalDate,
-      endLocalDate: context.nextWeekEndLocalDate,
+    planningWindow: {
+      kind: context.planWindowKind,
+      startLocalDate: context.planStartLocalDate,
+      endLocalDate: context.planEndLocalDate,
       timezone: context.timezone
     },
     latestWeeklyReview: context.latestWeeklyReview
@@ -4074,12 +4076,11 @@ function parseLlmNextWeekPlanSuggestions(
         goalTitle: goal?.title,
         priority,
         actionPriority,
-        suggestedDueAt: dueAt && dueAt >= context.nextWeekRangeStart && dueAt < context.nextWeekRangeEnd
-          ? dueAt
-          : localPlanDate(context, 2, 16 * 60 + 30),
+        suggestedDueAt: coercePlanDueAt(context, dueAt, 2, 16 * 60 + 30),
         actionType: "generic",
         source: "weekly_plan",
-        duplicateRisk: false
+        duplicateRisk: false,
+        dedupeKey: inferWeeklyPlanDedupeKey(title, goal?.title)
       };
     })
     .filter(Boolean) as NextWeekPlanSuggestion[];
@@ -4094,14 +4095,16 @@ function normalizeNextWeekPlanSuggestions(
 
   for (const suggestion of suggestions) {
     const title = sentenceLikeTitle(suggestion.title);
-    const key = normalizeManualActionTitleKey(title);
+    const dedupeKey = suggestion.dedupeKey ?? inferWeeklyPlanDedupeKey(title, suggestion.goalTitle);
+    const key = dedupeKey ?? normalizeManualActionTitleKey(title);
 
     if (!title || seen.has(key) || containsUnsafePlanAction(title)) {
       continue;
     }
 
     seen.add(key);
-    const duplicate = findEquivalentOpenPlanAction(context, title, suggestion.suggestedDueAt);
+    const suggestedDueAt = coercePlanDueAt(context, suggestion.suggestedDueAt, 2, 16 * 60 + 30);
+    const duplicate = findEquivalentOpenPlanAction(context, title, suggestedDueAt, dedupeKey);
     normalized.push({
       ...suggestion,
       index: normalized.length + 1,
@@ -4109,6 +4112,8 @@ function normalizeNextWeekPlanSuggestions(
       reason: suggestion.reason.trim().slice(0, 220),
       priority: normalizePlanPriority(suggestion.priority),
       actionPriority: normalizePlanActionPriority(suggestion.actionPriority ?? suggestion.priority),
+      suggestedDueAt,
+      dedupeKey,
       duplicateRisk: suggestion.duplicateRisk || Boolean(duplicate),
       existingActionId: suggestion.existingActionId ?? duplicate?.id,
       existingActionTitle: suggestion.existingActionTitle ?? duplicate?.title,
@@ -4135,10 +4140,19 @@ function compareGoalsForPlan(context: NextWeekPlanContext) {
 function findEquivalentOpenPlanAction(
   context: NextWeekPlanContext,
   title: string,
-  dueAt?: Date
+  dueAt?: Date,
+  dedupeKey?: string
 ): ActionItem | undefined {
   const key = normalizeManualActionTitleKey(title);
   const dueLocalDate = dueAt ? formatDateInTimezone(dueAt, context.timezone) : "";
+
+  if (dedupeKey) {
+    const semanticDuplicate = context.openActions.find((action) => weeklyPlanDedupeKeyForAction(action) === dedupeKey);
+
+    if (semanticDuplicate) {
+      return semanticDuplicate;
+    }
+  }
 
   return context.openActions.find((action) => {
     const actionKey = normalizeManualActionTitleKey(action.title);
@@ -4152,11 +4166,80 @@ function findEquivalentOpenPlanAction(
   });
 }
 
+function inferWeeklyPlanDedupeKey(title: string, goalTitle?: string): string | undefined {
+  const text = normalizeForComparison(`${title} ${goalTitle ?? ""}`);
+
+  if (isGuardrailReviewPlanText(text)) {
+    return "weekly_plan.guardrail_review";
+  }
+
+  if (/apply.*(developer|job)|developer.*job|job.*application|send.*cv|cv|resume/.test(text)) {
+    return "weekly_plan.job_search_apply_3";
+  }
+
+  if (/youtube|script|channel|video/.test(text)) {
+    return "weekly_plan.youtube_script_bullets";
+  }
+
+  if (/strength|training|workout|gym/.test(text)) {
+    return "weekly_plan.strength_sessions";
+  }
+
+  if (/sleep.*cutoff|cutoff.*sleep/.test(text)) {
+    return "weekly_plan.sleep_cutoff";
+  }
+
+  if (/read|reading|book/.test(text)) {
+    return "weekly_plan.reading_20_min_3_days";
+  }
+
+  if (/car|vehicle|listings/.test(text)) {
+    return "weekly_plan.car_listings_twice";
+  }
+
+  if (/review.*open.*actions|open.*actions.*finish/.test(text)) {
+    return "weekly_plan.review_open_actions";
+  }
+
+  if (/meaningful.*progress|progress.*action/.test(text)) {
+    return "weekly_plan.progress_action";
+  }
+
+  if (/weekly.*review|review.*sunday/.test(text)) {
+    return "weekly_plan.run_weekly_review";
+  }
+
+  return undefined;
+}
+
+function weeklyPlanDedupeKeyForAction(action: ActionItem): string | undefined {
+  const sourceId = action.sourceId ?? "";
+  const sourceMatch = sourceId.match(/weekly-plan:[^:]+:(weekly_plan\.[a-z0-9_.-]+)/);
+
+  if (sourceMatch) {
+    return sourceMatch[1];
+  }
+
+  return inferWeeklyPlanDedupeKey([
+    action.title,
+    action.description ?? "",
+    action.evidence ?? "",
+    action.goalTitleSnapshot ?? ""
+  ].join(" "));
+}
+
+function isGuardrailReviewPlanText(text: string): boolean {
+  return /review/.test(text) &&
+    /guardrail|rules/.test(text) &&
+    /betting|trading|risk|control impulsive betting|impulsive betting/.test(text);
+}
+
 function summarizeNextWeekPlanContext(context: NextWeekPlanContext) {
   return {
-    nextWeek: {
-      start: context.nextWeekStartLocalDate,
-      end: context.nextWeekEndLocalDate
+    planningWindow: {
+      kind: context.planWindowKind,
+      start: context.planStartLocalDate,
+      end: context.planEndLocalDate
     },
     latestWeeklyReview: context.latestWeeklyReview
       ? {
@@ -4178,8 +4261,8 @@ function summarizeNextWeekPlanContext(context: NextWeekPlanContext) {
 
 function formatNextWeekPlanContextDebug(context: NextWeekPlanContext): string {
   return [
-    "Next-week plan context:",
-    `nextWeek: ${context.nextWeekStartLocalDate} to ${context.nextWeekEndLocalDate}`,
+    `${formatPlanTitle(context)} context:`,
+    `planningWindow: ${context.planStartLocalDate} to ${context.planEndLocalDate}`,
     `latest weekly review: ${context.latestWeeklyReview ? `${context.latestWeeklyReview.id} (${context.latestWeeklyReview.weekStartLocalDate} to ${context.latestWeeklyReview.reviewedEndLocalDate})` : "none"}`,
     `active goals: ${context.activeGoals.length}`,
     `goals with no progress: ${context.goalsWithNoProgress.length}`,
@@ -4194,19 +4277,63 @@ function formatNextWeekPlanContextDebug(context: NextWeekPlanContext): string {
 }
 
 function formatNextWeekPlanMessage(context: NextWeekPlanContext, suggestions: NextWeekPlanSuggestion[]): string {
+  const groups = groupPlanSuggestions(suggestions);
   return [
-    `Next week plan - ${context.nextWeekStartLocalDate} to ${context.nextWeekEndLocalDate}`,
+    formatPlanTitle(context),
+    `Planning window: ${context.planStartLocalDate} to ${context.planEndLocalDate}`,
     "",
-    "Suggested actions:",
-    ...suggestions.map((suggestion) => formatNextWeekPlanSuggestionLine(suggestion, context.timezone)),
+    "Needs cleanup:",
+    ...formatPlanSuggestionGroup(groups.cleanup, context.timezone, "- None."),
     "",
-    "Reply:",
-    "- create 1",
-    "- create 1 and 2",
-    "- create all",
-    "- skip",
-    "- edit 2 to Friday morning"
+    "Already scheduled:",
+    ...formatPlanSuggestionGroup(groups.alreadyScheduled, context.timezone, "- None."),
+    "",
+    "Suggested new actions:",
+    ...formatPlanSuggestionGroup(groups.newActions, context.timezone, "- None."),
+    "",
+    ...formatNextWeekPlanReplyExamples(suggestions)
   ].join("\n");
+}
+
+function formatPlanTitle(context: NextWeekPlanContext): string {
+  return context.planWindowKind === "current_week" ? "This week plan" : "Next week plan";
+}
+
+function groupPlanSuggestions(suggestions: NextWeekPlanSuggestion[]) {
+  return {
+    cleanup: suggestions.filter((suggestion) => suggestion.planKind === "cleanup"),
+    alreadyScheduled: suggestions.filter((suggestion) => suggestion.planKind !== "cleanup" && (suggestion.duplicateRisk || suggestion.existingActionId)),
+    newActions: suggestions.filter((suggestion) => suggestion.planKind !== "cleanup" && !suggestion.duplicateRisk && !suggestion.existingActionId)
+  };
+}
+
+function formatPlanSuggestionGroup(suggestions: NextWeekPlanSuggestion[], timezone: string, emptyLine: string): string[] {
+  return suggestions.length > 0
+    ? suggestions.map((suggestion) => formatNextWeekPlanSuggestionLine(suggestion, timezone))
+    : [emptyLine];
+}
+
+async function replacePendingPlan(
+  userId: string,
+  context: NextWeekPlanContext,
+  suggestions: NextWeekPlanSuggestion[],
+  originalText: string
+) {
+  await replacePendingAction(userId, {
+    type: "next_week_plan",
+    summary: `${formatPlanTitle(context)} - ${context.planStartLocalDate} to ${context.planEndLocalDate}`,
+    payload: {
+      originalText,
+      planWindowKind: context.planWindowKind,
+      planStartLocalDate: context.planStartLocalDate,
+      planEndLocalDate: context.planEndLocalDate,
+      nextWeekStartLocalDate: context.planStartLocalDate,
+      nextWeekEndLocalDate: context.planEndLocalDate,
+      timezone: context.timezone,
+      suggestions: suggestions.map(toPendingNextWeekPlanSuggestion)
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
 }
 
 async function resolveNextWeekPlanReply(userId: string, pendingAction: PendingAction, message: string): Promise<string | undefined> {
@@ -4260,17 +4387,17 @@ async function resolveNextWeekPlanReply(userId: string, pendingAction: PendingAc
       return `Suggestion ${parsed.index} is already covered by an existing action. I did not move it. To move the existing action, say: move ${suggestion.existingActionTitle ?? suggestion.title} to ${parsed.timeText}.`;
     }
 
-    const nextWeekStart = typeof pendingAction.payload.nextWeekStartLocalDate === "string" ? pendingAction.payload.nextWeekStartLocalDate : "";
-    const nextWeekEnd = typeof pendingAction.payload.nextWeekEndLocalDate === "string" ? pendingAction.payload.nextWeekEndLocalDate : "";
+    const planStart = getPendingPlanStart(pendingAction.payload);
+    const planEnd = getPendingPlanEnd(pendingAction.payload);
     const parsedTime = parseActionDueDate(parsed.timeText, {
-      now: localDateStartUtc(nextWeekStart, timezone),
+      now: localDateStartUtc(planStart, timezone),
       timezone,
       preferences: await getOrCreateNotificationSettings(userId)
     });
     const dueAt = parsedTime.dueAt;
 
-    if (!dueAt || !nextWeekStart || !nextWeekEnd || dueAt < localDateStartUtc(nextWeekStart, timezone) || dueAt >= localDateStartUtc(addDaysToLocalDateString(nextWeekEnd, 1), timezone)) {
-      return "That edit does not land inside next week. Try: edit 2 to Friday morning.";
+    if (!dueAt || !planStart || !planEnd || dueAt < localDateStartUtc(planStart, timezone) || dueAt >= localDateStartUtc(addDaysToLocalDateString(planEnd, 1), timezone)) {
+      return "That edit does not land inside the planning window. Try: edit 2 to Friday morning.";
     }
 
     const updated = suggestions.map((item) => item.index === parsed.index ? { ...item, suggestedDueAt: dueAt } : item);
@@ -4298,7 +4425,12 @@ async function resolveNextWeekPlanReply(userId: string, pendingAction: PendingAc
     const created: string[] = [];
     const covered: string[] = [];
     const skipped: string[] = [];
-    const context = await buildNextWeekPlanContext(userId, new Date(), timezone);
+    const context = await buildNextWeekPlanContext(
+      userId,
+      new Date(),
+      timezone,
+      pendingAction.payload.planWindowKind === "current_week" ? "current_week" : "next_week"
+    );
 
     for (const suggestion of selected) {
       if (suggestion.creatable === false || suggestion.planKind === "cleanup") {
@@ -4306,7 +4438,7 @@ async function resolveNextWeekPlanReply(userId: string, pendingAction: PendingAc
         continue;
       }
 
-      const duplicate = findEquivalentOpenPlanAction(context, suggestion.title, suggestion.suggestedDueAt);
+      const duplicate = findEquivalentOpenPlanAction(context, suggestion.title, suggestion.suggestedDueAt, suggestion.dedupeKey);
 
       if (duplicate || suggestion.duplicateRisk) {
         covered.push(`${suggestion.title}${duplicate?.title ? ` (${duplicate.title})` : ""}`);
@@ -4368,7 +4500,7 @@ function parseNextWeekPlanReply(message: string):
     return { operation: "remove", index: Number(remove[1]) };
   }
 
-  if (/^create\s+all$/i.test(trimmed)) {
+  if (/^create\s+all(?:\s+new)?$/i.test(trimmed)) {
     return { operation: "create", all: true, indexes: [] };
   }
 
@@ -4413,17 +4545,35 @@ function readPendingNextWeekPlanSuggestions(value: unknown): NextWeekPlanSuggest
         existingActionTitle: typeof item.existingActionTitle === "string" ? item.existingActionTitle : undefined,
         planKind: item.planKind === "cleanup" ? "cleanup" : "action",
         creatable: item.creatable !== false,
-        notCreatableReason: typeof item.notCreatableReason === "string" ? item.notCreatableReason : undefined
+        notCreatableReason: typeof item.notCreatableReason === "string" ? item.notCreatableReason : undefined,
+        dedupeKey: typeof item.dedupeKey === "string" ? item.dedupeKey : inferWeeklyPlanDedupeKey(title, typeof item.goalTitle === "string" ? item.goalTitle : undefined)
       };
     })
     .filter(Boolean) as NextWeekPlanSuggestion[];
 }
 
+function getPendingPlanStart(payload: Record<string, unknown>): string {
+  return typeof payload.planStartLocalDate === "string"
+    ? payload.planStartLocalDate
+    : typeof payload.nextWeekStartLocalDate === "string"
+      ? payload.nextWeekStartLocalDate
+      : "";
+}
+
+function getPendingPlanEnd(payload: Record<string, unknown>): string {
+  return typeof payload.planEndLocalDate === "string"
+    ? payload.planEndLocalDate
+    : typeof payload.nextWeekEndLocalDate === "string"
+      ? payload.nextWeekEndLocalDate
+      : "";
+}
+
 function actionInputFromPlanSuggestion(suggestion: NextWeekPlanSuggestion, payload: Record<string, unknown>): CreateActionItemInput {
-  const weekStart = typeof payload.nextWeekStartLocalDate === "string" ? payload.nextWeekStartLocalDate : "unknown-week";
+  const weekStart = getPendingPlanStart(payload) || "unknown-week";
+  const sourceKey = suggestion.dedupeKey ?? normalizeManualActionTitleKey(suggestion.title);
   return {
     source: "system",
-    sourceId: `weekly-plan:${weekStart}:${normalizeManualActionTitleKey(suggestion.title)}`,
+    sourceId: `weekly-plan:${weekStart}:${sourceKey}`,
     sourceProvider: "weekly_plan",
     goalId: suggestion.goalId,
     goalTitleSnapshot: suggestion.goalTitle,
@@ -4432,7 +4582,7 @@ function actionInputFromPlanSuggestion(suggestion: NextWeekPlanSuggestion, paylo
     priority: suggestion.actionPriority ?? normalizePlanActionPriority(suggestion.priority),
     dueAt: suggestion.suggestedDueAt,
     actionType: "generic",
-    evidence: `Weekly plan suggestion: ${suggestion.reason}`
+    evidence: `Weekly plan suggestion (${sourceKey}): ${suggestion.reason}`
   };
 }
 
@@ -4444,17 +4594,65 @@ function toPendingNextWeekPlanSuggestion(suggestion: NextWeekPlanSuggestion) {
 }
 
 function formatPendingNextWeekPlan(timezone: string, payload: Record<string, unknown>, suggestions: NextWeekPlanSuggestion[]): string {
-  const start = typeof payload.nextWeekStartLocalDate === "string" ? payload.nextWeekStartLocalDate : "";
-  const end = typeof payload.nextWeekEndLocalDate === "string" ? payload.nextWeekEndLocalDate : "";
+  const start = getPendingPlanStart(payload);
+  const end = getPendingPlanEnd(payload);
+  const title = payload.planWindowKind === "current_week" ? "This week plan" : "Next week plan";
+  const groups = groupPlanSuggestions(suggestions);
 
   return [
-    `Next week plan - ${start} to ${end}`,
+    title,
+    `Planning window: ${start} to ${end}`,
     "",
-    "Suggested actions:",
-    ...suggestions.map((suggestion) => formatNextWeekPlanSuggestionLine(suggestion, timezone)),
+    "Needs cleanup:",
+    ...formatPlanSuggestionGroup(groups.cleanup, timezone, "- None."),
     "",
-    "Reply: create 1, create 1 and 2, create all, edit 2 to Friday morning, or skip."
+    "Already scheduled:",
+    ...formatPlanSuggestionGroup(groups.alreadyScheduled, timezone, "- None."),
+    "",
+    "Suggested new actions:",
+    ...formatPlanSuggestionGroup(groups.newActions, timezone, "- None."),
+    "",
+    ...formatNextWeekPlanReplyExamples(suggestions)
   ].join("\n");
+}
+
+function formatNextWeekPlanReplyExamples(suggestions: NextWeekPlanSuggestion[]): string[] {
+  const creatable = suggestions.filter(isCreatableNewPlanSuggestion);
+
+  if (creatable.length === 0) {
+    return [
+      "Reply:",
+      "Nothing new to create.",
+      "- run /action_hygiene to resolve cleanup",
+      "- ask what should I do today",
+      "- skip"
+    ];
+  }
+
+  const first = creatable[0].index;
+  const lines = [
+    "Reply:",
+    `- create ${first}`
+  ];
+
+  if (creatable.length > 1) {
+    lines.push(`- create ${first} and ${creatable[1].index}`);
+  }
+
+  lines.push(
+    "- create all new",
+    "- skip",
+    `- edit ${first} to Friday morning`
+  );
+
+  return lines;
+}
+
+function isCreatableNewPlanSuggestion(suggestion: NextWeekPlanSuggestion): boolean {
+  return suggestion.creatable !== false &&
+    suggestion.planKind !== "cleanup" &&
+    !suggestion.duplicateRisk &&
+    !suggestion.existingActionId;
 }
 
 function formatNextWeekPlanSuggestionLine(suggestion: NextWeekPlanSuggestion, timezone: string): string {
@@ -4484,10 +4682,27 @@ function formatSkippedNextWeekPlanSuggestion(suggestion: NextWeekPlanSuggestion)
   return `${suggestion.title} was skipped.`;
 }
 
-function localPlanDate(context: Pick<NextWeekPlanContext, "nextWeekStartLocalDate" | "timezone">, dayOffset: number, minutes: number): Date {
-  const date = addDaysToLocalDateString(context.nextWeekStartLocalDate, dayOffset);
+function localPlanDate(context: Pick<NextWeekPlanContext, "planStartLocalDate" | "timezone">, dayOffset: number, minutes: number): Date {
+  const date = addDaysToLocalDateString(context.planStartLocalDate, dayOffset);
   const start = localDateStartUtc(date, context.timezone);
   return new Date(start.getTime() + minutes * 60_000);
+}
+
+function coercePlanDueAt(context: NextWeekPlanContext, dueAt: Date | undefined, fallbackDayOffset: number, fallbackMinutes: number): Date {
+  if (dueAt && dueAt >= context.nextWeekRangeStart && dueAt < context.nextWeekRangeEnd) {
+    return dueAt;
+  }
+
+  const fallback = localPlanDate(context, fallbackDayOffset, fallbackMinutes);
+  if (fallback >= context.nextWeekRangeStart && fallback < context.nextWeekRangeEnd) {
+    return fallback;
+  }
+
+  const endStart = localDateStartUtc(context.planEndLocalDate, context.timezone);
+  const endFallback = new Date(endStart.getTime() + Math.min(fallbackMinutes, 18 * 60) * 60_000);
+  return endFallback >= context.nextWeekRangeStart && endFallback < context.nextWeekRangeEnd
+    ? endFallback
+    : new Date(context.nextWeekRangeStart.getTime() + 9 * 60 * 60_000);
 }
 
 function formatPlanDue(date: Date, timezone: string): string {
@@ -4525,11 +4740,41 @@ function containsUnsafePlanAction(value: string): boolean {
     /\b(?:20x|leverage|stop loss|entry|odds)\b/.test(text);
 }
 
-function looksLikeNextWeekPlanRequest(message: string): boolean {
+type PlanningRequestKind = "next_week" | "current_week" | "ambiguous";
+
+function detectPlanningRequestKind(message: string): PlanningRequestKind | undefined {
   const text = message.trim().toLowerCase();
-  return /^(create|make|build|generate)\s+(the\s+)?(?:next\s+week\s+)?plan$/.test(text) ||
-    /^(create|make|build|generate)\s+next\s+week\s+actions$/.test(text) ||
-    /^plan\s+next\s+week$/.test(text);
+
+  if (!text) {
+    return undefined;
+  }
+
+  if (
+    /^(plan|make|create|build|generate)\s+(the\s+)?next\s+week(?:\s+(plan|actions))?$/.test(text) ||
+    /^(make|create|build|generate)\s+next\s+week\s+actions$/.test(text) ||
+    /^plan\s+the\s+next\s+week$/.test(text) ||
+    /^create\s+a\s+plan\s+from\s+the\s+weekly\s+review$/.test(text)
+  ) {
+    return "next_week";
+  }
+
+  if (
+    /^(plan|make|create|build|generate)\s+(my|this)\s+week(?:\s+plan)?$/.test(text) ||
+    /^make\s+a\s+plan\s+for\s+this\s+week$/.test(text) ||
+    /^what\s+should\s+i\s+focus\s+on\s+this\s+week$/.test(text)
+  ) {
+    return "current_week";
+  }
+
+  if (/^(make\s+a\s+plan|help\s+me\s+plan|what\s+should\s+i\s+plan)$/.test(text)) {
+    return "ambiguous";
+  }
+
+  return undefined;
+}
+
+function looksLikeNextWeekPlanRequest(message: string): boolean {
+  return detectPlanningRequestKind(message) === "next_week";
 }
 
 function isActionRelevantToReviewedRange(action: ActionItem, rangeStart: Date, rangeEnd: Date): boolean {
@@ -4884,6 +5129,8 @@ type ConversationSurfaceIntent =
   | "daily_review"
   | "weekly_review"
   | "next_week_plan"
+  | "current_week_plan"
+  | "ambiguous_plan"
   | "action_hygiene"
   | "show_goals"
   | "show_actions"
@@ -4944,11 +5191,19 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     const context = await buildWeeklyReviewContext(userId, undefined, timezone, now);
     const existing = await getWeeklyReviewForWeek(userId, context.weekStartLocalDate);
     const review = existing ? toWeeklyReviewMemory(existing) : await generateAndSaveWeeklyReview(userId, context);
-    return formatWeeklyReview(review);
+    return appendWeeklyPlanningNextStep(formatWeeklyReview(review));
   }
 
   if (intent === "next_week_plan") {
-    return createNextWeekPlanForConversation(userId, message);
+    return createPlanForConversation(userId, message, "next_week");
+  }
+
+  if (intent === "current_week_plan") {
+    return createPlanForConversation(userId, message, "current_week");
+  }
+
+  if (intent === "ambiguous_plan") {
+    return createPlanForConversation(userId, message, "ambiguous");
   }
 
   if (intent === "action_hygiene") {
@@ -5053,8 +5308,17 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "weekly_review";
   }
 
-  if (looksLikeNextWeekPlanRequest(message) || /\b(plan next week|make next week actions|create a plan from the weekly review)\b/.test(text)) {
+  const planningRequest = detectPlanningRequestKind(message);
+  if (planningRequest === "next_week") {
     return "next_week_plan";
+  }
+
+  if (planningRequest === "current_week") {
+    return "current_week_plan";
+  }
+
+  if (planningRequest === "ambiguous") {
+    return "ambiguous_plan";
   }
 
   if (/\b(clean up my tasks|clean up tasks|what tasks are stale|help me clean actions|clean up my actions|stale tasks)\b/.test(text)) {
@@ -5401,23 +5665,29 @@ function formatConversationDailyReview(review: ReturnType<typeof buildDailyRevie
   ].filter(Boolean).join("\n");
 }
 
-async function createNextWeekPlanForConversation(userId: string, originalText: string): Promise<string> {
+async function createPlanForConversation(userId: string, originalText: string, requestKind: PlanningRequestKind): Promise<string> {
+  if (requestKind === "ambiguous") {
+    const pending = await getLatestPendingAction(userId);
+
+    if (pending?.type === "next_week_plan") {
+      const timezone = typeof pending.payload.timezone === "string" ? pending.payload.timezone : await getUserTimezone(userId);
+      return formatPendingNextWeekPlan(timezone, pending.payload, readPendingNextWeekPlanSuggestions(pending.payload.suggestions));
+    }
+
+    const recentWeeklyReview = await getLatestWeeklyReview(userId);
+
+    if (!recentWeeklyReview) {
+      return "Do you mean this week or next week?";
+    }
+
+    requestKind = "next_week";
+  }
+
   const timezone = await getUserTimezone(userId);
   const now = new Date();
-  const context = await buildNextWeekPlanContext(userId, now, timezone);
+  const context = await buildNextWeekPlanContext(userId, now, timezone, requestKind === "current_week" ? "current_week" : "next_week");
   const suggestions = await generateNextWeekPlanSuggestions(context);
-  await replacePendingAction(userId, {
-    type: "next_week_plan",
-    summary: `Next week plan - ${context.nextWeekStartLocalDate} to ${context.nextWeekEndLocalDate}`,
-    payload: {
-      originalText,
-      nextWeekStartLocalDate: context.nextWeekStartLocalDate,
-      nextWeekEndLocalDate: context.nextWeekEndLocalDate,
-      timezone: context.timezone,
-      suggestions: suggestions.map(toPendingNextWeekPlanSuggestion)
-    },
-    expiresAt: pendingDecisionExpiry()
-  });
+  await replacePendingPlan(userId, context, suggestions, originalText);
 
   return formatNextWeekPlanMessage(context, suggestions);
 }
@@ -10936,6 +11206,9 @@ interface NextWeekPlanContext {
   userId: string;
   timezone: string;
   now: Date;
+  planWindowKind: PlanWindowKind;
+  planStartLocalDate: string;
+  planEndLocalDate: string;
   nextWeekStartLocalDate: string;
   nextWeekEndLocalDate: string;
   nextWeekRangeStart: Date;
@@ -10974,6 +11247,7 @@ interface NextWeekPlanSuggestion {
   planKind?: "action" | "cleanup";
   creatable?: boolean;
   notCreatableReason?: string;
+  dedupeKey?: string;
 }
 
 type DailyCoachSource = "llm" | "fallback_disabled" | "fallback_invalid" | "fallback_error" | "fallback_timeout";
