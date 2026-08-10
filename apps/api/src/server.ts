@@ -4876,6 +4876,7 @@ type ConversationSurfaceIntent =
   | "setup_state"
   | "quickstart"
   | "configure_goals"
+  | "configure_actions"
   | "configure_daily_loop"
   | "configure_integrations"
   | "daily_operator"
@@ -4911,6 +4912,10 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
 
   if (intent === "configure_goals") {
     return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_goals");
+  }
+
+  if (intent === "configure_actions") {
+    return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_actions");
   }
 
   if (intent === "configure_daily_loop") {
@@ -5020,6 +5025,10 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "configure_goals";
   }
 
+  if (/\b(set up actions|setup actions|how do reminders work|how do tasks work|create my first task|set up tasks|setup tasks|configure actions|configure tasks)\b/.test(text)) {
+    return "configure_actions";
+  }
+
   if (/\b(set up daily loop|setup daily loop|configure daily loop|set up reminders|configure reminders)\b/.test(text)) {
     return "configure_daily_loop";
   }
@@ -5080,6 +5089,7 @@ type OnboardingIntent =
   | "setup_overview"
   | "quickstart"
   | "configure_goals"
+  | "configure_actions"
   | "configure_daily_loop"
   | "configure_reminders"
   | "configure_integrations"
@@ -5132,12 +5142,12 @@ async function buildOnboardingState(userId: string, now: Date, timezone: string)
   const recommendedNextStep =
     goals.length === 0
       ? "Tell me a real goal, for example: I want to find a new developer job."
-      : !settings.dailyLoopEnabled
-        ? "Say: turn on morning brief at 9 and evening review at 21:30."
-        : actions.length === 0
-          ? "Create one concrete next action, for example: remind me to apply tomorrow."
+      : actions.length === 0
+        ? "Create one concrete next action, for example: remind me to apply tomorrow."
+        : !settings.dailyLoopEnabled
+          ? "Say: turn on morning brief at 9 and evening review at 21:30."
           : hygiene.suggestedCleanupCandidates.length > 0
-            ? "Run /action_hygiene or say: clean up my tasks."
+            ? "Say: clean up my tasks."
             : "Ask: what should I do today.";
 
   return {
@@ -5203,11 +5213,22 @@ function composeOnboardingReply(state: OnboardingState, intent: OnboardingIntent
   }
 
   if (intent === "quickstart") {
+    const firstStep =
+      state.goalsCount === 0
+        ? 'Start here: say "I want to find a new developer job" or another real goal.'
+        : state.openActionsCount === 0
+          ? 'Start here: say "remind me to apply tomorrow" or another concrete next action.'
+          : state.overdueOrStaleActionsCount > 0
+            ? 'Start here: say "clean up my tasks".'
+            : 'Start here: ask "what should I do today".';
+
     return [
       "Quickstart:",
-      "1. Tell me one goal in normal language.",
-      "2. Create one next action.",
-      "3. Ask what to do today.",
+      "1. Set 1-3 real goals.",
+      "2. Add one next action.",
+      "3. Let Alecto pick the next move each day.",
+      "",
+      firstStep,
       "",
       "Examples:",
       '- "I want to find a new developer job"',
@@ -5219,16 +5240,40 @@ function composeOnboardingReply(state: OnboardingState, intent: OnboardingIntent
   }
 
   if (intent === "configure_goals") {
+    if (state.topGoals.length > 0) {
+      return [
+        "Goal setup:",
+        `Current goals: ${state.topGoals.join(", ")}${state.goalsCount > state.topGoals.length ? `, +${state.goalsCount - state.topGoals.length} more` : ""}.`,
+        "",
+        "That is enough to operate. Adding more goals may add noise unless something truly matters now.",
+        "",
+        "If you do want another one, say it naturally. I will ask confirmation before creating it."
+      ].join("\n");
+    }
+
     return [
       "Goal setup:",
-      state.topGoals.length > 0 ? `Current goals: ${state.topGoals.join(", ")}${state.goalsCount > state.topGoals.length ? `, +${state.goalsCount - state.topGoals.length} more` : ""}.` : "No active goals yet.",
+      "Choose 1-3 goals only. Fewer goals makes the operator loop sharper.",
       "",
-      "Tell me goals naturally:",
+      "Good first goals:",
       '- "I want to find a new developer job"',
       '- "I want to improve strength and energy"',
       '- "I want to read more"',
       "",
-      "I will ask confirmation when creating a goal. Optional shortcut: /templates."
+      "I will ask confirmation before creating a goal."
+    ].join("\n");
+  }
+
+  if (intent === "configure_actions") {
+    return [
+      "Actions are concrete things you might do, with optional reminders.",
+      "",
+      "Try:",
+      '- "remind me to apply to 3 jobs tomorrow"',
+      '- "I need to review homepage copy Friday"',
+      '- "move YouTube script to tomorrow afternoon"',
+      "",
+      "You can also say things like done with it, snooze it to tomorrow, or archive the car task. I will ask if the target is ambiguous."
     ].join("\n");
   }
 
@@ -5240,6 +5285,7 @@ function composeOnboardingReply(state: OnboardingState, intent: OnboardingIntent
       `- evening review: ${state.eveningTime} ${state.timezone}`,
       `- default action time: ${state.actionReminderDefaultTime}`,
       "",
+      "Morning brief picks the first move. Evening review closes the day and catches cleanup.",
       'Natural option: "turn on morning brief at 9 and evening review at 21:30".',
       "Optional shortcut: /set_daily_loop morning=09:00 evening=21:30 enabled=true."
     ].join("\n");
@@ -5263,7 +5309,18 @@ function composeOnboardingReply(state: OnboardingState, intent: OnboardingIntent
     `Daily brief: ${state.dailyLoopEnabled ? `enabled, ${state.morningTime}` : "disabled"}`,
     `Evening review: ${state.dailyLoopEnabled ? `enabled, ${state.eveningTime}` : "disabled"}`
   ];
-  const missing = state.missingSetupItems.length > 0 ? state.missingSetupItems : ["nothing required for local alpha"];
+  const needsAttention = [
+    state.goalsCount === 0 ? "No goals yet" : undefined,
+    state.openActionsCount === 0 ? "No open actions yet" : undefined,
+    !state.dailyLoopEnabled ? "Daily loop is off" : undefined,
+    state.overdueOrStaleActionsCount > 0 ? cleanupDecisionGrammar(state.overdueOrStaleActionsCount) : undefined
+  ].filter((item): item is string => Boolean(item));
+  const optional = [
+    `Gmail: ${state.gmailStatus === "connected" ? "connected" : "not connected"}`,
+    `GitHub: ${state.githubConnectionCount} public ${state.githubConnectionCount === 1 ? "connection" : "connections"}`,
+    `Email rules: ${state.activeEmailRulesCount} active`,
+    `Timezone: ${state.timezone}`
+  ];
 
   return [
     "Alecto setup",
@@ -5271,13 +5328,11 @@ function composeOnboardingReply(state: OnboardingState, intent: OnboardingIntent
     "Ready:",
     ...ready.map((item) => `- ${item}`),
     "",
-    "Missing:",
-    ...missing.map((item) => `- ${item}`),
+    "Needs attention:",
+    ...(needsAttention.length > 0 ? needsAttention : ["Nothing blocking the local alpha loop."]).map((item) => `- ${item}`),
     "",
-    `Profile: ${state.profileSummary}`,
-    `Notifications: ${state.notificationSummary}`,
-    `Integrations: ${state.connectedIntegrationsCount} connected; Gmail ${state.gmailStatus === "connected" ? "connected" : "not connected"}; GitHub ${state.githubConnectionCount}`,
-    state.overdueOrStaleActionsCount > 0 ? `Cleanup: ${cleanupDecisionGrammar(state.overdueOrStaleActionsCount)} Run /action_hygiene.` : undefined,
+    "Optional:",
+    ...optional.map((item) => `- ${item}`),
     "",
     `Best next step: ${state.recommendedNextStep}`
   ].filter(Boolean).join("\n");
@@ -5426,18 +5481,21 @@ function formatIntegrationGuidance(message: string): string {
 
   if (/\bgmail\b/.test(text)) {
     return [
-      "Gmail is a readonly signal source.",
-      "It never sends email or changes labels. It only scans after you connect Gmail and enable an explicit email rule.",
-      "Optional shortcuts: /connect_gmail, then /enable_email_rule job_search or /enable_email_rule work_action.",
-      "Local MVP note: tokens are stored locally and sanitized from all replies."
+      "Gmail setup is two steps.",
+      "1. Connect Gmail with readonly access.",
+      "2. Enable one email rule, such as job search or work actions.",
+      "",
+      "Alecto will not scan Gmail until a rule is enabled. Uncertain emails go to review before becoming events or actions.",
+      "Shortcuts: /connect_gmail, then /enable_email_rule job_search or /enable_email_rule work_action."
     ].join("\n");
   }
 
   if (/\bgithub\b/.test(text)) {
     return [
-      "GitHub public sync watches public repos only.",
-      "Without author=LOGIN, repo activity is context, not personal progress. With author=LOGIN, matching commits count as personal commits.",
-      "Optional shortcut: /connect_github OWNER/REPO author=LOGIN."
+      "GitHub setup is for public repos only.",
+      "Use author=LOGIN when you want matching commits to count as personal progress. Without it, repo activity is only context.",
+      "",
+      "Example: /connect_github OWNER/REPO author=LOGIN."
     ].join("\n");
   }
 

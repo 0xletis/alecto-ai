@@ -34,6 +34,7 @@ Status:
 - [x] inbound routing hardening and command batching
 - [x] conversation-first UX parity for core operator surfaces
 - [x] conversation-first onboarding/setup v1 for `/start`, `/setup`, natural quickstart, goals, daily loop, and integration guidance
+- [x] First 5 Minutes Onboarding v1 with guide-style `/start`, setup overview, goals/actions/reminders/daily-loop guidance, and explicit Gmail/GitHub setup boundaries
 
 Explicitly out of MVP 0:
 - [ ] WhatsApp
@@ -90,7 +91,7 @@ Status:
 ## Current Next Useful Work
 
 Likely high-leverage next items:
-- refine onboarding copy and guided setup sessions based on real alpha usage
+- refine first-run onboarding into a fuller guided setup session only after more real alpha usage
 - keep `/plan_next_week` regression-tested as the bridge from weekly review into confirmed next-week ActionItems
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until encryption is implemented

@@ -8,7 +8,7 @@ This is a product/architecture checkpoint. The implementation ledger remains `do
 
 Alecto is a **local technical alpha**.
 
-It is usable by the founder over Telegram, with real local persistence, proactive worker jobs, Gmail/GitHub signal ingestion, ActionItems, daily/weekly operator loops, deterministic guardrails, and a conversation-first onboarding/setup flow. It is not product-ready for non-technical users because auth, token encryption, settings UI, production scheduling, cross-channel UX, and broader product packaging are not ready.
+It is usable by the founder over Telegram, with real local persistence, proactive worker jobs, Gmail/GitHub signal ingestion, ActionItems, daily/weekly operator loops, deterministic guardrails, and a conversation-first first-five-minutes onboarding/setup flow. It is not product-ready for non-technical users because auth, token encryption, settings UI, production scheduling, cross-channel UX, and broader product packaging are not ready.
 
 ## Capability Matrix
 
@@ -16,8 +16,8 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | --- | --- | --- | --- | --- | --- | --- |
 | Telegram chat | implemented | Telegram bot | Telegram messages | optional response/analysis | yes, via worker | operational hardening |
 | Normal message routing | implemented | natural text, slash commands | `NormalizedInboundMessage` | optional fallback only | no | more channel tests |
-| Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts | existing services | none required | no | richer onboarding language |
-| User onboarding/setup v1 | implemented | `/start`, `/setup`, natural setup/quickstart messages | onboarding state from goals/actions/settings/integrations | none | no | full guided wizard/settings UI |
+| Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts | existing services | none required | no | richer cross-channel tests |
+| First 5 Minutes Onboarding v1 | implemented | `/start`, `/setup`, natural setup/quickstart/goals/actions/daily-loop/integration messages | onboarding state from goals/actions/settings/integrations/hygiene | none | no | full guided wizard/settings UI |
 | Goals | implemented | `/goals`, `/create_goal`, natural goal creation | Postgres `Goal` | optional classification | no | simpler onboarding |
 | Events/check-ins | implemented | `/checkin`, natural logs, `/events`, `/review` | Postgres `Event` | optional extraction | daily check-in reminder | broader parser coverage |
 | Memories | implemented | `/memory`, `/remember`, `/forget_memory` | Postgres `MemoryEntry` | optional inference | no | semantic retrieval missing |
@@ -243,7 +243,7 @@ The target product should work mostly without command memorization:
 
 ### Product UX
 
-- [x] local alpha conversation-first onboarding/setup flow
+- [x] local alpha conversation-first first-five-minutes onboarding/setup flow
 - [ ] production onboarding wizard/settings UI
 - [ ] simplified command surface
 - [ ] user settings UI
@@ -304,7 +304,7 @@ Risk:
 ### 3. Production Onboarding And Settings UX
 
 Why:
-- Local alpha onboarding exists, but production users still need account/auth, secure settings, and a cleaner guided setup surface.
+- First 5 Minutes Onboarding v1 exists for the local alpha, but production users still need account/auth, secure settings, and a cleaner guided setup surface.
 
 Risk:
 - Do not mark production OAuth/token encryption complete until it is actually implemented.
@@ -313,4 +313,4 @@ Risk:
 
 Build **Planning UX Consolidation v1** next.
 
-Onboarding v1 is now implemented for the local alpha. The next high-leverage work is smoothing the weekly-review-to-plan loop without adding new integrations or auto-creating actions. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.
+First 5 Minutes Onboarding v1 is now implemented for the local alpha. The next high-leverage work is smoothing the weekly-review-to-plan loop without adding new integrations or auto-creating actions. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.

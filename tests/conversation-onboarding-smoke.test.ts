@@ -104,10 +104,25 @@ test("conversation-first onboarding smoke routes through /messages/process safel
 
     const before = await counts();
 
+    const start = await server.inject({ method: "GET", url: `/users/${userId}/onboarding/start` });
+    assert.equal(start.statusCode, 200);
+    assert.match(start.json().message, /Hey, I'm Alecto/);
+    assert.match(start.json().message, /You can talk normally/);
+    assert.doesNotMatch(start.json().message, /\/[a-z_]{3,}.*\/[a-z_]{3,}.*\/[a-z_]{3,}/s);
+
     assert.match(await send("what can you do"), /I can help with|Daily planning|Goals|Guardrails/i);
-    assert.match(await send("help me set up"), /Alecto setup|Goals: 3 active|Actions: 2 open/i);
+    const setupReply = await send("help me set up");
+    assert.match(setupReply, /Alecto setup/);
+    assert.match(setupReply, /Ready:/);
+    assert.match(setupReply, /Goals: 3 active/);
+    assert.match(setupReply, /Actions: 2 open/);
+    assert.match(setupReply, /Needs attention:/);
+    assert.match(setupReply, /Optional:/);
+    assert.match(setupReply, /Best next step:/);
     assert.match(await send("how do I start"), /Quickstart:|what should I do today/i);
-    assert.match(await send("set up goals"), /Goal setup:|Tell me one outcome/i);
+    assert.match(await send("what should I configure"), /Alecto setup|Best next step/i);
+    assert.match(await send("set up goals"), /Goal setup:|enough to operate/i);
+    assert.match(await send("how do reminders work"), /Actions are concrete things|remind me to apply to 3 jobs tomorrow/i);
     assert.match(await send("set up daily loop"), /Daily loop setup:|morning brief/i);
 
     const afterReadOnly = await counts();
@@ -142,5 +157,69 @@ test("conversation-first onboarding smoke routes through /messages/process safel
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("first five minutes onboarding chooses safe next steps by setup state", async () => {
+  const server = buildServer();
+  const emptyUserId = `api-empty-onboarding-${randomUUID()}`;
+  const staleUserId = `api-stale-onboarding-${randomUUID()}`;
+
+  const send = async (userId: string, message: string) => {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message }
+    });
+    assert.equal(response.statusCode, 200, message);
+    return String(response.json().reply ?? "");
+  };
+
+  try {
+    await prisma.user.create({ data: { id: emptyUserId } });
+    await prisma.notificationSettings.create({ data: { userId: emptyUserId, timezone: "Europe/Madrid" } });
+
+    let reply = await send(emptyUserId, "how do I start");
+    assert.match(reply, /Start here: say "I want to find a new developer job"/);
+    assert.match(reply, /Best next step: Tell me a real goal/);
+
+    reply = await send(emptyUserId, "set up goals");
+    assert.match(reply, /Choose 1-3 goals only/);
+    assert.match(reply, /I want to find a new developer job/);
+    assert.match(reply, /I want to improve strength and energy/);
+    assert.match(reply, /I want to read more/);
+    assert.equal(await prisma.goal.count({ where: { userId: emptyUserId } }), 0);
+    assert.equal(await prisma.actionItem.count({ where: { userId: emptyUserId } }), 0);
+
+    await prisma.user.create({ data: { id: staleUserId } });
+    await prisma.notificationSettings.create({ data: { userId: staleUserId, timezone: "Europe/Madrid", dailyLoopEnabled: true } });
+    await prisma.goal.create({
+      data: {
+        userId: staleUserId,
+        title: "Build a YouTube channel",
+        category: "creative",
+        priority: "medium",
+        importanceScore: 25
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: staleUserId,
+        source: "manual",
+        title: "Write YouTube script",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-01T14:30:00.000Z"),
+        evidence: "write youtube script"
+      }
+    });
+
+    reply = await send(staleUserId, "help me set up");
+    assert.match(reply, /Needs attention:/);
+    assert.match(reply, /clean up my tasks|cleanup/i);
+    assert.match(reply, /Best next step: Say: clean up my tasks/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [emptyUserId, staleUserId] } } });
   }
 });

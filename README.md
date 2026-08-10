@@ -116,9 +116,9 @@ Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each T
 
 ## Product Surfaces
 
-Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what is missing`, `set up goals`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
+Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
 
-Onboarding is conversation-first and shared through the API. `/start` gives a first-run intro, `/setup` shows the same safe setup overview used by natural setup messages, and neither command mutates state. Gmail remains readonly local-MVP and does not scan until the user connects Gmail and explicitly enables an email rule.
+First 5 Minutes Onboarding v1 is conversation-first and shared through the API. `/start` gives a short first-run intro with four natural examples. `/setup`, `help me set up`, and `what should I configure` show Ready, Needs attention, Optional, and Best next step sections. Goal, action/reminder, daily-loop, Gmail, and GitHub setup messages guide the next safe step without requiring command memorization. These guide replies do not mutate state. Gmail remains readonly local-MVP and does not scan until the user connects Gmail and explicitly enables an email rule.
 
 Normal user commands:
 - `/today`, `/start_day`, `/end_day`, `/tomorrow`
@@ -661,6 +661,7 @@ Manual insight tests:
 - Weekly insight summary: log events across multiple days, then run `/weekly_insight`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
 - Weekly operator review: complete or snooze actions, trigger a guardrail if relevant, add/refine an operator reflection, then run `/weekly`. It should save one weekly review memory and `/weekly_last` should show it.
 - Next-week planning: run `/weekly`, then `/plan_next_week`. It should propose safe goal-linked actions, display action priority separately from goal priority, and create none until the user replies `create 1`, `create all`, or another explicit selection. Stale cleanup suggestions should be marked non-creatable and skipped by `create all`.
+- First 5 Minutes Onboarding: send `/start`, `help me set up`, `how do I start`, `what should I configure`, `set up goals`, `how do reminders work`, `set up daily loop`, `connect Gmail`, and `connect GitHub`. The replies should feel like a guide, not documentation; show a clear next step; avoid command dumps; expose no tokens/raw email/provider errors; and create no goals/actions/integrations/email rules unless the user gives an explicit mutation request.
 - Conversation-first UX: send natural messages such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my tasks`, and `connect Gmail`. They should route to the existing surfaces without exposing tokens, raw email bodies, or creating actions unless explicit confirmation/selection is required.
 
 ## API Routes

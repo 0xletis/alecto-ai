@@ -529,6 +529,10 @@ test("conversation-first surface routes natural operator requests without leakin
     assert.match(response.json().reply, /Alecto setup/);
     assert.match(response.json().reply, /Goals: 2 active/);
     assert.match(response.json().reply, /Actions: 2 open/);
+    assert.match(response.json().reply, /Ready:/);
+    assert.match(response.json().reply, /Needs attention:/);
+    assert.match(response.json().reply, /Optional:/);
+    assert.match(response.json().reply, /Best next step:/);
     assert.doesNotMatch(response.json().reply, /secret-access-token|secret-refresh-token/i);
 
     response = await server.inject({
@@ -546,7 +550,7 @@ test("conversation-first surface routes natural operator requests without leakin
       payload: { userId: uxUserId, message: "what is missing" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Missing:/);
+    assert.match(response.json().reply, /Needs attention:/);
 
     const beforeOnboardingActions = await prisma.actionItem.count({ where: { userId: uxUserId } });
     const beforeOnboardingGoals = await prisma.goal.count({ where: { userId: uxUserId } });
@@ -557,9 +561,18 @@ test("conversation-first surface routes natural operator requests without leakin
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Goal setup:/);
-    assert.match(response.json().reply, /I want to find a new developer job/);
+    assert.match(response.json().reply, /enough to operate|confirmation/i);
     assert.equal(await prisma.goal.count({ where: { userId: uxUserId } }), beforeOnboardingGoals);
     assert.equal(await prisma.actionItem.count({ where: { userId: uxUserId } }), beforeOnboardingActions);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "how do reminders work" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Actions are concrete things/i);
+    assert.match(response.json().reply, /remind me to apply to 3 jobs tomorrow/i);
 
     response = await server.inject({
       method: "POST",
@@ -661,8 +674,9 @@ test("conversation-first surface routes natural operator requests without leakin
       payload: { userId: uxUserId, message: "connect Gmail" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /readonly signal source/);
-    assert.match(response.json().reply, /explicit email rule/);
+    assert.match(response.json().reply, /readonly access/);
+    assert.match(response.json().reply, /will not scan Gmail until a rule is enabled/);
+    assert.match(response.json().reply, /go to review/);
     assert.doesNotMatch(response.json().reply, /secret-access-token|secret-refresh-token|raw/i);
 
     response = await server.inject({

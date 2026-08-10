@@ -29,6 +29,7 @@ After every implementation pass:
 - [x] Intent routing before business logic
 - [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, and integration guidance requests
 - [x] User onboarding/setup simplification v1: shared API onboarding state/reply composer, `/start`, `/setup`, natural quickstart, missing setup, goals setup, daily-loop setup, and integration setup guidance
+- [x] First 5 Minutes Onboarding v1: guide-style `/start`, setup overview with Ready/Needs attention/Optional/Best next step, state-aware next-step suggestions, action/reminder onboarding, and explicit Gmail/GitHub setup boundaries
 - [x] Inbound message segmentation for single commands, command batches, reference text, and normal text
 - [x] Safe command batches for read-only commands and selected action write commands
 - [x] Reference/log/code-fence safety so pasted command examples are not executed
