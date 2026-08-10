@@ -116,6 +116,8 @@ Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each T
 
 ## Product Surfaces
 
+Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
+
 Normal user commands:
 - `/today`, `/start_day`, `/end_day`, `/tomorrow`
 - `/actions`, `/action`, `/complete_action`, `/snooze_action`, `/archive_action`
@@ -509,6 +511,9 @@ Expected:
 - `work_action_email` reviews are different: approving `work_action_required`, `work_deadline_detected`, `work_follow_up_requested`, or `work_project_update_detected` creates an ActionItem, not an Event.
 - ActionItems are things to do. Events are things that happened. Use `/action`, `/todo`, `/add_action`, `/actions`, `/complete_action`, `/snooze_action`, and `/archive_action` to manage open work items.
 - Natural concrete task messages such as `I need to review homepage copy tomorrow` or `remind me to call Alex Friday` create manual ActionItems. Vague reflections and betting/trading reminders do not create actions.
+- Conversation-first operator requests such as `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, and `connect GitHub` route to the same existing read-only or confirmation-first product surfaces.
+- Hygiene-session replies are guarded against fake success: incomplete replies such as `snooze 2` ask for a time, and cleanup sessions remain active while other listed actions still need decisions.
+- Natural daily-loop settings such as `turn on morning brief at 9` update settings only after the database write succeeds. Ambiguous settings requests return a concrete example instead of pretending a change happened.
 - `/remember` still saves memory. If the remembered text clearly contains a concrete future task, Alecto also creates or reuses a manual ActionItem.
 - Use `/cleanup_gmail_rule_events RULE_ID` to archive test Gmail events from one rule without deleting historical data.
 - `/messages/process` returns a rule-based intent, mode, risk state, extracted events, and reply. Extracted events are saved in Postgres through Prisma.
@@ -654,6 +659,7 @@ Manual insight tests:
 - Weekly insight summary: log events across multiple days, then run `/weekly_insight`. It should aggregate applications, workouts, reading, sleep/anxiety/focus averages, cooldown count, check-ins, and consistency patterns.
 - Weekly operator review: complete or snooze actions, trigger a guardrail if relevant, add/refine an operator reflection, then run `/weekly`. It should save one weekly review memory and `/weekly_last` should show it.
 - Next-week planning: run `/weekly`, then `/plan_next_week`. It should propose safe goal-linked actions, display action priority separately from goal priority, and create none until the user replies `create 1`, `create all`, or another explicit selection. Stale cleanup suggestions should be marked non-creatable and skipped by `create all`.
+- Conversation-first UX: send natural messages such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my tasks`, and `connect Gmail`. They should route to the existing surfaces without exposing tokens, raw email bodies, or creating actions unless explicit confirmation/selection is required.
 
 ## API Routes
 

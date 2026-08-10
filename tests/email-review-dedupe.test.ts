@@ -404,6 +404,226 @@ test("pasted prompt with risky examples does not trigger guardrail or cooldown",
   }
 });
 
+test("conversation-first surface routes natural operator requests without leaking secrets", async () => {
+  const server = buildServer();
+  const uxUserId = `conversation-parity-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({
+      where: { id: uxUserId },
+      update: {},
+      create: { id: uxUserId }
+    });
+    await prisma.goal.createMany({
+      data: [
+        {
+          userId: uxUserId,
+          title: "Find a new developer job",
+          category: "career",
+          templateId: "career.job_search",
+          priority: "critical",
+          importanceScore: 70
+        },
+        {
+          userId: uxUserId,
+          title: "Build a YouTube channel",
+          category: "creative",
+          priority: "medium",
+          importanceScore: 25
+        }
+      ]
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: uxUserId,
+        source: "manual",
+        title: "Apply to 2 jobs",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-07T07:00:00.000Z"),
+        actionType: "deadline",
+        evidence: "apply to 2 jobs"
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: uxUserId,
+        source: "manual",
+        title: "Write YouTube script",
+        status: "open",
+        priority: "medium",
+        dueAt: new Date("2026-08-01T14:30:00.000Z"),
+        actionType: "deadline",
+        evidence: "write youtube script"
+      }
+    });
+    await prisma.memoryEntry.create({
+      data: {
+        userId: uxUserId,
+        type: "preference",
+        status: "active",
+        summary: "User prefers direct, factual replies.",
+        source: "test",
+        confidence: 1
+      }
+    });
+    await prisma.event.create({
+      data: {
+        userId: uxUserId,
+        type: "career.application_sent",
+        timestamp: new Date(),
+        source: "manual",
+        data: { count: 2 },
+        confidence: 1,
+        evidence: ["sent 2 applications"]
+      }
+    });
+    await prisma.integrationConnection.create({
+      data: {
+        userId: uxUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          email: "user@example.com",
+          accessToken: "secret-access-token",
+          refreshToken: "secret-refresh-token"
+        }
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "what can you do" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Daily planning/);
+    assert.match(response.json().reply, /Guardrails/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "help me set up" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Setup state:/);
+    assert.match(response.json().reply, /active goals: 2/);
+    assert.match(response.json().reply, /open actions: 2/);
+    assert.doesNotMatch(response.json().reply, /secret-access-token|secret-refresh-token/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "what should I do today" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Today -/);
+    assert.match(response.json().reply, /Next move:/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "review my day" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Today:/);
+    assert.match(response.json().reply, /Next step:/);
+    assert.doesNotMatch(response.json().reply, /Do one concrete action for Control impulsive betting/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "review my week" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Weekly review/);
+    const weeklyReviewCount = await prisma.memoryEntry.count({
+      where: { userId: uxUserId, status: "active", data: { path: ["kind"], equals: "weekly_review" } }
+    });
+    assert.equal(weeklyReviewCount, 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "plan next week" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Next week plan/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: uxUserId, sourceProvider: "weekly_plan" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "clean up my tasks" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action hygiene:/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "show my goals" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Active goals:/);
+    assert.match(response.json().reply, /Find a new developer job/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "show my tasks" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Open actions:/);
+    assert.match(response.json().reply, /Apply to 2 jobs/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "show my memories" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Active memories:/);
+    assert.match(response.json().reply, /direct, factual replies/);
+    assert.doesNotMatch(response.json().reply, /Verified reviewed period/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "connect Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /readonly signal source/);
+    assert.match(response.json().reply, /explicit email rule/);
+    assert.doesNotMatch(response.json().reply, /secret-access-token|secret-refresh-token|raw/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "turn on morning brief at 9" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Daily loop updated/);
+    assert.match(response.json().reply, /Morning brief: 09:00/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: uxUserId, message: "I want to bet 500 tomorrow and show setup" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.doesNotMatch(response.json().reply, /Setup state:/);
+
+    const reference = segmentInboundMessage("[30/07/2026 04:56] letis: /archive_action abc\n[30/07/2026 04:56] Alecto AI: Action archived");
+    assert.equal(reference.kind, "reference_text");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: uxUserId } });
+  }
+});
+
 test("manual actions infer links to active goals", async () => {
   const server = buildServer();
   const actionUserId = `action-goal-links-${randomUUID()}`;
@@ -4937,6 +5157,103 @@ test("action hygiene ignores future snoozed actions and updates daily loop hygie
     assert.equal(response.statusCode, 200);
     assert.equal(response.json().brief.suggestedNextStep, "Next upcoming action: Review homepage.");
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: futureAction.id } })).status, "open");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: hygieneUserId } });
+  }
+});
+
+test("action hygiene sessions stay active and never fake snooze success", async () => {
+  const server = buildServer();
+  const hygieneUserId = `action-hygiene-session-${randomUUID()}`;
+  const now = "2026-08-10T14:45:00+02:00";
+  await prisma.user.create({ data: { id: hygieneUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: hygieneUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  const youtubeGoal = await prisma.goal.create({
+    data: {
+      userId: hygieneUserId,
+      title: "Build a YouTube channel",
+      category: "creative",
+      priority: "high",
+      importanceScore: 45
+    }
+  });
+  const firstAction = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Write YouTube script",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T14:30:00.000Z"),
+      goalId: youtubeGoal.id,
+      goalTitleSnapshot: youtubeGoal.title
+    }
+  });
+  const secondAction = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Review homepage",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-05T07:00:00.000Z")
+    }
+  });
+
+  try {
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /1\. Write YouTube script/);
+    assert.match(response.json().message, /2\. Review homepage/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "complete 1 and snooze 2" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Handle one hygiene action at a time/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: firstAction.id } })).status, "open");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: secondAction.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "complete 1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action completed: Write YouTube script/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: firstAction.id } })).status, "completed");
+    assert.equal(await prisma.pendingAction.count({ where: { userId: hygieneUserId, status: "pending", type: "action_hygiene" } }), 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "snooze 2" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Add a time for the snooze/);
+    assert.doesNotMatch(response.json().reply, /I've logged|future scheduling/i);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: secondAction.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "snooze 2 tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action snoozed until 11\/08\/2026, 09:00: Review homepage/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: secondAction.id } })).status, "snoozed");
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: hygieneUserId } });

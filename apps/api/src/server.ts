@@ -51,6 +51,7 @@ import {
   processMessage,
   processMessageFromAnalysis,
   ProcessMessageInputSchema,
+  routeIntent,
   parsedDailyCheckInToAnswers,
   parseDailyCheckinText,
   parseConversationControlTime,
@@ -240,6 +241,16 @@ export function buildServer() {
       return replyOnly(parsed.data.userId, parsed.data.message, "What should I schedule now? Example: /action call Alex now");
     }
 
+    const earlyGuardrailGoals = await getActiveGoals(parsed.data.userId);
+    const earlyGuardrail = evaluateGoalGuardrails({
+      text: parsed.data.message,
+      activeGoals: earlyGuardrailGoals
+    });
+
+    if (earlyGuardrail.triggered && !earlyGuardrail.isReferenceOnly) {
+      return createGuardianGuardrailReply(parsed.data.userId, parsed.data.message, earlyGuardrail);
+    }
+
     const latestPendingAction = await getLatestPendingAction(parsed.data.userId);
 
     if (latestPendingAction) {
@@ -250,6 +261,14 @@ export function buildServer() {
       }
     } else if (looksLikePendingDecisionReply(parsed.data.message)) {
       return replyOnly(parsed.data.userId, parsed.data.message, "That pending decision expired. Please ask again.");
+    }
+
+    if (looksLikeUnresolvedHygieneReply(parsed.data.message)) {
+      return replyOnly(
+        parsed.data.userId,
+        parsed.data.message,
+        "Run /action_hygiene first, then reply with a cleanup command like: snooze 1 tomorrow."
+      );
     }
 
     if (looksLikeNextWeekPlanRequest(parsed.data.message)) {
@@ -296,8 +315,26 @@ export function buildServer() {
       return replyOnly(parsed.data.userId, parsed.data.message, replyText);
     }
 
+    const activeGoalsForGuardrail = earlyGuardrailGoals;
+    const surfaceGuardrail = evaluateGoalGuardrails({
+      text: parsed.data.message,
+      activeGoals: activeGoalsForGuardrail
+    });
+
+    if (surfaceGuardrail.triggered && !surfaceGuardrail.isReferenceOnly) {
+      return createGuardianGuardrailReply(parsed.data.userId, parsed.data.message, surfaceGuardrail);
+    }
+
+    if (!surfaceGuardrail.triggered || surfaceGuardrail.isReferenceOnly) {
+      const surfaceReply = await handleConversationSurfaceIntent(parsed.data.userId, parsed.data.message);
+
+      if (surfaceReply) {
+        return replyOnly(parsed.data.userId, parsed.data.message, surfaceReply);
+      }
+    }
+
     const recentEvents = await getRecentEvents(parsed.data.userId, 50);
-    const activeGoals = await getActiveGoals(parsed.data.userId);
+    const activeGoals = activeGoalsForGuardrail;
     const activeMemories = await getActiveMemories(parsed.data.userId);
     const userOperatingProfile = await getOrCreateUserOperatingProfile(parsed.data.userId);
     const processInput = {
@@ -4784,6 +4821,480 @@ class DailyCoachTimeoutError extends Error {
   constructor() {
     super("Daily coach LLM timed out.");
   }
+}
+
+type ConversationSurfaceIntent =
+  | "capability_help"
+  | "setup_state"
+  | "daily_operator"
+  | "start_day"
+  | "daily_review"
+  | "weekly_review"
+  | "next_week_plan"
+  | "action_hygiene"
+  | "show_goals"
+  | "show_actions"
+  | "show_memory"
+  | "integration_guidance"
+  | "daily_loop_settings";
+
+async function handleConversationSurfaceIntent(userId: string, message: string): Promise<string | undefined> {
+  const intent = detectConversationSurfaceIntent(message);
+
+  if (!intent) {
+    return undefined;
+  }
+
+  if (intent === "capability_help") {
+    return formatCapabilityHelpReply();
+  }
+
+  if (intent === "setup_state") {
+    return formatSetupStateReply(await buildSetupState(userId));
+  }
+
+  if (intent === "daily_operator") {
+    return formatConversationTodayReply(await generateDailyOperatorBrief(userId));
+  }
+
+  if (intent === "start_day") {
+    return buildStartDayMessage(userId, new Date());
+  }
+
+  if (intent === "daily_review") {
+    return formatConversationDailyReview(await buildConversationDailyReview(userId));
+  }
+
+  if (intent === "weekly_review") {
+    const timezone = await getUserTimezone(userId);
+    const now = new Date();
+    const context = await buildWeeklyReviewContext(userId, undefined, timezone, now);
+    const existing = await getWeeklyReviewForWeek(userId, context.weekStartLocalDate);
+    const review = existing ? toWeeklyReviewMemory(existing) : await generateAndSaveWeeklyReview(userId, context);
+    return formatWeeklyReview(review);
+  }
+
+  if (intent === "next_week_plan") {
+    return createNextWeekPlanForConversation(userId, message);
+  }
+
+  if (intent === "action_hygiene") {
+    const now = new Date();
+    const timezone = await getUserTimezone(userId);
+    const report = await analyzeActionHygiene(userId, now, timezone);
+    await replacePendingAction(userId, {
+      type: "action_hygiene",
+      summary: report.summary,
+      payload: {
+        originalText: message,
+        now: now.toISOString(),
+        timezone,
+        candidates: report.suggestedCleanupCandidates.map((candidate) => candidate.actionId),
+        candidateActions: report.suggestedCleanupCandidates.map((candidate) => ({
+          ...toPendingActionCandidate({
+            id: candidate.actionId,
+            title: candidate.title,
+            status: "open",
+            dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
+            goalTitleSnapshot: candidate.linkedGoalTitle
+          }),
+          recommendedOptions: candidate.recommendedOptions
+        }))
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+    return formatActionHygieneReport(report);
+  }
+
+  if (intent === "show_goals") {
+    return formatGoalsForConversation(await getGoals(userId));
+  }
+
+  if (intent === "show_actions") {
+    return formatActionsForConversation(await getActionItems(userId, { status: "open", limit: 10 }));
+  }
+
+  if (intent === "show_memory") {
+    return formatMemoriesForConversation(await getActiveMemories(userId));
+  }
+
+  if (intent === "integration_guidance") {
+    return formatIntegrationGuidance(message);
+  }
+
+  if (intent === "daily_loop_settings") {
+    return handleNaturalDailyLoopSettings(userId, message);
+  }
+
+  return undefined;
+}
+
+function detectConversationSurfaceIntent(message: string): ConversationSurfaceIntent | undefined {
+  const text = normalizeForComparison(message);
+
+  if (!text) {
+    return undefined;
+  }
+
+  if (/^(help|what can you do|how do you work|how do i use this|how to use this)$/.test(text)) {
+    return "capability_help";
+  }
+
+  if (/^(help me set up|how do i start|what should i configure|setup|show setup|set me up)$/.test(text)) {
+    return "setup_state";
+  }
+
+  if (/\b(turn on|enable|set)\b.*\b(morning brief|evening review|daily loop|morning|evening)\b/.test(text) || /\bremind me every morning\b/.test(text)) {
+    return "daily_loop_settings";
+  }
+
+  if (/\b(start my day|morning brief)\b/.test(text)) {
+    return "start_day";
+  }
+
+  if (/\b(what should i do today|what should i do now|show today|show my day|today plan|what is my plan today)\b/.test(text)) {
+    return "daily_operator";
+  }
+
+  if (/\b(review my day|what happened today|how did today go|daily review)\b/.test(text)) {
+    return "daily_review";
+  }
+
+  if (/\b(review my week|how did this week go|weekly review)\b/.test(text)) {
+    return "weekly_review";
+  }
+
+  if (looksLikeNextWeekPlanRequest(message) || /\b(plan next week|make next week actions|create a plan from the weekly review)\b/.test(text)) {
+    return "next_week_plan";
+  }
+
+  if (/\b(clean up my tasks|clean up tasks|what tasks are stale|help me clean actions|clean up my actions|stale tasks)\b/.test(text)) {
+    return "action_hygiene";
+  }
+
+  if (/\b(show my goals|show goals|list my goals|list goals)\b/.test(text)) {
+    return "show_goals";
+  }
+
+  if (/\b(show my tasks|show tasks|show my actions|show actions|list tasks|list actions)\b/.test(text)) {
+    return "show_actions";
+  }
+
+  if (/\b(show my memories|show memories|show my memory|list memories|what do you remember)\b/.test(text)) {
+    return "show_memory";
+  }
+
+  if (/\b(connect gmail|set up gmail|setup gmail|connect github|set up github|setup github|set up integrations|setup integrations|connect integrations)\b/.test(text)) {
+    return "integration_guidance";
+  }
+
+  return undefined;
+}
+
+function formatCapabilityHelpReply(): string {
+  return [
+    "I help you operate from evidence, not vibes.",
+    "",
+    "- Daily planning: what to do today, start/end day, tomorrow prep.",
+    "- Goals: track active goals, priorities, and progress evidence.",
+    "- Actions/reminders: create, complete, snooze, archive, and get due reminders.",
+    "- Check-ins/events: log sleep, energy, anxiety, focus, training, reading, applications, and other approved events.",
+    "- Memory: remember preferences and recurring patterns.",
+    "- Guardrails: hard-stop betting/trading risk before it becomes a task or rationalization.",
+    "- Weekly review/planning: review the week and propose next-week actions only after confirmation.",
+    "- Signals: Gmail/GitHub can add context after explicit connection and approved rules.",
+    "",
+    "You can talk naturally. Commands like /today, /actions, /weekly, and /plan_next_week are shortcuts."
+  ].join("\n");
+}
+
+async function buildSetupState(userId: string) {
+  const [goals, actions, settings, connections, emailRules] = await Promise.all([
+    getActiveGoals(userId),
+    getActionItems(userId, { status: "open", limit: 100 }),
+    getOrCreateNotificationSettings(userId),
+    getIntegrationConnections(userId),
+    getEmailSignalRules(userId)
+  ]);
+  const activeConnections = connections.filter((connection) => connection.status === "active");
+  const activeEmailRules = emailRules.filter((rule) => rule.status === "active");
+  const gmailConnected = activeConnections.some((connection) => connection.integrationId === "gmail");
+  const githubConnected = activeConnections.some((connection) => connection.integrationId === "github_public");
+  const bestNextStep =
+    goals.length === 0
+      ? "Create one active goal."
+      : !settings.dailyLoopEnabled
+        ? "Turn on the daily loop when you want proactive morning/evening briefs."
+        : actions.length === 0
+          ? "Create one concrete next action."
+          : gmailConnected && activeEmailRules.length === 0
+            ? "Enable an email rule only if you want Gmail scanning."
+            : "Use /today or ask what to do today.";
+
+  return {
+    goalsCount: goals.length,
+    openActionsCount: actions.length,
+    dailyLoopEnabled: settings.dailyLoopEnabled,
+    timezone: settings.timezone,
+    gmailConnected,
+    githubConnected,
+    activeEmailRulesCount: activeEmailRules.length,
+    bestNextStep
+  };
+}
+
+function formatSetupStateReply(state: Awaited<ReturnType<typeof buildSetupState>>): string {
+  return [
+    "Setup state:",
+    `- active goals: ${state.goalsCount}`,
+    `- daily loop: ${state.dailyLoopEnabled ? "on" : "off"} (${state.timezone})`,
+    `- open actions: ${state.openActionsCount}`,
+    `- integrations: Gmail ${state.gmailConnected ? "connected" : "not connected"}, GitHub ${state.githubConnected ? "connected" : "not connected"}`,
+    `- active email rules: ${state.activeEmailRulesCount}`,
+    "",
+    `Best next step: ${state.bestNextStep}`
+  ].join("\n");
+}
+
+async function createGuardianGuardrailReply(
+  userId: string,
+  message: string,
+  guardrail: ReturnType<typeof evaluateGoalGuardrails>
+): Promise<ProcessMessageResult> {
+  const intent = routeIntent(message);
+  await createEvent(userId, {
+    type: "finance.betting.cooldown_triggered",
+    timestamp: new Date(),
+    source: "manual",
+    data: {
+      intent,
+      reason: "goal_guardrail",
+      guardrail: {
+        goalId: guardrail.goalId,
+        goalTitle: guardrail.goalTitle,
+        category: guardrail.guardrailCategory,
+        severity: guardrail.severity,
+        responseMode: guardrail.responseMode,
+        blockedActionCreation: guardrail.blockedActionCreation,
+        cooldownRequired: guardrail.cooldownRequired,
+        reason: guardrail.reason
+      }
+    },
+    evidence: [message],
+    confidence: guardrail.confidence
+  });
+
+  return {
+    userId,
+    message,
+    intent: isFinancialRiskIntent(intent) ? intent : "financial_impulse",
+    mode: "guardian",
+    riskState: "RED",
+    extractedEvents: [],
+    reply: "No. Hard stop. I am not helping you turn this into permission. Cooldown now. If it still matters later, bring a written thesis, exact size, invalidation point, and emotional state."
+  };
+}
+
+async function buildConversationDailyReview(userId: string) {
+  const todayRange = getLocalTodayRange(new Date(), await getUserTimezone(userId));
+  return buildDailyReview({
+    userId,
+    activeGoals: await getActiveGoals(userId),
+    todayEvents: await getEventsBetween(userId, todayRange.start, todayRange.end),
+    activeMemories: await getRelevantMemories(userId, {
+      types: ["risk_pattern"],
+      limit: 3
+    })
+  });
+}
+
+function formatConversationDailyReview(review: ReturnType<typeof buildDailyReview>): string {
+  return [
+    review.summary,
+    review.checkIn.length > 0 ? `Check-in: ${review.checkIn.join(", ")}` : undefined,
+    `Wins: ${review.wins.length > 0 ? review.wins.join(", ") : "none logged"}`,
+    `Gaps: ${review.gaps.length > 0 ? review.gaps.join(", ") : "none obvious"}`,
+    review.warnings.length > 0 ? `Warnings:\n${review.warnings.map((warning) => `- ${warning}`).join("\n")}` : undefined,
+    `Next step: ${review.suggestedFocus}`
+  ].filter(Boolean).join("\n");
+}
+
+async function createNextWeekPlanForConversation(userId: string, originalText: string): Promise<string> {
+  const timezone = await getUserTimezone(userId);
+  const now = new Date();
+  const context = await buildNextWeekPlanContext(userId, now, timezone);
+  const suggestions = await generateNextWeekPlanSuggestions(context);
+  await replacePendingAction(userId, {
+    type: "next_week_plan",
+    summary: `Next week plan - ${context.nextWeekStartLocalDate} to ${context.nextWeekEndLocalDate}`,
+    payload: {
+      originalText,
+      nextWeekStartLocalDate: context.nextWeekStartLocalDate,
+      nextWeekEndLocalDate: context.nextWeekEndLocalDate,
+      timezone: context.timezone,
+      suggestions: suggestions.map(toPendingNextWeekPlanSuggestion)
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
+
+  return formatNextWeekPlanMessage(context, suggestions);
+}
+
+function formatGoalsForConversation(goals: Awaited<ReturnType<typeof getGoals>>): string {
+  const active = sortGoalsForDisplay(goals).filter((goal) => goal.status === "active");
+  if (active.length === 0) {
+    return "No active goals.";
+  }
+
+  return ["Active goals:", ...active.slice(0, 10).map((goal, index) => `${index + 1}. ${goal.title} - ${goal.priority ?? "medium"}`)].join("\n");
+}
+
+function formatActionsForConversation(actions: Awaited<ReturnType<typeof getActionItems>>): string {
+  if (actions.length === 0) {
+    return "No open action items.";
+  }
+
+  return [
+    "Open actions:",
+    ...actions.slice(0, 10).map((action) =>
+      `- ${action.title}${action.dueAt ? ` - due ${formatLocalDateTime(action.dueAt)}` : ""}${action.goalTitleSnapshot ? ` - goal: ${action.goalTitleSnapshot}` : ""}`
+    )
+  ].join("\n");
+}
+
+function formatMemoriesForConversation(memories: MemoryEntry[]): string {
+  const visibleMemories = uniqueConversationMemories(memories);
+
+  if (visibleMemories.length === 0) {
+    return "No active memories.";
+  }
+
+  return ["Active memories:", ...visibleMemories.slice(0, 10).map((memory) => `- ${memory.summary}`)].join("\n");
+}
+
+function uniqueConversationMemories(memories: MemoryEntry[]): MemoryEntry[] {
+  const seen = new Set<string>();
+  const visible: MemoryEntry[] = [];
+
+  for (const memory of memories) {
+    if (isRecord(memory.data) && memory.data.kind === "weekly_review") {
+      continue;
+    }
+
+    const key = normalizeComparableText(memory.summary);
+
+    if (!key || seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    visible.push(memory);
+  }
+
+  return visible;
+}
+
+function formatIntegrationGuidance(message: string): string {
+  const text = normalizeForComparison(message);
+
+  if (/\bgmail\b/.test(text)) {
+    return [
+      "Gmail is a readonly signal source.",
+      "It never sends email or changes labels. It only scans after you connect Gmail and enable an explicit email rule.",
+      "Optional shortcuts: /connect_gmail, then /enable_email_rule job_search or /enable_email_rule work_action.",
+      "Local MVP note: tokens are stored locally and sanitized from all replies."
+    ].join("\n");
+  }
+
+  if (/\bgithub\b/.test(text)) {
+    return [
+      "GitHub public sync watches public repos only.",
+      "Without author=LOGIN, repo activity is context, not personal progress. With author=LOGIN, matching commits count as personal commits.",
+      "Optional shortcut: /connect_github OWNER/REPO author=LOGIN."
+    ].join("\n");
+  }
+
+  return [
+    "Integrations are explicit and opt-in.",
+    "- Gmail: readonly, rule-based scanning only after approval.",
+    "- GitHub: public repos only; author=LOGIN is needed for personal commit progress.",
+    "Optional shortcuts: /connect_gmail, /connect_github OWNER/REPO author=LOGIN, /my_integrations."
+  ].join("\n");
+}
+
+async function handleNaturalDailyLoopSettings(userId: string, message: string): Promise<string> {
+  const settings = await getOrCreateNotificationSettings(userId);
+  const parsed = parseNaturalDailyLoopSettings(message);
+
+  if (!parsed) {
+    return [
+      "I can help set the daily loop, but I need a concrete time.",
+      "Examples: turn on morning brief at 09:00, set evening review at 21:30."
+    ].join("\n");
+  }
+
+  const updated = await updateNotificationSettings(userId, {
+    dailyLoopEnabled: true,
+    morningTimeMinutes: parsed.morningTimeMinutes,
+    eveningTimeMinutes: parsed.eveningTimeMinutes
+  });
+
+  return [
+    "Daily loop updated.",
+    parsed.morningTimeMinutes !== undefined ? `Morning brief: ${formatMinutesOfDay(parsed.morningTimeMinutes)} ${updated.timezone}` : undefined,
+    parsed.eveningTimeMinutes !== undefined ? `Evening review: ${formatMinutesOfDay(parsed.eveningTimeMinutes)} ${updated.timezone}` : undefined,
+    parsed.morningTimeMinutes === undefined && parsed.eveningTimeMinutes === undefined ? `Enabled with current times: morning ${formatMinutesOfDay(settings.morningTimeMinutes)}, evening ${formatMinutesOfDay(settings.eveningTimeMinutes)} ${updated.timezone}` : undefined
+  ].filter(Boolean).join("\n");
+}
+
+function parseNaturalDailyLoopSettings(message: string): { morningTimeMinutes?: number; eveningTimeMinutes?: number } | undefined {
+  const text = message.trim();
+  const timeMatch = text.match(/\b(?:at|a las)?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
+  const minutes = timeMatch ? parseNaturalTimeToMinutes(timeMatch[1], timeMatch[2], timeMatch[3]) : undefined;
+
+  if (/\bmorning\b/i.test(text) && minutes !== undefined) {
+    return { morningTimeMinutes: minutes };
+  }
+
+  if (/\bevening|night|review\b/i.test(text) && minutes !== undefined) {
+    return { eveningTimeMinutes: minutes };
+  }
+
+  if (/\bremind me every morning\b/i.test(text)) {
+    return {};
+  }
+
+  return undefined;
+}
+
+function parseNaturalTimeToMinutes(hourText: string, minuteText?: string, meridiem?: string): number | undefined {
+  let hour = Number(hourText);
+  const minute = minuteText ? Number(minuteText) : 0;
+
+  if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+    return undefined;
+  }
+
+  if (meridiem?.toLowerCase() === "pm" && hour < 12) {
+    hour += 12;
+  }
+
+  if (meridiem?.toLowerCase() === "am" && hour === 12) {
+    hour = 0;
+  }
+
+  if (hour < 0 || hour > 23) {
+    return undefined;
+  }
+
+  return hour * 60 + minute;
+}
+
+function formatMinutesOfDay(minutes: number): string {
+  const safe = Number.isInteger(minutes) && minutes >= 0 && minutes <= 1439 ? minutes : 0;
+  const hours = Math.floor(safe / 60);
+  const mins = safe % 60;
+  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
 }
 
 async function buildConversationControlDebugForUser(userId: string, text: string) {
@@ -9348,6 +9859,14 @@ async function resolveActionHygieneReply(
   message: string,
   now = new Date()
 ): Promise<string | undefined> {
+  if (/\s+\band\b\s+/i.test(message.trim())) {
+    return "Handle one hygiene action at a time. Try: complete 1 or snooze 2 tomorrow.";
+  }
+
+  if (/^snooze\s+(.+)$/i.test(message.trim()) && !parseActionHygieneReply(message)) {
+    return "Add a time for the snooze. Try: snooze 2 tomorrow.";
+  }
+
   const parsed = parseActionHygieneReply(message);
 
   if (!parsed) {
@@ -9403,7 +9922,7 @@ async function resolveActionHygieneReply(
   }
 
   if (parsed.operation === "keep") {
-    await confirmPendingAction(userId, pendingAction.id);
+    await closeHygieneSessionIfDone(userId, pendingAction, now);
     return `Kept for now: ${action.title}`;
   }
 
@@ -9421,7 +9940,7 @@ async function resolveActionHygieneReply(
     }
 
     const progressEvent = await createGoalProgressFromCompletedAction(userId, completed);
-    await confirmPendingAction(userId, pendingAction.id);
+    await closeHygieneSessionIfDone(userId, pendingAction, now);
 
     return [
       `Action completed: ${completed.title}`,
@@ -9470,11 +9989,31 @@ async function resolveActionHygieneReply(
       return "I could not update that action.";
     }
 
-    await confirmPendingAction(userId, pendingAction.id);
+    await closeHygieneSessionIfDone(userId, pendingAction, now);
     return `Action snoozed until ${formatLocalDateTime(updated.snoozedUntil, settings.timezone)}: ${updated.title}`;
   }
 
   return undefined;
+}
+
+async function closeHygieneSessionIfDone(userId: string, pendingAction: PendingAction, now: Date): Promise<void> {
+  const candidates = readPendingActionCandidates(pendingAction.payload.candidateActions);
+  const remaining = await Promise.all(candidates.map((candidate) => getActionItem(userId, candidate.id)));
+  const stillNeedsDecision = remaining.some((action) => {
+    if (!action || action.status === "completed" || action.status === "archived") {
+      return false;
+    }
+
+    if (action.status === "snoozed" && action.snoozedUntil && action.snoozedUntil.getTime() > now.getTime()) {
+      return false;
+    }
+
+    return true;
+  });
+
+  if (!stillNeedsDecision) {
+    await confirmPendingAction(userId, pendingAction.id);
+  }
 }
 
 function readPendingActionCandidates(value: unknown): PendingActionCandidate[] {
@@ -9611,6 +10150,20 @@ function looksLikePendingDecisionReply(message: string): boolean {
     /^#?\d+$/.test(trimmed) ||
     /^(the\s+)?(first|second|third|fourth|fifth)(\s+one)?$/i.test(trimmed) ||
     /^(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta)$/i.test(trimmed)
+  );
+}
+
+function looksLikeUnresolvedHygieneReply(message: string): boolean {
+  const trimmed = message.trim();
+
+  if (!trimmed) {
+    return false;
+  }
+
+  return (
+    /^snooze\s+(?:#?\d+|first|second|third|fourth|fifth|.+)$/i.test(trimmed) ||
+    /^(complete|done|archive|delete|remove|keep)\s+(?:#?\d+|first|second|third|fourth|fifth)$/i.test(trimmed) ||
+    /\b(?:complete|done|snooze|archive|delete|remove|keep)\s+#?\d+\s+\band\b\s+(?:complete|done|snooze|archive|delete|remove|keep)\s+#?\d+/i.test(trimmed)
   );
 }
 

@@ -32,6 +32,7 @@ Status:
 - [x] action items and reminders
 - [x] daily operator brief and daily operating loop
 - [x] inbound routing hardening and command batching
+- [x] conversation-first UX parity for core operator surfaces
 
 Explicitly out of MVP 0:
 - [ ] WhatsApp
@@ -88,7 +89,7 @@ Status:
 ## Current Next Useful Work
 
 Likely high-leverage next items:
-- simplify onboarding/setup and the command surface now that `/weekly` and `/plan_next_week` are both implemented
+- continue simplifying onboarding/setup now that common natural requests route to the right surfaces
 - keep `/plan_next_week` regression-tested as the bridge from weekly review into confirmed next-week ActionItems
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until encryption is implemented

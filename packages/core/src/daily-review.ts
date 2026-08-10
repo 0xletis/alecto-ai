@@ -193,6 +193,7 @@ function buildGaps(activeGoals: Goal[], todayEvents: StoredEvent[]): string[] {
 
   const todayEventTypes = new Set<string>(todayEvents.map((event) => event.type));
   const gaps = activeGoals
+    .filter((goal) => !isRiskControlGoalForReview(goal))
     .filter((goal) => {
       if (goal.templateId) {
         return goalStatusForTemplate(goal.templateId, todayEvents, todayEventTypes) === "no relevant event today";
@@ -216,7 +217,13 @@ function buildSuggestedFocus(activeGoals: Goal[], gaps: string[]): string {
   const firstGoal = activeGoals[0];
 
   if (firstGoal) {
-    return `Move one concrete step on ${firstGoal.title}.`;
+    const normalGoal = activeGoals.find((goal) => !isRiskControlGoalForReview(goal));
+
+    if (normalGoal) {
+      return `Move one concrete step on ${normalGoal.title}.`;
+    }
+
+    return "Keep guardrails separate from normal task progress.";
   }
 
   if (gaps.includes("No active goals set")) {
@@ -224,6 +231,11 @@ function buildSuggestedFocus(activeGoals: Goal[], gaps: string[]): string {
   }
 
   return "Log one meaningful action before the day ends.";
+}
+
+function isRiskControlGoalForReview(goal: Goal): boolean {
+  const text = `${goal.title} ${goal.category} ${goal.templateId ?? ""}`.toLowerCase();
+  return /\b(finance|betting|trading|gambling|impulse|risk|risk-control|control_betting_trading|apuesta|apostar)\b/.test(text);
 }
 
 function buildActiveGoalStatuses(activeGoals: Goal[], todayEvents: StoredEvent[]) {

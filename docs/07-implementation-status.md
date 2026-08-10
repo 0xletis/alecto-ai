@@ -27,6 +27,7 @@ After every implementation pass:
 - [x] Telegram-first channel adapter
 - [x] Channel-agnostic `NormalizedInboundMessage` abstraction
 - [x] Intent routing before business logic
+- [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, and integration guidance requests
 - [x] Inbound message segmentation for single commands, command batches, reference text, and normal text
 - [x] Safe command batches for read-only commands and selected action write commands
 - [x] Reference/log/code-fence safety so pasted command examples are not executed
@@ -106,11 +107,13 @@ After every implementation pass:
 - [x] Pending decisions for ambiguous or destructive conversational actions
 - [x] Multi-intent conversational orchestrator
 - [x] Action hygiene analyzer, `/action_hygiene`, `/debug_action_hygiene`, and hygiene-session replies
+- [x] Hygiene reply hardening: sessions stay active across completed/snoozed candidates, incomplete snooze replies ask for a time, and generic chat cannot fake cleanup success
 - [~] Snooze history/count is inferred from available state where possible; no full action history model yet
 
 ## Daily And Weekly Operator Loop
 
 - [x] `/today` daily operator brief
+- [x] Natural daily operator requests such as `what should I do today` and `start my day`
 - [x] Daily priority scoring with goal priority weights
 - [x] `/debug_daily_priorities`
 - [x] Optional LLM Daily Coach with strict validation and deterministic fallback

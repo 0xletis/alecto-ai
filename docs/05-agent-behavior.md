@@ -44,6 +44,7 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] Pasted logs, code fences, Codex prompts, and debug output are treated as reference text and have no side effects.
 - [x] Pending decision replies such as `yes`, `no`, `1`, or `second one` resolve before normal routing.
 - [x] Guardrail/risk intent wins before action creation or generic chat.
+- [x] Conversation-first surface routing maps natural operator requests to existing services: help/capabilities, setup state, daily operator brief, daily review, weekly review, next-week planning, action hygiene, goals, actions, memories, and integration guidance.
 - [x] Explicit memory phrases create memory through the message processor.
 - [x] Natural daily check-ins require state/progress signals.
 - [x] Pasted job-search emails route through generic ingestion.
@@ -58,6 +59,7 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] `/plan_next_week` turns weekly review context into proposed next-week actions and waits for explicit create/skip/edit replies.
 - [x] `/insight` and `/weekly_insight` provide interpretive coaching reports.
 - [x] `/action_hygiene` asks the user to decide on stale/overdue tasks; it never archives automatically.
+- [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my goals`, and `connect Gmail` use the same underlying services as command shortcuts.
 - [x] `/debug_route`, `/debug_conversation_intent`, `/debug_daily_priorities`, `/debug_daily_coach`, `/debug_action_hygiene`, and `/debug_weekly_context` expose safe debugging views.
 
 ## Side-Effect Rule

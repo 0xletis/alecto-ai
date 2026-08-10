@@ -111,7 +111,7 @@ export function detectConversationControlIntent(text: string): ConversationContr
     return goalPriority;
   }
 
-  const showToday = /\b(show today|plan today|my plan today|what is my plan today|what'?s my plan today|what is due today|what'?s due today)\b/i.test(trimmed);
+  const showToday = /\b(show today|show my day|start my day|plan today|my plan today|what should i do today|what is my plan today|what'?s my plan today|what is due today|what'?s due today)\b/i.test(trimmed);
   if (showToday) {
     return {
       intent: "show_today",

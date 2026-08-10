@@ -16,6 +16,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | --- | --- | --- | --- | --- | --- | --- |
 | Telegram chat | implemented | Telegram bot | Telegram messages | optional response/analysis | yes, via worker | operational hardening |
 | Normal message routing | implemented | natural text, slash commands | `NormalizedInboundMessage` | optional fallback only | no | more channel tests |
+| Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts | existing services | none required | no | richer onboarding language |
 | Goals | implemented | `/goals`, `/create_goal`, natural goal creation | Postgres `Goal` | optional classification | no | simpler onboarding |
 | Events/check-ins | implemented | `/checkin`, natural logs, `/events`, `/review` | Postgres `Event` | optional extraction | daily check-in reminder | broader parser coverage |
 | Memories | implemented | `/memory`, `/remember`, `/forget_memory` | Postgres `MemoryEntry` | optional inference | no | semantic retrieval missing |
@@ -27,6 +28,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | Multi-intent orchestration | implemented | natural multi-part messages | message segments + services | no required LLM | no | more regression tests |
 | Daily loop | implemented | `/today`, `/start_day`, `/end_day`, `/tomorrow` | actions/goals/events/risks | optional Daily Coach | yes | UX consolidation |
 | Action hygiene | implemented | `/action_hygiene` | ActionItems | none | surfaced in daily loop | history/snooze analytics |
+| Hygiene-session safety | implemented | natural replies such as `complete 1`, `snooze 2 tomorrow` | PendingAction + ActionItems | asks for missing time or confirmation | prevents fake cleanup success | richer multi-operation cleanup replies |
 | Weekly review/planning | implemented | `/weekly`, `/weekly_last`, `/plan_next_week` | actions/events/goals/reflections/hygiene | optional guarded draft for review; plan is deterministic with optional mock-gated suggestions | no | planning UX consolidation |
 | Weekly insight | implemented | `/weekly_insight` | active events/goals/memory/profile | optional polish | scheduled delivery available | overlaps with weekly review |
 | Gmail readonly | partial | `/connect_gmail`, `/sync_gmail` | Gmail API | optional classifier | scheduled sync available | token encryption/OAuth production |
@@ -74,6 +76,7 @@ These exist, but normal messages should often replace them:
 - `/log_progress`
 - `/checkin`
 - `/remember`
+- `/today`, `/review`, `/weekly`, `/plan_next_week`, `/action_hygiene`, `/goals`, `/actions`, `/memory`, and integration setup readouts
 
 Expected natural alternatives:
 - `I need to call Alex tomorrow`
@@ -81,6 +84,14 @@ Expected natural alternatives:
 - `done with apply to 2 jobs`
 - `slept 6h, energy 5, anxiety 7, trained 30 min`
 - `remember that I hate generic motivation`
+- `what can you do`
+- `help me set up`
+- `what should I do today`
+- `review my week`
+- `plan next week`
+- `clean up my tasks`
+- `show my goals`
+- `connect Gmail`
 
 ### 3. Review And Planning Commands
 
@@ -200,7 +211,7 @@ The target product should work mostly without command memorization:
 
 1. Morning: Alecto sends a `/start_day`-style brief with the first move, top open actions, and guardrail watchouts.
 2. During the day: the user replies naturally with updates, tasks, reschedules, completions, or reflections.
-3. Alecto logs events/actions only when appropriate, asks clarification when ambiguous, and asks confirmation before destructive changes.
+3. Alecto routes natural help/setup/review/planning/readout requests to the existing services; it logs events/actions only when appropriate, asks clarification when ambiguous, and asks confirmation before destructive changes.
 4. Due actions and snoozed actions resurface automatically through reminders.
 5. Email/GitHub sync quietly gathers approved signals; Gmail review items wait for user approval before becoming events or actions.
 6. Evening: Alecto sends an `/end_day`-style review and asks for remaining cleanup.
