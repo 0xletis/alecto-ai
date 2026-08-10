@@ -116,9 +116,9 @@ Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each T
 
 ## Product Surfaces
 
-Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, or `connect Gmail`. Slash commands remain shortcuts/backdoors for precision and debugging.
+Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, `what can Gmail track`, `Gmail status`, `enable job search rule for Gmail`, `enable work action rule for Gmail`, `sync Gmail`, or `sync integrations`. Slash commands remain shortcuts/backdoors for precision and debugging.
 
-First 5 Minutes Onboarding v1 is conversation-first and shared through the API. `/start` gives a short first-run intro with four natural examples. `/setup`, `help me set up`, and `what should I configure` show Ready, Needs attention, Optional, and Best next step sections. Goal, action/reminder, daily-loop, Gmail, and GitHub setup messages guide the next safe step without requiring command memorization. These guide replies do not mutate state. Gmail remains readonly local-MVP and does not scan until the user connects Gmail and explicitly enables an email rule.
+First 5 Minutes Onboarding v1 is conversation-first and shared through the API. `/start` gives a short first-run intro with four natural examples. `/setup`, `help me set up`, and `what should I configure` show Ready, Needs attention, Optional, and Best next step sections. Goal, action/reminder, daily-loop, Gmail, and GitHub setup messages guide the next safe step without requiring command memorization. These guide replies do not mutate state. Gmail remains readonly local-MVP and does not scan until the user connects Gmail and explicitly enables an email rule. Natural Gmail setup/status replies inspect connection state, active rules, sync mode, and active goals to recommend job-search or work-action tracking when relevant. Natural explicit rule requests such as `enable job search rule for Gmail` use the same safe email-rule path as `/enable_email_rule`, but custom keyword/goal-specific Gmail rules are not implemented yet.
 
 Normal user commands:
 - `/today`, `/start_day`, `/end_day`, `/tomorrow`
@@ -500,12 +500,16 @@ Expected:
 - `job_search_email` searches user-approved Gmail results for recruiter replies, interview scheduling, application confirmations, rejections, and offers, then feeds the existing `job_search_text` ingestion adapter.
 - `work_action_email` is a review-first adapter for action requests, deadlines, follow-ups, feedback, blockers, and project updates. It uses the existing Gmail source and readonly scope.
 - Planned email adapters include finance receipts, learning deadlines, and custom goal email signals.
+- User-facing Gmail setup is natural: `connect Gmail`, `show Gmail setup`, `Gmail status`, `what can Gmail track`, `enable job search rule for Gmail`, `enable work action rule for Gmail`, and `sync Gmail`.
+- Natural Gmail setup/status replies show whether Gmail is connected, which tracking rules are active, whether automatic worker sync is enabled, how to run manual sync, and goal-based recommendations for job-search or work-action tracking.
+- Normal Gmail rule replies use human labels such as "Job-search email tracking" and "Work-action email tracking"; internal adapter IDs are kept for debug/developer surfaces.
 - Email rules control the fetch strategy, lookback window, classifier mode, message cap, event cap, and confidence thresholds. Supported fetch strategies are `query` and `all_recent`; `sender_allowlist` and `label` are reserved for later and fail safely.
 - Classifier modes are `rules`, `hybrid`, and `llm`. `rules` uses the deterministic classifier and never calls OpenAI. `hybrid` keeps hard deterministic filters first, uses rules for obvious high-confidence classifications, and can use OpenAI only for ambiguous cases when `OPENAI_API_KEY` is available. `llm` still applies hard filters before OpenAI and does not crash without a key; it marks the email for review instead of auto-logging.
 - Rule sync is capped by `maxMessagesPerSync` and `maxEventsPerSync`, creates at most one event per email, and only logs approved event types from the ontology.
-- Gmail OAuth tokens are stored in local Postgres JSON config for the MVP. They are never returned by the OAuth callback, `/my_integrations`, sync responses, or Telegram replies. Encrypt tokens before production.
+- Gmail OAuth tokens are stored encrypted at rest in local Postgres JSON config when `ALECTO_SECRET_ENCRYPTION_KEY` is set. Existing legacy plaintext local tokens can still be read and migrate to encrypted config on the next successful token read/sync when the key is available. Tokens, encrypted ciphertext, IVs, and auth tags are never returned by the OAuth callback, `/my_integrations`, sync responses, or Telegram replies.
 - Never commit `.env`. If OAuth tokens are leaked during local testing, revoke the Google app/session and reconnect Gmail.
 - `/sync_gmail` reports safe counters: messages found, processed, ignored, deduped, and events created. `/sync_gmail_debug` adds per-rule IDs, LLM counters, and last errors without email bodies or tokens.
+- Custom keyword/goal-specific Gmail rules, such as tracking Endesa bills or custom goal senders, are planned but not implemented. The current advanced query field is developer-facing and should not be presented as a polished rule builder.
 - Gmail dedupe skips active duplicates. Events archived by `/cleanup_gmail_rule_events` can be reprocessed after classifier fixes; normal manual archives still block recreation.
 - Gmail `job_search_email` is conservative. It requires strong recruiting/job context, ignores obvious marketing/newsletter/promotional emails, and never treats the word `offer` alone as a career offer.
 - Gmail emails below auto-log confidence are not logged automatically. Uncertain messages count as `needs review`; weak matches count as low-confidence ignored or unknown.
@@ -513,7 +517,7 @@ Expected:
 - `work_action_email` reviews are different: approving `work_action_required`, `work_deadline_detected`, `work_follow_up_requested`, or `work_project_update_detected` creates an ActionItem, not an Event.
 - ActionItems are things to do. Events are things that happened. Use `/action`, `/todo`, `/add_action`, `/actions`, `/complete_action`, `/snooze_action`, and `/archive_action` to manage open work items.
 - Natural concrete task messages such as `I need to review homepage copy tomorrow` or `remind me to call Alex Friday` create manual ActionItems. Vague reflections and betting/trading reminders do not create actions.
-- Conversation-first operator requests such as `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, and `connect GitHub` route to the same existing read-only or confirmation-first product surfaces.
+- Conversation-first operator requests such as `what can you do`, `help me set up`, `what should I do today`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, `connect GitHub`, `enable job search rule for Gmail`, `enable work action rule for Gmail`, `sync Gmail`, and `sync integrations` route to the same existing read-only, explicit-mutation, or confirmation-first product surfaces.
 - Hygiene-session replies are guarded against fake success: incomplete replies such as `snooze 2` ask for a time, and cleanup sessions remain active while other listed actions still need decisions.
 - Natural daily-loop settings such as `turn on morning brief at 9` update settings only after the database write succeeds. Ambiguous settings requests return a concrete example instead of pretending a change happened.
 - `/remember` still saves memory. If the remembered text clearly contains a concrete future task, Alecto also creates or reuses a manual ActionItem.
@@ -593,9 +597,18 @@ Gmail OAuth setup:
 GOOGLE_CLIENT_ID=your-google-client-id
 GOOGLE_CLIENT_SECRET=your-google-client-secret
 GMAIL_REDIRECT_URI=http://localhost:3000/oauth/gmail/callback
+ALECTO_SECRET_ENCRYPTION_KEY=base64-32-byte-key
+```
+
+Generate a local encryption key with:
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
 ```
 
 Create a Google OAuth client with the redirect URI above and the readonly Gmail scope. Then run `/connect_gmail`, open the returned URL, complete consent, and enable scanning with `/enable_email_rule job_search`. The OAuth callback only displays `Gmail connected. You can return to Telegram.`
+
+Gmail remains readonly. It does not scan until an email rule is explicitly enabled. Gmail send/label mutation and production OAuth/account management are not implemented.
 
 Integration Registry v1 manual test:
 
@@ -663,7 +676,7 @@ Manual insight tests:
 - Weekly planning: run `/weekly`, then say `plan next week` or run `/plan_next_week`. Natural `plan this week` and `plan my week` plan the remaining current local week. Plan output shows `Planning window`, `Needs cleanup`, `Already scheduled`, and `Suggested new actions`. It should propose safe goal-linked actions, display action priority separately from goal priority, and create none until the user replies with a shown creatable selection, `create all new`, or another explicit selection. Stale cleanup suggestions and already-covered items are non-creatable and skipped by `create all new`. Recurring system suggestions use semantic duplicate keys, so old and new guardrail-review titles are treated as the same plan item.
 - Planning UX smoke: `/weekly`, `plan next week`, `plan this week`, `plan my week`, `make a plan`, `create all new`, `/actions`, and `I need a plan to bet safely next week`. Pass if `/weekly` suggests planning next, the planning window is correct, cleanup is not creatable, already-covered/guardrail-review aliases are not recreated, reply examples only reference creatable suggestions, `create all new` creates only new actions, and betting/trading planning hits the hard guardrail.
 - First 5 Minutes Onboarding: send `/start`, `help me set up`, `how do I start`, `what should I configure`, `set up goals`, `how do reminders work`, `set up daily loop`, `connect Gmail`, and `connect GitHub`. The replies should feel like a guide, not documentation; show a clear next step; avoid command dumps; expose no tokens/raw email/provider errors; and create no goals/actions/integrations/email rules unless the user gives an explicit mutation request.
-- Conversation-first UX: send natural messages such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my tasks`, and `connect Gmail`. They should route to the existing surfaces without exposing tokens, raw email bodies, or creating actions unless explicit confirmation/selection is required.
+- Conversation-first UX: send natural messages such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan next week`, `clean up my tasks`, `show my tasks`, `connect Gmail`, `show Gmail setup`, `what can Gmail track`, `enable job search rule for Gmail`, `sync Gmail`, and `sync integrations`. They should route to the existing surfaces without exposing tokens, raw email bodies, or creating actions unless explicit confirmation/selection is required.
 
 ## API Routes
 
@@ -771,4 +784,4 @@ Manual insight tests:
 
 ## Current Scope
 
-This local MVP intentionally does not include UI, OpenClaw integration, WhatsApp, wallet/private-key functionality, private GitHub, vector DB/embeddings, or general app auth. Gmail has a minimal readonly OAuth flow for local MVP email ingestion; tokens must be encrypted before production.
+This local MVP intentionally does not include UI, OpenClaw integration, WhatsApp, wallet/private-key functionality, private GitHub, vector DB/embeddings, or general app auth. Gmail has a minimal readonly OAuth flow for local MVP email ingestion with encrypted local token storage when `ALECTO_SECRET_ENCRYPTION_KEY` is configured, but production OAuth/account management and secret rotation are still not implemented.

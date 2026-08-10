@@ -8,7 +8,7 @@ This is a product/architecture checkpoint. The implementation ledger remains `do
 
 Alecto is a **local technical alpha**.
 
-It is usable by the founder over Telegram, with real local persistence, proactive worker jobs, Gmail/GitHub signal ingestion, ActionItems, daily/weekly operator loops, deterministic guardrails, and a conversation-first first-five-minutes onboarding/setup flow. It is not product-ready for non-technical users because auth, token encryption, settings UI, production scheduling, cross-channel UX, and broader product packaging are not ready.
+It is usable by the founder over Telegram, with real local persistence, proactive worker jobs, Gmail/GitHub signal ingestion, ActionItems, daily/weekly operator loops, deterministic guardrails, and a conversation-first first-five-minutes onboarding/setup flow. It is not product-ready for non-technical users because auth, production OAuth/account linking, key management/rotation, settings UI, production scheduling, cross-channel UX, and broader product packaging are not ready.
 
 ## Capability Matrix
 
@@ -16,7 +16,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | --- | --- | --- | --- | --- | --- | --- |
 | Telegram chat | implemented | Telegram bot | Telegram messages | optional response/analysis | yes, via worker | operational hardening |
 | Normal message routing | implemented | natural text, slash commands | `NormalizedInboundMessage` | optional fallback only | no | more channel tests |
-| Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts | existing services | none required | no | richer cross-channel tests |
+| Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts, explicit email-rule enable requests, and explicit sync requests | existing services | none required | no | richer cross-channel tests |
 | First 5 Minutes Onboarding v1 | implemented | `/start`, `/setup`, natural setup/quickstart/goals/actions/daily-loop/integration messages | onboarding state from goals/actions/settings/integrations/hygiene | none | no | full guided wizard/settings UI |
 | Goals | implemented | `/goals`, `/create_goal`, natural goal creation | Postgres `Goal` | optional classification | no | simpler onboarding |
 | Events/check-ins | implemented | `/checkin`, natural logs, `/events`, `/review` | Postgres `Event` | optional extraction | daily check-in reminder | broader parser coverage |
@@ -32,15 +32,15 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | Hygiene-session safety | implemented | natural replies such as `complete 1`, `snooze 2 tomorrow` | PendingAction + ActionItems | asks for missing time or confirmation | prevents fake cleanup success | richer multi-operation cleanup replies |
 | Weekly review/planning | implemented | `/weekly`, `/weekly_last`, `/plan_next_week`, natural `plan this week` / `plan next week` | actions/events/goals/reflections/hygiene | optional guarded draft for review; plan is deterministic with optional mock-gated suggestions | no | more real-user planning polish |
 | Weekly insight | implemented | `/weekly_insight` | active events/goals/memory/profile | optional polish | scheduled delivery available | overlaps with weekly review |
-| Gmail readonly | partial | `/connect_gmail`, `/sync_gmail` | Gmail API | optional classifier | scheduled sync available | token encryption/OAuth production |
+| Gmail readonly | partial | `/connect_gmail`, natural Gmail setup/status/sync/rule enable, `/sync_gmail` | Gmail API | optional classifier | scheduled sync available | production OAuth/account management, key rotation, custom rule builder |
 | Gmail review queue | implemented | `/email_reviews`, approve/reject | EmailReviewItem | optional classifier | no direct push yet | reviewer UX |
 | GitHub public sync | implemented | `/connect_github`, sync commands | public GitHub API | none | scheduled sync available | private/OAuth unsupported |
 | Worker proactive jobs | implemented | settings + worker | DB schedules/logs | none | yes | production scheduling/observability |
 | OpenAI/LLM layer | partial | env-gated | message/context packs | optional only | no | evals, cost, observability |
 | Semantic memory/vector search | not implemented | none | none | not used | no | vector store/design |
 | WhatsApp/OpenClaw/web/mobile | not implemented | none | none | none | no | channel adapters/UX |
-| Production OAuth/auth | not implemented | Gmail local only | local MVP tokens | none | no | auth/security design |
-| Token encryption | not implemented | none | DB config contains local tokens | none | no | encryption/key management |
+| Production OAuth/auth | not implemented | Gmail local only | local MVP encrypted token config | none | no | auth/security design |
+| Token encryption | implemented | none | encrypted DB config when `ALECTO_SECRET_ENCRYPTION_KEY` is set | none | no | key management/rotation |
 | Calendar/health/wallet integrations | not implemented | registry/planned only | none | none | no | integration design |
 
 ## Command Surface Map
@@ -94,6 +94,13 @@ Expected natural alternatives:
 - `clean up my tasks`
 - `show my goals`
 - `connect Gmail`
+- `what can Gmail track`
+- `show Gmail setup`
+- `Gmail status`
+- `enable job search rule for Gmail`
+- `enable work action rule for Gmail`
+- `sync Gmail`
+- `sync integrations`
 
 ### 3. Review And Planning Commands
 
@@ -224,7 +231,7 @@ The target product should work mostly without command memorization:
 
 ## Current Autonomy Level
 
-- Can it read mail independently? **Partially.** Gmail can sync readonly after OAuth and explicit active email rules. No rule means no scanning.
+- Can it read mail independently? **Partially.** Gmail can sync readonly after OAuth and explicit active email rules. Natural `show Gmail setup`, `Gmail status`, `what can Gmail track`, `enable job search rule for Gmail`, and `enable work action rule for Gmail` explain current state, goal-based recommendations, manual vs scheduled sync, and use the same rule creation path as `/enable_email_rule`; natural `sync Gmail` uses the same safe sync path. No active rule means no scanning. Custom keyword/sender/goal-specific Gmail rule building is not implemented yet.
 - Can it ask for updates alone? **Yes.** Worker can send daily check-ins, daily insights, weekly insights, and daily loop briefs.
 - Can it create actions from email? **Yes, with review.** `work_action_email` creates review items; approval creates ActionItems.
 - Can it send emails? **No.**
@@ -232,13 +239,13 @@ The target product should work mostly without command memorization:
 - Can it use LLMs? **Yes, optionally.** OpenAI is env-gated and validated.
 - Can it operate without LLMs? **Yes.** Deterministic fallback is required and implemented.
 - Can it work for users today? **For a technical/founder local alpha user, yes.** For general users, no.
-- What blocks production? **Auth/security, token encryption, onboarding, UX simplification, scheduling/observability, and product packaging.**
+- What blocks production? **Auth/security, production OAuth/account linking, key management/rotation, onboarding, UX simplification, scheduling/observability, and product packaging.**
 
 ## Production Readiness Checklist
 
 ### Security/Auth
 
-- [ ] encrypt Gmail tokens at rest
+- [x] encrypt Gmail tokens at rest for the local MVP
 - [ ] production OAuth/account linking
 - [ ] multi-user auth and isolation beyond Telegram ID mapping
 - [ ] secret management and rotation
@@ -302,7 +309,7 @@ Why:
 
 Risk:
 - More email automation increases privacy/security expectations.
-- Token encryption should come first or be part of the milestone.
+- Production OAuth/account linking, key management, and review-notification UX should come before broader Gmail autonomy.
 
 ### 3. Production Onboarding And Settings UX
 
@@ -310,10 +317,10 @@ Why:
 - First 5 Minutes Onboarding v1 exists for the local alpha, but production users still need account/auth, secure settings, and a cleaner guided setup surface.
 
 Risk:
-- Do not mark production OAuth/token encryption complete until it is actually implemented.
+- Do not mark production OAuth/account management, key management, or secret rotation complete until they are actually implemented.
 
 ## Recommendation
 
 Build **Real-World Planning Polish** next only after another Telegram log pass.
 
-First 5 Minutes Onboarding v1 and Planning UX Consolidation v1 are now implemented for the local alpha. The next high-leverage work is smoothing observed operator-loop friction without adding integrations or auto-creating actions. Gmail Autonomy should wait until token encryption and review-notification UX are clearer.
+First 5 Minutes Onboarding v1 and Planning UX Consolidation v1 are now implemented for the local alpha. Gmail token encryption at rest is implemented for the local MVP. The next high-leverage work is smoothing observed operator-loop friction without adding integrations or auto-creating actions. Gmail Autonomy should wait until production OAuth/account management, key management/rotation, and review-notification UX are clearer.

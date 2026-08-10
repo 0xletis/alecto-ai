@@ -27,7 +27,7 @@ After every implementation pass:
 - [x] Telegram-first channel adapter
 - [x] Channel-agnostic `NormalizedInboundMessage` abstraction
 - [x] Intent routing before business logic
-- [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, and integration guidance requests
+- [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, integration guidance, explicit email-rule enable requests, and explicit integration sync requests
 - [x] User onboarding/setup simplification v1: shared API onboarding state/reply composer, `/start`, `/setup`, natural quickstart, missing setup, goals setup, daily-loop setup, and integration setup guidance
 - [x] First 5 Minutes Onboarding v1: guide-style `/start`, setup overview with Ready/Needs attention/Optional/Best next step, state-aware next-step suggestions, action/reminder onboarding, and explicit Gmail/GitHub setup boundaries
 - [x] Inbound message segmentation for single commands, command batches, reference text, and normal text
@@ -164,6 +164,10 @@ After every implementation pass:
 - [x] GitHub repo activity semantics when no author is configured
 - [x] GitHub safe 404/private/rate-limit errors
 - [x] Scheduled and manual integration sync
+- [x] Natural `sync Gmail`, `sync email`, and `sync integrations` requests route through safe API sync behavior instead of generic chat
+- [x] Natural explicit email-rule requests such as `enable job search rule for Gmail` and `enable work action rule for Gmail` create/reuse active Gmail email rules through the same safe API path as `/enable_email_rule`
+- [x] Gmail setup/rule replies use human tracking labels and explain what the rule watches for instead of exposing adapter IDs in normal user output
+- [x] Natural Gmail setup/status wizard shows connection state, active tracking rules, manual vs scheduled sync, and goal-based rule recommendations
 - [~] GitHub supports public repos only; no OAuth/private repo support
 - [ ] Wallet public-address fetcher
 - [ ] Health integrations
@@ -173,19 +177,26 @@ After every implementation pass:
 
 - [x] Gmail listed as generic readonly email source
 - [x] Minimal Gmail OAuth callback for local MVP
-- [x] Tokens stored in local DB config and sanitized from all user/API-visible output
+- [x] Gmail OAuth tokens encrypted at rest in local DB config when `ALECTO_SECRET_ENCRYPTION_KEY` is configured
+- [x] Existing legacy plaintext Gmail token config can be read and migrated to encrypted config on successful token read/sync when the key is available
+- [x] Tokens and encrypted token envelopes are sanitized from all user/API-visible output
 - [x] Email signal rules with query, fetch strategy, classifier mode, caps, thresholds, and review-before-logging
 - [x] Email adapter registry
 - [x] `job_search_email` adapter
 - [x] `work_action_email` adapter
 - [x] Conservative Gmail hard filters for security, marketing, account/admin, and non-work noise
 - [x] Gmail sync summaries and debug counters
+- [x] Natural Gmail/email sync requests use the same readonly sync path and preserve token/ciphertext redaction
+- [x] Natural Gmail email-rule enable requests require an active Gmail connection, preserve explicit rule approval, and do not auto-scan by themselves
+- [x] Natural Gmail guidance explains implemented tracking choices and safely says custom keyword/goal-specific rules are not ready yet
+- [x] Gmail setup/status replies recommend job-search tracking for active career/job-search goals and work-action tracking for work/project-like goals
 - [x] Email review queue
 - [x] Review semantic dedupe
 - [x] Review approval/rejection
 - [x] Work-action review approval creates ActionItems instead of Events
-- [~] Gmail token storage is local-MVP only; encrypt before production
+- [~] Gmail OAuth/account management remains local-MVP; production auth, key management, and secret rotation are not implemented
 - [~] LLM email classifier is optional and post-processed by strict allowlists
+- [ ] User-friendly custom Gmail keyword/sender/goal-specific rule builder
 - [ ] Gmail send/label modification
 - [ ] Additional planned adapters: finance receipts, learning deadlines, custom goal email signals
 
@@ -194,6 +205,6 @@ After every implementation pass:
 - [~] LLM weekly review support exists as guarded/fallback behavior; deterministic weekly review is the reliable path
 - [ ] WhatsApp, OpenClaw, web UI, dashboard, mobile app
 - [ ] Private GitHub support
-- [ ] Full production token encryption/secret management
+- [ ] Full production OAuth/account management, key management, and secret rotation
 - [ ] Vector DB/embeddings
 - [ ] Billing, enterprise, multi-user product hardening beyond Telegram user mapping

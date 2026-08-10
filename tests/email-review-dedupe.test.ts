@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
@@ -14,7 +14,10 @@ import {
   classifyWorkActionEmail,
   explainNormalizedInboundRoute,
   classifyDueWindow,
+  decryptSecretJson,
+  encryptSecretJson,
   getLocalTodayRange,
+  isEncryptedSecretJsonEnvelope,
   normalizeManualActionTitleKey,
   parseActionDueDate,
   routeNormalizedInboundMessage,
@@ -315,6 +318,719 @@ test("route debug explains action, event, goal guardrail, and standalone now rou
   assert.equal(reference.allowedSideEffects.createEvent, false);
   assert.equal(debugOutput.intentType, "generic_chat");
   assert.equal(debugOutput.isReferenceOnly, true);
+});
+
+test("secret JSON encryption roundtrips, uses random IVs, and rejects tampering", () => {
+  const key = randomBytes(32);
+  const value = {
+    accessToken: "secret-access-token",
+    refreshToken: "secret-refresh-token",
+    expiresAt: 1786372120000
+  };
+
+  const first = encryptSecretJson(value, key);
+  const second = encryptSecretJson(value, key);
+
+  assert.equal(isEncryptedSecretJsonEnvelope(first), true);
+  assert.equal(isEncryptedSecretJsonEnvelope(second), true);
+  assert.notEqual(first.iv, second.iv);
+  assert.notEqual(first.ciphertext, second.ciphertext);
+  assert.deepEqual(decryptSecretJson(first, key), value);
+  assert.throws(() => decryptSecretJson(first, randomBytes(32)), /could not be decrypted/);
+  assert.throws(() => decryptSecretJson({ ...first, ciphertext: `${first.ciphertext.slice(0, -2)}aa` }, key), /could not be decrypted/);
+});
+
+test("Gmail OAuth callback stores encrypted tokens and integration output redacts secrets", async () => {
+  const server = buildServer();
+  const tokenUserId = `gmail-token-oauth-${randomUUID()}`;
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const previousClientId = process.env.GOOGLE_CLIENT_ID;
+  const previousClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const previousRedirect = process.env.GMAIL_REDIRECT_URI;
+  const originalFetch = globalThis.fetch;
+
+  try {
+    process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+    process.env.GOOGLE_CLIENT_ID = "google-client";
+    process.env.GOOGLE_CLIENT_SECRET = "google-secret";
+    process.env.GMAIL_REDIRECT_URI = "http://localhost:3000/oauth/gmail/callback";
+
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input);
+
+      if (url.includes("oauth2.googleapis.com/token")) {
+        return new Response(JSON.stringify({
+          access_token: "secret-access-token",
+          refresh_token: "secret-refresh-token",
+          expires_in: 3600,
+          token_type: "Bearer",
+          scope: "https://www.googleapis.com/auth/gmail.readonly"
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+
+      if (url.includes("gmail.googleapis.com/gmail/v1/users/me/profile")) {
+        return new Response(JSON.stringify({ emailAddress: "user@example.com" }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      return new Response("not found", { status: 404 });
+    }) as typeof fetch;
+
+    const state = Buffer.from(JSON.stringify({ userId: tokenUserId }), "utf8").toString("base64url");
+    const callback = await server.inject({
+      method: "GET",
+      url: `/oauth/gmail/callback?code=fake-code&state=${state}`
+    });
+
+    assert.equal(callback.statusCode, 200);
+    assert.equal(callback.body, "Gmail connected. You can return to Telegram.");
+    assert.doesNotMatch(callback.body, /secret-access-token|secret-refresh-token|ciphertext|accessToken|refreshToken/);
+
+    const connection = await prisma.integrationConnection.findFirstOrThrow({
+      where: { userId: tokenUserId, integrationId: "gmail" }
+    });
+    const rawConfig = JSON.stringify(connection.config);
+    assert.match(rawConfig, /"alg":"aes-256-gcm"/);
+    assert.doesNotMatch(rawConfig, /secret-access-token|secret-refresh-token/);
+
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${tokenUserId}/integrations`
+    });
+    assert.equal(response.statusCode, 200);
+    const visible = JSON.stringify(response.json());
+    assert.match(visible, /"tokenStorage":"encrypted"/);
+    assert.match(visible, /"hasRefreshToken":true/);
+    assert.doesNotMatch(visible, /secret-access-token|secret-refresh-token|"ciphertext"|"iv"|"tag"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    if (previousClientId === undefined) delete process.env.GOOGLE_CLIENT_ID;
+    else process.env.GOOGLE_CLIENT_ID = previousClientId;
+    if (previousClientSecret === undefined) delete process.env.GOOGLE_CLIENT_SECRET;
+    else process.env.GOOGLE_CLIENT_SECRET = previousClientSecret;
+    if (previousRedirect === undefined) delete process.env.GMAIL_REDIRECT_URI;
+    else process.env.GMAIL_REDIRECT_URI = previousRedirect;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: tokenUserId } });
+  }
+});
+
+test("Gmail legacy plaintext tokens migrate to encrypted config on sync", async () => {
+  const server = buildServer();
+  const tokenUserId = `gmail-token-legacy-${randomUUID()}`;
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const originalFetch = globalThis.fetch;
+
+  try {
+    process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+    await prisma.user.create({ data: { id: tokenUserId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: tokenUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "legacy@example.com",
+          token: {
+            accessToken: "legacy-access-token",
+            refreshToken: "legacy-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: tokenUserId,
+        connectionId: connection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:1d interview",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 5,
+        maxEventsPerSync: 2,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: false,
+        createdBy: "user"
+      }
+    });
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal((init?.headers as Record<string, string> | undefined)?.authorization, "Bearer legacy-access-token");
+      return new Response(JSON.stringify({ messages: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${tokenUserId}/integrations/${connection.id}/sync`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().status, "success");
+
+    const migrated = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: connection.id } });
+    const rawConfig = JSON.stringify(migrated.config);
+    assert.match(rawConfig, /"alg":"aes-256-gcm"/);
+    assert.doesNotMatch(rawConfig, /legacy-access-token|legacy-refresh-token/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: tokenUserId } });
+  }
+});
+
+test("Gmail sync decrypts encrypted token internally without exposing it", async () => {
+  const server = buildServer();
+  const tokenUserId = `gmail-token-encrypted-sync-${randomUUID()}`;
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const originalFetch = globalThis.fetch;
+
+  try {
+    process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+    await prisma.user.create({ data: { id: tokenUserId } });
+    const token = {
+      accessToken: "encrypted-sync-access-token",
+      refreshToken: "encrypted-sync-refresh-token",
+      expiresAt: Date.now() + 3_600_000,
+      tokenType: "Bearer",
+      scope: "gmail.readonly"
+    };
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: tokenUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "encrypted-sync@example.com",
+          token: encryptSecretJson(token),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true,
+          tokenExpiresAt: token.expiresAt
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: tokenUserId,
+        connectionId: connection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:1d interview",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 5,
+        maxEventsPerSync: 2,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: false,
+        createdBy: "user"
+      }
+    });
+
+    globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+      assert.equal((init?.headers as Record<string, string> | undefined)?.authorization, "Bearer encrypted-sync-access-token");
+      return new Response(JSON.stringify({ messages: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${tokenUserId}/integrations/${connection.id}/sync`
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().status, "success");
+    assert.doesNotMatch(JSON.stringify(response.json()), /encrypted-sync-access-token|encrypted-sync-refresh-token|ciphertext/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: tokenUserId } });
+  }
+});
+
+test("natural Gmail sync requests route through safe sync behavior", async () => {
+  const server = buildServer();
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const previousGoogleClientId = process.env.GOOGLE_CLIENT_ID;
+  const previousGoogleClientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const originalFetch = globalThis.fetch;
+  const notConnectedUserId = `natural-gmail-sync-none-${randomUUID()}`;
+  const noRuleUserId = `natural-gmail-sync-no-rule-${randomUUID()}`;
+  const syncUserId = `natural-gmail-sync-ok-${randomUUID()}`;
+  const expiredAuthUserId = `natural-gmail-sync-expired-${randomUUID()}`;
+  const missingKeyUserId = `natural-gmail-sync-missing-key-${randomUUID()}`;
+
+  try {
+    process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+    process.env.GOOGLE_CLIENT_ID = "test-google-client-id";
+    process.env.GOOGLE_CLIENT_SECRET = "test-google-client-secret";
+    await prisma.user.createMany({
+      data: [
+        { id: notConnectedUserId },
+        { id: noRuleUserId },
+        { id: syncUserId },
+        { id: expiredAuthUserId },
+        { id: missingKeyUserId }
+      ]
+    });
+    await prisma.integrationConnection.create({
+      data: {
+        userId: noRuleUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "no-rule@example.com",
+          token: encryptSecretJson({
+            accessToken: "no-rule-access-token",
+            refreshToken: "no-rule-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: noRuleUserId,
+        title: "Find a new developer job",
+        category: "career",
+        templateId: "career.job_search",
+        status: "active",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    const syncConnection = await prisma.integrationConnection.create({
+      data: {
+        userId: syncUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "sync@example.com",
+          token: encryptSecretJson({
+            accessToken: "natural-sync-access-token",
+            refreshToken: "natural-sync-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.integrationConnection.create({
+      data: {
+        userId: syncUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "old-no-rule@example.com",
+          token: encryptSecretJson({
+            accessToken: "old-no-rule-access-token",
+            refreshToken: "old-no-rule-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: syncUserId,
+        connectionId: syncConnection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:1d interview",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 5,
+        maxEventsPerSync: 2,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: false,
+        createdBy: "user"
+      }
+    });
+    const expiredAuthConnection = await prisma.integrationConnection.create({
+      data: {
+        userId: expiredAuthUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "expired-auth@example.com",
+          token: encryptSecretJson({
+            accessToken: "expired-auth-access-token",
+            refreshToken: "expired-auth-refresh-token",
+            expiresAt: Date.now() - 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: expiredAuthUserId,
+        connectionId: expiredAuthConnection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:1d interview",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 5,
+        maxEventsPerSync: 2,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: false,
+        createdBy: "user"
+      }
+    });
+    const missingKeyConnection = await prisma.integrationConnection.create({
+      data: {
+        userId: missingKeyUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "missing-key@example.com",
+          token: encryptSecretJson({
+            accessToken: "missing-key-access-token",
+            refreshToken: "missing-key-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: missingKeyUserId,
+        connectionId: missingKeyConnection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:1d interview",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 5,
+        maxEventsPerSync: 2,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: false,
+        createdBy: "user"
+      }
+    });
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+
+      if (url.includes("oauth2.googleapis.com/token")) {
+        return new Response(JSON.stringify({ error: "invalid_grant" }), {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      assert.match(
+        (init?.headers as Record<string, string> | undefined)?.authorization ?? "",
+        /^Bearer (natural-sync-access-token|no-rule-access-token)$/
+      );
+      return new Response(JSON.stringify({ messages: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }) as typeof fetch;
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: notConnectedUserId, message: "sync Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail is not connected yet/);
+    assert.doesNotMatch(response.json().reply, /generic|maybe|secret|ciphertext|refresh/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: notConnectedUserId, message: "connect Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Step 1: connect Gmail with readonly access/);
+    assert.match(response.json().reply, /\/connect_gmail/);
+    assert.match(response.json().reply, /will not scan Gmail until you enable a rule/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "sync my email" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail is connected, but no email tracking rules are active/);
+    assert.doesNotMatch(response.json().reply, /no-rule-access-token|no-rule-refresh-token|ciphertext|"iv"|"tag"/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "show Gmail setup" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail setup/);
+    assert.match(response.json().reply, /Status: connected/);
+    assert.match(response.json().reply, /No active email tracking rules/);
+    assert.match(response.json().reply, /Recommended: enable job search rule for Gmail/);
+    assert.match(response.json().reply, /Automatic sync:/);
+    assert.match(response.json().reply, /Manual sync: say 'sync Gmail'/);
+    assert.doesNotMatch(response.json().reply, /adapter:|job_search_email|access token|refresh token|ciphertext/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "enable job search rule for gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Job-search email tracking is on/);
+    assert.match(response.json().reply, /recruiter replies/);
+    assert.match(response.json().reply, /Sync now: sync Gmail/);
+    assert.doesNotMatch(response.json().reply, /adapter:|job_search_email|I've logged|great step|no-rule-access-token|no-rule-refresh-token|ciphertext|"iv"|"tag"/i);
+
+    const enabledRules = await prisma.emailSignalRule.findMany({
+      where: {
+        userId: noRuleUserId,
+        adapterId: "job_search_email",
+        status: "active"
+      }
+    });
+    assert.equal(enabledRules.length, 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "enable job search rule for gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Job-search email tracking is already on/);
+    assert.doesNotMatch(response.json().reply, /adapter:|job_search_email/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "sync my email" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new items/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "Gmail status" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Active tracking:\n- Job-search email tracking/);
+    assert.match(response.json().reply, /Next step: say 'sync Gmail'/);
+    assert.doesNotMatch(response.json().reply, /adapter:|job_search_email|no-rule-access-token|no-rule-refresh-token|ciphertext/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: expiredAuthUserId, message: "sync Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Gmail sync failed: Gmail authorization expired. Reconnect Gmail.");
+    assert.doesNotMatch(response.json().reply, /Gmail sync failed: Gmail sync failed/);
+    assert.doesNotMatch(response.json().reply, /expired-auth-access-token|expired-auth-refresh-token|ciphertext|"iv"|"tag"/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: syncUserId, message: "check my Gmail now" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new items/);
+    assert.doesNotMatch(response.json().reply, /older Gmail connection|active deduped|semantic deduped/);
+    assert.doesNotMatch(response.json().reply, /natural-sync-access-token|natural-sync-refresh-token|ciphertext|"iv"|"tag"/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: syncUserId, message: "sync integrations" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new items/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: syncUserId, message: "check inbox" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /For Gmail, say 'sync Gmail'/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: syncUserId, message: "what can Gmail track" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail works through explicit tracking rules/);
+    assert.match(response.json().reply, /Job search/);
+    assert.match(response.json().reply, /Work actions/);
+    assert.doesNotMatch(response.json().reply, /adapter:|job_search_email|work_action_email|access token|refresh token|ciphertext/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: syncUserId, message: "can you track Endesa bills from Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Custom Gmail tracking is not ready yet/);
+    assert.doesNotMatch(response.json().reply, /I've logged|created|adapter:|access token|refresh token|ciphertext/i);
+
+    delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: missingKeyUserId, message: "update Gmail signals" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.");
+    assert.doesNotMatch(JSON.stringify(response.json()), /missing-key-access-token|missing-key-refresh-token|ciphertext|"iv"|"tag"/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: syncUserId, message: "sync Gmail so I can bet safely" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.doesNotMatch(response.json().reply, /Gmail sync:/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    if (previousGoogleClientId === undefined) delete process.env.GOOGLE_CLIENT_ID;
+    else process.env.GOOGLE_CLIENT_ID = previousGoogleClientId;
+    if (previousGoogleClientSecret === undefined) delete process.env.GOOGLE_CLIENT_SECRET;
+    else process.env.GOOGLE_CLIENT_SECRET = previousGoogleClientSecret;
+    await server.close();
+    await prisma.user.deleteMany({
+      where: { id: { in: [notConnectedUserId, noRuleUserId, syncUserId, expiredAuthUserId, missingKeyUserId] } }
+    });
+  }
+});
+
+test("Gmail encrypted token without encryption key returns safe sync error", async () => {
+  const server = buildServer();
+  const tokenUserId = `gmail-token-missing-key-${randomUUID()}`;
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const key = randomBytes(32);
+
+  try {
+    await prisma.user.create({ data: { id: tokenUserId } });
+    const token = {
+      accessToken: "encrypted-access-token",
+      refreshToken: "encrypted-refresh-token",
+      expiresAt: Date.now() + 3_600_000,
+      tokenType: "Bearer",
+      scope: "gmail.readonly"
+    };
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: tokenUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "encrypted@example.com",
+          token: encryptSecretJson(token, key),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true,
+          tokenExpiresAt: token.expiresAt
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: tokenUserId,
+        connectionId: connection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:1d interview",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 5,
+        maxEventsPerSync: 2,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: false,
+        createdBy: "user"
+      }
+    });
+
+    delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+
+    const response = await server.inject({
+      method: "POST",
+      url: `/users/${tokenUserId}/integrations/${connection.id}/sync`
+    });
+
+    assert.equal(response.statusCode, 502);
+    assert.equal(response.json().error, "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.");
+    assert.equal(response.json().errorStage, "token_refresh");
+    assert.doesNotMatch(JSON.stringify(response.json()), /encrypted-access-token|encrypted-refresh-token|ciphertext/);
+  } finally {
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: tokenUserId } });
+  }
 });
 
 test("risky action command text routes to guardrail response without creating ActionItem", async () => {

@@ -23,5 +23,6 @@ export * from "./notifications.js";
 export * from "./reminders.js";
 export * from "./response-composer.js";
 export * from "./risk.js";
+export * from "./secret-encryption.js";
 export * from "./time.js";
 export * from "./user-operating-profile.js";

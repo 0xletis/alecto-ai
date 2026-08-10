@@ -83,7 +83,7 @@ Current:
 - [x] `work_action_email`
 
 Partial/local MVP:
-- [~] Gmail OAuth tokens are stored in DB JSON config and sanitized from output; encrypt before production
+- [~] Gmail OAuth tokens are encrypted at rest in DB JSON config when `ALECTO_SECRET_ENCRYPTION_KEY` is set, sanitized from output, and legacy plaintext local tokens migrate on read/sync; production OAuth/account management and key rotation are still not implemented
 - [~] Scheduled integration sync is available but disabled by default through `INTEGRATION_SYNC_ENABLED=false`
 
 Not implemented:

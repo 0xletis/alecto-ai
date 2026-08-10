@@ -791,7 +791,7 @@ bot.command("enable_email_rule", async (ctx) => {
       ...emailRuleInputForKind(parsed.kind)
     });
 
-    await ctx.reply(`${response.message ?? `Email rule enabled: ${response.emailRule.id}`}\n${formatEmailRule(response.emailRule, gmailConnection)}`);
+    await ctx.reply(formatEmailRuleEnabledReply(response, gmailConnection));
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
   }
@@ -1193,7 +1193,7 @@ bot.command("sync_gmail", async (ctx) => {
       }
     }
 
-    await replyWithIntegrationMessage(ctx, results.join("\n"));
+    await replyWithIntegrationMessage(ctx, formatBatchIntegrationSyncResults(results));
   } catch (error) {
     await replyWithIntegrationMessage(ctx, `Integration sync failed: ${safeIntegrationErrorMessage(error)}`);
   }
@@ -1287,7 +1287,7 @@ bot.command("sync_integrations", async (ctx) => {
       }
     }
 
-    await replyWithIntegrationMessage(ctx, results.join("\n"));
+    await replyWithIntegrationMessage(ctx, formatBatchIntegrationSyncResults(results));
   } catch (error) {
     await replyWithIntegrationMessage(ctx, `Integration sync failed: ${safeIntegrationErrorMessage(error)}`);
   }
@@ -2788,11 +2788,31 @@ async function postIntegrationSyncForDebug(ctx: Context, connectionId: string): 
 
 function formatGmailSyncSummary(response: IntegrationSyncResponse): string {
   if ((response.emailSummaries?.length ?? 0) === 0 && response.emailRuleDiagnostics?.activeRulesForConnection === 0) {
-    return "No active email rules for current Gmail connection. Enable with /enable_email_rule job_search.";
+    return noActiveEmailRulesMessage();
   }
 
   const totals = gmailSyncTotals(response.emailSummaries ?? []);
-  return `Gmail sync: ${totals.messagesFound} messages found, ${totals.processed} processed, ${totals.ignoredUnknown} ignored, ${totals.deduped} active deduped, ${totals.semanticDeduped} semantic deduped, ${totals.eventsCreated} events created.`;
+  const newItems = totals.eventsCreated + totals.reviewItemsCreated;
+  return `Gmail sync: ${totals.messagesFound} messages checked, ${newItems} new ${newItems === 1 ? "item" : "items"}.`;
+}
+
+function noActiveEmailRulesMessage(): string {
+  return "Gmail is connected, but no email tracking rules are active. Say \"enable job search rule for Gmail\" or \"enable work action rule for Gmail\".";
+}
+
+function formatBatchIntegrationSyncResults(results: string[]): string {
+  const noRuleResults = results.filter((result) => result === noActiveEmailRulesMessage());
+  const otherResults = results.filter((result) => result !== noActiveEmailRulesMessage());
+
+  if (otherResults.length === 0) {
+    return noRuleResults.length > 0 ? noActiveEmailRulesMessage() : "No integration sync results.";
+  }
+
+  return dedupeTelegramLines(otherResults).join("\n\n");
+}
+
+function dedupeTelegramLines(lines: string[]): string[] {
+  return [...new Set(lines.filter((line) => line.trim().length > 0))];
 }
 
 function formatGmailConnectionErrorDebug(connection: IntegrationConnection): string {
@@ -3766,30 +3786,77 @@ function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnecti
     rule.status === "active" && connectionStatus !== "active"
       ? "warning: rule is attached to inactive Gmail connection"
       : undefined;
+  const details = emailRuleDisplayDetails(rule);
 
   return [
     `id: ${rule.id}`,
-    `adapter: ${rule.adapterId}`,
-    `name: ${rule.name}`,
+    `tracks: ${details.title}`,
     `status: ${rule.status}`,
+    details.description,
     `connectionId: ${rule.connectionId}`,
     `connectionStatus: ${connectionStatus}`,
     staleWarning,
     rule.goalId ? `goalId: ${rule.goalId}` : undefined,
-    `fetchStrategy: ${rule.fetchStrategy}`,
-    `classifierMode: ${rule.classifierMode}`,
-    `lookbackDays: ${rule.lookbackDays}`,
-    `maxMessagesPerSync: ${rule.maxMessagesPerSync}`,
-    `maxEventsPerSync: ${rule.maxEventsPerSync}`,
-    `minAutoLogConfidence: ${rule.minAutoLogConfidence}`,
-    `minReviewConfidence: ${rule.minReviewConfidence}`,
-    rule.query ? `query: ${truncateText(rule.query, 140)}` : undefined,
-    `reviewBeforeLogging: ${rule.reviewBeforeLogging}`,
+    `mode: ${details.mode}`,
+    rule.query ? `search filter: ${truncateText(rule.query, 140)}` : undefined,
     rule.lastSyncedAt ? `lastSyncedAt: ${new Date(rule.lastSyncedAt).toLocaleString()}` : undefined,
     rule.lastError ? `lastError: ${safeGmailIntegrationMessageFromText(rule.lastError)}` : undefined
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function formatEmailRuleEnabledReply(response: EmailRuleResponse, connection: IntegrationConnection): string {
+  const rule = response.emailRule;
+  const details = emailRuleDisplayDetails(rule);
+  const alreadyExists = response.message?.includes("already exists");
+
+  return [
+    `${details.title} is ${alreadyExists ? "already on" : "on"}.`,
+    "",
+    "What I will watch for:",
+    ...details.watchItems.map((item) => `- ${item}`),
+    "",
+    details.mode,
+    "I only scan Gmail while this rule is active.",
+    "",
+    `Rule id: ${rule.id}`,
+    typeof connection.config.email === "string" ? `Gmail account: ${connection.config.email}` : undefined,
+    "Sync now: sync Gmail",
+    "See rules: /my_email_rules"
+  ].filter(Boolean).join("\n");
+}
+
+function emailRuleDisplayDetails(rule: EmailSignalRule): {
+  title: string;
+  description: string;
+  watchItems: string[];
+  mode: string;
+} {
+  if (rule.adapterId === "work_action_email") {
+    return {
+      title: "Work-action email tracking",
+      description: "Watches for work requests, deadlines, follow-ups, feedback, blockers, and project updates.",
+      watchItems: ["work requests", "deadlines", "follow-ups", "feedback requests", "blockers"],
+      mode: "Work-action emails go to review before becoming action items."
+    };
+  }
+
+  if (rule.adapterId === "job_search_email") {
+    return {
+      title: "Job-search email tracking",
+      description: "Watches for recruiter replies, interviews, rejections, offers, and application confirmations.",
+      watchItems: ["recruiter replies", "interview scheduling", "rejections", "offers", "application confirmations"],
+      mode: "Clear job-search emails can become career events. Uncertain emails go to review."
+    };
+  }
+
+  return {
+    title: rule.name || "Email tracking rule",
+    description: "Custom email tracking is not fully supported yet.",
+    watchItems: ["emails matching this rule"],
+    mode: "Uncertain emails go to review."
+  };
 }
 
 function gmailRuleSuggestion(connections: IntegrationConnection[], goals: Goal[], rules: EmailSignalRule[]): string | undefined {

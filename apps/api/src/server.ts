@@ -58,6 +58,11 @@ import {
   resolveActionReference,
   resolveGoalReference,
   routeIngestion,
+  decryptSecretJson,
+  encryptSecretJson,
+  getSecretEncryptionKeyFromEnv,
+  isEncryptedSecretJsonEnvelope,
+  SecretEncryptionError,
   UpdateIntegrationConnectionInputSchema,
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
@@ -308,7 +313,9 @@ export function buildServer() {
       return createGuardianGuardrailReply(parsed.data.userId, parsed.data.message, surfaceGuardrail);
     }
 
-    if (!surfaceGuardrail.triggered || surfaceGuardrail.isReferenceOnly) {
+    const directIntentBeforeSurface = routeIntent(parsed.data.message);
+
+    if ((!surfaceGuardrail.triggered || surfaceGuardrail.isReferenceOnly) && !isFinancialRiskIntent(directIntentBeforeSurface)) {
       const surfaceReply = await handleConversationSurfaceIntent(parsed.data.userId, parsed.data.message);
 
       if (surfaceReply) {
@@ -1310,14 +1317,13 @@ export function buildServer() {
         const token = await exchangeGmailOAuthCode(request.query.code, config);
         const email = await getGmailProfileEmail(token.accessToken);
 
-        await createGmailConnection(userId, {
+        await createGmailConnection(userId, buildEncryptedGmailConnectionConfig({
           provider: "gmail",
           scope: "gmail.readonly",
-          email,
-          token
-        });
-      } catch {
-        return reply.status(400).type("text/plain").send("Gmail connection failed. Try again from Telegram.");
+          email
+        }, token));
+      } catch (error) {
+        return reply.status(400).type("text/plain").send(safeGmailErrorMessage(error));
       }
 
       return reply.type("text/plain").send("Gmail connected. You can return to Telegram.");
@@ -5135,6 +5141,14 @@ type ConversationSurfaceIntent =
   | "show_goals"
   | "show_actions"
   | "show_memory"
+  | "gmail_sync"
+  | "integration_sync"
+  | "gmail_sync_guidance"
+  | "gmail_setup"
+  | "gmail_capability_guidance"
+  | "gmail_custom_rule_guidance"
+  | "enable_job_search_email_rule"
+  | "enable_work_action_email_rule"
   | "integration_guidance"
   | "daily_loop_settings";
 
@@ -5246,6 +5260,38 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     return formatMemoriesForConversation(await getActiveMemories(userId));
   }
 
+  if (intent === "gmail_sync") {
+    return syncGmailForConversation(userId);
+  }
+
+  if (intent === "integration_sync") {
+    return syncIntegrationsForConversation(userId);
+  }
+
+  if (intent === "gmail_sync_guidance") {
+    return "For Gmail, say 'sync Gmail' after connecting Gmail and enabling a rule.";
+  }
+
+  if (intent === "gmail_setup") {
+    return formatGmailSetupForConversation(userId);
+  }
+
+  if (intent === "gmail_capability_guidance") {
+    return formatGmailCapabilityGuidance();
+  }
+
+  if (intent === "gmail_custom_rule_guidance") {
+    return formatGmailCustomRuleGuidance();
+  }
+
+  if (intent === "enable_job_search_email_rule") {
+    return enableEmailRuleForConversation(userId, "job_search");
+  }
+
+  if (intent === "enable_work_action_email_rule") {
+    return enableEmailRuleForConversation(userId, "work_action");
+  }
+
   if (intent === "integration_guidance") {
     return formatIntegrationGuidance(message);
   }
@@ -5255,6 +5301,412 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
   }
 
   return undefined;
+}
+
+async function syncGmailForConversation(userId: string): Promise<string> {
+  const gmailConnections = (await getIntegrationConnections(userId)).filter(
+    (connection) => connection.integrationId === "gmail" && connection.status === "active"
+  );
+
+  if (gmailConnections.length === 0) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const replies: string[] = [];
+  let noRuleConnections = 0;
+
+  for (const connection of gmailConnections) {
+    const rules = await getActiveEmailSignalRulesForConnection(userId, connection.id);
+
+    if (rules.length === 0) {
+      noRuleConnections += 1;
+      continue;
+    }
+
+    const result = await syncGmailConnection(connection);
+    replies.push(formatConversationGmailSyncResult(result));
+  }
+
+  if (replies.length === 0) {
+    return noActiveGmailRulesMessage();
+  }
+
+  return dedupeLines(replies).join("\n\n");
+}
+
+async function syncIntegrationsForConversation(userId: string): Promise<string> {
+  const connections = (await getIntegrationConnections(userId)).filter(
+    (connection) =>
+      connection.status === "active" &&
+      (connection.integrationId === "gmail" || connection.integrationId === "github_public")
+  );
+
+  if (connections.length === 0) {
+    return "No active integrations to sync. Connect Gmail or GitHub first.";
+  }
+
+  const replies: string[] = [];
+  let noRuleGmailConnections = 0;
+
+  for (const connection of connections) {
+    if (connection.integrationId === "gmail") {
+      const rules = await getActiveEmailSignalRulesForConnection(userId, connection.id);
+
+      if (rules.length === 0) {
+        noRuleGmailConnections += 1;
+        continue;
+      }
+
+      replies.push(formatConversationGmailSyncResult(await syncGmailConnection(connection)));
+      continue;
+    }
+
+    replies.push(formatConversationGithubSyncResult(await syncGithubPublicConnection(connection)));
+  }
+
+  if (replies.length === 0 && noRuleGmailConnections > 0) {
+    return noActiveGmailRulesMessage();
+  }
+
+  return dedupeLines(replies).join("\n\n");
+}
+
+function formatConversationGmailSyncResult(result: {
+  status: "success" | "error";
+  emailSummaries?: EmailRuleSyncSummary[];
+  emailRuleDiagnostics?: EmailRuleDiagnostics;
+  error?: string;
+}): string {
+  if (result.status === "error") {
+    const safeError = safeGmailErrorMessage(result.error);
+    if (safeError.includes("Gmail token encryption key is missing") || safeError.startsWith("Gmail sync failed:")) {
+      return safeError;
+    }
+
+    return `Gmail sync failed: ${safeError}`;
+  }
+
+  if ((result.emailSummaries?.length ?? 0) === 0 && result.emailRuleDiagnostics?.activeRulesForConnection === 0) {
+    return noActiveGmailRulesMessage();
+  }
+
+  const totals = gmailSyncTotals(result.emailSummaries ?? []);
+  const newItems = totals.eventsCreated + totals.reviewItemsCreated;
+  return `Gmail sync: ${totals.messagesFound} messages checked, ${newItems} new ${newItems === 1 ? "item" : "items"}.`;
+}
+
+function formatConversationGithubSyncResult(result: {
+  status: "success" | "error";
+  eventsCreated: number;
+  personalCommitEvents: number;
+  repoActivityEvents: number;
+  repoSummaries?: Array<{ repo: string; personalCommitEvents: number; repoActivityEvents: number }>;
+  error?: string;
+}): string {
+  if (result.status === "error") {
+    return result.error ?? "Integration sync failed.";
+  }
+
+  if (result.repoSummaries && result.repoSummaries.length > 0) {
+    return result.repoSummaries
+      .map((summary) => {
+        const kind =
+          summary.personalCommitEvents > 0
+            ? `${summary.personalCommitEvents} personal commit events`
+            : `${summary.repoActivityEvents} repo activity events`;
+        return `Synced github_public ${summary.repo}: ${kind}.`;
+      })
+      .join("\n");
+  }
+
+  return `Synced github_public: ${result.eventsCreated} new events.`;
+}
+
+function gmailSyncTotals(summaries: EmailRuleSyncSummary[]) {
+  return summaries.reduce(
+    (totals, summary) => ({
+      messagesFound: totals.messagesFound + summary.messagesFound,
+      processed: totals.processed + summary.processed,
+      ignoredUnknown: totals.ignoredUnknown + summary.ignoredUnknown,
+      deduped: totals.deduped + summary.deduped,
+      semanticDeduped: totals.semanticDeduped + summary.semanticDeduped,
+      reviewItemsCreated: totals.reviewItemsCreated + summary.reviewItemsCreated,
+      eventsCreated: totals.eventsCreated + summary.eventsCreated
+    }),
+    {
+      messagesFound: 0,
+      processed: 0,
+      ignoredUnknown: 0,
+      deduped: 0,
+      semanticDeduped: 0,
+      reviewItemsCreated: 0,
+      eventsCreated: 0
+    }
+  );
+}
+
+function dedupeLines(lines: string[]): string[] {
+  return [...new Set(lines.filter((line) => line.trim().length > 0))];
+}
+
+function noActiveGmailRulesMessage(): string {
+  return "Gmail is connected, but no email tracking rules are active. Say 'enable job search rule for Gmail' or 'enable work action rule for Gmail'.";
+}
+
+async function enableEmailRuleForConversation(userId: string, kind: "job_search" | "work_action"): Promise<string> {
+  const gmailConnection = (await getIntegrationConnections(userId)).find(
+    (connection) => connection.integrationId === "gmail" && connection.status === "active"
+  );
+
+  if (!gmailConnection) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const adapterId = kind === "work_action" ? "work_action_email" : "job_search_email";
+  const adapter = getEmailAdapterDefinition(adapterId);
+
+  if (!adapter || adapter.status !== "available") {
+    return "That email rule is not available yet.";
+  }
+
+  if (adapter.id === "job_search_email") {
+    await archiveStaleJobSearchEmailRules(userId, gmailConnection.id);
+  }
+
+  const existingRule = (await getEmailSignalRules(userId)).find(
+    (rule) =>
+      rule.status === "active" &&
+      rule.connectionId === gmailConnection.id &&
+      rule.adapterId === adapter.id
+  );
+
+  if (existingRule) {
+    return `${emailRuleHumanTitle(kind)} is already on.\n\n${formatConversationEmailRuleEnabled(existingRule)}`;
+  }
+
+  const input = conversationEmailRuleInputForKind(kind);
+  const rule = await createEmailSignalRule(userId, {
+    connectionId: gmailConnection.id,
+    adapterId,
+    name: input.name,
+    reviewBeforeLogging: input.reviewBeforeLogging,
+    fetchStrategy: input.fetchStrategy,
+    classifierMode: input.classifierMode,
+    lookbackDays: input.lookbackDays,
+    maxMessagesPerSync: input.maxMessagesPerSync,
+    maxEventsPerSync: input.maxEventsPerSync,
+    minAutoLogConfidence: input.minAutoLogConfidence,
+    minReviewConfidence: input.minReviewConfidence,
+    query: adapter.defaultQuery ?? "",
+    createdBy: "user"
+  });
+
+  return `${emailRuleHumanTitle(kind)} is on.\n\n${formatConversationEmailRuleEnabled(rule)}`;
+}
+
+function conversationEmailRuleInputForKind(kind: "job_search" | "work_action") {
+  if (kind === "work_action") {
+    return {
+      name: "Work action emails",
+      reviewBeforeLogging: true,
+      fetchStrategy: "query" as const,
+      classifierMode: "hybrid" as const,
+      lookbackDays: 7,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 5,
+      minAutoLogConfidence: 0.95,
+      minReviewConfidence: 0.7
+    };
+  }
+
+  return {
+    name: "Job search emails",
+    reviewBeforeLogging: false,
+    fetchStrategy: "query" as const,
+    classifierMode: "rules" as const,
+    lookbackDays: 30,
+    maxMessagesPerSync: 25,
+    maxEventsPerSync: 10,
+    minAutoLogConfidence: 0.9,
+    minReviewConfidence: 0.65
+  };
+}
+
+function formatConversationEmailRuleEnabled(rule: EmailSignalRule): string {
+  const isWorkAction = rule.adapterId === "work_action_email";
+  const watchItems = isWorkAction
+    ? ["work requests", "deadlines", "follow-ups", "feedback requests", "blockers"]
+    : ["recruiter replies", "interview scheduling", "rejections", "offers", "application confirmations"];
+
+  return [
+    "What I will watch for:",
+    ...watchItems.map((item) => `- ${item}`),
+    "",
+    isWorkAction
+      ? "Work-action emails go to review before becoming action items."
+      : "Clear job-search emails can become career events. Uncertain emails go to review.",
+    "I only scan Gmail while this rule is active.",
+    "Sync now: sync Gmail",
+    "See rules: /my_email_rules"
+  ].join("\n");
+}
+
+function emailRuleHumanTitle(kind: "job_search" | "work_action"): string {
+  return kind === "work_action" ? "Work-action email tracking" : "Job-search email tracking";
+}
+
+async function formatGmailSetupForConversation(userId: string): Promise<string> {
+  const [connections, rules, goals] = await Promise.all([
+    getIntegrationConnections(userId),
+    getEmailSignalRules(userId),
+    getActiveGoals(userId)
+  ]);
+  const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail");
+  const activeGmailConnections = gmailConnections.filter((connection) => connection.status === "active");
+  const activeConnectionIds = new Set(activeGmailConnections.map((connection) => connection.id));
+  const activeRules = rules.filter((rule) => rule.status === "active" && activeConnectionIds.has(rule.connectionId));
+  const recommendedRules = gmailRuleRecommendationsFromGoals(goals, activeRules);
+  const syncLine = gmailScheduledSyncDescription();
+
+  if (activeGmailConnections.length === 0) {
+    return [
+      "Gmail is not connected yet.",
+      "",
+      "Step 1: connect Gmail with readonly access.",
+      "Use: /connect_gmail",
+      "",
+      "Step 2: choose what to track.",
+      ...recommendedRules.map((recommendation) => `- ${recommendation}`),
+      "",
+      "Alecto will not scan Gmail until you enable a rule.",
+      syncLine
+    ].join("\n");
+  }
+
+  const ruleLines =
+    activeRules.length > 0
+      ? activeRules.map((rule) => `- ${emailRuleTitleForAdapter(rule.adapterId)} (${rule.reviewBeforeLogging ? "review first" : "auto-log clear matches"})`)
+      : ["No active email tracking rules."];
+
+  const nextStep =
+    activeRules.length === 0
+      ? recommendedRules.length > 0
+        ? `Next step: ${recommendedRules[0].replace(/^Recommended: /, "")}`
+        : "Next step: say 'enable job search rule for Gmail' or 'enable work action rule for Gmail'."
+      : "Next step: say 'sync Gmail' when you want to check now.";
+
+  return [
+    "Gmail setup",
+    "",
+    "Status: connected.",
+    "Access: readonly access. Alecto cannot send emails or change labels.",
+    "Alecto will not scan Gmail until a rule is enabled.",
+    "Active tracking:",
+    ...ruleLines,
+    "",
+    "What is available today:",
+    "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
+    "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+    "",
+    recommendedRules.length > 0 ? "Recommendations from your goals:" : undefined,
+    ...(recommendedRules.length > 0 ? recommendedRules.map((recommendation) => `- ${recommendation}`) : []),
+    "",
+    syncLine,
+    "Manual sync: say 'sync Gmail'.",
+    "",
+    "Customize:",
+    "- Pause a rule: /pause_email_rule RULE_ID",
+    "- Delete a rule: /delete_email_rule RULE_ID",
+    "- Custom keyword and sender rules are planned, but not ready yet.",
+    "",
+    nextStep
+  ].filter((line) => line !== undefined).join("\n");
+}
+
+function gmailRuleRecommendationsFromGoals(goals: Goal[], activeRules: EmailSignalRule[]): string[] {
+  const activeAdapterIds = new Set(activeRules.map((rule) => rule.adapterId));
+  const recommendations: string[] = [];
+  const hasJobGoal = goals.some((goal) => {
+    const text = normalizeForComparison(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`);
+    return goal.status === "active" && (text.includes("job") || text.includes("career") || text.includes("application") || text.includes("developer"));
+  });
+  const hasWorkLikeGoal = goals.some((goal) => {
+    const text = normalizeForComparison(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`);
+    return (
+      goal.status === "active" &&
+      (text.includes("work") ||
+        text.includes("project") ||
+        text.includes("client") ||
+        text.includes("youtube") ||
+        text.includes("creative") ||
+        text.includes("deep work"))
+    );
+  });
+
+  if (hasJobGoal && !activeAdapterIds.has("job_search_email")) {
+    recommendations.push("Recommended: enable job search rule for Gmail.");
+  }
+
+  if (hasWorkLikeGoal && !activeAdapterIds.has("work_action_email")) {
+    recommendations.push("Recommended: enable work action rule for Gmail.");
+  }
+
+  if (recommendations.length === 0 && activeRules.length === 0) {
+    recommendations.push("Recommended: start with job-search or work-action tracking if either matches your goals.");
+  }
+
+  return recommendations;
+}
+
+function gmailScheduledSyncDescription(): string {
+  if (process.env.INTEGRATION_SYNC_ENABLED === "true") {
+    const interval = Number.parseInt(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15", 10);
+    return `Automatic sync: on, about every ${Number.isFinite(interval) && interval > 0 ? interval : 15} minutes.`;
+  }
+
+  return "Automatic sync: off.";
+}
+
+function emailRuleTitleForAdapter(adapterId: string): string {
+  if (adapterId === "work_action_email") {
+    return "Work-action email tracking";
+  }
+
+  if (adapterId === "job_search_email") {
+    return "Job-search email tracking";
+  }
+
+  return "Email tracking rule";
+}
+
+function formatGmailCapabilityGuidance(): string {
+  return [
+    "Gmail works through explicit tracking rules. It does not read your whole inbox by default.",
+    "",
+    "Ready today:",
+    "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
+    "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+    "",
+    "Say:",
+    '- "enable job search rule for Gmail"',
+    '- "enable work action rule for Gmail"',
+    '- "sync Gmail"',
+    "",
+    "Custom keyword rules like Endesa bills are planned, but not ready yet."
+  ].join("\n");
+}
+
+function formatGmailCustomRuleGuidance(): string {
+  return [
+    "Custom Gmail tracking is not ready yet.",
+    "",
+    "Today I can track:",
+    "- job-search emails",
+    "- work-action emails",
+    "",
+    "For something like Endesa bills, the intended future flow is: choose the goal, add sender/keyword filters, then review matches before Alecto creates anything.",
+    "I will not pretend that is implemented yet."
+  ].join("\n");
 }
 
 function detectConversationSurfaceIntent(message: string): ConversationSurfaceIntent | undefined {
@@ -5335,6 +5787,49 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
 
   if (/\b(show my memories|show memories|show my memory|list memories|what do you remember)\b/.test(text)) {
     return "show_memory";
+  }
+
+  if (/\b(sync integrations|sync my integrations|update integrations|update my integrations|sync all integrations)\b/.test(text)) {
+    return "integration_sync";
+  }
+
+  if (/\b(what can gmail|how does gmail|gmail work|email tracking|gmail tracking|gmail rules|email rules)\b/.test(text)) {
+    return "gmail_capability_guidance";
+  }
+
+  if (/\b(endesa|receipt|receipts|bill|bills|invoice|invoices|custom gmail|custom email|keyword|keywords|filter|filters)\b/.test(text) && /\b(gmail|email|mail|inbox)\b/.test(text)) {
+    return "gmail_custom_rule_guidance";
+  }
+
+  if (
+    /\b(enable|turn on|activate|set up|setup|create)\b.*\b(job search|job|recruiter|application)\b.*\b(email rule|gmail rule|rule|gmail|email)\b/.test(text) ||
+    /\b(enable|turn on|activate|set up|setup|create)\b.*\b(email rule|gmail rule|rule|gmail|email)\b.*\b(job search|job|recruiter|application)\b/.test(text)
+  ) {
+    return "enable_job_search_email_rule";
+  }
+
+  if (
+    /\b(enable|turn on|activate|set up|setup|create)\b.*\b(work action|work actions|work email|work emails)\b.*\b(email rule|gmail rule|rule|gmail|email)\b/.test(text) ||
+    /\b(enable|turn on|activate|set up|setup|create)\b.*\b(email rule|gmail rule|rule|gmail|email)\b.*\b(work action|work actions|work email|work emails)\b/.test(text)
+  ) {
+    return "enable_work_action_email_rule";
+  }
+
+  if (
+    /^(connect gmail|set up gmail|setup gmail|gmail setup|show gmail setup|gmail status|show gmail status|configure gmail|gmail settings)$/.test(text) ||
+    /\b(gmail|email)\b.*\b(setup|set up|status|settings|configure)\b/.test(text)
+  ) {
+    return "gmail_setup";
+  }
+
+  if (
+    /\b(sync gmail|sync my gmail|sync email|sync my email|check gmail now|check my gmail now|update gmail signals|update my gmail signals)\b/.test(text)
+  ) {
+    return "gmail_sync";
+  }
+
+  if (/\b(check my messages|check messages|check inbox|check my inbox|any emails|any email)\b/.test(text)) {
+    return "gmail_sync_guidance";
   }
 
   if (/\b(set up integrations|setup integrations|connect integrations)\b/.test(text)) {
@@ -5751,12 +6246,21 @@ function formatIntegrationGuidance(message: string): string {
 
   if (/\bgmail\b/.test(text)) {
     return [
-      "Gmail setup is two steps.",
+      "Gmail setup is explicit and readonly.",
       "1. Connect Gmail with readonly access.",
-      "2. Enable one email rule, such as job search or work actions.",
+      "2. Choose what Alecto should watch for.",
       "",
-      "Alecto will not scan Gmail until a rule is enabled. Uncertain emails go to review before becoming events or actions.",
-      "Shortcuts: /connect_gmail, then /enable_email_rule job_search or /enable_email_rule work_action."
+      "Ready today:",
+      "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
+      "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+      "",
+      "Alecto will not scan Gmail until a rule is enabled. Custom keyword rules like Endesa bills are planned, but not ready yet.",
+      "",
+      "Say:",
+      '- "enable job search rule for Gmail"',
+      '- "enable work action rule for Gmail"',
+      "",
+      "Shortcut: /connect_gmail"
     ].join("\n");
   }
 
@@ -8324,18 +8828,47 @@ function sanitizeIntegrationConfig(connection: IntegrationConnection): Record<st
   }
 
   if (connection.integrationId === "gmail") {
-    const token = readGmailToken(connection);
+    const storage = gmailTokenStorageInfo(connection.config);
 
     return {
       provider: "gmail",
       scope: typeof connection.config.scope === "string" ? connection.config.scope : "gmail.readonly",
       email: typeof connection.config.email === "string" ? connection.config.email : undefined,
-      hasRefreshToken: Boolean(token.refreshToken),
-      expiresAt: token.expiresAt || undefined
+      hasRefreshToken: storage.hasRefreshToken,
+      tokenStorage: storage.tokenStorage,
+      expiresAt: storage.expiresAt || undefined
     };
   }
 
   return {};
+}
+
+function gmailTokenStorageInfo(config: Record<string, unknown>): {
+  tokenStorage: "encrypted" | "legacy_plaintext" | "missing";
+  hasRefreshToken: boolean;
+  expiresAt?: number;
+} {
+  if (isEncryptedSecretJsonEnvelope(config.token)) {
+    return {
+      tokenStorage: "encrypted",
+      hasRefreshToken: config.hasRefreshToken === true,
+      expiresAt: typeof config.tokenExpiresAt === "number" ? config.tokenExpiresAt : undefined
+    };
+  }
+
+  const legacy = normalizeGmailToken(readLegacyGmailTokenConfig(config));
+  if (legacy.accessToken || legacy.refreshToken) {
+    return {
+      tokenStorage: "legacy_plaintext",
+      hasRefreshToken: Boolean(legacy.refreshToken),
+      expiresAt: legacy.expiresAt || undefined
+    };
+  }
+
+  return {
+    tokenStorage: "missing",
+    hasRefreshToken: false
+  };
 }
 
 function normalizeGithubPublicConnectionInput(input: GithubPublicConnectionInput): GithubPublicConnectionInput {
@@ -8532,7 +9065,7 @@ async function getGmailProfileEmail(accessToken: string): Promise<string | undef
 }
 
 async function getValidGmailAccessToken(connection: IntegrationConnection): Promise<string> {
-  const token = readGmailToken(connection);
+  const token = await readGmailToken(connection);
 
   if (token.accessToken && token.expiresAt > Date.now() + 60_000) {
     return token.accessToken;
@@ -8574,16 +9107,47 @@ async function getValidGmailAccessToken(connection: IntegrationConnection): Prom
     scope: refreshed.scope ?? token.scope
   };
 
-  await updateIntegrationConnectionConfig(connection.userId, connection.id, {
-    ...connection.config,
-    token: nextToken
-  });
+  await updateIntegrationConnectionConfig(connection.userId, connection.id, buildEncryptedGmailConnectionConfig(connection.config, nextToken));
 
   return nextToken.accessToken;
 }
 
-function readGmailToken(connection: IntegrationConnection) {
-  const token = isRecord(connection.config.token) ? connection.config.token : {};
+async function readGmailToken(connection: IntegrationConnection): Promise<GmailStoredToken> {
+  if (isEncryptedSecretJsonEnvelope(connection.config.token)) {
+    try {
+      return normalizeGmailToken(decryptSecretJson(connection.config.token));
+    } catch (error) {
+      if (error instanceof SecretEncryptionError && error.message.includes("missing")) {
+        throw new GmailSyncError(
+          "GMAIL_ENCRYPTION_KEY_MISSING",
+          "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.",
+          "token_refresh"
+        );
+      }
+
+      throw new GmailSyncError("GMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.", "token_refresh");
+    }
+  }
+
+  const token = normalizeGmailToken(readLegacyGmailTokenConfig(connection.config));
+
+  if ((token.accessToken || token.refreshToken) && getSecretEncryptionKeyFromEnv()) {
+    await updateIntegrationConnectionConfig(connection.userId, connection.id, buildEncryptedGmailConnectionConfig(connection.config, token));
+  }
+
+  return token;
+}
+
+function readLegacyGmailTokenConfig(config: Record<string, unknown>): Record<string, unknown> {
+  if (isRecord(config.token) && !isEncryptedSecretJsonEnvelope(config.token)) {
+    return config.token;
+  }
+
+  return config;
+}
+
+function normalizeGmailToken(value: unknown): GmailStoredToken {
+  const token = isRecord(value) ? value : {};
   return {
     accessToken: typeof token.accessToken === "string" ? token.accessToken : "",
     refreshToken: typeof token.refreshToken === "string" ? token.refreshToken : "",
@@ -8591,6 +9155,39 @@ function readGmailToken(connection: IntegrationConnection) {
     tokenType: typeof token.tokenType === "string" ? token.tokenType : "Bearer",
     scope: typeof token.scope === "string" ? token.scope : ""
   };
+}
+
+function buildEncryptedGmailConnectionConfig(
+  baseConfig: Record<string, unknown>,
+  token: unknown
+): Record<string, unknown> {
+  const normalizedToken = normalizeGmailToken(token);
+  const config = { ...baseConfig };
+  delete config.accessToken;
+  delete config.refreshToken;
+  delete config.expiresAt;
+  delete config.tokenType;
+  config.provider = "gmail";
+  config.scope = typeof config.scope === "string" ? config.scope : "gmail.readonly";
+
+  try {
+    config.token = encryptSecretJson(normalizedToken);
+  } catch (error) {
+    if (error instanceof SecretEncryptionError) {
+      throw new GmailSyncError(
+        "GMAIL_ENCRYPTION_KEY_MISSING",
+        "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.",
+        "token_refresh"
+      );
+    }
+
+    throw error;
+  }
+
+  config.tokenStorage = "encrypted";
+  config.hasRefreshToken = Boolean(normalizedToken.refreshToken);
+  config.tokenExpiresAt = normalizedToken.expiresAt || undefined;
+  return config;
 }
 
 async function searchGmailMessagesForRule(accessToken: string, rule: EmailSignalRule): Promise<string[]> {
@@ -8730,6 +9327,10 @@ function safeGmailErrorMessage(error: unknown): string {
     return "Gmail API is disabled in Google Cloud project. Enable Gmail API and retry.";
   }
 
+  if (lower.includes("gmail token encryption key is missing") || lower.includes("alecto_secret_encryption_key")) {
+    return "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.";
+  }
+
   if (lower.includes("refresh token") || lower.includes("invalid_grant") || lower.includes("unauthorized")) {
     return "Gmail authorization expired. Reconnect Gmail.";
   }
@@ -8823,7 +9424,7 @@ function safeShortErrorReason(message: string): string {
 function isGmailConnectionError(error: unknown): boolean {
   return (
     error instanceof GmailSyncError &&
-    (error.code === "GMAIL_AUTH_EXPIRED" || error.code === "GMAIL_PERMISSION")
+    (error.code === "GMAIL_AUTH_EXPIRED" || error.code === "GMAIL_PERMISSION" || error.code === "GMAIL_ENCRYPTION_KEY_MISSING")
   );
 }
 
@@ -10965,6 +11566,14 @@ interface GmailTokenResponse {
   scope?: string;
 }
 
+interface GmailStoredToken {
+  accessToken: string;
+  refreshToken: string;
+  expiresAt: number;
+  tokenType: string;
+  scope: string;
+}
+
 interface GmailMessage {
   id: string;
   threadId?: string;
@@ -11345,6 +11954,7 @@ class GmailSyncError extends Error {
   constructor(
     readonly code:
       | "GMAIL_AUTH_EXPIRED"
+      | "GMAIL_ENCRYPTION_KEY_MISSING"
       | "GMAIL_PERMISSION"
       | "GMAIL_RATE_LIMITED"
       | "GMAIL_QUERY_INVALID"
