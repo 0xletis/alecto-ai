@@ -19,6 +19,8 @@ export const SemanticRouterIntentSchema = z.enum([
   "show_goals",
   "show_actions",
   "show_memory",
+  "email_review_inbox",
+  "email_review_action",
   "email_rules_list",
   "integration_guidance",
   "integration_sync",

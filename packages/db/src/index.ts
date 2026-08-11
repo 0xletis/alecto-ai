@@ -97,6 +97,7 @@ export type PendingActionType =
   | "next_week_plan"
   | "goal_progress_log"
   | "custom_email_rule"
+  | "email_review_context"
   | "memory_create"
   | "event_undo_last";
 export type PendingActionStatus = "pending" | "confirmed" | "rejected" | "expired";

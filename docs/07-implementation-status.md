@@ -187,6 +187,7 @@ After every implementation pass:
 - [x] `job_search_email` adapter
 - [x] `work_action_email` adapter
 - [x] Conservative Gmail hard filters for security, marketing, account/admin, and non-work noise
+- [x] Gmail security/auth/account noise is filtered before job-search classification and before custom review creation. Security-code, verification-code, OTP, login, password-reset, 2FA/authentication, suspicious-login, device-login, and account-recovery emails do not create EmailReviewItems in v1.
 - [x] Gmail sync summaries and debug counters
 - [x] Natural Gmail/email sync requests use the same readonly sync path and preserve token/ciphertext redaction
 - [x] Natural Gmail email-rule enable requests require an active Gmail connection, preserve explicit rule approval, and do not auto-scan by themselves
@@ -198,6 +199,7 @@ After every implementation pass:
 - [x] Custom Gmail rule management through natural chat for clear pause/resume/remove requests, with confirmation before removal
 - [x] Pending custom Gmail rule conversation state: natural English/Spanish/Catalan edits to `looks for` keywords, replacement wording such as `Aigues de Barcelona instead of Endesa`, `solo Aigues de Barcelona, no Endesa`, and `en lloc de`, questions about where matches go, timing/sync questions, goal-link correction/removal, cancel, and confirmation before scanning
 - [x] Active custom Gmail rule editing through natural chat: after rule list/status/edit replies, Alecto keeps short-lived rule context so follow-ups such as `make that rule look for only Aigues de Barcelona instead of Endesa`, `when will you tell me about it?`, `pause it`, and Spanish/Catalan equivalents resolve to the focused rule
+- [x] Natural Gmail timing/status questions such as `when do u check my gmail?`, `when do u check my mail`, `do you check Gmail automatically?`, and `will you notify me about emails?` route to sync timing guidance before broad custom-rule creation or LLM semantic routing
 - [x] Ambiguous custom Gmail rule management stores pending clarification before routing falls back. Example: `elimina Endesa` can be resolved by replying `1` or `Endesa emails`, then destructive removal asks for yes/no confirmation.
 - [x] Multi-rule Gmail removal asks a bulk confirmation and archives matched Gmail email rules only after confirmation. Example: `elimina Aigues de Barcelona y Endesa`.
 - [x] Gmail rule list/reset phrases avoid action-control and multi-intent fallback. Examples: `what email rules do we have`, `delete all email rules`, `turn all off and delete them`, and contextual `can u delete all of em?` after listing rules route to Gmail status/cleanup and never produce "I could not confidently match that to an open action."
@@ -209,6 +211,13 @@ After every implementation pass:
 - [x] Expired pending confirmations no longer block fresh full-message requests such as `create a rule for Endesa bills`
 - [x] Conversation repair for bad routing around pending Gmail rules; Alecto acknowledges the specific pending-rule problem instead of falling into generic support/coaching
 - [x] Email review queue
+- [x] Email Review Inbox v1: `/email_reviews`, `email reviews`, `show Gmail reviews`, `what emails need review`, `correos pendientes`, and Catalan variants show grouped pending reviews with human labels and short-lived visible numbers instead of adapter IDs or permanent IDs
+- [x] Email review context actions: after showing the inbox, `show 1`, `approve 1`, `reject 2`, `approve all job-search reviews`, `reject all Endesa reviews`, `reject all the rest reviews from Endesa`, and `turn 3 into an action tomorrow` resolve only against the visible pending review context and expire safely
+- [x] Email Review Inbox visible numbers now follow display order across groups; `show 1` and `reject 5` resolve to the number the user saw
+- [x] Bulk email review operations re-check current DB status and only mutate still-pending visible reviews. Already approved, rejected, action-converted, or missing reviews are reported separately as already handled.
+- [x] Gmail sync replies include pending email review counts and user-friendly new-review/new-event summaries without raw bodies, provider payloads, tokens, ciphertext, IVs, or tags
+- [x] Scheduled integration sync can send one bundled Telegram notification when new Gmail review items are created, e.g. grouped job-search/work-action/custom counts; unchanged pending reviews do not produce a new notification
+- [x] Custom Gmail review approval remains review-only by default; explicit `turn N into an action` can create an ActionItem from a visible custom review
 - [x] Review semantic dedupe
 - [x] Review approval/rejection
 - [x] Work-action review approval creates ActionItems instead of Events

@@ -1035,6 +1035,118 @@ test("Gmail encrypted token without encryption key returns safe sync error", asy
   }
 });
 
+test("Gmail timing questions route to sync guidance before custom rule creation or LLM routing", async () => {
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `gmail-timing-routing-${randomUUID()}`;
+  const riskUserId = `gmail-timing-risk-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    process.env.LLM_ROUTER_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_request",
+      operation: "create",
+      confidence: 0.97,
+      reason: "Bad mock tries to turn a timing question into a custom rule.",
+      language: "en",
+      sideEffectRisk: "write",
+      requiresConfirmation: true,
+      target: "Gmail",
+      keywordFilters: ["Gmail"],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+    await prisma.user.createMany({ data: [{ id: userId }, { id: riskUserId }] });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "timing@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"can you review\"",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "hybrid",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: riskUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        status: "active"
+      }
+    });
+
+    for (const message of [
+      "when do u check my gmail?",
+      "when do u check my mail",
+      "do you check Gmail automatically",
+      "will you notify me about emails"
+    ]) {
+      const response = await server.inject({
+        method: "POST",
+        url: "/messages/process",
+        payload: { userId, message }
+      });
+      assert.equal(response.statusCode, 200);
+      assert.match(response.json().reply, /Alecto checks Gmail when you say 'sync Gmail'/);
+      assert.match(response.json().reply, /Automatic sync:/);
+      assert.match(response.json().reply, /not instant arrival tracking yet/i);
+      assert.match(response.json().reply, /^For active Gmail rules:/);
+      assert.doesNotMatch(response.json().reply, /^For Work action emails:/);
+      assert.equal(response.json().routeDebug.intent, "gmail_sync_guidance");
+      assert.equal(response.json().routeDebug.routerSource, "deterministic_surface");
+      assert.doesNotMatch(response.json().reply, /review-first Gmail rule|too broad|sender, company|project, or 2-3 keywords/i);
+    }
+
+    const riskResponse = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: riskUserId, message: "when do you check Gmail so I can bet safely" }
+    });
+    assert.equal(riskResponse.statusCode, 200);
+    assert.equal(riskResponse.json().riskState, "RED");
+    assert.doesNotMatch(riskResponse.json().reply, /sync Gmail|email rules/i);
+  } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [userId, riskUserId] } } });
+  }
+});
+
 test("custom Gmail tracking rules are confirmation-first and review-only", async () => {
   const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
   const originalFetch = globalThis.fetch;
@@ -1229,7 +1341,8 @@ test("custom Gmail tracking rules are confirmation-first and review-only", async
       payload: { userId, message: "sync Gmail" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 1 messages checked, 1 new item/);
+    assert.match(response.json().reply, /Gmail sync: 1 messages checked, 1 new review item/);
+    assert.match(response.json().reply, /1 email review is waiting/);
 
     const review = await prisma.emailReviewItem.findFirstOrThrow({
       where: { userId, ruleId: rule.id, adapterId: "custom_email_review", status: "pending" }
@@ -1286,6 +1399,717 @@ test("custom Gmail tracking rules are confirmation-first and review-only", async
     else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
     await server.close();
     await prisma.user.deleteMany({ where: { id: { in: [userId, broadUserId] } } });
+  }
+});
+
+test("email review inbox supports numbered natural review handling", async () => {
+  const reviewUserId = `email-review-inbox-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    await prisma.user.create({ data: { id: reviewUserId } });
+    await prisma.notificationSettings.create({
+      data: {
+        userId: reviewUserId,
+        timezone: "Europe/Madrid",
+        telegramUserId: "123456"
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: reviewUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: { provider: "gmail", scope: "gmail.readonly", email: "reviews@example.com", hasRefreshToken: true }
+      }
+    });
+    const jobRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "newer_than:30d interview",
+        status: "active",
+        createdBy: "user"
+      }
+    });
+    const workRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"please review\"",
+        status: "active",
+        createdBy: "user",
+        reviewBeforeLogging: true
+      }
+    });
+    const customRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        createdBy: "user",
+        reviewBeforeLogging: true
+      }
+    });
+
+    await prisma.emailReviewItem.createMany({
+      data: [
+        {
+          userId: reviewUserId,
+          connectionId: connection.id,
+          ruleId: jobRule.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          providerMessageId: "job-message-1",
+          externalId: `gmail-review:${jobRule.id}:job-message-1`,
+          subject: "Recruiter reply from Example Labs",
+          from: "Recruiter <recruiter@example.com>",
+          snippet: "Thanks for applying. Can we talk tomorrow?",
+          evidence: "Thanks for applying. Can we talk tomorrow?",
+          proposedEventType: "career.recruiter_reply_received",
+          confidence: 0.91,
+          reason: "recruiter_reply",
+          extracted: { company: "Example Labs" },
+          status: "pending"
+        },
+        {
+          userId: reviewUserId,
+          connectionId: connection.id,
+          ruleId: workRule.id,
+          adapterId: "work_action_email",
+          provider: "gmail",
+          providerMessageId: "work-message-1",
+          externalId: `gmail-review:${workRule.id}:work-message-1`,
+          subject: "Homepage deadline",
+          from: "Client <client@example.com>",
+          snippet: "Please send the homepage fixes by Friday.",
+          evidence: "Please send the homepage fixes by Friday.",
+          proposedEventType: "work_deadline_detected",
+          confidence: 0.86,
+          reason: "work_deadline_detected",
+          extracted: { project: "homepage", deadline: "Friday" },
+          status: "pending"
+        },
+        {
+          userId: reviewUserId,
+          connectionId: connection.id,
+          ruleId: customRule.id,
+          adapterId: "custom_email_review",
+          provider: "gmail",
+          providerMessageId: "custom-message-1",
+          externalId: `gmail-review:${customRule.id}:custom-message-1`,
+          subject: "Endesa factura",
+          from: "Endesa <noreply@endesa.com>",
+          snippet: "Your Endesa factura is ready.",
+          evidence: "Your Endesa factura is ready.",
+          confidence: 0.8,
+          reason: "custom_email_match",
+          extracted: { customRuleName: "Endesa emails" },
+          status: "pending"
+        }
+      ]
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "correos pendientes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Email reviews waiting: 3/);
+    assert.match(response.json().reply, /Job-search:/);
+    assert.match(response.json().reply, /Work actions:/);
+    assert.match(response.json().reply, /Custom tracking:/);
+    assert.match(response.json().reply, /Proposed: log recruiter reply/);
+    assert.match(response.json().reply, /Proposed: create action/);
+    assert.match(response.json().reply, /Proposed: review only/);
+    assert.deepEqual(
+      response.json().reply.match(/^\d+\./gm)?.map((line: string) => Number(line.match(/^(\d+)\./)?.[1])) ?? [],
+      [1, 2, 3]
+    );
+    assert.match(response.json().reply, /Job-search:\n1\. Recruiter reply/);
+    assert.match(response.json().reply, /Work actions:\n2\. Homepage deadline/);
+    assert.match(response.json().reply, /Custom tracking:\n3\. Endesa factura/);
+    assert.doesNotMatch(response.json().reply, /job_search_email|work_action_email|custom_email_review|access token|refresh token|ciphertext|"iv"|"tag"/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "show 1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Email review: Recruiter reply/);
+    assert.match(response.json().reply, /Tracking: job-search email tracking/);
+    assert.doesNotMatch(response.json().reply, /raw|ciphertext|refresh token/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "approve 1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Approved 1:/);
+    assert.equal(
+      await prisma.event.count({ where: { userId: reviewUserId, source: "gmail", type: "career.recruiter_reply_received" } }),
+      1
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject 2" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rejected 2: Homepage deadline/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "turn 3 into an action tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action created from email review: Endesa factura/);
+    assert.equal(await prisma.actionItem.count({ where: { userId: reviewUserId, source: "email_review" } }), 1);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, status: "pending" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "email reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "No email reviews are waiting.");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject all the rest reviews from Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /No pending email reviews are visible right now/);
+    assert.doesNotMatch(response.json().reply, /expired/i);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reviewUserId } });
+  }
+});
+
+test("Gmail security and auth emails are hard-filtered before job search and custom review creation", async () => {
+  const securityUserId = `gmail-security-filter-${randomUUID()}`;
+  const server = buildServer();
+  const originalFetch = globalThis.fetch;
+
+  try {
+    await server.ready();
+    await prisma.user.create({ data: { id: securityUserId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: securityUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          accessToken: "security-filter-token",
+          expiresAt: Date.now() + 3_600_000,
+          tokenType: "Bearer"
+        }
+      }
+    });
+    await prisma.emailSignalRule.createMany({
+      data: [
+        {
+          userId: securityUserId,
+          connectionId: connection.id,
+          adapterId: "job_search_email",
+          name: "Job search emails",
+          query: "newer_than:30d application",
+          status: "active",
+          fetchStrategy: "query",
+          maxMessagesPerSync: 5,
+          maxEventsPerSync: 5,
+          classifierMode: "hybrid",
+          minAutoLogConfidence: 0.9,
+          minReviewConfidence: 0.65,
+          reviewBeforeLogging: false,
+          createdBy: "user"
+        },
+        {
+          userId: securityUserId,
+          connectionId: connection.id,
+          adapterId: "custom_email_review",
+          name: "Blockchain application emails",
+          query: "newer_than:30d Blockchain application",
+          status: "active",
+          fetchStrategy: "query",
+          maxMessagesPerSync: 5,
+          maxEventsPerSync: 5,
+          classifierMode: "rules",
+          minAutoLogConfidence: 1,
+          minReviewConfidence: 0.65,
+          reviewBeforeLogging: true,
+          createdBy: "user"
+        }
+      ]
+    });
+
+    const messages: Record<string, { subject: string; from: string; snippet: string; body: string }> = {
+      "security-code": {
+        subject: "Security code for your application to Blockchain.com",
+        from: "Blockchain.com <no-reply@blockchain.com>",
+        snippet: "Copy and paste this code into the security code field on your application.",
+        body: "Copy and paste this code into the security code field on your application. After you enter the code, resubmit your application."
+      },
+      "verification-code": {
+        subject: "Verification code",
+        from: "Accounts <security@example.com>",
+        snippet: "Your verification code is 123456.",
+        body: "Use this verification code to continue."
+      },
+      "password-reset": {
+        subject: "Password reset request",
+        from: "Accounts <security@example.com>",
+        snippet: "Reset your password.",
+        body: "We received a password reset request for your account."
+      }
+    };
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      assert.equal((init?.headers as Record<string, string> | undefined)?.authorization, "Bearer security-filter-token");
+
+      if (url.includes("/messages?")) {
+        return new Response(JSON.stringify({ messages: Object.keys(messages).map((id) => ({ id })) }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      const messageId = Object.keys(messages).find((id) => url.includes(`/messages/${id}`));
+      if (messageId) {
+        const message = messages[messageId];
+        return new Response(
+          JSON.stringify({
+            id: messageId,
+            threadId: `thread-${messageId}`,
+            snippet: message.snippet,
+            payload: {
+              mimeType: "text/plain",
+              headers: [
+                { name: "Subject", value: message.subject },
+                { name: "From", value: message.from }
+              ],
+              body: {
+                data: Buffer.from(message.body, "utf8").toString("base64url")
+              }
+            }
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
+
+      return new Response(JSON.stringify({}), { status: 404 });
+    }) as typeof fetch;
+
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: securityUserId, message: "sync Gmail" }
+    });
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail sync: 6 messages checked, 0 new items/);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: securityUserId } }), 0);
+    assert.equal(await prisma.event.count({ where: { userId: securityUserId, source: "gmail" } }), 0);
+    assert.doesNotMatch(response.json().reply, /security-filter-token|ciphertext|refresh token|access token/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: securityUserId } });
+  }
+});
+
+test("email review context bulk operations and expiry are safe", async () => {
+  const reviewUserId = `email-review-bulk-${randomUUID()}`;
+  const expiredUserId = `email-review-expired-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    for (const id of [reviewUserId, expiredUserId]) {
+      await prisma.user.create({ data: { id } });
+    }
+
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: reviewUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: { provider: "gmail", scope: "gmail.readonly" }
+      }
+    });
+    const jobRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        status: "active",
+        createdBy: "user"
+      }
+    });
+    const customRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        createdBy: "user",
+        reviewBeforeLogging: true
+      }
+    });
+
+    await prisma.emailReviewItem.createMany({
+      data: [
+        {
+          userId: reviewUserId,
+          connectionId: connection.id,
+          ruleId: jobRule.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          providerMessageId: "job-bulk-1",
+          externalId: `gmail-review:${jobRule.id}:job-bulk-1`,
+          subject: "Interview scheduling",
+          from: "Example Labs <jobs@example.com>",
+          snippet: "Interview next week",
+          evidence: "Interview next week",
+          proposedEventType: "career.interview_scheduled",
+          confidence: 0.94,
+          reason: "interview_scheduled",
+          extracted: { company: "Example Labs" },
+          status: "pending"
+        },
+        {
+          userId: reviewUserId,
+          connectionId: connection.id,
+          ruleId: customRule.id,
+          adapterId: "custom_email_review",
+          provider: "gmail",
+          providerMessageId: "custom-bulk-1",
+          externalId: `gmail-review:${customRule.id}:custom-bulk-1`,
+          subject: "Endesa factura agosto",
+          from: "Endesa <noreply@endesa.com>",
+          snippet: "Factura ready",
+          evidence: "Factura ready",
+          confidence: 0.8,
+          reason: "custom_email_match",
+          extracted: {},
+          status: "pending"
+        },
+        {
+          userId: reviewUserId,
+          connectionId: connection.id,
+          ruleId: customRule.id,
+          adapterId: "custom_email_review",
+          provider: "gmail",
+          providerMessageId: "custom-bulk-2",
+          externalId: `gmail-review:${customRule.id}:custom-bulk-2`,
+          subject: "Endesa payment",
+          from: "Endesa <noreply@endesa.com>",
+          snippet: "Payment notice",
+          evidence: "Payment notice",
+          confidence: 0.8,
+          reason: "custom_email_match",
+          extracted: {},
+          status: "pending"
+        }
+      ]
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "email reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "approve all" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which group do you mean/);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, status: "pending" } }), 3);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "approve all job-search reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Approved 1:/);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, adapterId: "job_search_email", status: "approved" } }), 1);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, adapterId: "custom_email_review", status: "pending" } }), 2);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject all Endesa reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rejected 2:/);
+    assert.match(response.json().reply, /Rejected 3:/);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, adapterId: "custom_email_review", status: "rejected" } }), 2);
+
+    const expiredConnection = await prisma.integrationConnection.create({
+      data: {
+        userId: expiredUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: { provider: "gmail" }
+      }
+    });
+    const expiredRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: expiredUserId,
+        connectionId: expiredConnection.id,
+        adapterId: "custom_email_review",
+        name: "Expired context",
+        status: "active",
+        createdBy: "user"
+      }
+    });
+    await prisma.emailReviewItem.create({
+      data: {
+        userId: expiredUserId,
+        connectionId: expiredConnection.id,
+        ruleId: expiredRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "expired-1",
+        externalId: `gmail-review:${expiredRule.id}:expired-1`,
+        subject: "Expired review",
+        confidence: 0.8,
+        reason: "custom_email_match",
+        extracted: {},
+        status: "pending"
+      }
+    });
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: expiredUserId, message: "email reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    await prisma.pendingAction.updateMany({
+      where: { userId: expiredUserId, type: "email_review_context", status: "pending" },
+      data: { expiresAt: new Date(Date.now() - 60_000) }
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: expiredUserId, message: "approve 1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /pending decision expired/i);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: expiredUserId, status: "pending" } }), 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [reviewUserId, expiredUserId] } } });
+  }
+});
+
+test("email review bulk rest only mutates currently pending visible reviews", async () => {
+  const reviewUserId = `email-review-rest-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    await prisma.user.create({ data: { id: reviewUserId } });
+    await prisma.notificationSettings.create({
+      data: {
+        userId: reviewUserId,
+        timezone: "Europe/Madrid",
+        telegramUserId: "123456"
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: reviewUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: { provider: "gmail", scope: "gmail.readonly" }
+      }
+    });
+    const customRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        createdBy: "user",
+        reviewBeforeLogging: true
+      }
+    });
+
+    await prisma.emailReviewItem.createMany({
+      data: [1, 2, 3, 4].map((number) => ({
+        userId: reviewUserId,
+        connectionId: connection.id,
+        ruleId: customRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: `endesa-rest-${number}`,
+        externalId: `gmail-review:${customRule.id}:endesa-rest-${number}`,
+        subject: `Endesa factura ${number}`,
+        from: "Endesa <noreply@endesa.com>",
+        snippet: `Endesa factura ${number} ready`,
+        evidence: `Endesa factura ${number} ready`,
+        confidence: 0.8,
+        reason: "custom_email_match",
+        extracted: { customRuleName: "Endesa emails" },
+        status: "pending"
+      }))
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "email reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(
+      response.json().reply.match(/^\d+\./gm)?.map((line: string) => Number(line.match(/^(\d+)\./)?.[1])) ?? [],
+      [1, 2, 3, 4]
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject 1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rejected 1: Endesa factura 1/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "turn 2 into an action for rating Endesa this week" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action created from email review: Endesa factura 2/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject all the rest reviews from Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rejected 3: Endesa factura 3/);
+    assert.match(response.json().reply, /Rejected 4: Endesa factura 4/);
+    assert.doesNotMatch(response.json().reply, /Rejected 1|Rejected 2/);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, status: "pending" } }), 0);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, status: "rejected" } }), 3);
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, status: "approved" } }), 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reviewUserId } });
+  }
+});
+
+test("email review bulk response separates already handled matching reviews", async () => {
+  const reviewUserId = `email-review-already-handled-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    await prisma.user.create({ data: { id: reviewUserId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: reviewUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: { provider: "gmail", scope: "gmail.readonly" }
+      }
+    });
+    const customRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: reviewUserId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        createdBy: "user",
+        reviewBeforeLogging: true
+      }
+    });
+
+    await prisma.emailReviewItem.createMany({
+      data: [1, 2].map((number) => ({
+        userId: reviewUserId,
+        connectionId: connection.id,
+        ruleId: customRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: `endesa-already-${number}`,
+        externalId: `gmail-review:${customRule.id}:endesa-already-${number}`,
+        subject: `Endesa already ${number}`,
+        from: "Endesa <noreply@endesa.com>",
+        snippet: `Endesa already ${number}`,
+        evidence: `Endesa already ${number}`,
+        confidence: 0.8,
+        reason: "custom_email_match",
+        extracted: {},
+        status: "pending"
+      }))
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "email reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject 1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rejected 1/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "reject all Endesa reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rejected 2: Endesa already [12]/);
+    assert.match(response.json().reply, /Already handled:/);
+    assert.match(response.json().reply, /1: Endesa already [12] \(rejected\)/);
+    assert.doesNotMatch(response.json().reply, /Rejected 1/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reviewUserId } });
   }
 });
 
@@ -1517,7 +2341,7 @@ test("semantic router edits pending Gmail rules and repairs misunderstood replie
     assert.match(response.json().reply, /not instant arrival tracking yet/i);
     assert.match(response.json().reply, /email review/i);
     assert.doesNotMatch(response.json().reply, /I could not identify which Gmail rule/i);
-    assert.equal(response.json().routeDebug.intent, "gmail_rule_question");
+    assert.equal(response.json().routeDebug.intent, "gmail_sync_guidance");
 
     response = await server.inject({
       method: "POST",

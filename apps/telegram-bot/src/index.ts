@@ -880,10 +880,14 @@ bot.command("email_reviews", async (ctx) => {
   const showAll = getCommandText(ctx).trim().toLowerCase() === "all";
 
   try {
-    const response = await apiGet<EmailReviewsResponse>(
-      `/users/${getTelegramUserId(ctx)}/email-reviews${showAll ? "?status=all" : ""}`
-    );
-    await replyWithIntegrationMessage(ctx, formatEmailReviews(response.emailReviews, showAll));
+    if (showAll) {
+      const response = await apiGet<EmailReviewsResponse>(`/users/${getTelegramUserId(ctx)}/email-reviews?status=all`);
+      await replyWithIntegrationMessage(ctx, formatEmailReviews(response.emailReviews, showAll));
+      return;
+    }
+
+    const response = await apiGet<EmailReviewInboxResponse>(`/users/${getTelegramUserId(ctx)}/email-reviews/inbox`);
+    await replyWithIntegrationMessage(ctx, response.message);
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
   }
@@ -2790,16 +2794,45 @@ async function postIntegrationSyncForDebug(ctx: Context, connectionId: string): 
 
 function formatGmailSyncSummary(response: IntegrationSyncResponse): string {
   if ((response.emailSummaries?.length ?? 0) === 0 && response.emailRuleDiagnostics?.activeRulesForConnection === 0) {
-    return noActiveEmailRulesMessage();
+    return formatGmailPendingReviewLine(noActiveEmailRulesMessage(), response.pendingEmailReviewCount ?? 0);
   }
 
   const totals = gmailSyncTotals(response.emailSummaries ?? []);
-  const newItems = totals.eventsCreated + totals.reviewItemsCreated;
-  return `Gmail sync: ${totals.messagesFound} messages checked, ${newItems} new ${newItems === 1 ? "item" : "items"}.`;
+  const lines: Array<string | undefined> = [formatGmailSyncTotals(totals)];
+
+  lines.push(formatPendingEmailReviewLine(response.pendingEmailReviewCount ?? 0));
+
+  return lines.filter(Boolean).join("\n\n");
+}
+
+function formatGmailSyncTotals(totals: ReturnType<typeof gmailSyncTotals>): string {
+  if (totals.reviewItemsCreated > 0 && totals.eventsCreated > 0) {
+    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+  }
+
+  if (totals.reviewItemsCreated > 0) {
+    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}.`;
+  }
+
+  if (totals.eventsCreated > 0) {
+    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+  }
+
+  return `Gmail sync: ${totals.messagesFound} messages checked, 0 new items.`;
 }
 
 function noActiveEmailRulesMessage(): string {
   return "Gmail is connected, but no email tracking rules are active. Say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\".";
+}
+
+function formatPendingEmailReviewLine(count: number): string | undefined {
+  return count > 0
+    ? `${count} email review${count === 1 ? "" : "s"} ${count === 1 ? "is" : "are"} waiting. Say "email reviews" to handle ${count === 1 ? "it" : "them"}.`
+    : undefined;
+}
+
+function formatGmailPendingReviewLine(message: string, count: number): string {
+  return [message, formatPendingEmailReviewLine(count)].filter(Boolean).join("\n\n");
 }
 
 function formatBatchIntegrationSyncResults(results: string[]): string {
@@ -4585,6 +4618,11 @@ interface EmailReviewsResponse {
   emailReviews: EmailReviewItem[];
 }
 
+interface EmailReviewInboxResponse {
+  pendingReviewCount: number;
+  message: string;
+}
+
 interface EmailReviewMutationResponse {
   emailReview: EmailReviewItem;
   event?: Event | null;
@@ -4663,6 +4701,7 @@ interface IntegrationSyncResponse {
   repoSummaries?: IntegrationRepoSyncSummary[];
   emailSummaries?: EmailSyncSummary[];
   emailRuleDiagnostics?: EmailRuleDiagnostics;
+  pendingEmailReviewCount?: number;
   error?: string;
   errorStage?: GmailErrorStage;
 }

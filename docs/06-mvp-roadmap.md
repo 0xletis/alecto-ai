@@ -60,6 +60,7 @@ Status:
 - [x] Gmail OAuth local MVP
 - [x] email signal rules
 - [x] email review queue
+- [x] Email Review Inbox + Proactive Review Notifications v1: natural inbox phrases, grouped short-lived visible numbers, approval/rejection/action conversion against visible context, sync replies with pending review counts, and bundled scheduled review-waiting notifications
 - [x] `job_search_email` adapter
 - [x] `work_action_email` adapter
 - [x] memory viewer through Telegram/API
@@ -97,7 +98,7 @@ Likely high-leverage next items:
 - refine first-run onboarding into a fuller guided setup session only after more real alpha usage
 - keep weekly planning regression-tested as the bridge from weekly review into confirmed current-week/next-week ActionItems
 - polish the planning loop from real Telegram usage now that Planning UX Consolidation v1 is implemented
-- keep polishing Gmail setup and custom-rule management from real Telegram usage; pending and active custom rules can be edited with multilingual replacement wording such as `Aigues de Barcelona instead of Endesa`, `solo Aigues de Barcelona, no Endesa`, and Catalan timing questions, but the eval set still needs more real phrasing from English/Spanish/Catalan users
+- keep polishing Gmail setup, custom-rule management, and Email Review Inbox from real Telegram usage; v1 supports grouped review handling and bundled worker notifications, but Gmail webhooks, full-inbox monitoring, per-rule schedules, richer notification preferences, and broader multilingual evals are still later work
 - expand the semantic-router eval set from real Telegram logs across English, Spanish, and Catalan, keeping guardrails and executors deterministic
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until production OAuth/account management, key management, and secret rotation are implemented

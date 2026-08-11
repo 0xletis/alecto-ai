@@ -286,7 +286,10 @@ export function buildServer() {
           routerSource: "pending_decision",
           intent: latestPendingAction.type,
           handlerName: "resolvePendingDecisionReply",
-          mutation: isConfirmationMessage(parsed.data.message) || isRejectionMessage(parsed.data.message),
+          mutation:
+            isConfirmationMessage(parsed.data.message) ||
+            isRejectionMessage(parsed.data.message) ||
+            (latestPendingAction.type === "email_review_context" && looksLikeEmailReviewContextAction(parsed.data.message)),
           reason: "Resolved existing pending decision before normal routing."
         });
       }
@@ -1570,6 +1573,15 @@ export function buildServer() {
   );
 
   server.get<{ Params: { userId: string }; Querystring: { status?: string } }>(
+    "/users/:userId/email-reviews/inbox",
+    async (request) => {
+      return buildEmailReviewInboxResponse(request.params.userId, {
+        storeContext: request.query.status !== "all"
+      });
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { status?: string } }>(
     "/users/:userId/email-reviews",
     async (request) => {
       const status = request.query.status === "all" ? "all" : "pending";
@@ -1586,107 +1598,24 @@ export function buildServer() {
   server.post<{ Params: { userId: string; reviewId: string } }>(
     "/users/:userId/email-reviews/:reviewId/approve",
     async (request, reply) => {
-      const review = await getEmailReviewItem(request.params.userId, request.params.reviewId);
+      const result = await approveEmailReviewForUser(request.params.userId, request.params.reviewId);
 
-      if (!review) {
+      if (result.status === "not_found") {
         return reply.status(404).send({ error: "Email review item not found" });
       }
 
-      if (review.status !== "pending") {
-        if (review.status === "approved" && review.actionItemId) {
-          const actionItem = await getActionItem(request.params.userId, review.actionItemId);
-
-          if (actionItem) {
-            return {
-              emailReview: sanitizeEmailReviewItem(review),
-              actionItem: sanitizeActionItem(actionItem),
-              event: null,
-              message: `Email review already approved. Action item exists: ${actionItem.title}`
-            };
-          }
-        }
-
+      if (result.status === "not_pending") {
         return reply.status(400).send({
-          error: `Email review item is already ${review.status}.`,
-          emailReview: sanitizeEmailReviewItem(review)
+          error: `Email review item is already ${result.review.status}.`,
+          emailReview: sanitizeEmailReviewItem(result.review)
         });
       }
 
-      if (isWorkActionReviewType(review.proposedEventType)) {
-        const actionInput = actionItemInputFromEmailReview(review);
-        const goalLink = await inferActionGoalLink(
-          request.params.userId,
-          actionInput.title,
-          actionInput.description,
-          actionInput.evidence
-        );
-        actionInput.goalId = goalLink.goalId ?? undefined;
-        actionInput.goalSlug = goalLink.goalSlug ?? undefined;
-        actionInput.goalTitleSnapshot = goalLink.matchedGoalTitle;
-        const result = await createActionItemIfNotExists(request.params.userId, actionInput);
-        const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId, undefined, result.actionItem.id);
-
-        return {
-          emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
-          actionItem: sanitizeActionItem(result.actionItem),
-          event: null,
-          message: `Email review approved. Action item ${result.created ? "created" : "already exists"}: ${result.actionItem.title}`
-        };
-      }
-
-      if (review.adapterId === "custom_email_review") {
-        const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId);
-
-        return {
-          emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
-          event: null,
-          actionItem: null,
-          message: "Custom email review approved. No event or action was created."
-        };
-      }
-
-      if (!review.proposedEventType || !EventTypeSchema.safeParse(review.proposedEventType).success) {
-        const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId);
-
-        return {
-          emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
-          event: null,
-          message: "This review item does not map to an approved event type yet. No event created."
-        };
-      }
-
-      const eventExternalId = review.externalId.replace(/^gmail-review:/, "gmail:");
-      const created = await createExternalEventIfNotExists(request.params.userId, {
-        type: EventTypeSchema.parse(review.proposedEventType),
-        timestamp: new Date(),
-        source: "gmail",
-        provider: "gmail",
-        externalId: eventExternalId,
-        data: {
-          ...review.extracted,
-          provider: "gmail",
-          emailAdapterId: review.adapterId,
-          adapterId: review.adapterId === "job_search_email" ? "job_search_text" : review.adapterId,
-          classification: review.reason,
-          ruleId: review.ruleId,
-          gmailMessageId: review.providerMessageId,
-          subject: review.subject,
-          from: review.from,
-          snippet: review.snippet,
-          confidence: review.confidence,
-          reason: review.reason,
-          reviewItemId: review.id,
-          externalId: eventExternalId
-        },
-        confidence: review.confidence,
-        evidence: review.evidence ? [review.evidence] : undefined
-      });
-      const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId, created.event.id);
-
       return {
-        emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
-        event: created.event,
-        message: created.created ? "Email review approved and event created." : "Email review approved. Event already existed."
+        emailReview: sanitizeEmailReviewItem(result.emailReview),
+        event: result.event ?? null,
+        actionItem: result.actionItem ? sanitizeActionItem(result.actionItem) : undefined,
+        message: result.message
       };
     }
   );
@@ -5233,6 +5162,8 @@ type ConversationSurfaceIntent =
   | "show_goals"
   | "show_actions"
   | "show_memory"
+  | "email_review_inbox"
+  | "email_review_action"
   | "email_rules_list"
   | "gmail_sync"
   | "integration_sync"
@@ -5357,6 +5288,14 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     return formatMemoriesForConversation(await getActiveMemories(userId));
   }
 
+  if (intent === "email_review_inbox") {
+    return (await buildEmailReviewInboxResponse(userId, { storeContext: true })).message;
+  }
+
+  if (intent === "email_review_action") {
+    return "Run \"email reviews\" first so I can number the visible items safely.";
+  }
+
   if (intent === "email_rules_list") {
     return formatEmailRulesForConversation(userId, message);
   }
@@ -5370,7 +5309,9 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
   }
 
   if (intent === "gmail_sync_guidance") {
-    return "For Gmail, say 'sync Gmail' after connecting Gmail and enabling a rule.";
+    return looksLikeGmailNotificationTimingQuestion(message)
+      ? formatGmailNotificationTimingForConversation(userId, message)
+      : "For Gmail, say 'sync Gmail' after connecting Gmail and enabling a rule.";
   }
 
   if (intent === "gmail_setup") {
@@ -5445,7 +5386,7 @@ async function syncGmailForConversation(userId: string): Promise<string> {
   }
 
   if (replies.length === 0) {
-    return noActiveGmailRulesMessage();
+    return appendPendingEmailReviewLine(noActiveGmailRulesMessage(), await getPendingEmailReviewCount(userId));
   }
 
   return dedupeLines(replies).join("\n\n");
@@ -5482,7 +5423,7 @@ async function syncIntegrationsForConversation(userId: string): Promise<string> 
   }
 
   if (replies.length === 0 && noRuleGmailConnections > 0) {
-    return noActiveGmailRulesMessage();
+    return appendPendingEmailReviewLine(noActiveGmailRulesMessage(), await getPendingEmailReviewCount(userId));
   }
 
   return dedupeLines(replies).join("\n\n");
@@ -5492,6 +5433,7 @@ function formatConversationGmailSyncResult(result: {
   status: "success" | "error";
   emailSummaries?: EmailRuleSyncSummary[];
   emailRuleDiagnostics?: EmailRuleDiagnostics;
+  pendingEmailReviewCount?: number;
   error?: string;
 }): string {
   if (result.status === "error") {
@@ -5504,12 +5446,30 @@ function formatConversationGmailSyncResult(result: {
   }
 
   if ((result.emailSummaries?.length ?? 0) === 0 && result.emailRuleDiagnostics?.activeRulesForConnection === 0) {
-    return noActiveGmailRulesMessage();
+    return appendPendingEmailReviewLine(noActiveGmailRulesMessage(), result.pendingEmailReviewCount ?? 0);
   }
 
   const totals = gmailSyncTotals(result.emailSummaries ?? []);
-  const newItems = totals.eventsCreated + totals.reviewItemsCreated;
-  return `Gmail sync: ${totals.messagesFound} messages checked, ${newItems} new ${newItems === 1 ? "item" : "items"}.`;
+  return [
+    formatGmailSyncTotalsForConversation(totals),
+    pendingEmailReviewLine(result.pendingEmailReviewCount ?? 0)
+  ].filter(Boolean).join("\n\n");
+}
+
+function formatGmailSyncTotalsForConversation(totals: ReturnType<typeof gmailSyncTotals>): string {
+  if (totals.reviewItemsCreated > 0 && totals.eventsCreated > 0) {
+    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+  }
+
+  if (totals.reviewItemsCreated > 0) {
+    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}.`;
+  }
+
+  if (totals.eventsCreated > 0) {
+    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+  }
+
+  return `Gmail sync: ${totals.messagesFound} messages checked, 0 new items.`;
 }
 
 function formatConversationGithubSyncResult(result: {
@@ -5571,10 +5531,11 @@ function noActiveGmailRulesMessage(): string {
 }
 
 async function formatEmailRulesForConversation(userId: string, message?: string): Promise<string> {
-  const [connections, rules, goals] = await Promise.all([
+  const [connections, rules, goals, pendingReviewCount] = await Promise.all([
     getIntegrationConnections(userId),
     getEmailSignalRules(userId),
-    getGoals(userId)
+    getGoals(userId),
+    getPendingEmailReviewCount(userId)
   ]);
   const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived");
 
@@ -5616,6 +5577,7 @@ async function formatEmailRulesForConversation(userId: string, message?: string)
     ...pausedLines.map((line) => `- ${line}`),
     "",
     `${gmailScheduledSyncDescription()} Manual sync: say 'sync Gmail'.`,
+    pendingEmailReviewLine(pendingReviewCount),
     hiddenInactiveCount > 0 ? `${hiddenInactiveCount} paused/error rule${hiddenInactiveCount === 1 ? " is" : "s are"} hidden here.` : undefined,
     "Full IDs and settings: /my_email_rules"
   ].filter((line) => line !== undefined).join("\n");
@@ -5920,10 +5882,11 @@ function choosePrimaryBuiltInEmailRule(rules: EmailSignalRule[]): EmailSignalRul
 }
 
 async function formatGmailSetupForConversation(userId: string): Promise<string> {
-  const [connections, rules, goals] = await Promise.all([
+  const [connections, rules, goals, pendingReviewCount] = await Promise.all([
     getIntegrationConnections(userId),
     getEmailSignalRules(userId),
-    getActiveGoals(userId)
+    getActiveGoals(userId),
+    getPendingEmailReviewCount(userId)
   ]);
   const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail");
   const activeGmailConnections = gmailConnections.filter((connection) => connection.status === "active");
@@ -5978,6 +5941,8 @@ async function formatGmailSetupForConversation(userId: string): Promise<string> 
     syncLine,
     "Manual sync: say 'sync Gmail'.",
     "",
+    pendingEmailReviewLine(pendingReviewCount),
+    pendingReviewCount > 0 ? "" : undefined,
     "Customize:",
     "- Pause a rule: /pause_email_rule RULE_ID",
     "- Delete a rule: /delete_email_rule RULE_ID",
@@ -6519,6 +6484,21 @@ async function handleSemanticRouterIntent(
     reply = formatMemoriesForConversation(await getActiveMemories(userId));
   }
 
+  if (route.intent === "email_review_inbox") {
+    handlerName = "buildEmailReviewInboxResponse";
+    reply = (await buildEmailReviewInboxResponse(userId, { storeContext: true })).message;
+    mutation = true;
+  }
+
+  if (route.intent === "email_review_action") {
+    handlerName = "resolveEmailReviewContextReply";
+    const emailReviewContext = isPendingEmailReviewContext(pendingAction) ? pendingAction : undefined;
+    reply = emailReviewContext
+      ? await resolveEmailReviewContextReply(userId, emailReviewContext, message)
+      : "Run \"email reviews\" first so I can number the visible items safely.";
+    mutation = Boolean(reply && !/^Run "email reviews"/.test(reply));
+  }
+
   if (route.intent === "email_rules_list") {
     handlerName = "formatEmailRulesForConversation";
     reply = await formatEmailRulesForConversation(userId, message);
@@ -6559,7 +6539,9 @@ async function handleSemanticRouterIntent(
 
   if (route.intent === "gmail_sync_guidance") {
     handlerName = "formatGmailNotificationTimingForConversation";
-    reply = await formatGmailNotificationTimingForConversation(userId, message, pendingAction, route);
+    reply = looksLikeGmailNotificationTimingQuestion(message)
+      ? await formatGmailNotificationTimingForConversation(userId, message, pendingAction, route)
+      : "For Gmail, say 'sync Gmail' after connecting Gmail and enabling a rule.";
   }
 
   if (route.intent === "enable_job_search_email_rule") {
@@ -6746,6 +6728,65 @@ function detectDeterministicSemanticRouterIntent(message: string, pendingAction?
       sideEffectRisk: "none",
       requiresConfirmation: false,
       target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
+  }
+
+  if (looksLikeEmailReviewInboxRequest(message)) {
+    return {
+      intent: "email_review_inbox",
+      operation: "review",
+      confidence: 0.94,
+      reason: "User asks to show pending email review items.",
+      language: "unknown",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
+  }
+
+  if (isPendingEmailReviewContext(pendingAction) && looksLikeEmailReviewContextAction(message)) {
+    return {
+      intent: "email_review_action",
+      operation: "review",
+      confidence: 0.92,
+      reason: "User is responding to visible email review context.",
+      language: "unknown",
+      sideEffectRisk: /reject|clear|dismiss|rechaza|descarta|borra|approve|accept|yes|aprueba|acepta|turn|make|create|task|action|remind|haz|crea|tarea/i.test(message)
+        ? "write"
+        : "read",
+      requiresConfirmation: false,
+      target: extractEmailReviewReference(message) ?? null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
+  }
+
+  if (looksLikeGmailNotificationTimingQuestion(message)) {
+    return {
+      intent: "gmail_sync_guidance",
+      operation: "timing",
+      confidence: 0.96,
+      reason: "User asks when or how Gmail/email checks and notifications happen.",
+      language: "unknown",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: extractGmailRuleQuestionTarget(message) ?? null,
       keywordFilters: [],
       senderFilters: [],
       removeKeywordFilters: [],
@@ -7247,7 +7288,10 @@ async function formatGmailNotificationTimingForConversation(
     ].join("\n");
   }
 
-  const connections = await getIntegrationConnections(userId);
+  const [connections, pendingReviewCount] = await Promise.all([
+    getIntegrationConnections(userId),
+    getPendingEmailReviewCount(userId)
+  ]);
   const gmailConnected = connections.some((connection) => connection.integrationId === "gmail" && connection.status === "active");
 
   if (!gmailConnected) {
@@ -7264,6 +7308,7 @@ async function formatGmailNotificationTimingForConversation(
     pendingAction
   );
   const targetMatches = target ? findEmailRulesByTarget(visibleRules, target) : [];
+  const hasSpecificRuleMatch = targetMatches.length > 0 || customMatches.length > 0;
   const matches = targetMatches.length > 0
     ? targetMatches
     : customMatches.length > 0
@@ -7273,13 +7318,18 @@ async function formatGmailNotificationTimingForConversation(
         : visibleRules;
 
   if (visibleRules.length === 0) {
-    return noActiveGmailRulesMessage();
+    return [
+      noActiveGmailRulesMessage(),
+      "Alecto checks Gmail when you say 'sync Gmail', but no active rule means no Gmail scanning.",
+      `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
+      "This is not instant arrival tracking yet. Gmail webhooks are not implemented."
+    ].join("\n");
   }
 
   const ruleLine =
-    matches.length === 1
+    hasSpecificRuleMatch && matches.length === 1
       ? `For ${matches[0].name}${matches[0].status !== "active" ? ` (${matches[0].status})` : ""}:`
-      : matches.length > 1 && targetMatches.length > 0
+      : hasSpecificRuleMatch && matches.length > 1
         ? `For matching rules: ${matches.slice(0, 3).map((rule) => rule.name).join(", ")}.`
         : "For active Gmail rules:";
 
@@ -7292,8 +7342,9 @@ async function formatGmailNotificationTimingForConversation(
       : "Alecto checks Gmail when you say 'sync Gmail'.",
     `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
     "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
-    "New custom/work uncertain matches go to email review. Check them with /email_reviews."
-  ].join("\n");
+    "New custom/work uncertain matches go to email review. Check them with /email_reviews.",
+    pendingEmailReviewLine(pendingReviewCount)
+  ].filter(Boolean).join("\n");
 }
 
 function looksLikeGmailNotificationTimingQuestion(message: string): boolean {
@@ -7304,6 +7355,10 @@ function looksLikeGmailNotificationTimingQuestion(message: string): boolean {
   }
 
   return (
+    /\bwhen\b.*\b(check|sync|scan|look|read)\b.*\b(gmail|email|emails|mail|mails|inbox)\b/.test(text) ||
+    /\bhow\b.*\b(often|much|many|does|do)\b.*\b(check|sync|scan|look|read)\b/.test(text) ||
+    /\b(do|does|will|would|can|could)\b.*\b(check|sync|scan|look|read|notify|tell|let me know)\b.*\b(automatically|background|arrival|arrive|new|gmail|email|emails|mail|mails)\b/.test(text) ||
+    /\b(automatically|background|instant|webhook|webhooks)\b.*\b(gmail|email|emails|mail|mails|inbox|notify|notification|sync|check|scan)\b/.test(text) ||
     /\bwhen\b.*\b(let me know|tell me|notify|notification|new|arrive|comes?|come in|sync|check)\b/.test(text) ||
     /\b(let me know|tell me|notify|notification)\b.*\b(new|arrive|comes?|come in|sync|check|email|emails|mail|mails)\b/.test(text) ||
     /\bwhen they arrive\b/.test(text)
@@ -7711,6 +7766,14 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "show_memory";
   }
 
+  if (looksLikeEmailReviewInboxRequest(message)) {
+    return "email_review_inbox";
+  }
+
+  if (looksLikeEmailReviewContextAction(message)) {
+    return "email_review_action";
+  }
+
   if (/\b(sync integrations|sync my integrations|update integrations|update my integrations|sync all integrations)\b/.test(text)) {
     return "integration_sync";
   }
@@ -7740,6 +7803,10 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     /\b(sync gmail|sync my gmail|sync email|sync my email|check gmail now|check my gmail now|update gmail signals|update my gmail signals)\b/.test(text)
   ) {
     return "gmail_sync";
+  }
+
+  if (looksLikeGmailNotificationTimingQuestion(message)) {
+    return "gmail_sync_guidance";
   }
 
   if (/\b(check my messages|check messages|check inbox|check my inbox|any emails|any email)\b/.test(text)) {
@@ -9828,6 +9895,7 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       repoActivityEvents: 0,
       repoSummaries: [],
       emailSummaries: [],
+      pendingEmailReviewCount: await getPendingEmailReviewCount(connection.userId),
       emailRuleDiagnostics,
       syncLog
     };
@@ -9895,6 +9963,7 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       repoActivityEvents: 0,
       repoSummaries: [],
       emailSummaries,
+      pendingEmailReviewCount: await getPendingEmailReviewCount(connection.userId),
       emailRuleDiagnostics,
       syncLog
     };
@@ -9933,6 +10002,7 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       repoActivityEvents: 0,
       repoSummaries: [],
       emailSummaries,
+      pendingEmailReviewCount: await getPendingEmailReviewCount(connection.userId),
       emailRuleDiagnostics,
       error: reason,
       errorStage,
@@ -10246,6 +10316,11 @@ async function classifyEmailForRule(
   message: GmailMessage,
   text: string
 ): Promise<{ classification: ReturnType<typeof classifyJobSearchEmail>; llmStatus?: "classified" | "unavailable" | "error" }> {
+  const securityNoise = classifySecurityAuthEmailNoise(rule, message, text);
+  if (securityNoise) {
+    return { classification: securityNoise };
+  }
+
   if (rule.adapterId === "custom_email_review") {
     return {
       classification: {
@@ -10385,6 +10460,58 @@ function unavailableEmailClassification(
   }
 
   return classifyJobSearchEmail({ text, classifierMode: "llm", llmAvailable: false });
+}
+
+function classifySecurityAuthEmailNoise(
+  rule: EmailSignalRule,
+  message: GmailMessage,
+  text: string
+): ReturnType<typeof classifyJobSearchEmail> | undefined {
+  if (!isSecurityAuthAccountEmail(text)) {
+    return undefined;
+  }
+
+  return {
+    decision: "ignore",
+    eventType: undefined,
+    confidence: 0.05,
+    reason: "filtered_non_action_email",
+    evidence: text.slice(0, 300),
+    extracted: {
+      subject: getGmailHeader(message, "subject"),
+      from: getGmailHeader(message, "from")
+    },
+    metadata: {
+      classifierMode: rule.classifierMode,
+      adapterId: rule.adapterId,
+      source: "gmail",
+      classifier: "rules"
+    }
+  };
+}
+
+function isSecurityAuthAccountEmail(text: string): boolean {
+  const normalized = normalizeForComparison(text);
+
+  return [
+    /\bsecurity code\b/,
+    /\bverification code\b/,
+    /\botp\b/,
+    /\blogin code\b/,
+    /\bsign in alert\b/,
+    /\bsignin alert\b/,
+    /\bsign in\b.*\balert\b/,
+    /\bpassword reset\b/,
+    /\breset your password\b/,
+    /\baccount security\b/,
+    /\btwo factor\b/,
+    /\b2fa\b/,
+    /\bauthentication\b/,
+    /\bsuspicious login\b/,
+    /\bdevice login\b/,
+    /\bnew device\b.*\blogin\b/,
+    /\baccount recovery\b/
+  ].some((pattern) => pattern.test(normalized));
 }
 
 async function createEmailReviewItemForClassification(input: {
@@ -10681,6 +10808,962 @@ function sanitizeActionItem(item: ActionItem) {
     evidence: item.evidence ? truncatePlainText(item.evidence, 500) : undefined,
     description: item.description ? truncatePlainText(item.description, 500) : undefined
   };
+}
+
+type EmailReviewKind = "job_search" | "work_action" | "custom_tracking" | "other";
+
+interface EmailReviewInboxItem {
+  number: number;
+  reviewId: string;
+  kind: EmailReviewKind;
+  groupLabel: string;
+  ruleName: string;
+  trackingLabel: string;
+  from?: string;
+  subject?: string;
+  snippet?: string;
+  evidence?: string;
+  proposedEventType?: string;
+  proposedOutcome: string;
+  goalTitle?: string;
+  confidence: number;
+  createdAt: string;
+}
+
+interface EmailReviewInboxResponse {
+  pendingReviewCount: number;
+  groups: Array<{
+    kind: EmailReviewKind;
+    label: string;
+    count: number;
+    reviews: EmailReviewInboxItem[];
+  }>;
+  reviews: EmailReviewInboxItem[];
+  message: string;
+}
+
+type EmailReviewApprovalResult =
+  | { status: "not_found" }
+  | { status: "not_pending"; review: EmailReviewItem }
+  | {
+      status: "ok";
+      emailReview: EmailReviewItem;
+      event?: StoredEvent | null;
+      actionItem?: ActionItem | null;
+      message: string;
+    };
+
+async function buildEmailReviewInboxResponse(
+  userId: string,
+  options: { storeContext?: boolean; limit?: number } = {}
+): Promise<EmailReviewInboxResponse> {
+  const limit = options.limit ?? 10;
+  const [pendingReviewCount, reviews, rules, goals, timezone] = await Promise.all([
+    getPendingEmailReviewCount(userId),
+    getEmailReviewItems(userId, { status: "pending", limit }),
+    getEmailSignalRules(userId),
+    getGoals(userId),
+    getUserTimezone(userId)
+  ]);
+  const ruleById = new Map(rules.map((rule) => [rule.id, rule]));
+  const goalById = new Map(goals.map((goal) => [goal.id, goal.title]));
+  const orderedReviews = [...reviews].sort((left, right) => {
+    const kindDelta = emailReviewKindSortIndex(emailReviewKind(left)) - emailReviewKindSortIndex(emailReviewKind(right));
+    if (kindDelta !== 0) {
+      return kindDelta;
+    }
+
+    return right.updatedAt.getTime() - left.updatedAt.getTime();
+  });
+  const items = orderedReviews.map((review, index) =>
+    toEmailReviewInboxItem({
+      review,
+      number: index + 1,
+      rule: ruleById.get(review.ruleId),
+      goalById,
+      timezone
+    })
+  );
+  const groups = groupEmailReviewInboxItems(items);
+
+  if (options.storeContext) {
+    await replacePendingAction(userId, {
+      type: "email_review_context",
+      summary: `${pendingReviewCount} email review${pendingReviewCount === 1 ? "" : "s"} visible`,
+      payload: {
+        operation: "email_review_context",
+        reviews: items,
+        pendingReviewCount,
+        visibleCount: items.length
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+  }
+
+  return {
+    pendingReviewCount,
+    groups,
+    reviews: items,
+    message: formatEmailReviewInboxMessage(pendingReviewCount, groups)
+  };
+}
+
+async function approveEmailReviewForUser(userId: string, reviewId: string): Promise<EmailReviewApprovalResult> {
+  const review = await getEmailReviewItem(userId, reviewId);
+
+  if (!review) {
+    return { status: "not_found" };
+  }
+
+  if (review.status !== "pending") {
+    if (review.status === "approved" && review.actionItemId) {
+      const actionItem = await getActionItem(userId, review.actionItemId);
+
+      if (actionItem) {
+        return {
+          status: "ok",
+          emailReview: review,
+          actionItem,
+          event: null,
+          message: `Email review already approved. Action item exists: ${actionItem.title}`
+        };
+      }
+    }
+
+    return { status: "not_pending", review };
+  }
+
+  if (isWorkActionReviewType(review.proposedEventType)) {
+    const result = await createActionItemFromEmailReview(userId, review, {});
+    const updated = await approveEmailReviewItem(userId, review.id, undefined, result.actionItem.id);
+
+    return {
+      status: "ok",
+      emailReview: updated ?? review,
+      actionItem: result.actionItem,
+      event: null,
+      message: `Email review approved. Action item ${result.created ? "created" : "already exists"}: ${result.actionItem.title}`
+    };
+  }
+
+  if (review.adapterId === "custom_email_review") {
+    const updated = await approveEmailReviewItem(userId, review.id);
+
+    return {
+      status: "ok",
+      emailReview: updated ?? review,
+      event: null,
+      actionItem: null,
+      message: "Custom email review approved. No event or action was created."
+    };
+  }
+
+  if (!review.proposedEventType || !EventTypeSchema.safeParse(review.proposedEventType).success) {
+    const updated = await approveEmailReviewItem(userId, review.id);
+
+    return {
+      status: "ok",
+      emailReview: updated ?? review,
+      event: null,
+      actionItem: null,
+      message: "This review item does not map to an approved event type yet. No event created."
+    };
+  }
+
+  const eventExternalId = review.externalId.replace(/^gmail-review:/, "gmail:");
+  const created = await createExternalEventIfNotExists(userId, {
+    type: EventTypeSchema.parse(review.proposedEventType),
+    timestamp: new Date(),
+    source: "gmail",
+    provider: "gmail",
+    externalId: eventExternalId,
+    data: {
+      ...review.extracted,
+      provider: "gmail",
+      emailAdapterId: review.adapterId,
+      adapterId: review.adapterId === "job_search_email" ? "job_search_text" : review.adapterId,
+      classification: review.reason,
+      ruleId: review.ruleId,
+      gmailMessageId: review.providerMessageId,
+      subject: review.subject,
+      from: review.from,
+      snippet: review.snippet,
+      confidence: review.confidence,
+      reason: review.reason,
+      reviewItemId: review.id,
+      externalId: eventExternalId
+    },
+    confidence: review.confidence,
+    evidence: review.evidence ? [review.evidence] : undefined
+  });
+  const updated = await approveEmailReviewItem(userId, review.id, created.event.id);
+
+  return {
+    status: "ok",
+    emailReview: updated ?? review,
+    event: created.event,
+    actionItem: null,
+    message: created.created ? "Email review approved and event created." : "Email review approved. Event already existed."
+  };
+}
+
+async function createActionItemFromEmailReview(
+  userId: string,
+  review: EmailReviewItem,
+  options: { dueText?: string; now?: Date } = {}
+): Promise<{ created: boolean; actionItem: ActionItem }> {
+  const actionInput = actionItemInputFromEmailReview(review);
+  const dueAt = await parseEmailReviewActionDueAt(userId, options.dueText, options.now);
+
+  if (dueAt) {
+    actionInput.dueAt = dueAt;
+  }
+
+  const rule = (await getEmailSignalRules(userId)).find((item) => item.id === review.ruleId);
+  const goals = await getGoals(userId);
+  const linkedGoal = rule?.goalId ? goals.find((goal) => goal.id === rule.goalId && goal.status === "active") : undefined;
+
+  if (linkedGoal) {
+    actionInput.goalId = linkedGoal.id;
+    actionInput.goalSlug = linkedGoal.templateId ?? undefined;
+    actionInput.goalTitleSnapshot = linkedGoal.title;
+  } else {
+    const goalLink = await inferActionGoalLink(userId, actionInput.title, actionInput.description, actionInput.evidence);
+    actionInput.goalId = goalLink.goalId ?? undefined;
+    actionInput.goalSlug = goalLink.goalSlug ?? undefined;
+    actionInput.goalTitleSnapshot = goalLink.matchedGoalTitle;
+  }
+
+  return createActionItemIfNotExists(userId, actionInput);
+}
+
+async function parseEmailReviewActionDueAt(userId: string, dueText: string | undefined, now = new Date()): Promise<Date | undefined> {
+  if (!dueText?.trim()) {
+    return undefined;
+  }
+
+  const settings = await getOrCreateNotificationSettings(userId);
+  const parsed = parseActionDueDate(dueText, {
+    now,
+    timezone: settings.timezone,
+    preferences: settings
+  });
+
+  if (parsed.invalidReason === "past_explicit_time") {
+    throw new Error("That time has already passed. Use a future time, or say 'now'.");
+  }
+
+  return parsed.dueAt ?? undefined;
+}
+
+async function rejectEmailReviewForUser(userId: string, reviewId: string): Promise<{ status: "not_found" | "ok"; review?: EmailReviewItem; message: string }> {
+  const review = await rejectEmailReviewItem(userId, reviewId);
+
+  if (!review) {
+    return { status: "not_found", message: "Email review item not found" };
+  }
+
+  return {
+    status: "ok",
+    review,
+    message: review.status === "rejected" ? "Email review rejected." : `Email review item is already ${review.status}.`
+  };
+}
+
+async function resolveEmailReviewContextReply(
+  userId: string,
+  pendingAction: PendingAction,
+  message: string
+): Promise<string | undefined> {
+  if (looksLikeEmailReviewInboxRequest(message)) {
+    return (await buildEmailReviewInboxResponse(userId, { storeContext: true })).message;
+  }
+
+  const parsed = parseEmailReviewContextReply(message);
+
+  if (!parsed) {
+    return undefined;
+  }
+
+  if (parsed.operation === "cancel") {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "Cancelled. I did not change anything.";
+  }
+
+  const items = readEmailReviewContextItems(pendingAction.payload.reviews);
+
+  if (items.length === 0) {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "No pending email reviews are visible right now. Run \"email reviews\" after Gmail finds reviews.";
+  }
+
+  if (parsed.operation === "show") {
+    const item = selectEmailReviewContextItem(parsed.target, items);
+    if (!item) {
+      return emailReviewSelectionPrompt(items);
+    }
+
+    return formatEmailReviewDetailsForContext(userId, item.reviewId);
+  }
+
+  if (parsed.operation === "approve" || parsed.operation === "reject") {
+    const lastHandledReviewIds = readEmailReviewContextHandledReviewIds(pendingAction.payload);
+    const selectedItems = selectEmailReviewContextItems(parsed.target, items, parsed.bulk);
+
+    if (selectedItems.status === "ambiguous") {
+      return selectedItems.message;
+    }
+
+    const itemsToHandle = parsed.bulk && emailReviewTargetMentionsRest(parsed.target)
+      ? selectedItems.items.filter((item) => !lastHandledReviewIds.has(item.reviewId))
+      : selectedItems.items;
+
+    if (itemsToHandle.length === 0) {
+      return emailReviewSelectionPrompt(items);
+    }
+
+    const replies: string[] = [];
+    const alreadyHandled: string[] = [];
+    const handledReviewIds: string[] = [];
+
+    for (const item of itemsToHandle) {
+      const review = await getEmailReviewItem(userId, item.reviewId);
+
+      if (!review) {
+        alreadyHandled.push(`${item.number}: ${item.subject ?? item.ruleName} (not found)`);
+        continue;
+      }
+
+      if (review.status !== "pending") {
+        alreadyHandled.push(`${item.number}: ${item.subject ?? item.ruleName} (${review.status})`);
+        continue;
+      }
+
+      if (parsed.operation === "approve") {
+        const result = await approveEmailReviewForUser(userId, item.reviewId);
+        replies.push(formatEmailReviewApprovalContextReply(result, item));
+      } else {
+        const result = await rejectEmailReviewForUser(userId, item.reviewId);
+        replies.push(result.status === "ok" ? `Rejected ${item.number}: ${item.subject ?? item.ruleName}` : `Skipped ${item.number}: not found`);
+      }
+
+      handledReviewIds.push(item.reviewId);
+    }
+
+    await rememberEmailReviewContextHandled(userId, pendingAction, handledReviewIds);
+    await closeEmailReviewContextIfDone(userId, pendingAction);
+
+    return formatEmailReviewBulkContextReply(replies, alreadyHandled);
+  }
+
+  if (parsed.operation === "action") {
+    const item = selectEmailReviewContextItem(parsed.target, items);
+    if (!item) {
+      return emailReviewSelectionPrompt(items);
+    }
+
+    const review = await getEmailReviewItem(userId, item.reviewId);
+    if (!review) {
+      return "I could not find that email review anymore. Run \"email reviews\" again.";
+    }
+
+    if (review.status !== "pending") {
+      return `That email review is already ${review.status}. Run "email reviews" again.`;
+    }
+
+    try {
+      const result = await createActionItemFromEmailReview(userId, review, { dueText: parsed.timeText });
+      const updated = await approveEmailReviewItem(userId, review.id, undefined, result.actionItem.id);
+      await rememberEmailReviewContextHandled(userId, pendingAction, [review.id]);
+      await closeEmailReviewContextIfDone(userId, pendingAction);
+      return [
+        `Action ${result.created ? "created" : "already exists"} from email review: ${result.actionItem.title}`,
+        result.actionItem.dueAt ? `due: ${formatLocalDateTime(result.actionItem.dueAt, await getUserTimezone(userId))}` : undefined,
+        updated ? "Email review marked approved." : undefined
+      ].filter(Boolean).join("\n");
+    } catch (error) {
+      return safeErrorForLog(error);
+    }
+  }
+
+  return undefined;
+}
+
+function toEmailReviewInboxItem(input: {
+  review: EmailReviewItem;
+  number: number;
+  rule?: EmailSignalRule;
+  goalById: Map<string, string>;
+  timezone: string;
+}): EmailReviewInboxItem {
+  const kind = emailReviewKind(input.review);
+  const ruleName = input.rule?.name ?? "Gmail tracking";
+  const goalTitle = input.rule?.goalId ? input.goalById.get(input.rule.goalId) : undefined;
+
+  return {
+    number: input.number,
+    reviewId: input.review.id,
+    kind,
+    groupLabel: emailReviewGroupLabel(kind),
+    ruleName,
+    trackingLabel: emailReviewTrackingLabel(input.review),
+    from: input.review.from ? truncatePlainText(input.review.from, 100) : undefined,
+    subject: input.review.subject ? truncatePlainText(input.review.subject, 100) : undefined,
+    snippet: input.review.snippet ? truncatePlainText(input.review.snippet, 180) : undefined,
+    evidence: input.review.evidence ? truncatePlainText(input.review.evidence, 180) : undefined,
+    proposedEventType: input.review.proposedEventType,
+    proposedOutcome: emailReviewProposedOutcome(input.review),
+    goalTitle,
+    confidence: input.review.confidence,
+    createdAt: formatLocalDateTime(input.review.createdAt, input.timezone)
+  };
+}
+
+function groupEmailReviewInboxItems(items: EmailReviewInboxItem[]) {
+  const order: EmailReviewKind[] = ["job_search", "work_action", "custom_tracking", "other"];
+
+  return order
+    .map((kind) => {
+      const reviews = items.filter((item) => item.kind === kind);
+      return {
+        kind,
+        label: emailReviewGroupLabel(kind),
+        count: reviews.length,
+        reviews
+      };
+    })
+    .filter((group) => group.count > 0);
+}
+
+function emailReviewKindSortIndex(kind: EmailReviewKind): number {
+  const order: EmailReviewKind[] = ["job_search", "work_action", "custom_tracking", "other"];
+  const index = order.indexOf(kind);
+  return index === -1 ? order.length : index;
+}
+
+function formatEmailReviewInboxMessage(pendingReviewCount: number, groups: EmailReviewInboxResponse["groups"]): string {
+  if (pendingReviewCount === 0) {
+    return "No email reviews are waiting.";
+  }
+
+  const lines = [`Email reviews waiting: ${pendingReviewCount}`];
+
+  for (const group of groups) {
+    lines.push("", `${group.label}:`);
+
+    for (const item of group.reviews) {
+      lines.push(
+        `${item.number}. ${item.subject ?? item.ruleName} - ${senderOrRuleLabel(item)} - ${item.createdAt}`,
+        `   Proposed: ${item.proposedOutcome}`,
+        item.kind === "custom_tracking"
+          ? `   Say "show ${item.number}", "reject ${item.number}", or "turn ${item.number} into an action".`
+          : `   Say "approve ${item.number}" or "reject ${item.number}".`
+      );
+    }
+  }
+
+  if (pendingReviewCount > visibleEmailReviewCount(groups)) {
+    lines.push("", `Showing ${visibleEmailReviewCount(groups)}. Run /email_reviews all for recent handled items with IDs.`);
+  }
+
+  return lines.join("\n");
+}
+
+function visibleEmailReviewCount(groups: EmailReviewInboxResponse["groups"]): number {
+  return groups.reduce((count, group) => count + group.reviews.length, 0);
+}
+
+function senderOrRuleLabel(item: EmailReviewInboxItem): string {
+  const sender = item.from ? extractSafeSenderLabel(item.from) : "";
+  return sender || item.ruleName;
+}
+
+function extractSafeSenderLabel(value: string): string {
+  const withoutEmail = value.replace(/<[^>]+>/g, "").replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, "").trim();
+  return truncatePlainText(withoutEmail || value, 80);
+}
+
+async function formatEmailReviewDetailsForContext(userId: string, reviewId: string): Promise<string> {
+  const review = await getEmailReviewItem(userId, reviewId);
+
+  if (!review) {
+    return "I could not find that email review anymore. Run \"email reviews\" again.";
+  }
+
+  const rule = (await getEmailSignalRules(userId)).find((item) => item.id === review.ruleId);
+  const goal = rule?.goalId ? (await getGoals(userId)).find((item) => item.id === rule.goalId) : undefined;
+
+  return [
+    `Email review: ${review.subject ?? rule?.name ?? "Gmail item"}`,
+    review.from ? `From: ${truncatePlainText(review.from, 120)}` : undefined,
+    `Tracking: ${emailReviewTrackingLabel(review)}`,
+    rule ? `Rule: ${rule.name}` : undefined,
+    goal ? `Linked goal: ${goal.title}` : undefined,
+    `Proposed: ${emailReviewProposedOutcome(review)}`,
+    `Reason: ${truncatePlainText(review.reason, 160)}`,
+    review.snippet ? `Preview: ${truncatePlainText(review.snippet, 260)}` : undefined,
+    review.evidence ? `Evidence: ${truncatePlainText(review.evidence, 260)}` : undefined
+  ].filter(Boolean).join("\n");
+}
+
+function emailReviewKind(review: EmailReviewItem): EmailReviewKind {
+  if (review.adapterId === "job_search_email") {
+    return "job_search";
+  }
+
+  if (review.adapterId === "work_action_email") {
+    return "work_action";
+  }
+
+  if (review.adapterId === "custom_email_review") {
+    return "custom_tracking";
+  }
+
+  return "other";
+}
+
+function emailReviewGroupLabel(kind: EmailReviewKind): string {
+  if (kind === "job_search") {
+    return "Job-search";
+  }
+
+  if (kind === "work_action") {
+    return "Work actions";
+  }
+
+  if (kind === "custom_tracking") {
+    return "Custom tracking";
+  }
+
+  return "Other";
+}
+
+function emailReviewTrackingLabel(review: EmailReviewItem): string {
+  if (review.adapterId === "job_search_email") {
+    return "job-search email tracking";
+  }
+
+  if (review.adapterId === "work_action_email") {
+    return "work-action email tracking";
+  }
+
+  if (review.adapterId === "custom_email_review") {
+    return "custom Gmail tracking";
+  }
+
+  return "Gmail tracking";
+}
+
+function emailReviewProposedOutcome(review: EmailReviewItem): string {
+  if (isWorkActionReviewType(review.proposedEventType)) {
+    return "create action";
+  }
+
+  if (review.adapterId === "custom_email_review") {
+    return "review only";
+  }
+
+  if (review.proposedEventType && EventTypeSchema.safeParse(review.proposedEventType).success) {
+    return `log ${humanEmailReviewEventLabel(review.proposedEventType)}`;
+  }
+
+  return review.proposedEventType ? "review only" : "unknown";
+}
+
+function humanEmailReviewEventLabel(eventType: string): string {
+  const labels: Record<string, string> = {
+    "career.application_confirmation_received": "application confirmation",
+    "career.recruiter_reply_received": "recruiter reply",
+    "career.interview_scheduled": "interview event",
+    "career.rejection_received": "rejection",
+    "career.offer_received": "job offer"
+  };
+
+  return labels[eventType] ?? "event";
+}
+
+function readEmailReviewContextItems(value: unknown): EmailReviewInboxItem[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(isRecord)
+    .map((item) => ({
+      number: typeof item.number === "number" ? item.number : Number(item.number),
+      reviewId: typeof item.reviewId === "string" ? item.reviewId : "",
+      kind: normalizeEmailReviewKind(typeof item.kind === "string" ? item.kind : ""),
+      groupLabel: typeof item.groupLabel === "string" ? item.groupLabel : "Other",
+      ruleName: typeof item.ruleName === "string" ? item.ruleName : "Gmail tracking",
+      trackingLabel: typeof item.trackingLabel === "string" ? item.trackingLabel : "Gmail tracking",
+      from: typeof item.from === "string" ? item.from : undefined,
+      subject: typeof item.subject === "string" ? item.subject : undefined,
+      snippet: typeof item.snippet === "string" ? item.snippet : undefined,
+      evidence: typeof item.evidence === "string" ? item.evidence : undefined,
+      proposedEventType: typeof item.proposedEventType === "string" ? item.proposedEventType : undefined,
+      proposedOutcome: typeof item.proposedOutcome === "string" ? item.proposedOutcome : "unknown",
+      goalTitle: typeof item.goalTitle === "string" ? item.goalTitle : undefined,
+      confidence: typeof item.confidence === "number" ? item.confidence : 0,
+      createdAt: typeof item.createdAt === "string" ? item.createdAt : ""
+    }))
+    .filter((item) => Number.isFinite(item.number) && item.number > 0 && item.reviewId);
+}
+
+function readEmailReviewContextHandledReviewIds(payload: unknown): Set<string> {
+  if (!isRecord(payload) || !Array.isArray(payload.lastHandledReviewIds)) {
+    return new Set();
+  }
+
+  return new Set(payload.lastHandledReviewIds.filter((value): value is string => typeof value === "string" && value.length > 0));
+}
+
+async function rememberEmailReviewContextHandled(
+  userId: string,
+  pendingAction: PendingAction,
+  reviewIds: string[]
+): Promise<void> {
+  if (reviewIds.length === 0 || !isRecord(pendingAction.payload)) {
+    return;
+  }
+
+  const handledIds = uniqueStrings([...readEmailReviewContextHandledReviewIds(pendingAction.payload), ...reviewIds]);
+  await prisma.pendingAction.updateMany({
+    where: {
+      id: pendingAction.id,
+      userId,
+      status: "pending"
+    },
+    data: {
+      payload: {
+        ...pendingAction.payload,
+        lastHandledReviewIds: handledIds
+      }
+    }
+  });
+}
+
+function emailReviewTargetMentionsRest(target: string): boolean {
+  return /\b(rest|remaining|left|the rest|los dem[aá]s|las dem[aá]s|el resto|la resta)\b/i.test(target);
+}
+
+function formatEmailReviewBulkContextReply(changed: string[], alreadyHandled: string[]): string {
+  const lines: string[] = [];
+
+  if (changed.length > 0) {
+    lines.push(...changed);
+  } else if (alreadyHandled.length > 0) {
+    lines.push("No pending matching reviews changed.");
+  }
+
+  if (alreadyHandled.length > 0) {
+    lines.push("Already handled:");
+    lines.push(...alreadyHandled.map((line) => `- ${line}`));
+  }
+
+  return lines.join("\n");
+}
+
+function normalizeEmailReviewKind(value: string): EmailReviewKind {
+  return value === "job_search" || value === "work_action" || value === "custom_tracking" ? value : "other";
+}
+
+function parseEmailReviewContextReply(message: string):
+  | { operation: "cancel" }
+  | { operation: "show"; target: string }
+  | { operation: "approve" | "reject"; target: string; bulk: boolean }
+  | { operation: "action"; target: string; timeText?: string }
+  | undefined {
+  const trimmed = message.trim();
+  const text = normalizeForComparison(trimmed);
+
+  if (!trimmed) {
+    return undefined;
+  }
+
+  if (isRejectionMessage(trimmed) || /^(cancel|cancelar|cancela|stop)$/i.test(trimmed)) {
+    return { operation: "cancel" };
+  }
+
+  const showMatch = trimmed.match(/^(?:show|details?(?:\s+for)?|what\s+is|explain|muestra|ensen(?:a|ame)|ens[eé]ñ(?:a|ame)|detalles?(?:\s+de)?|que\s+es|qué\s+es)\s+(.+)$/i);
+  if (showMatch?.[1] && extractEmailReviewReference(showMatch[1])) {
+    return { operation: "show", target: showMatch[1].trim() };
+  }
+
+  const approveBulk = trimmed.match(/^(?:approve|accept|ok|yes|aprueba|acepta)\s+all(?:\s+(.+))?$/i);
+  if (approveBulk) {
+    return { operation: "approve", target: cleanEmailReviewBulkTarget(approveBulk[1]) || "all", bulk: true };
+  }
+
+  const rejectBulk = trimmed.match(/^(?:reject|clear|dismiss|no|rechaza|descarta|borra|limpia)\s+all(?:\s+(.+))?$/i);
+  if (rejectBulk) {
+    return { operation: "reject", target: cleanEmailReviewBulkTarget(rejectBulk[1]) || "all", bulk: true };
+  }
+
+  const approveMatch = trimmed.match(/^(?:approve\s+review|approve|accept|yes\s+to|ok\s+to|aprueba|acepta|si\s+a|sí\s+a)\s+(.+)$/i);
+  if (approveMatch?.[1]) {
+    return { operation: "approve", target: approveMatch[1].trim(), bulk: false };
+  }
+
+  const rejectMatch = trimmed.match(/^(?:reject\s+review|reject|no\s+to|dismiss|clear|rechaza|descarta|no\s+a)\s+(.+)$/i);
+  if (rejectMatch?.[1]) {
+    return { operation: "reject", target: rejectMatch[1].trim(), bulk: false };
+  }
+
+  const actionNumber = extractEmailReviewActionReference(trimmed);
+  if (actionNumber) {
+    return {
+      operation: "action",
+      target: actionNumber,
+      timeText: extractEmailReviewActionTimeText(trimmed)
+    };
+  }
+
+  if (/^#?\d+$/.test(trimmed) || ordinalSelectionIndex(trimmed) !== undefined) {
+    return { operation: "show", target: trimmed };
+  }
+
+  if (/\b(email|gmail|correo|correu|review|revision|revisi[oó])\b/.test(text) && /\b(approve|reject|show|details|action|task|aprueba|rechaza|muestra|tarea)\b/.test(text)) {
+    return { operation: "show", target: trimmed };
+  }
+
+  return undefined;
+}
+
+function cleanEmailReviewBulkTarget(value: string | undefined): string {
+  if (!value) {
+    return "";
+  }
+
+  return value
+    .trim()
+    .replace(/\s+(?:reviews?|items?|correos?|correus?)$/i, "")
+    .trim();
+}
+
+function extractEmailReviewReference(message: string): string | undefined {
+  const numeric = message.match(/(?:^|\s)#?(\d+)(?:\b|$)/);
+  if (numeric?.[1]) {
+    return numeric[1];
+  }
+
+  const ordinal = ordinalSelectionIndex(message);
+  return ordinal !== undefined ? String(ordinal + 1) : undefined;
+}
+
+function extractEmailReviewActionReference(message: string): string | undefined {
+  const trimmed = message.trim();
+  const patterns = [
+    /\b(?:turn|make|convert)\s+(?:review\s+|email\s+review\s+)?#?(\d+)\s+(?:into|to)\s+(?:an?\s+|the\s+)?(?:action|task|reminder)\b/i,
+    /\b(?:turn|make|convert)\s+(?:review\s+|email\s+review\s+)?#?(\d+)\s+(?:an?\s+|the\s+)?(?:action|task|reminder)\b/i,
+    /\b(?:create|make|add|haz|crea)\s+(?:an?\s+)?(?:action|task|tarea|reminder)\s+(?:from|for|about|de|para|sobre)\s+(?:review\s+|email\s+review\s+)?#?(\d+)\b/i,
+    /\b(?:remind|reminder|recorda|recordam|recu[eé]rdame|recordarme)\b.*\b(?:about|for|de|para|sobre)\s+(?:review\s+|email\s+review\s+)?#?(\d+)\b/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = trimmed.match(pattern);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  const ordinal = ordinalSelectionIndex(trimmed);
+  if (
+    ordinal !== undefined &&
+    /\b(?:turn|make|convert|create|add|action|task|remind|reminder|haz|crea|tarea|recorda|recordam|recu[eé]rdame|recordarme)\b/i.test(trimmed)
+  ) {
+    return String(ordinal + 1);
+  }
+
+  return undefined;
+}
+
+function extractEmailReviewActionTimeText(message: string): string | undefined {
+  const match = message.match(/\b(now|today.*|tomorrow.*|tonight.*|in\s+\d+\s+days?|next\s+\w+.*|\d{4}-\d{2}-\d{2}.*)$/i);
+  return match?.[1]?.trim();
+}
+
+function selectEmailReviewContextItem(target: string, items: EmailReviewInboxItem[]): EmailReviewInboxItem | undefined {
+  const selected = selectEmailReviewContextItems(target, items, false);
+  return selected.status === "ok" && selected.items.length === 1 ? selected.items[0] : undefined;
+}
+
+function selectEmailReviewContextItems(
+  target: string,
+  items: EmailReviewInboxItem[],
+  bulk: boolean
+): { status: "ok"; items: EmailReviewInboxItem[] } | { status: "ambiguous"; message: string } {
+  const trimmed = target.trim().replace(/[?.!]+$/g, "");
+  const numeric = trimmed.match(/^#?(\d+)$/);
+
+  if (numeric) {
+    const index = Number(numeric[1]);
+    return { status: "ok", items: items.filter((item) => item.number === index) };
+  }
+
+  const ordinalIndex = ordinalSelectionIndex(trimmed);
+  if (ordinalIndex !== undefined) {
+    return { status: "ok", items: items.filter((item) => item.number === ordinalIndex + 1) };
+  }
+
+  const text = normalizeForComparison(trimmed);
+  const matchText = cleanEmailReviewSelectionTarget(trimmed);
+
+  if (bulk && (text === "all" || text === "all reviews" || text === "todos" || text === "todas" || text === "tots" || text === "totes")) {
+    const kinds = new Set(items.map((item) => item.kind));
+    if (kinds.size === 1) {
+      return { status: "ok", items };
+    }
+
+    return {
+      status: "ambiguous",
+      message: "Which group do you mean? Try: approve all job-search reviews, reject all custom reviews, or reject all Endesa reviews."
+    };
+  }
+
+  const kind = emailReviewKindFromTarget(text);
+  if (kind) {
+    return { status: "ok", items: items.filter((item) => item.kind === kind) };
+  }
+
+  const matches = items.filter((item) => emailReviewContextItemMatches(item, matchText || text));
+  if (!bulk && matches.length > 1) {
+    return {
+      status: "ambiguous",
+      message: [
+        "Which email review do you mean?",
+        ...matches.slice(0, 5).map((item) => `${item.number}. ${item.subject ?? item.ruleName}`)
+      ].join("\n")
+    };
+  }
+
+  return { status: "ok", items: matches };
+}
+
+function cleanEmailReviewSelectionTarget(target: string): string {
+  return normalizeForComparison(target)
+    .replace(/\b(the|rest|remaining|left|all|reviews?|items?|emails?|email|gmail|mail|mails|correos?|correus?|from|about|for|de|del|dels|para|sobre)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function emailReviewKindFromTarget(text: string): EmailReviewKind | undefined {
+  if (/\b(job|career|recruiter|application|interview|trabajo|feina)\b/.test(text)) {
+    return "job_search";
+  }
+
+  if (/\b(work|action|deadline|client|project|trabajo|feina|tasca)\b/.test(text)) {
+    return "work_action";
+  }
+
+  if (/\b(custom|tracking|personalizado|personalitzada)\b/.test(text)) {
+    return "custom_tracking";
+  }
+
+  return undefined;
+}
+
+function emailReviewContextItemMatches(item: EmailReviewInboxItem, targetKey: string): boolean {
+  if (!targetKey) {
+    return false;
+  }
+
+  const haystack = normalizeForComparison([
+    item.ruleName,
+    item.subject,
+    item.from,
+    item.trackingLabel,
+    item.groupLabel,
+    item.goalTitle
+  ].filter(Boolean).join(" "));
+
+  return haystack.includes(targetKey) || targetKey.includes(normalizeForComparison(item.ruleName));
+}
+
+function emailReviewSelectionPrompt(items: EmailReviewInboxItem[]): string {
+  return items.length > 0
+    ? `Reply with 1-${items.length}, a visible subject, or run "email reviews" again.`
+    : "Run \"email reviews\" again so I can number the visible items safely.";
+}
+
+function formatEmailReviewApprovalContextReply(result: EmailReviewApprovalResult, item: EmailReviewInboxItem): string {
+  if (result.status === "not_found") {
+    return `Skipped ${item.number}: not found`;
+  }
+
+  if (result.status === "not_pending") {
+    return `Skipped ${item.number}: already ${result.review.status}`;
+  }
+
+  return `Approved ${item.number}: ${result.message.replace(/^Email review approved\.?\s*/i, "")}`;
+}
+
+async function closeEmailReviewContextIfDone(userId: string, pendingAction: PendingAction): Promise<void> {
+  const items = readEmailReviewContextItems(pendingAction.payload.reviews);
+  const statuses = await Promise.all(items.map((item) => getEmailReviewItem(userId, item.reviewId)));
+  const hasPendingVisibleItem = statuses.some((item) => item?.status === "pending");
+
+  if (!hasPendingVisibleItem) {
+    await confirmPendingAction(userId, pendingAction.id);
+  }
+}
+
+function isPendingEmailReviewContext(pendingAction: PendingAction | undefined): boolean {
+  return Boolean(
+    pendingAction &&
+      pendingAction.status === "pending" &&
+      pendingAction.type === "email_review_context" &&
+      isRecord(pendingAction.payload) &&
+      pendingAction.payload.operation === "email_review_context"
+  );
+}
+
+function looksLikeEmailReviewInboxRequest(message: string): boolean {
+  const text = normalizeForComparison(message);
+
+  return (
+    /^(email reviews?|gmail reviews?|emails? to review|show email reviews?|show gmail reviews?)$/.test(text) ||
+    /\b(what|which|any|show|review|revisa|mostra|ensenya|quins?|que|qué)\b.*\b(email|emails|gmail|correo|correos|correu|correus)\b.*\b(review|approval|pending|waiting|pendientes?|pendents?|revisar|aprobaci[oó]n)\b/.test(text) ||
+    /\b(correos pendientes|correus pendents|emails waiting|gmail items need review|emails need review|needs email approval)\b/.test(text)
+  );
+}
+
+function looksLikeEmailReviewContextAction(message: string): boolean {
+  const trimmed = message.trim();
+
+  if (!trimmed) {
+    return false;
+  }
+
+  if (/^#?\d+$/.test(trimmed) || ordinalSelectionIndex(trimmed) !== undefined) {
+    return true;
+  }
+
+  return (
+    /^(?:show|details?(?:\s+for)?|what\s+is|explain|muestra|detalles?(?:\s+de)?|que\s+es|qué\s+es)\s+#?\d+[?.!]?$/i.test(trimmed) ||
+    /^(?:approve\s+review|approve|accept|yes\s+to|ok\s+to|aprueba|acepta|si\s+a|sí\s+a)\s+(?:#?\d+|all\b.*|job|job-search|work|custom|endesa|aigues|aigües)/i.test(trimmed) ||
+    /^(?:reject\s+review|reject|no\s+to|dismiss|clear|rechaza|descarta|no\s+a)\s+(?:#?\d+|all\b.*|job|job-search|work|custom|endesa|aigues|aigües)/i.test(trimmed) ||
+    Boolean(extractEmailReviewActionReference(trimmed))
+  );
+}
+
+async function getPendingEmailReviewCount(userId: string): Promise<number> {
+  await ensureUser(userId);
+  return prisma.emailReviewItem.count({
+    where: {
+      userId,
+      status: "pending"
+    }
+  });
+}
+
+function pendingEmailReviewLine(count: number): string | undefined {
+  return count > 0
+    ? `${count} email review${count === 1 ? "" : "s"} ${count === 1 ? "is" : "are"} waiting. Say "email reviews" to handle ${count === 1 ? "it" : "them"}.`
+    : undefined;
+}
+
+function appendPendingEmailReviewLine(message: string, count: number): string {
+  return [message, pendingEmailReviewLine(count)].filter(Boolean).join("\n\n");
 }
 
 function isWorkActionReviewType(type?: string): type is NonNullable<ActionItem["actionType"]> {
@@ -12977,6 +14060,10 @@ async function resolvePendingDecisionReply(
   pendingAction: PendingAction,
   message: string
 ): Promise<string | undefined> {
+  if (isPendingEmailReviewContext(pendingAction)) {
+    return resolveEmailReviewContextReply(userId, pendingAction, message);
+  }
+
   if (isPendingCustomGmailRuleContext(pendingAction)) {
     return undefined;
   }
@@ -13496,7 +14583,8 @@ function looksLikeExpiredPendingDecisionReply(message: string): boolean {
     /^(skip|cancel|show\s+plan)$/i.test(trimmed) ||
     /^create\s+(?:all(?:\s+new)?|(?:#?\d+\s*(?:,|\band\b)?\s*)+)$/i.test(trimmed) ||
     /^edit\s+#?\d+\s+to\s+.+$/i.test(trimmed) ||
-    /^remove\s+#?\d+$/i.test(trimmed)
+    /^remove\s+#?\d+$/i.test(trimmed) ||
+    looksLikeEmailReviewContextAction(trimmed)
   );
 }
 

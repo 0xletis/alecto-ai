@@ -15,6 +15,10 @@ import {
   type ActionItemReminderType
 } from "@operator-agent/db";
 import { buildDailyCheckinPrompt } from "@operator-agent/core";
+import {
+  formatIntegrationSyncNotifications,
+  type IntegrationSyncResponse
+} from "./integration-notifications.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -381,41 +385,6 @@ function safeErrorMessage(error: unknown): string {
   return "Integration sync failed.";
 }
 
-function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): string[] {
-  if (response.eventsCreated <= 0) {
-    return [];
-  }
-
-  if (response.integrationId === "gmail" && response.emailSummaries?.length) {
-    const total = response.emailSummaries.reduce((sum, summary) => sum + summary.eventsCreated, 0);
-    return total > 0 ? [`Gmail: ${total} job-search email event${total === 1 ? "" : "s"} logged.`] : [];
-  }
-
-  const summaries = response.repoSummaries ?? [];
-
-  if (summaries.length === 0) {
-    return [`GitHub: ${response.eventsCreated} new event${response.eventsCreated === 1 ? "" : "s"} detected.`];
-  }
-
-  return summaries.flatMap((summary) => {
-    const messages: string[] = [];
-
-    if (summary.personalCommitEvents > 0) {
-      messages.push(
-        `GitHub: ${summary.personalCommitEvents} personal commit${summary.personalCommitEvents === 1 ? "" : "s"} detected in ${summary.repo}.`
-      );
-    }
-
-    if (summary.repoActivityEvents > 0) {
-      messages.push(
-        `GitHub: ${summary.repoActivityEvents} repo activity signal${summary.repoActivityEvents === 1 ? "" : "s"} detected in ${summary.repo}.`
-      );
-    }
-
-    return messages;
-  });
-}
-
 function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {
   const isOverdue = reminderType === "due" && Boolean(actionItem.dueAt && actionItem.dueAt < new Date());
   const header = reminderType === "snoozed" ? "Snoozed action is back:" : isOverdue ? "Action overdue:" : "Action due:";
@@ -573,66 +542,6 @@ interface InsightResponse {
 interface DailyLoopMessageResponse {
   message: string;
 }
-
-interface IntegrationSyncResponse {
-  status: "success" | "error";
-  connectionId: string;
-  integrationId: string;
-  eventsCreated: number;
-  personalCommitEvents?: number;
-  repoActivityEvents?: number;
-  repoSummaries?: IntegrationRepoSyncSummary[];
-  emailSummaries?: EmailSyncSummary[];
-  errorStage?: GmailErrorStage;
-}
-
-interface IntegrationRepoSyncSummary {
-  repo: string;
-  personalCommitEvents: number;
-  repoActivityEvents: number;
-}
-
-interface EmailSyncSummary {
-  ruleId: string;
-  adapterId: string;
-  query?: string;
-  fetchStrategy: string;
-  classifierMode: string;
-  lookbackDays: number;
-  maxMessagesPerSync: number;
-  maxEventsPerSync: number;
-  messagesFound: number;
-  processed: number;
-  ignoredUnknown: number;
-  filteredMarketing: number;
-  needsReview: number;
-  llmClassified: number;
-  llmUnavailable: number;
-  llmErrors: number;
-  llmNeedsReview: number;
-  llmIgnored: number;
-  reviewItemsCreated: number;
-  reviewItemsAlreadyPending: number;
-  reviewItemsSemanticDeduped: number;
-  reviewItemsRejectedDeduped: number;
-  lowConfidenceIgnored: number;
-  deduped: number;
-  semanticDeduped: number;
-  archivedCleanupReprocessed: number;
-  skippedDueMaxEventsPerSync: number;
-  eventsCreated: number;
-  lastError?: string;
-  lastErrorStage?: GmailErrorStage;
-  reviewCandidateDebug?: unknown[];
-}
-
-type GmailErrorStage =
-  | "rule_loading"
-  | "token_refresh"
-  | "gmail_search"
-  | "gmail_message_fetch"
-  | "classification"
-  | "event_creation";
 
 interface InsightReport {
   headline: string;
