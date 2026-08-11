@@ -66,6 +66,8 @@ Status:
 - [x] templates for goals
 - [~] OpenAI analysis/composition is optional and has deterministic fallback
 - [x] Gmail token encryption at rest for the local MVP when `ALECTO_SECRET_ENCRYPTION_KEY` is configured, with legacy plaintext migration on read/sync
+- [x] Custom Gmail sender/keyword tracking v1 with confirmation-first setup and review-only output
+- [x] Optional LLM semantic router v4 for English/Spanish/Catalan Gmail custom-rule create/edit/question/management flows, broader operator surface routing, email-rule list/timing questions, short-lived active-rule context, replacement corrections such as `instead of` / `en vez de` / `en lloc de`, routeDebug language/confidence/side-effect-risk observability, and conversation repair without direct DB mutation
 - [ ] wallet public-address fetcher
 - [ ] basic web settings page
 - [ ] production OAuth/account management
@@ -95,6 +97,8 @@ Likely high-leverage next items:
 - refine first-run onboarding into a fuller guided setup session only after more real alpha usage
 - keep weekly planning regression-tested as the bridge from weekly review into confirmed current-week/next-week ActionItems
 - polish the planning loop from real Telegram usage now that Planning UX Consolidation v1 is implemented
+- keep polishing Gmail setup and custom-rule management from real Telegram usage; pending and active custom rules can be edited with multilingual replacement wording such as `Aigues de Barcelona instead of Endesa`, `solo Aigues de Barcelona, no Endesa`, and Catalan timing questions, but the eval set still needs more real phrasing from English/Spanish/Catalan users
+- expand the semantic-router eval set from real Telegram logs across English, Spanish, and Catalan, keeping guardrails and executors deterministic
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until production OAuth/account management, key management, and secret rotation are implemented
 - defer new integrations until the operator loop and onboarding are easier to use

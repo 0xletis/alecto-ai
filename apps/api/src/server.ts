@@ -81,6 +81,7 @@ import {
   type ConversationIntentPlanItem,
   type MemoryEntry,
   type ProcessMessageResult,
+  type SemanticRouterResult,
   type StoredEvent,
   type UpdateUserOperatingProfileInput
 } from "@operator-agent/core";
@@ -93,6 +94,7 @@ import {
   JobSearchEmailAllowedEventTypes,
   WorkActionEmailAllowedEventTypes,
   polishInsightWithOpenAI,
+  routeSemanticMessageWithLLM,
   type OpenAIMessageAnalysis
 } from "@operator-agent/llm";
 import {
@@ -183,6 +185,7 @@ import {
   updateIntegrationConnection,
   updateIntegrationConnectionConfig,
   updateIntegrationConnectionSyncState,
+  updateEmailSignalRuleDefinition,
   updateEmailSignalRule,
   updateEmailSignalRuleSyncState,
   updateMemory,
@@ -190,6 +193,23 @@ import {
   updateUserOperatingProfile,
   prisma
 } from "@operator-agent/db";
+import {
+  cleanEmailRuleTarget,
+  findEmailRulesByTarget as findSelectableEmailRulesByTarget,
+  readEmailRuleSelectionCandidates,
+  resolveMultipleEmailRuleTargets,
+  selectEmailRuleCandidate,
+  sortEmailRuleCandidates,
+  splitEmailRuleTargets,
+  toEmailRuleSelectionCandidate
+} from "./conversation/email-rule-selection.js";
+
+type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
+
+interface RoutedProcessReply {
+  reply: string;
+  routeDebug: ProcessRouteDebug;
+}
 
 export function buildServer() {
   const server = Fastify({
@@ -262,10 +282,24 @@ export function buildServer() {
       const pendingReply = await resolvePendingDecisionReply(parsed.data.userId, latestPendingAction, parsed.data.message);
 
       if (pendingReply) {
-        return replyOnly(parsed.data.userId, parsed.data.message, pendingReply);
+        return replyOnly(parsed.data.userId, parsed.data.message, pendingReply, {
+          routerSource: "pending_decision",
+          intent: latestPendingAction.type,
+          handlerName: "resolvePendingDecisionReply",
+          mutation: isConfirmationMessage(parsed.data.message) || isRejectionMessage(parsed.data.message),
+          reason: "Resolved existing pending decision before normal routing."
+        });
       }
-    } else if (looksLikePendingDecisionReply(parsed.data.message)) {
+    } else if (looksLikeExpiredPendingDecisionReply(parsed.data.message)) {
       return replyOnly(parsed.data.userId, parsed.data.message, "That pending decision expired. Please ask again.");
+    }
+
+  if (isPendingCustomGmailRuleCreate(latestPendingAction)) {
+    const pendingGmailRoute = await handleSemanticRouterIntent(parsed.data.userId, parsed.data.message, latestPendingAction);
+
+    if (pendingGmailRoute) {
+      return replyOnly(parsed.data.userId, parsed.data.message, pendingGmailRoute.reply, pendingGmailRoute.routeDebug);
+      }
     }
 
     if (looksLikeUnresolvedHygieneReply(parsed.data.message)) {
@@ -319,8 +353,20 @@ export function buildServer() {
       const surfaceReply = await handleConversationSurfaceIntent(parsed.data.userId, parsed.data.message);
 
       if (surfaceReply) {
-        return replyOnly(parsed.data.userId, parsed.data.message, surfaceReply);
+        return replyOnly(parsed.data.userId, parsed.data.message, surfaceReply, {
+          routerSource: "deterministic_surface",
+          intent: detectConversationSurfaceIntent(parsed.data.message) ?? "unknown",
+          handlerName: "handleConversationSurfaceIntent",
+          mutation: surfaceReplyIncludesMutation(surfaceReply),
+          reason: "Matched deterministic conversation surface intent."
+        });
       }
+    }
+
+    const semanticRouterReply = await handleSemanticRouterIntent(parsed.data.userId, parsed.data.message, latestPendingAction);
+
+    if (semanticRouterReply) {
+      return replyOnly(parsed.data.userId, parsed.data.message, semanticRouterReply.reply, semanticRouterReply.routeDebug);
     }
 
     const recentEvents = await getRecentEvents(parsed.data.userId, 50);
@@ -1397,7 +1443,7 @@ export function buildServer() {
 
     const adapter = getEmailAdapterDefinition(parsed.data.adapterId);
 
-    if (!adapter || adapter.status !== "available" || !["job_search_email", "work_action_email"].includes(adapter.id)) {
+    if (!adapter || adapter.status !== "available" || !["job_search_email", "work_action_email", "custom_email_review"].includes(adapter.id)) {
       return reply.status(400).send({
         error: "Unsupported email adapter."
       });
@@ -1407,11 +1453,31 @@ export function buildServer() {
       await archiveStaleJobSearchEmailRules(request.params.userId, connection.id);
     }
 
+    if (isBuiltInEmailAdapter(adapter.id)) {
+      const reusedRule = await reactivateOrReuseBuiltInEmailRule(request.params.userId, connection.id, adapter.id);
+
+      if (reusedRule) {
+        return {
+          emailRule: sanitizeEmailSignalRule(reusedRule.rule),
+          message: [
+            reusedRule.wasReactivated ? `Email rule resumed: ${reusedRule.rule.id}` : `Email rule already exists: ${reusedRule.rule.id}`,
+            reusedRule.archivedDuplicateCount > 0
+              ? `Archived ${reusedRule.archivedDuplicateCount} duplicate email rule${reusedRule.archivedDuplicateCount === 1 ? "" : "s"}.`
+              : undefined
+          ]
+            .filter(Boolean)
+            .join(" ")
+        };
+      }
+    }
+
     const existingCurrentRule = (await getEmailSignalRules(request.params.userId)).find(
       (rule) =>
         rule.status === "active" &&
         rule.connectionId === connection.id &&
-        rule.adapterId === adapter.id
+        rule.adapterId === adapter.id &&
+        (adapter.id !== "custom_email_review" ||
+          normalizeForComparison(rule.query ?? "") === normalizeForComparison(parsed.data.query ?? adapter.defaultQuery ?? ""))
     );
 
     if (existingCurrentRule) {
@@ -1565,6 +1631,17 @@ export function buildServer() {
           actionItem: sanitizeActionItem(result.actionItem),
           event: null,
           message: `Email review approved. Action item ${result.created ? "created" : "already exists"}: ${result.actionItem.title}`
+        };
+      }
+
+      if (review.adapterId === "custom_email_review") {
+        const updated = await approveEmailReviewItem(request.params.userId, request.params.reviewId);
+
+        return {
+          emailReview: updated ? sanitizeEmailReviewItem(updated) : sanitizeEmailReviewItem(review),
+          event: null,
+          actionItem: null,
+          message: "Custom email review approved. No event or action was created."
         };
       }
 
@@ -2202,6 +2279,21 @@ function defaultEmailRuleConfigForAdapter(adapterId: string, rawBody: unknown) {
       ...(!("classifierMode" in input) ? { classifierMode: "hybrid" as const } : {}),
       ...(!("minAutoLogConfidence" in input) ? { minAutoLogConfidence: 0.95 } : {}),
       ...(!("minReviewConfidence" in input) ? { minReviewConfidence: 0.7 } : {}),
+      ...(!("reviewBeforeLogging" in input) ? { reviewBeforeLogging: true } : {})
+    };
+  }
+
+  if (adapterId === "custom_email_review") {
+    const input = typeof rawBody === "object" && rawBody !== null ? (rawBody as Record<string, unknown>) : {};
+
+    return {
+      ...(!("fetchStrategy" in input) ? { fetchStrategy: "query" as const } : {}),
+      ...(!("lookbackDays" in input) ? { lookbackDays: 30 } : {}),
+      ...(!("maxMessagesPerSync" in input) ? { maxMessagesPerSync: 25 } : {}),
+      ...(!("maxEventsPerSync" in input) ? { maxEventsPerSync: 5 } : {}),
+      ...(!("classifierMode" in input) ? { classifierMode: "rules" as const } : {}),
+      ...(!("minAutoLogConfidence" in input) ? { minAutoLogConfidence: 1 } : {}),
+      ...(!("minReviewConfidence" in input) ? { minReviewConfidence: 0.65 } : {}),
       ...(!("reviewBeforeLogging" in input) ? { reviewBeforeLogging: true } : {})
     };
   }
@@ -5141,12 +5233,17 @@ type ConversationSurfaceIntent =
   | "show_goals"
   | "show_actions"
   | "show_memory"
+  | "email_rules_list"
   | "gmail_sync"
   | "integration_sync"
   | "gmail_sync_guidance"
   | "gmail_setup"
   | "gmail_capability_guidance"
   | "gmail_custom_rule_guidance"
+  | "gmail_custom_rule_request"
+  | "gmail_custom_rule_manage"
+  | "gmail_rule_question"
+  | "gmail_custom_rule_edit_guidance"
   | "enable_job_search_email_rule"
   | "enable_work_action_email_rule"
   | "integration_guidance"
@@ -5260,6 +5357,10 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     return formatMemoriesForConversation(await getActiveMemories(userId));
   }
 
+  if (intent === "email_rules_list") {
+    return formatEmailRulesForConversation(userId, message);
+  }
+
   if (intent === "gmail_sync") {
     return syncGmailForConversation(userId);
   }
@@ -5282,6 +5383,22 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
 
   if (intent === "gmail_custom_rule_guidance") {
     return formatGmailCustomRuleGuidance();
+  }
+
+  if (intent === "gmail_custom_rule_request") {
+    return proposeCustomGmailRuleForConversation(userId, message);
+  }
+
+  if (intent === "gmail_custom_rule_manage") {
+    return manageCustomGmailRuleForConversation(userId, message);
+  }
+
+  if (intent === "gmail_rule_question") {
+    return answerGmailRuleQuestionForConversation(userId, message);
+  }
+
+  if (intent === "gmail_custom_rule_edit_guidance") {
+    return "Keyword edits for custom Gmail rules are not ready yet. For now, remove the rule and create a new one with the filters you want.";
   }
 
   if (intent === "enable_job_search_email_rule") {
@@ -5450,7 +5567,192 @@ function dedupeLines(lines: string[]): string[] {
 }
 
 function noActiveGmailRulesMessage(): string {
-  return "Gmail is connected, but no email tracking rules are active. Say 'enable job search rule for Gmail' or 'enable work action rule for Gmail'.";
+  return "Gmail is connected, but no email tracking rules are active. Say 'enable job search rule for Gmail', 'enable work action rule for Gmail', or 'track Endesa bills from Gmail'.";
+}
+
+async function formatEmailRulesForConversation(userId: string, message?: string): Promise<string> {
+  const [connections, rules, goals] = await Promise.all([
+    getIntegrationConnections(userId),
+    getEmailSignalRules(userId),
+    getGoals(userId)
+  ]);
+  const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived");
+
+  if (gmailConnections.length === 0) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const connectionById = new Map(gmailConnections.map((connection) => [connection.id, connection]));
+  const visibleRules = rules.filter((rule) => rule.status !== "archived" && connectionById.has(rule.connectionId));
+  const activeRules = visibleRules.filter((rule) => rule.status === "active");
+  const wantsActiveOnly = message
+    ? /\b(on|active|enabled|running|now)\b/.test(normalizeForComparison(message))
+    : false;
+
+  if (visibleRules.length === 0) {
+    return noActiveGmailRulesMessage();
+  }
+
+  const goalById = new Map(goals.map((goal) => [goal.id, goal.title]));
+  const activeLines = groupEmailRulesForHumanDisplay(activeRules).map((group) =>
+    formatEmailRuleConversationGroupLine(group, goalById)
+  );
+  const pausedLines = wantsActiveOnly
+    ? []
+    : groupEmailRulesForHumanDisplay(visibleRules.filter((rule) => rule.status !== "active")).map((group) =>
+        formatEmailRuleConversationGroupLine(group, goalById)
+      );
+  const hiddenInactiveCount = wantsActiveOnly ? visibleRules.length - activeRules.length : 0;
+
+  await maybeRememberGmailRuleConversationContext(userId, visibleRules, activeRules.length === 1 ? activeRules[0] : undefined);
+
+  return [
+    wantsActiveOnly ? "Email rules currently on:" : "Email rules currently configured:",
+    "",
+    activeLines.length > 0 ? "On:" : undefined,
+    ...(activeLines.length > 0 ? activeLines.map((line) => `- ${line}`) : ["No active email rules."]),
+    pausedLines.length > 0 ? "" : undefined,
+    pausedLines.length > 0 ? "Paused/error:" : undefined,
+    ...pausedLines.map((line) => `- ${line}`),
+    "",
+    `${gmailScheduledSyncDescription()} Manual sync: say 'sync Gmail'.`,
+    hiddenInactiveCount > 0 ? `${hiddenInactiveCount} paused/error rule${hiddenInactiveCount === 1 ? " is" : "s are"} hidden here.` : undefined,
+    "Full IDs and settings: /my_email_rules"
+  ].filter((line) => line !== undefined).join("\n");
+}
+
+function formatEmailRuleConversationLine(rule: EmailSignalRule, goalById: Map<string, string>): string {
+  const goalTitle = rule.goalId ? goalById.get(rule.goalId) : undefined;
+  const parts = [
+    rule.name,
+    rule.status !== "active" ? rule.status : undefined,
+    emailRuleConversationBehavior(rule),
+    `looks for: ${formatEmailRuleQueryForHumans(rule.query)}`,
+    goalTitle ? `goal: ${goalTitle}` : undefined
+  ];
+
+  return parts.filter(Boolean).join(" - ");
+}
+
+interface EmailRuleHumanDisplayGroup {
+  primary: EmailSignalRule;
+  rules: EmailSignalRule[];
+}
+
+function groupEmailRulesForHumanDisplay(rules: EmailSignalRule[]): EmailRuleHumanDisplayGroup[] {
+  const groups = new Map<string, EmailRuleHumanDisplayGroup>();
+
+  for (const rule of sortEmailRuleCandidates(rules)) {
+    const key = emailRuleHumanDisplayKey(rule);
+    const existing = groups.get(key);
+
+    if (existing) {
+      existing.rules.push(rule);
+    } else {
+      groups.set(key, { primary: rule, rules: [rule] });
+    }
+  }
+
+  return [...groups.values()];
+}
+
+function emailRuleHumanDisplayKey(rule: EmailSignalRule): string {
+  if (isBuiltInEmailAdapter(rule.adapterId)) {
+    return [
+      "builtin",
+      rule.connectionId,
+      rule.adapterId,
+      rule.status,
+      normalizeForComparison(rule.query ?? "")
+    ].join("|");
+  }
+
+  return `rule:${rule.id}`;
+}
+
+function formatEmailRuleConversationGroupLine(
+  group: EmailRuleHumanDisplayGroup,
+  goalById: Map<string, string>
+): string {
+  const line = formatEmailRuleConversationLine(group.primary, goalById);
+
+  if (group.rules.length <= 1) {
+    return line;
+  }
+
+  return `${line} - ${group.rules.length} duplicate rules; shown once`;
+}
+
+function formatGmailEmailRuleSelectionLines(rules: EmailSignalRule[], options: { showStatus?: boolean } = {}): string[] {
+  return groupEmailRulesForHumanDisplay(rules).map((group) => {
+    const parts = [
+      group.primary.name,
+      options.showStatus && group.primary.status !== "active" ? group.primary.status : undefined,
+      group.rules.length > 1 ? `${group.rules.length} duplicate rules` : undefined
+    ];
+
+    return `- ${parts.filter(Boolean).join(" - ")}`;
+  });
+}
+
+function isBuiltInEmailAdapter(adapterId: string): boolean {
+  return adapterId === "job_search_email" || adapterId === "work_action_email";
+}
+
+function emailRuleConversationBehavior(rule: EmailSignalRule): string {
+  if (rule.adapterId === "custom_email_review") {
+    return "custom tracking, review first, auto-log off";
+  }
+
+  if (rule.adapterId === "work_action_email") {
+    return "work actions, review first";
+  }
+
+  if (rule.adapterId === "job_search_email") {
+    return rule.reviewBeforeLogging ? "job search, review first" : "job search, auto-log clear matches";
+  }
+
+  return rule.reviewBeforeLogging ? "review first" : "auto-log clear matches";
+}
+
+async function maybeRememberGmailRuleConversationContext(
+  userId: string,
+  rules: EmailSignalRule[],
+  focusedRule?: EmailSignalRule
+): Promise<void> {
+  const contextRules = rules
+    .filter((rule) => rule.status !== "archived")
+    .slice(0, 10);
+
+  if (contextRules.length === 0) {
+    return;
+  }
+
+  const latestPending = await getLatestPendingAction(userId);
+  if (latestPending && !isPendingCustomGmailRuleContext(latestPending)) {
+    return;
+  }
+
+  const goals = await getGoals(userId);
+  const goalById = new Map(goals.map((goal) => [goal.id, goal.title]));
+
+  await replacePendingAction(userId, {
+    type: "custom_email_rule",
+    summary: focusedRule ? `Gmail rule context: ${focusedRule.name}` : "Gmail rule context",
+    payload: {
+      operation: "rule_context",
+      focusedRuleId: focusedRule?.id,
+      rules: contextRules.map((rule) => ({
+        id: rule.id,
+        adapterId: rule.adapterId,
+        name: rule.name,
+        query: rule.query,
+        status: rule.status,
+        goalTitle: rule.goalId ? goalById.get(rule.goalId) ?? null : null
+      }))
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
 }
 
 async function enableEmailRuleForConversation(userId: string, kind: "job_search" | "work_action"): Promise<string> {
@@ -5473,15 +5775,18 @@ async function enableEmailRuleForConversation(userId: string, kind: "job_search"
     await archiveStaleJobSearchEmailRules(userId, gmailConnection.id);
   }
 
-  const existingRule = (await getEmailSignalRules(userId)).find(
-    (rule) =>
-      rule.status === "active" &&
-      rule.connectionId === gmailConnection.id &&
-      rule.adapterId === adapter.id
-  );
+  const reusedRule = await reactivateOrReuseBuiltInEmailRule(userId, gmailConnection.id, adapter.id);
 
-  if (existingRule) {
-    return `${emailRuleHumanTitle(kind)} is already on.\n\n${formatConversationEmailRuleEnabled(existingRule)}`;
+  if (reusedRule) {
+    const actionLine = reusedRule.wasReactivated
+      ? `${emailRuleHumanTitle(kind)} is back on.`
+      : `${emailRuleHumanTitle(kind)} is already on.`;
+    const duplicateLine =
+      reusedRule.archivedDuplicateCount > 0
+        ? `I archived ${reusedRule.archivedDuplicateCount} duplicate built-in rule${reusedRule.archivedDuplicateCount === 1 ? "" : "s"}.`
+        : undefined;
+
+    return [actionLine, duplicateLine, "", formatConversationEmailRuleEnabled(reusedRule.rule)].filter(Boolean).join("\n");
   }
 
   const input = conversationEmailRuleInputForKind(kind);
@@ -5555,6 +5860,65 @@ function emailRuleHumanTitle(kind: "job_search" | "work_action"): string {
   return kind === "work_action" ? "Work-action email tracking" : "Job-search email tracking";
 }
 
+async function reactivateOrReuseBuiltInEmailRule(
+  userId: string,
+  connectionId: string,
+  adapterId: string
+): Promise<{ rule: EmailSignalRule; wasReactivated: boolean; archivedDuplicateCount: number } | undefined> {
+  if (!isBuiltInEmailAdapter(adapterId)) {
+    return undefined;
+  }
+
+  const matchingRules = (await getEmailSignalRules(userId)).filter(
+    (rule) =>
+      rule.status !== "archived" &&
+      rule.connectionId === connectionId &&
+      rule.adapterId === adapterId
+  );
+
+  if (matchingRules.length === 0) {
+    return undefined;
+  }
+
+  const primary = choosePrimaryBuiltInEmailRule(matchingRules);
+  const wasReactivated = primary.status !== "active";
+  const activePrimary = wasReactivated
+    ? await updateEmailSignalRule(userId, primary.id, { status: "active" })
+    : primary;
+
+  if (!activePrimary) {
+    return undefined;
+  }
+
+  let archivedDuplicateCount = 0;
+
+  for (const rule of matchingRules) {
+    if (rule.id === primary.id) {
+      continue;
+    }
+
+    const archived = await archiveEmailSignalRule(userId, rule.id);
+    if (archived) {
+      archivedDuplicateCount += 1;
+    }
+  }
+
+  return { rule: activePrimary, wasReactivated, archivedDuplicateCount };
+}
+
+function choosePrimaryBuiltInEmailRule(rules: EmailSignalRule[]): EmailSignalRule {
+  return [...rules].sort((left, right) => {
+    const leftActive = left.status === "active" ? 1 : 0;
+    const rightActive = right.status === "active" ? 1 : 0;
+
+    if (leftActive !== rightActive) {
+      return rightActive - leftActive;
+    }
+
+    return right.updatedAt.getTime() - left.updatedAt.getTime();
+  })[0];
+}
+
 async function formatGmailSetupForConversation(userId: string): Promise<string> {
   const [connections, rules, goals] = await Promise.all([
     getIntegrationConnections(userId),
@@ -5585,7 +5949,7 @@ async function formatGmailSetupForConversation(userId: string): Promise<string> 
 
   const ruleLines =
     activeRules.length > 0
-      ? activeRules.map((rule) => `- ${emailRuleTitleForAdapter(rule.adapterId)} (${rule.reviewBeforeLogging ? "review first" : "auto-log clear matches"})`)
+      ? activeRules.map(formatGmailSetupRuleLine)
       : ["No active email tracking rules."];
 
   const nextStep =
@@ -5617,7 +5981,7 @@ async function formatGmailSetupForConversation(userId: string): Promise<string> 
     "Customize:",
     "- Pause a rule: /pause_email_rule RULE_ID",
     "- Delete a rule: /delete_email_rule RULE_ID",
-    "- Custom keyword and sender rules are planned, but not ready yet.",
+    "- Custom rules can use sender and keyword filters. Say: \"track Endesa bills from Gmail\".",
     "",
     nextStep
   ].filter((line) => line !== undefined).join("\n");
@@ -5668,6 +6032,10 @@ function gmailScheduledSyncDescription(): string {
 }
 
 function emailRuleTitleForAdapter(adapterId: string): string {
+  if (adapterId === "custom_email_review") {
+    return "Custom Gmail tracking";
+  }
+
   if (adapterId === "work_action_email") {
     return "Work-action email tracking";
   }
@@ -5679,6 +6047,14 @@ function emailRuleTitleForAdapter(adapterId: string): string {
   return "Email tracking rule";
 }
 
+function formatGmailSetupRuleLine(rule: EmailSignalRule): string {
+  if (rule.adapterId === "custom_email_review") {
+    return `- ${rule.name} (review first, auto-log off)`;
+  }
+
+  return `- ${emailRuleTitleForAdapter(rule.adapterId)} (${rule.reviewBeforeLogging ? "review first" : "auto-log clear matches"})`;
+}
+
 function formatGmailCapabilityGuidance(): string {
   return [
     "Gmail works through explicit tracking rules. It does not read your whole inbox by default.",
@@ -5686,27 +6062,1573 @@ function formatGmailCapabilityGuidance(): string {
     "Ready today:",
     "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
     "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+    "- Custom tracking: sender and keyword rules. These go to review first and never auto-log.",
     "",
     "Say:",
     '- "enable job search rule for Gmail"',
     '- "enable work action rule for Gmail"',
+    '- "track Endesa bills from Gmail"',
     '- "sync Gmail"',
-    "",
-    "Custom keyword rules like Endesa bills are planned, but not ready yet."
   ].join("\n");
 }
 
 function formatGmailCustomRuleGuidance(): string {
   return [
-    "Custom Gmail tracking is not ready yet.",
+    "Custom Gmail tracking is review-first.",
     "",
-    "Today I can track:",
-    "- job-search emails",
-    "- work-action emails",
+    "Give me a sender, company, project, or 2-3 keywords.",
+    "Examples:",
+    '- "track Endesa bills from Gmail"',
+    '- "track emails from client@example.com for dashboard project"',
+    '- "watch emails mentioning invoice and Endesa"',
     "",
-    "For something like Endesa bills, the intended future flow is: choose the goal, add sender/keyword filters, then review matches before Alecto creates anything.",
-    "I will not pretend that is implemented yet."
+    "Matches go to email review only. Auto-log is off."
   ].join("\n");
+}
+
+interface CustomGmailRuleProposal {
+  displayName: string;
+  senderFilters: string[];
+  keywordFilters: string[];
+  goalId?: string;
+  goalTitle?: string;
+  queryPreview: string;
+  reviewBeforeLogging: true;
+  adapterId: "custom_email_review";
+  confidence: number;
+  missingFields: string[];
+}
+
+function looksLikeCustomGmailTrackingRequest(message: string): boolean {
+  const text = normalizeForComparison(message);
+  const hasTrackVerb = /\b(track|watch|monitor|look for|follow|check)\b/.test(text);
+  const hasRuleCreationVerb = /\b(create|enable|turn on|activate|set up|setup|add|make)\b/.test(text) && /\brules?\b/.test(text);
+
+  if (!hasTrackVerb && !hasRuleCreationVerb) {
+    return false;
+  }
+
+  if (/\b(sync|connect|status|what can|how does)\b/.test(text) || (!hasRuleCreationVerb && /\b(setup|set up)\b/.test(text))) {
+    return false;
+  }
+
+  return (
+    /\b(gmail|email|emails|mail|inbox)\b/.test(text) ||
+    /\b(receipt|receipts|bill|bills|invoice|invoices|factura|facturas|payment|payments)\b/.test(text) ||
+    /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(message)
+  );
+}
+
+function looksLikeGmailRuleQuestion(message: string): boolean {
+  const text = normalizeForComparison(message);
+
+  if (looksLikeCustomGmailTrackingRequest(message)) {
+    return false;
+  }
+
+  if (!/\b(gmail|email|emails|mail|inbox|rule|tracking|endesa|job search|work action)\b/.test(text)) {
+    return false;
+  }
+
+  return (
+    /\b(where|what|how|when|will|would|does|do|can|could|should|linked|link|goal|actions?|events?|reviews?|saved|auto log|scan|sync)\b/.test(text) &&
+    /\?|\b(where|what|how|when|will|would|does|do|can|could|should)\b/.test(text)
+  );
+}
+
+async function proposeCustomGmailRuleForConversation(
+  userId: string,
+  message: string,
+  route?: SemanticRouterResult
+): Promise<string> {
+  const gmailConnection = (await getIntegrationConnections(userId)).find(
+    (connection) => connection.integrationId === "gmail" && connection.status === "active"
+  );
+
+  if (!gmailConnection) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const goals = await getActiveGoals(userId);
+  const proposal = buildCustomGmailRuleProposal(message, goals, route);
+
+  if (proposal.missingFields.length > 0 || proposal.confidence < 0.65) {
+    return "That is too broad. Give me a sender, company, project, or 2-3 keywords.";
+  }
+
+  await replacePendingAction(userId, {
+    type: "custom_email_rule",
+    summary: `Enable Gmail tracking: ${proposal.displayName}`,
+    payload: {
+      operation: "create_rule",
+      connectionId: gmailConnection.id,
+      ...proposal
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
+
+  return formatCustomGmailRuleProposal(proposal);
+}
+
+function buildCustomGmailRuleProposal(message: string, goals: Goal[], route?: SemanticRouterResult): CustomGmailRuleProposal {
+  const senderFilters = uniqueStrings((message.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) ?? []).map((item) => item.toLowerCase()));
+  const routeSenderFilters = route?.senderFilters.map((sender) => sender.toLowerCase()).filter(Boolean) ?? [];
+  const routeKeywordFilters = route?.keywordFilters.map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate) ?? [];
+  const finalSenderFilters = uniqueStrings([...senderFilters, ...routeSenderFilters]);
+  const keywordFilters = routeKeywordFilters.length > 0 ? routeKeywordFilters : extractCustomGmailKeywords(message, finalSenderFilters);
+  const goal = inferCustomGmailGoal(route?.goalHint ?? message, goals);
+  const usefulKeywords = keywordFilters.filter((keyword) => !isBroadCustomEmailKeyword(keyword));
+  const missingFields = finalSenderFilters.length === 0 && usefulKeywords.length < 1 ? ["sender_or_keywords"] : [];
+  const displayName = buildCustomGmailRuleDisplayName(message, finalSenderFilters, keywordFilters);
+  const queryPreview = buildCustomGmailQuery(finalSenderFilters, keywordFilters);
+
+  return {
+    displayName,
+    senderFilters: finalSenderFilters,
+    keywordFilters,
+    goalId: goal?.id,
+    goalTitle: goal?.title,
+    queryPreview,
+    reviewBeforeLogging: true,
+    adapterId: "custom_email_review",
+    confidence: missingFields.length === 0 ? finalSenderFilters.length > 0 || usefulKeywords.length >= 2 ? 0.85 : 0.7 : 0.35,
+    missingFields
+  };
+}
+
+function extractCustomGmailKeywords(message: string, senderFilters: string[]): string[] {
+  const keywords: string[] = [];
+  const text = normalizeForComparison(message);
+
+  if (/\binvoices?\b/.test(text)) {
+    keywords.push("invoice", "factura");
+  }
+  if (/\bbills?\b/.test(text)) {
+    keywords.push("bill", "invoice", "factura");
+  }
+  if (/\breceipts?\b/.test(text)) {
+    keywords.push("receipt");
+  }
+  if (/\bpayments?\b/.test(text)) {
+    keywords.push("payment", "receipt");
+  }
+  if (/\bfacturas?\b/.test(text)) {
+    keywords.push("factura", "invoice");
+  }
+
+  const fromPhrase = message.match(/\bfrom\s+([A-Z][A-Za-z0-9._ -]{1,40})(?:\s+(?:about|for|with|in|on)\b|$)/);
+  if (fromPhrase && senderFilters.length === 0) {
+    keywords.push(cleanCustomKeyword(fromPhrase[1]));
+  }
+
+  const aboutPhrase = message.match(/\b(?:about|for|mentioning|mentions?)\s+([A-Za-z0-9._@ -]{2,80})/i);
+  if (aboutPhrase) {
+    for (const part of aboutPhrase[1].split(/\s+(?:and|or)\s+|[,/]/i)) {
+      const keyword = cleanCustomKeyword(part);
+      if (keyword) {
+        keywords.push(keyword);
+      }
+    }
+  }
+
+  for (const proper of message.match(/\b[A-Z][a-zA-Z0-9]{2,}\b/g) ?? []) {
+    if (!/^(Gmail|Email|Mail|Inbox|Track|Watch|Monitor|I|Can|You)$/i.test(proper)) {
+      keywords.push(proper);
+    }
+  }
+
+  return uniqueStrings(keywords.map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate)).slice(0, 8);
+}
+
+function cleanCustomKeyword(value: string): string {
+  const cleaned = value
+    .replace(/[<>"'`]/g, "")
+    .replace(
+      /\b(gmail|email|emails|correo|correos|mail|mails|inbox|rule|rules|regla|reglas|tracking|track|watch|monitor|please|the|my|from|about|for|project|goal|word|words|only|just|solo|solamente|nomes|nom[eé]s|unic|unica|[uú]nicament|busca|buscar|busque|busqui|mira|mirar|filtra|filtrar|palabra|palabras|paraula|paraules|clave|clau)\b/gi,
+      " "
+    )
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return normalizeCustomKeywordSpelling(cleaned);
+}
+
+function normalizeCustomKeywordSpelling(value: string): string {
+  return value
+    .replace(/\bbarceloa\b/gi, "Barcelona")
+    .replace(/\baigues\s+(?:the\s+)?barcelona\b/gi, "Aigues de Barcelona")
+    .replace(/\baigues\s+de\s+barcelona\b/gi, "Aigues de Barcelona");
+}
+
+function isUsefulCustomKeywordCandidate(keyword: string): boolean {
+  const clean = keyword.trim();
+  const key = normalizeForComparison(clean);
+
+  if (!clean || isBroadCustomEmailKeyword(clean)) {
+    return false;
+  }
+
+  if (clean.length > 40) {
+    return false;
+  }
+
+  if (
+    /\b(can you|could you|would you|link|linked|goal|spending|less than|under|always|saved|action|actions|review|auto|log|notify|let me know)\b/i.test(clean)
+  ) {
+    return false;
+  }
+
+  return key.length >= 3;
+}
+
+function isBroadCustomEmailKeyword(keyword: string): boolean {
+  return /^(gmail|email|emails|mail|inbox|message|messages|update|updates|all|every|anything|everything)$/i.test(keyword.trim());
+}
+
+function inferCustomGmailGoal(message: string, goals: Goal[]): Goal | undefined {
+  const text = normalizeForComparison(message);
+  const active = goals.filter((goal) => goal.status === "active" && !isRiskControlGoal(goal));
+  const energyOrUtilityHint = /\b(energy|utility|utilities|consumption|energia|energía|consumo|consum|electric|electricity|electricidad|llum|luz|agua|aigua|water|gas|endesa|aigues|aigües|bill|bills|invoice|factura|facturas|receipt)\b/.test(text);
+
+  if (/\bfinance goal\b|\breceipt|\bbill|\binvoice|\bfactura|\bpayment/.test(text)) {
+    const finance = active.find((goal) => /finance|receipt|bill|invoice|factura|payment|money/.test(normalizeForComparison(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`)));
+    if (finance) {
+      return finance;
+    }
+  }
+
+  if (energyOrUtilityHint) {
+    const utilityGoal = active.find((goal) => {
+      const goalText = normalizeForComparison(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`);
+      const looksLikeUtilityGoal = /\b(utility|utilities|consumption|consume|consumo|consum|electric|electricity|electricidad|llum|luz|agua|aigua|water|gas|endesa|aigues|aigües|bills?|invoice|factura|expenses?|spending|costs?)\b/.test(goalText);
+      const looksLikeEnergyConsumptionGoal = /\benergy|energia|energía\b/.test(goalText) && /\b(consumption|consume|consumo|consum|bill|bills|invoice|factura|expense|spending|cost)\b/.test(goalText);
+
+      return looksLikeUtilityGoal || looksLikeEnergyConsumptionGoal;
+    });
+
+    if (utilityGoal) {
+      return utilityGoal;
+    }
+
+    return undefined;
+  }
+
+  const matches = active.filter((goal) => {
+    const goalText = normalizeForComparison(goal.title);
+    const goalTokens = meaningfulCustomGmailGoalTokens(goalText);
+    return goalText.length > 3 && (text.includes(goalText) || goalTokens.some((token) => text.includes(token)));
+  });
+
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+function meaningfulCustomGmailGoalTokens(value: string): string[] {
+  return value
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(
+      (token) =>
+        token.length >= 4 &&
+        !/^(track|watch|monitor|find|build|make|create|goal|goals|more|better|improve|control|gmail|email|emails|rule|rules)$/.test(token)
+    );
+}
+
+function buildCustomGmailRuleDisplayName(message: string, senderFilters: string[], keywordFilters: string[]): string {
+  const lower = normalizeForComparison(message);
+  const primary = keywordFilters.find((keyword) => !/^(invoice|factura|bill|receipt|payment)$/i.test(keyword));
+  const noun = lower.includes("receipt")
+    ? "receipts"
+    : lower.includes("bill") || lower.includes("factura")
+      ? "bills"
+      : lower.includes("invoice")
+        ? "invoices"
+        : "emails";
+
+  if (primary) {
+    return sentenceLikeTitle(`${primary} ${noun}`);
+  }
+
+  if (senderFilters[0]) {
+    return sentenceLikeTitle(`${senderFilters[0]} ${noun}`);
+  }
+
+  return "Custom Gmail tracking";
+}
+
+function buildCustomGmailQuery(senderFilters: string[], keywordFilters: string[]): string {
+  const parts = ["newer_than:30d"];
+  parts.push(...senderFilters.map((sender) => `from:${sender}`));
+  parts.push(...keywordFilters.filter((keyword) => !isBroadCustomEmailKeyword(keyword)).map(formatGmailQueryTerm));
+  return parts.join(" ");
+}
+
+function formatGmailQueryTerm(term: string): string {
+  const clean = term.trim();
+  return /\s/.test(clean) ? `"${clean.replace(/"/g, "")}"` : clean;
+}
+
+function formatCustomGmailRuleProposal(proposal: CustomGmailRuleProposal): string {
+  return [
+    "I can set up a review-first Gmail rule.",
+    "",
+    "Rule:",
+    `- name: ${proposal.displayName}`,
+    `- looks for: ${proposal.keywordFilters.length > 0 ? proposal.keywordFilters.join(", ") : "emails from the sender"}`,
+    `- sender: ${proposal.senderFilters.length > 0 ? proposal.senderFilters.join(", ") : "any"}`,
+    proposal.goalTitle ? `- linked goal: ${proposal.goalTitle}` : undefined,
+    "- creates: email review items only",
+    "- auto-log: off",
+    "",
+    "Confirm with \"yes\" to enable it, or say \"no\" to cancel.",
+    "No Gmail scan will happen before you confirm."
+  ].filter(Boolean).join("\n");
+}
+
+async function handleSemanticRouterIntent(
+  userId: string,
+  message: string,
+  pendingAction?: PendingAction
+): Promise<RoutedProcessReply | undefined> {
+  const deterministicRoute = detectDeterministicSemanticRouterIntent(message, pendingAction);
+  const semanticRouterAttempted = shouldUseSemanticRouterLLM();
+  const llmRoute = semanticRouterAttempted ? await maybeRouteSemanticMessageWithLLM(userId, message, pendingAction) : undefined;
+  const route = selectSemanticRouterRoute(deterministicRoute, llmRoute, pendingAction);
+  const routerSource = route && llmRoute && route === llmRoute ? "llm_semantic" : "deterministic_semantic";
+
+  if (!route || route.intent === "unknown" || route.confidence < 0.68) {
+    return undefined;
+  }
+
+  let reply: string | undefined;
+  let handlerName = "handleSemanticRouterIntent";
+  let mutation = false;
+
+  if (route.intent === "capability_help") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "explain_capabilities");
+  }
+
+  if (route.intent === "quickstart") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "quickstart");
+  }
+
+  if (route.intent === "setup_state") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "setup_overview");
+  }
+
+  if (route.intent === "configure_goals") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_goals");
+  }
+
+  if (route.intent === "configure_actions") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_actions");
+  }
+
+  if (route.intent === "configure_daily_loop") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_daily_loop");
+  }
+
+  if (route.intent === "configure_integrations") {
+    handlerName = "composeOnboardingReply";
+    reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_integrations");
+  }
+
+  if (route.intent === "daily_operator") {
+    handlerName = "generateDailyOperatorBrief";
+    reply = formatConversationTodayReply(await generateDailyOperatorBrief(userId));
+  }
+
+  if (route.intent === "start_day") {
+    handlerName = "buildStartDayMessage";
+    reply = await buildStartDayMessage(userId, new Date());
+  }
+
+  if (route.intent === "daily_review") {
+    handlerName = "buildConversationDailyReview";
+    reply = formatConversationDailyReview(await buildConversationDailyReview(userId));
+  }
+
+  if (route.intent === "weekly_review") {
+    handlerName = "generateAndSaveWeeklyReview";
+    const timezone = await getUserTimezone(userId);
+    const now = new Date();
+    const context = await buildWeeklyReviewContext(userId, undefined, timezone, now);
+    const existing = await getWeeklyReviewForWeek(userId, context.weekStartLocalDate);
+    const review = existing ? toWeeklyReviewMemory(existing) : await generateAndSaveWeeklyReview(userId, context);
+    reply = appendWeeklyPlanningNextStep(formatWeeklyReview(review));
+    mutation = !existing;
+  }
+
+  if (route.intent === "current_week_plan" || route.intent === "next_week_plan" || route.intent === "ambiguous_plan") {
+    handlerName = "createPlanForConversation";
+    reply = await createPlanForConversation(
+      userId,
+      message,
+      route.intent === "current_week_plan" ? "current_week" : route.intent === "next_week_plan" ? "next_week" : "ambiguous"
+    );
+    mutation = true;
+  }
+
+  if (route.intent === "action_hygiene") {
+    handlerName = "analyzeActionHygiene";
+    const now = new Date();
+    const timezone = await getUserTimezone(userId);
+    const report = await analyzeActionHygiene(userId, now, timezone);
+    await replacePendingAction(userId, {
+      type: "action_hygiene",
+      summary: report.summary,
+      payload: {
+        originalText: message,
+        now: now.toISOString(),
+        timezone,
+        candidates: report.suggestedCleanupCandidates.map((candidate) => candidate.actionId),
+        candidateActions: report.suggestedCleanupCandidates.map((candidate) => ({
+          ...toPendingActionCandidate({
+            id: candidate.actionId,
+            title: candidate.title,
+            status: "open",
+            dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
+            goalTitleSnapshot: candidate.linkedGoalTitle
+          }),
+          recommendedOptions: candidate.recommendedOptions
+        }))
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+    reply = formatActionHygieneReport(report);
+    mutation = true;
+  }
+
+  if (route.intent === "show_goals") {
+    handlerName = "formatGoalsForConversation";
+    reply = formatGoalsForConversation(await getGoals(userId));
+  }
+
+  if (route.intent === "show_actions") {
+    handlerName = "formatActionsForConversation";
+    reply = formatActionsForConversation(await getActionItems(userId, { status: "open", limit: 10 }));
+  }
+
+  if (route.intent === "show_memory") {
+    handlerName = "formatMemoriesForConversation";
+    reply = formatMemoriesForConversation(await getActiveMemories(userId));
+  }
+
+  if (route.intent === "email_rules_list") {
+    handlerName = "formatEmailRulesForConversation";
+    reply = await formatEmailRulesForConversation(userId, message);
+  }
+
+  if (route.intent === "integration_guidance") {
+    handlerName = "formatIntegrationGuidance";
+    reply = formatIntegrationGuidance(message);
+  }
+
+  if (route.intent === "integration_sync") {
+    handlerName = "syncIntegrationsForConversation";
+    reply = await syncIntegrationsForConversation(userId);
+    mutation = true;
+  }
+
+  if (route.intent === "daily_loop_settings") {
+    handlerName = "handleNaturalDailyLoopSettings";
+    reply = await handleNaturalDailyLoopSettings(userId, message);
+    mutation = reply.startsWith("Daily loop updated.");
+  }
+
+  if (route.intent === "gmail_capability_guidance") {
+    handlerName = "formatGmailCapabilityGuidance";
+    reply = formatGmailCapabilityGuidance();
+  }
+
+  if (route.intent === "gmail_setup") {
+    handlerName = "formatGmailSetupForConversation";
+    reply = await formatGmailSetupForConversation(userId);
+  }
+
+  if (route.intent === "gmail_sync") {
+    handlerName = "syncGmailForConversation";
+    reply = await syncGmailForConversation(userId);
+    mutation = true;
+  }
+
+  if (route.intent === "gmail_sync_guidance") {
+    handlerName = "formatGmailNotificationTimingForConversation";
+    reply = await formatGmailNotificationTimingForConversation(userId, message, pendingAction, route);
+  }
+
+  if (route.intent === "enable_job_search_email_rule") {
+    handlerName = "enableEmailRuleForConversation";
+    reply = await enableEmailRuleForConversation(userId, "job_search");
+    mutation = reply.includes(" is on.");
+  }
+
+  if (route.intent === "enable_work_action_email_rule") {
+    handlerName = "enableEmailRuleForConversation";
+    reply = await enableEmailRuleForConversation(userId, "work_action");
+    mutation = reply.includes(" is on.");
+  }
+
+  if (route.intent === "gmail_custom_rule_request") {
+    if (route.confidence < 0.65) {
+      handlerName = "proposeCustomGmailRuleForConversation";
+      reply = "That is too broad. Give me a sender, company, project, or 2-3 keywords.";
+    } else {
+      handlerName = "proposeCustomGmailRuleForConversation";
+      reply = await proposeCustomGmailRuleForConversation(userId, message, route);
+      mutation = true;
+    }
+  }
+
+  if (route.intent === "gmail_custom_rule_edit_pending") {
+    if (isPendingCustomGmailRuleCreate(pendingAction)) {
+      handlerName = "editPendingCustomGmailRule";
+      reply = await editPendingCustomGmailRule(userId, pendingAction, route);
+      mutation = reply.startsWith("Updated the pending Gmail rule.");
+    } else {
+      handlerName = "editActiveCustomGmailRuleForConversation";
+      reply = await editActiveCustomGmailRuleForConversation(userId, message, route, pendingAction);
+      mutation = reply.startsWith("Updated Gmail rule:");
+    }
+  }
+
+  if (route.intent === "gmail_custom_rule_edit") {
+    handlerName = "editActiveCustomGmailRuleForConversation";
+    reply = await editActiveCustomGmailRuleForConversation(userId, message, route, pendingAction);
+    mutation = reply.startsWith("Updated Gmail rule:");
+  }
+
+  if (route.intent === "gmail_custom_rule_manage") {
+    handlerName = "manageCustomGmailRuleForConversation";
+    reply = await manageCustomGmailRuleForConversation(userId, message, route, pendingAction);
+    mutation =
+      reply.startsWith("Gmail rule active:") ||
+      reply.startsWith("Gmail rule paused:") ||
+      reply.startsWith("Confirm remove Gmail rule:") ||
+      reply.startsWith("Confirm remove ") && reply.includes("Gmail email rule");
+  }
+
+  if (route.intent === "gmail_rule_question") {
+    handlerName = "answerGmailRuleQuestionForConversation";
+    reply = await answerGmailRuleQuestionForConversation(userId, message, pendingAction, route);
+  }
+
+  if (route.intent === "conversation_repair") {
+    handlerName = "formatConversationRepairReply";
+    reply = formatConversationRepairReply(pendingAction, route);
+  }
+
+  if (!reply) {
+    return undefined;
+  }
+
+  return {
+    reply,
+    routeDebug: {
+      routerSource,
+      intent: route.intent,
+      handlerName,
+      semanticRouterAttempted,
+      semanticRouterUsed: true,
+      mutation,
+      confidence: route.confidence,
+      language: route.language,
+      sideEffectRisk: route.sideEffectRisk,
+      requiresConfirmation: route.requiresConfirmation,
+      reason: route.reason
+    }
+  };
+}
+
+function selectSemanticRouterRoute(
+  deterministicRoute: SemanticRouterResult | undefined,
+  llmRoute: SemanticRouterResult | undefined,
+  pendingAction?: PendingAction
+): SemanticRouterResult | undefined {
+  const usableLlmRoute = llmRoute && llmRoute.intent !== "unknown" && llmRoute.confidence >= 0.68 ? llmRoute : undefined;
+
+  if (deterministicRoute?.intent === "conversation_repair") {
+    return deterministicRoute;
+  }
+
+  if (deterministicRoute?.sideEffectRisk === "destructive") {
+    return deterministicRoute;
+  }
+
+  if (usableLlmRoute && (isPendingCustomGmailRuleCreate(pendingAction) || isPendingCustomGmailRuleContext(pendingAction))) {
+    return usableLlmRoute;
+  }
+
+  return deterministicRoute ?? usableLlmRoute;
+}
+
+function detectDeterministicSemanticRouterIntent(message: string, pendingAction?: PendingAction): SemanticRouterResult | undefined {
+  const text = normalizeForComparison(message);
+  const hasPendingCustomRule = isPendingCustomGmailRuleCreate(pendingAction);
+
+  if (isPendingCustomGmailRuleContext(pendingAction)) {
+    if (looksLikeContextualDeleteAllEmailRules(message)) {
+      return {
+        intent: "gmail_custom_rule_manage",
+        operation: "remove",
+        confidence: 0.92,
+        reason: "User asks to delete/reset all email rules in the current Gmail rule context.",
+        language: "unknown",
+        sideEffectRisk: "destructive",
+        requiresConfirmation: true,
+        target: "all email rules",
+        keywordFilters: [],
+        senderFilters: [],
+        removeKeywordFilters: [],
+        goalHint: null,
+        shouldUnlinkGoal: false,
+        userFacingIssue: null
+      };
+    }
+  }
+
+  if (hasPendingCustomRule) {
+    const replacementKeywords = extractPendingCustomRuleReplacementKeywords(message);
+    const removeKeywordFilters = extractPendingCustomRuleRemovedKeywords(message);
+    const goalCorrection = extractPendingCustomRuleGoalCorrection(message);
+
+    if (replacementKeywords.length > 0 || removeKeywordFilters.length > 0 || goalCorrection) {
+      return {
+        intent: "gmail_custom_rule_edit_pending",
+        operation: "edit_pending",
+        confidence: 0.92,
+        reason: "User is editing the pending Gmail custom rule proposal.",
+        language: "unknown",
+        sideEffectRisk: "write",
+        requiresConfirmation: true,
+        target: null,
+        keywordFilters: replacementKeywords,
+        senderFilters: [],
+        removeKeywordFilters,
+        goalHint: goalCorrection?.goalHint ?? null,
+        shouldUnlinkGoal: goalCorrection?.shouldUnlinkGoal ?? false,
+        userFacingIssue: null
+      };
+    }
+
+    if (looksLikeGmailRuleQuestion(message)) {
+      return {
+        intent: "gmail_rule_question",
+        operation: "answer",
+        confidence: 0.9,
+        reason: "User is asking about the pending Gmail rule proposal.",
+        language: "unknown",
+        sideEffectRisk: "read",
+        requiresConfirmation: false,
+        target: null,
+        keywordFilters: [],
+        senderFilters: [],
+        removeKeywordFilters: [],
+        goalHint: null,
+        shouldUnlinkGoal: false,
+        userFacingIssue: null
+      };
+    }
+  }
+
+  if (/\b(wtf|what are you doing|bro what|that's wrong|this is wrong|not good|you misunderstood|wrong goal|wrong rule)\b/.test(text)) {
+    return {
+      intent: "conversation_repair",
+      operation: "repair",
+      confidence: 0.86,
+      reason: "User is complaining about a misunderstanding.",
+      language: "unknown",
+      sideEffectRisk: "none",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
+  }
+
+  return undefined;
+}
+
+function looksLikeContextualDeleteAllEmailRules(message: string): boolean {
+  const text = normalizeForComparison(message);
+
+  if (!/\b(delete|remove|clear|archive|reset|elimina|eliminar|borra|borrar)\b/.test(text)) {
+    return false;
+  }
+
+  return (
+    /\b(all|everything|every|all of them|all of em|em|them|todos|todas|totes)\b/.test(text) ||
+    /\breset\b/.test(text)
+  );
+}
+
+async function maybeRouteSemanticMessageWithLLM(
+  userId: string,
+  message: string,
+  pendingAction?: PendingAction
+): Promise<SemanticRouterResult | undefined> {
+  if (!shouldUseSemanticRouterLLM()) {
+    return undefined;
+  }
+
+  try {
+    const [activeGoals, emailRules, goals] = await Promise.all([
+      getActiveGoals(userId),
+      getEmailSignalRules(userId),
+      getGoals(userId)
+    ]);
+    const goalById = new Map(goals.map((goal) => [goal.id, goal.title]));
+
+    return await routeSemanticMessageWithLLM({
+      userId,
+      message,
+      activeGoals: activeGoals.map((goal) => ({
+        id: goal.id,
+        title: goal.title,
+        category: goal.category,
+        templateId: goal.templateId,
+        status: goal.status
+      })),
+      activeEmailRules: emailRules
+        .filter((rule) => rule.status !== "archived")
+        .map((rule) => ({
+          id: rule.id,
+          adapterId: rule.adapterId,
+          name: rule.name,
+          query: rule.query,
+          status: rule.status,
+          goalTitle: rule.goalId ? goalById.get(rule.goalId) ?? null : null
+        })),
+      pendingAction: pendingAction
+        ? {
+            type: pendingAction.type,
+            summary: pendingAction.summary,
+            payload: sanitizePendingActionForSemanticRouter(pendingAction)
+          }
+        : null
+    });
+  } catch (error) {
+    console.warn("Semantic router LLM failed; continuing deterministic routing.", safeErrorForLog(error));
+    return undefined;
+  }
+}
+
+function shouldUseSemanticRouterLLM(): boolean {
+  return process.env.LLM_ROUTER_ENABLED === "true" && (Boolean(process.env.OPENAI_API_KEY) || Boolean(process.env.LLM_ROUTER_MOCK_RESPONSE));
+}
+
+function sanitizePendingActionForSemanticRouter(pendingAction: PendingAction): Record<string, unknown> {
+  if (pendingAction.type !== "custom_email_rule" || !isRecord(pendingAction.payload)) {
+    return {
+      type: pendingAction.type,
+      summary: pendingAction.summary
+    };
+  }
+
+  return {
+    operation: pendingAction.payload.operation,
+    displayName: pendingAction.payload.displayName,
+    keywordFilters: pendingAction.payload.keywordFilters,
+    senderFilters: pendingAction.payload.senderFilters,
+    goalTitle: pendingAction.payload.goalTitle,
+    queryPreview: pendingAction.payload.queryPreview,
+    focusedRuleId: pendingAction.payload.focusedRuleId,
+    rules: pendingAction.payload.rules
+  };
+}
+
+function safeErrorForLog(error: unknown): string {
+  if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
+    return (error as { message: string }).message.slice(0, 240);
+  }
+
+  return "Unknown error";
+}
+
+function isPendingCustomGmailRuleCreate(pendingAction: PendingAction | undefined): boolean {
+  return Boolean(
+    pendingAction &&
+      pendingAction.status === "pending" &&
+      pendingAction.type === "custom_email_rule" &&
+      isRecord(pendingAction.payload) &&
+      pendingAction.payload.operation === "create_rule"
+  );
+}
+
+function isPendingCustomGmailRuleContext(pendingAction: PendingAction | undefined): boolean {
+  return Boolean(
+    pendingAction &&
+      pendingAction.status === "pending" &&
+      pendingAction.type === "custom_email_rule" &&
+      isRecord(pendingAction.payload) &&
+      pendingAction.payload.operation === "rule_context"
+  );
+}
+
+function extractPendingCustomRuleReplacementKeywords(message: string): string[] {
+  const replacements: string[] = [];
+  const match = message.match(
+    /\b(?:look(?:s)?\s+for|looking\s+for|keywords?|filters?|search(?:es)?\s+for|busca(?:r|ndo)?|busque|busqui|mirar|mira|filtra(?:r)?|palabras?\s+clave|paraules?\s+clau)\s+(?:just|only|solo|solamente|nom[eé]s|unic(?:o|a)?|[uú]nicament)?\s*([\p{L}0-9._@ ,/-]{2,160})/iu
+  );
+
+  if (match) {
+    replacements.push(...splitCustomKeywordPhrase(extractCustomKeywordClause(match[1])));
+  }
+
+  const justMatch = message.match(/\b(?:just|only|solo|solamente|nom[eé]s|[uú]nicament)\s+([\p{L}][\p{L}0-9._ -]{2,60})\b/iu);
+  if (replacements.length === 0 && justMatch) {
+    replacements.push(cleanCustomKeyword(justMatch[1]));
+  }
+
+  return uniqueStrings(replacements.map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate));
+}
+
+function extractPendingCustomRuleRemovedKeywords(message: string): string[] {
+  const match = message.match(
+    /\b(?:remove|drop|delete|quita(?:r)?|elimina(?:r)?|treu(?:re)?|saca(?:r)?)\s+(.+?)\s+(?:from|in|de|del|dels?|en)\s+(?:the\s+|la\s+|el\s+)?(?:rule|filter|keywords?|looks? for|regla|filtro|filtros|paraules?\s+clau|palabras?\s+clave)\b/iu
+  );
+
+  if (match) {
+    return uniqueStrings(splitCustomKeywordPhrase(match[1]).map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate));
+  }
+
+  const contrastMatch = message.match(/\b(?:instead of|rather than|en vez de|en lugar de|en lloc de|no|not|sin|sense)\s+([\p{L}0-9._@ -]{2,80})$/iu);
+  return contrastMatch
+    ? uniqueStrings(splitCustomKeywordPhrase(contrastMatch[1]).map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate))
+    : [];
+}
+
+function splitCustomKeywordPhrase(value: string): string[] {
+  return value
+    .replace(/\b(?:from|for|in|on|de|del|dels?|para|per|por|amb|con|please|thanks|gmail|email|correo|correos|mail|rule|regla|filter|filtro|keyword|keywords|palabra|palabras|paraula|paraules)\b.*$/iu, "")
+    .split(/\s+(?:and|or|y|o|i)\s+|[,/]/iu)
+    .map(cleanCustomKeyword)
+    .filter(isUsefulCustomKeywordCandidate);
+}
+
+function extractCustomKeywordClause(value: string): string {
+  const firstClause = value.split(/[.;?]/)[0] ?? value;
+  return firstClause
+    .replace(/\s+\b(?:instead of|rather than|en vez de|en lugar de|en lloc de)\b\s+.+$/iu, "")
+    .replace(/\s+\b(?:not|no|sin|sense)\b\s+[\p{L}0-9._@ -]{2,80}$/iu, "")
+    .replace(/,\s*(?:and|but|y|pero|i|per[oò])\s+.*$/iu, "")
+    .replace(/\s+\b(?:and|but|y|pero|i|per[oò])\b\s+(?:can|could|would|should|do|does|will|where|what|how|link|linked|save|create|puede|puedes|podria|podrias|debe|deberia|donde|que|como|cuando|enlaza|vincula|guarda|crea)\b.*$/iu, "")
+    .replace(/\s+\b(?:treu|quita|remove|drop|delete)\b\s+.+$/iu, "")
+    .trim();
+}
+
+function extractPendingCustomRuleGoalCorrection(message: string): { goalHint?: string; shouldUnlinkGoal: boolean } | undefined {
+  const text = normalizeForComparison(message);
+
+  if (!/\b(goal|linked goal|link|objetivo|meta|vincula|enlaza|lliga|relaciona)\b/.test(text) && !/\b(for energy consumption|consumo de energia|consumo de energía|consum d energia|factura luz|factures llum)\b/.test(text)) {
+    return undefined;
+  }
+
+  const shouldUnlinkGoal = /\b(wrong goal|not linked|do not link|don't link|remove linked goal|unlink|no goal|is not|isnt|isn't|objetivo equivocado|meta equivocada|no lo enlaces|no l enlaces|no ho vinculis|quita el objetivo|treu l objectiu|no es apuestas|no son apuestas|no es apostes|not betting|not trading)\b/.test(text);
+  const goalHintMatch = message.match(/\bgoal\s+(?:to|for|about)\s+([A-Za-z][A-Za-z0-9 -]{2,80})/i) ??
+    message.match(/\blink(?:ed)?\s+(?:it|this|rule)?\s*(?:to|with)\s+([A-Za-z][A-Za-z0-9 -]{2,80})/i) ??
+    message.match(/\b(?:objetivo|meta)\s+(?:de|para|sobre)\s+([\p{L}][\p{L}0-9 -]{2,80})/iu) ??
+    message.match(/\b(?:vincula|enlaza|lliga|relaciona)\s+(?:lo|la|esto|aixo|aix[oò]|it|this|rule)?\s*(?:a|con|amb|to|with)\s+([\p{L}][\p{L}0-9 -]{2,80})/iu) ??
+    message.match(/\b(?:for|to|para|per|por)\s+([\p{L}][\p{L}0-9 -]{2,80})$/iu) ??
+    message.match(/\b(?:it'?s|its|this is|esto es|aixo es|aix[oò] [eé]s)\s+(?:for|about|para|sobre|per)\s+([\p{L}][\p{L}0-9 -]{2,80})/iu);
+  const goalHint = goalHintMatch ? cleanCustomKeyword(goalHintMatch[1]) : undefined;
+
+  if (!goalHint && !shouldUnlinkGoal) {
+    return undefined;
+  }
+
+  return {
+    goalHint,
+    shouldUnlinkGoal
+  };
+}
+
+async function editPendingCustomGmailRule(
+  userId: string,
+  pendingAction: PendingAction | undefined,
+  route: SemanticRouterResult
+): Promise<string> {
+  if (!isPendingCustomGmailRuleCreate(pendingAction) || !pendingAction || !isRecord(pendingAction.payload)) {
+    return "There is no pending Gmail rule to edit. Say something like: track Endesa bills from Gmail.";
+  }
+
+  const currentKeywordFilters = arrayOfStrings(pendingAction.payload.keywordFilters).map(cleanCustomKeyword).filter(Boolean);
+  const currentSenderFilters = arrayOfStrings(pendingAction.payload.senderFilters).map((sender) => sender.toLowerCase());
+  const replacementKeywords = route.keywordFilters.map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate);
+  const removeKeywords = route.removeKeywordFilters.map((keyword) => normalizeForComparison(cleanCustomKeyword(keyword)));
+  const keywordFilters = replacementKeywords.length > 0
+    ? replacementKeywords
+    : currentKeywordFilters.filter((keyword) => !removeKeywords.includes(normalizeForComparison(keyword)));
+  const senderFilters = route.senderFilters.length > 0
+    ? route.senderFilters.map((sender) => sender.toLowerCase())
+    : currentSenderFilters;
+
+  if (senderFilters.length === 0 && keywordFilters.filter((keyword) => !isBroadCustomEmailKeyword(keyword)).length === 0) {
+    return "That would make the Gmail rule too broad. Give me a sender, company, project, or keyword.";
+  }
+
+  const goals = await getActiveGoals(userId);
+  const requestedGoalHint = route.goalHint?.trim() || undefined;
+  const goal = requestedGoalHint ? inferCustomGmailGoal(requestedGoalHint, goals) : undefined;
+  const shouldDropRiskGoal = typeof pendingAction.payload.goalTitle === "string" && /betting|trading|impulsive|risk/i.test(pendingAction.payload.goalTitle);
+  const goalId = goal?.id ?? (route.shouldUnlinkGoal || shouldDropRiskGoal ? undefined : stringFromRecord(pendingAction.payload, "goalId"));
+  const goalTitle = goal?.title ?? (route.shouldUnlinkGoal || shouldDropRiskGoal ? undefined : stringFromRecord(pendingAction.payload, "goalTitle"));
+  const displayName = replacementKeywords.length > 0 || shouldDropRiskGoal
+    ? buildCustomGmailRuleDisplayName(keywordFilters.join(" "), senderFilters, keywordFilters)
+    : stringFromRecord(pendingAction.payload, "displayName") ?? buildCustomGmailRuleDisplayName(keywordFilters.join(" "), senderFilters, keywordFilters);
+  const queryPreview = buildCustomGmailQuery(senderFilters, keywordFilters);
+  const updatedProposal: CustomGmailRuleProposal = {
+    displayName,
+    senderFilters,
+    keywordFilters,
+    goalId,
+    goalTitle,
+    queryPreview,
+    reviewBeforeLogging: true,
+    adapterId: "custom_email_review",
+    confidence: 0.9,
+    missingFields: []
+  };
+
+  await replacePendingAction(userId, {
+    type: "custom_email_rule",
+    summary: `Enable Gmail tracking: ${updatedProposal.displayName}`,
+    payload: {
+      ...pendingAction.payload,
+      operation: "create_rule",
+      ...updatedProposal
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
+
+  return [
+    "Updated the pending Gmail rule.",
+    requestedGoalHint && !goal
+      ? `I did not link a goal because I could not find an active goal matching "${requestedGoalHint}".`
+      : undefined,
+    shouldDropRiskGoal && !goal
+      ? "I removed the previous risk-control goal link. This rule is not a betting/trading guardrail."
+      : undefined,
+    "",
+    formatCustomGmailRuleProposal(updatedProposal)
+  ].filter((line) => line !== undefined).join("\n");
+}
+
+async function editActiveCustomGmailRuleForConversation(
+  userId: string,
+  message: string,
+  route: SemanticRouterResult,
+  pendingAction?: PendingAction
+): Promise<string> {
+  const rules = (await getEmailSignalRules(userId)).filter(
+    (rule) => rule.adapterId === "custom_email_review" && rule.status !== "archived"
+  );
+  const matches = resolveCustomGmailRulesForConversation(rules, message, route, pendingAction);
+
+  if (matches.length === 0) {
+    return "I could not find a matching custom Gmail rule. Say the rule name, like: change Endesa emails to only look for Aigues de Barcelona.";
+  }
+
+  if (matches.length > 1) {
+    return [
+      "Which custom Gmail rule do you mean?",
+      ...matches.slice(0, 5).map((rule, index) => `${index + 1}. ${rule.name}`),
+      "Reply with the rule name."
+    ].join("\n");
+  }
+
+  const rule = matches[0];
+  const currentFilters = parseCustomGmailRuleFilters(rule);
+  const replacementKeywords = route.keywordFilters.map(cleanCustomKeyword).filter(isUsefulCustomKeywordCandidate);
+  const removeKeywords = route.removeKeywordFilters.map((keyword) => normalizeForComparison(cleanCustomKeyword(keyword)));
+  const senderFilters = route.senderFilters.length > 0
+    ? uniqueStrings(route.senderFilters.map((sender) => sender.toLowerCase()).filter(Boolean))
+    : currentFilters.senderFilters;
+  const shouldReplaceKeywords = shouldReplaceCustomRuleKeywords(message, route);
+  const keywordFilters = shouldReplaceKeywords && replacementKeywords.length > 0
+    ? replacementKeywords
+    : uniqueStrings([
+        ...currentFilters.keywordFilters.filter((keyword) => !removeKeywords.includes(normalizeForComparison(keyword))),
+        ...replacementKeywords
+      ]);
+
+  const queryChanged =
+    replacementKeywords.length > 0 ||
+    removeKeywords.length > 0 ||
+    route.senderFilters.length > 0;
+
+  if (!queryChanged && !route.goalHint && !route.shouldUnlinkGoal) {
+    return "Tell me what to change on that Gmail rule. Example: make Endesa emails look only for Aigues de Barcelona.";
+  }
+
+  if (queryChanged && senderFilters.length === 0 && keywordFilters.filter((keyword) => !isBroadCustomEmailKeyword(keyword)).length === 0) {
+    return "That would make the Gmail rule too broad. Give me a sender, company, project, or keyword.";
+  }
+
+  const goals = await getActiveGoals(userId);
+  const requestedGoalHint = route.goalHint?.trim() || undefined;
+  const goal = requestedGoalHint ? inferCustomGmailGoal(requestedGoalHint, goals) : undefined;
+  const goalPatch = route.shouldUnlinkGoal
+    ? null
+    : goal
+      ? goal.id
+      : undefined;
+  const query = queryChanged ? buildCustomGmailQuery(senderFilters, keywordFilters) : rule.query;
+  const name = queryChanged ? buildCustomGmailRuleDisplayName(keywordFilters.join(" "), senderFilters, keywordFilters) : rule.name;
+
+  const updated = await updateEmailSignalRuleDefinition(userId, rule.id, {
+    name,
+    query,
+    goalId: goalPatch
+  });
+
+  if (!updated) {
+    return "I could not update that Gmail rule.";
+  }
+
+  await maybeRememberGmailRuleConversationContext(userId, [updated], updated);
+
+  const goalById = new Map((await getGoals(userId)).map((item) => [item.id, item.title]));
+  const linkedGoalTitle = updated.goalId ? goalById.get(updated.goalId) : undefined;
+  const warnings = [
+    requestedGoalHint && !goal ? `I did not link a goal because I could not find an active goal matching "${requestedGoalHint}".` : undefined
+  ].filter(Boolean);
+
+  return [
+    `Updated Gmail rule: ${updated.name}`,
+    `Looks for: ${formatEmailRuleQueryForHumans(updated.query)}`,
+    `Linked goal: ${linkedGoalTitle ?? "none"}`,
+    "Matches still go to email review first. Auto-log is off.",
+    ...warnings
+  ].join("\n");
+}
+
+function parseCustomGmailRuleFilters(rule: EmailSignalRule): { senderFilters: string[]; keywordFilters: string[] } {
+  const query = rule.query ?? "";
+  const senderFilters = uniqueStrings(
+    [...query.matchAll(/\bfrom:("[^"]+"|\S+)/gi)]
+      .map((match) => match[1]?.replace(/^"|"$/g, "").toLowerCase() ?? "")
+      .filter(Boolean)
+  );
+  const withoutControlTerms = query
+    .replace(/\bnewer_than:\d+d\b/gi, " ")
+    .replace(/\bfrom:("[^"]+"|\S+)/gi, " ");
+  const quotedTerms = [...withoutControlTerms.matchAll(/"([^"]+)"/g)].map((match) => match[1] ?? "");
+  const unquoted = withoutControlTerms.replace(/"[^"]+"/g, " ").split(/\s+/);
+  const keywordFilters = uniqueStrings(
+    [...quotedTerms, ...unquoted]
+      .map(cleanCustomKeyword)
+      .filter(isUsefulCustomKeywordCandidate)
+  );
+
+  return { senderFilters, keywordFilters };
+}
+
+function shouldReplaceCustomRuleKeywords(message: string, route: SemanticRouterResult): boolean {
+  const text = normalizeForComparison(message);
+  return (
+    route.removeKeywordFilters.length > 0 ||
+    /\b(only|just|solo|solamente|nomes|només|unic|únicament|instead of|rather than|en vez de|en lugar de|en lloc de|replace|change to|cambia(?:r)? a|canvia(?:r)? a|use)\b/.test(text)
+  );
+}
+
+function formatConversationRepairReply(pendingAction: PendingAction | undefined, route: SemanticRouterResult): string {
+  if (isPendingCustomGmailRuleCreate(pendingAction)) {
+    return [
+      "You are right to call that out.",
+      "I was handling a pending Gmail rule. I should edit that rule or ask a clear question, not invent progress.",
+      route.userFacingIssue ? `Issue: ${route.userFacingIssue}` : undefined,
+      "Tell me the exact change, for example: \"make the Gmail rule look only for Endesa\" or \"remove the linked goal\"."
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    "You are right to call that out.",
+    "I should not pretend I changed something unless the database update actually happened.",
+    "Tell me the exact change you wanted, or use /actions, /my_email_rules, or /today to check the current state."
+  ].join("\n");
+}
+
+async function answerGmailRuleQuestionForConversation(
+  userId: string,
+  message: string,
+  pendingAction?: PendingAction,
+  route?: SemanticRouterResult
+): Promise<string> {
+  if (route?.operation === "timing" || looksLikeGmailNotificationTimingQuestion(message)) {
+    return formatGmailNotificationTimingForConversation(userId, message, pendingAction, route);
+  }
+
+  if (isPendingCustomGmailRuleCreate(pendingAction) && pendingAction && isRecord(pendingAction.payload)) {
+    const goalTitle = stringFromRecord(pendingAction.payload, "goalTitle");
+    const keywordFilters = arrayOfStrings(pendingAction.payload.keywordFilters);
+    const senderFilters = arrayOfStrings(pendingAction.payload.senderFilters);
+    const displayName = stringFromRecord(pendingAction.payload, "displayName") ?? "Custom Gmail tracking";
+
+    return [
+      `${displayName} is still pending. It is not scanning Gmail yet.`,
+      `Looks for: ${keywordFilters.length > 0 ? keywordFilters.join(", ") : "emails from the sender"}`,
+      `Sender: ${senderFilters.length > 0 ? senderFilters.join(", ") : "any"}`,
+      `Linked goal: ${goalTitle ?? "none"}`,
+      "Where matches go: email review only. It will not create actions or events automatically.",
+      "Confirm with yes, cancel with no, or edit it in plain language."
+    ].join("\n");
+  }
+
+  const rules = (await getEmailSignalRules(userId)).filter((rule) => rule.status !== "archived");
+  const target = route?.target ?? extractGmailRuleQuestionTarget(message);
+  const matches = target
+    ? findEmailRulesByTarget(rules, target)
+    : rules.length === 1
+      ? rules
+      : [];
+
+  if (matches.length === 0) {
+    if (rules.length === 0) {
+      return "No Gmail rules are active yet. Say what to track, for example: track Endesa bills from Gmail.";
+    }
+
+    return "I could not identify which Gmail rule you mean. Say the rule name, like: what happens with Endesa emails?";
+  }
+
+  if (matches.length > 1) {
+    await maybeRememberGmailRuleConversationContext(userId, matches);
+    return [
+      "Which Gmail rule do you mean?",
+      ...matches.slice(0, 5).map((rule, index) => `${index + 1}. ${rule.name}`),
+      "Ask again with the rule name."
+    ].join("\n");
+  }
+
+  const rule = matches[0];
+  const goals = await getGoals(userId);
+  const goal = rule.goalId ? goals.find((item) => item.id === rule.goalId) : undefined;
+  await maybeRememberGmailRuleConversationContext(userId, [rule], rule);
+
+  return [
+    `Gmail rule: ${rule.name}`,
+    `Status: ${rule.status}`,
+    `Looks for: ${formatEmailRuleQueryForHumans(rule.query)}`,
+    `Linked goal: ${goal?.title ?? "none"}`,
+    "Where matches go: email review first.",
+    rule.adapterId === "custom_email_review"
+      ? "Custom rules never auto-log or create actions."
+      : rule.reviewBeforeLogging
+        ? "Matches wait for your approval before becoming events or actions."
+        : "Clear matches can be logged automatically; uncertain matches go to review.",
+    `${gmailScheduledSyncDescription()} Manual sync: say 'sync Gmail'.`
+  ].join("\n");
+}
+
+async function formatGmailNotificationTimingForConversation(
+  userId: string,
+  message: string,
+  pendingAction?: PendingAction,
+  route?: SemanticRouterResult
+): Promise<string> {
+  if (isPendingCustomGmailRuleCreate(pendingAction) && pendingAction && isRecord(pendingAction.payload)) {
+    const displayName = stringFromRecord(pendingAction.payload, "displayName") ?? "Custom Gmail tracking";
+
+    return [
+      `${displayName} is still pending, so it is not scanning Gmail yet.`,
+      "After you confirm, Alecto checks Gmail when you say 'sync Gmail'.",
+      `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
+      "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
+      "Matches go to email review first; they do not become actions or events automatically."
+    ].join("\n");
+  }
+
+  const connections = await getIntegrationConnections(userId);
+  const gmailConnected = connections.some((connection) => connection.integrationId === "gmail" && connection.status === "active");
+
+  if (!gmailConnected) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const visibleRules = (await getEmailSignalRules(userId)).filter((rule) => rule.status !== "archived");
+  const rules = visibleRules.filter((rule) => rule.status === "active");
+  const target = route?.target ?? extractGmailRuleQuestionTarget(message);
+  const customMatches = resolveCustomGmailRulesForConversation(
+    visibleRules.filter((rule) => rule.adapterId === "custom_email_review"),
+    message,
+    route,
+    pendingAction
+  );
+  const targetMatches = target ? findEmailRulesByTarget(visibleRules, target) : [];
+  const matches = targetMatches.length > 0
+    ? targetMatches
+    : customMatches.length > 0
+      ? customMatches
+      : rules.length > 0
+        ? rules
+        : visibleRules;
+
+  if (visibleRules.length === 0) {
+    return noActiveGmailRulesMessage();
+  }
+
+  const ruleLine =
+    matches.length === 1
+      ? `For ${matches[0].name}${matches[0].status !== "active" ? ` (${matches[0].status})` : ""}:`
+      : matches.length > 1 && targetMatches.length > 0
+        ? `For matching rules: ${matches.slice(0, 3).map((rule) => rule.name).join(", ")}.`
+        : "For active Gmail rules:";
+
+  await maybeRememberGmailRuleConversationContext(userId, matches.length > 0 ? matches : rules, matches.length === 1 ? matches[0] : undefined);
+
+  return [
+    ruleLine,
+    matches.length === 1 && matches[0].status !== "active"
+      ? "That rule is not active right now, so it will not check Gmail until you resume it."
+      : "Alecto checks Gmail when you say 'sync Gmail'.",
+    `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
+    "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
+    "New custom/work uncertain matches go to email review. Check them with /email_reviews."
+  ].join("\n");
+}
+
+function looksLikeGmailNotificationTimingQuestion(message: string): boolean {
+  const text = normalizeForComparison(message);
+
+  if (!/\b(gmail|email|emails|mail|mails|inbox|rule|rules|endesa)\b/.test(text)) {
+    return false;
+  }
+
+  return (
+    /\bwhen\b.*\b(let me know|tell me|notify|notification|new|arrive|comes?|come in|sync|check)\b/.test(text) ||
+    /\b(let me know|tell me|notify|notification)\b.*\b(new|arrive|comes?|come in|sync|check|email|emails|mail|mails)\b/.test(text) ||
+    /\bwhen they arrive\b/.test(text)
+  );
+}
+
+async function manageCustomGmailRuleForConversation(
+  userId: string,
+  message: string,
+  route?: SemanticRouterResult,
+  pendingAction?: PendingAction
+): Promise<string> {
+  const parsed = parseCustomGmailRuleManagement(message, route);
+  if (!parsed) {
+    return "Tell me which custom Gmail rule to change. Example: pause Endesa emails.";
+  }
+
+  const rules = await getVisibleGmailEmailRules(userId);
+
+  if (parsed.operation === "archive" && isAllCustomGmailRulesTarget(message, parsed.target)) {
+    const selectedRules = sortEmailRuleCandidates(
+      normalizeForComparison(`${message} ${parsed.target ?? ""}`).includes("custom")
+        ? rules.filter((rule) => rule.adapterId === "custom_email_review")
+        : rules
+    );
+
+    if (selectedRules.length === 0) {
+      return "No Gmail email rules matched. Gmail connection and historical email reviews were not changed.";
+    }
+
+    await replacePendingAction(userId, {
+      type: "custom_email_rule",
+      summary: `Archive ${selectedRules.length} Gmail email rules`,
+      payload: {
+        operation: "archive_rules",
+        ruleScope: "gmail_email_rules",
+        ruleIds: selectedRules.map((rule) => rule.id),
+        ruleNames: selectedRules.map((rule) => rule.name)
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return [
+      `Confirm remove ${selectedRules.length} Gmail email rule${selectedRules.length === 1 ? "" : "s"}?`,
+      ...formatGmailEmailRuleSelectionLines(selectedRules, { showStatus: true }),
+      "Reply yes to confirm or no to cancel."
+    ].join("\n");
+  }
+
+  const targetParts = parsed.operation === "archive" && parsed.target ? splitEmailRuleTargets(parsed.target) : [];
+
+  if (targetParts.length > 1) {
+    const resolution = resolveMultipleEmailRuleTargets(rules, targetParts);
+
+    if (resolution.unmatchedTargets.length > 0 || resolution.ambiguousTargets.length > 0) {
+      return [
+        "I can remove multiple custom Gmail rules, but I need clearer rule names.",
+        resolution.unmatchedTargets.length > 0 ? `No match for: ${resolution.unmatchedTargets.join(", ")}` : undefined,
+        ...resolution.ambiguousTargets.map(
+          (item) => `Ambiguous: ${item.target} (${item.candidates.slice(0, 3).map((rule) => rule.name).join(", ")})`
+        ),
+        "Use exact rule names from /my_email_rules, or remove one rule at a time."
+      ]
+        .filter(Boolean)
+        .join("\n");
+    }
+
+    if (resolution.matches.length > 1) {
+      const selectedRules = sortEmailRuleCandidates(resolution.matches);
+      await replacePendingAction(userId, {
+        type: "custom_email_rule",
+        summary: `Archive ${selectedRules.length} Gmail email rules`,
+        payload: {
+          operation: "archive_rules",
+          ruleScope: "gmail_email_rules",
+          ruleIds: selectedRules.map((rule) => rule.id),
+          ruleNames: selectedRules.map((rule) => rule.name)
+        },
+        expiresAt: pendingDecisionExpiry()
+      });
+
+      return [
+        `Confirm remove ${selectedRules.length} Gmail email rules?`,
+        ...formatGmailEmailRuleSelectionLines(selectedRules, { showStatus: true }),
+        "Reply yes to confirm or no to cancel."
+      ].join("\n");
+    }
+  }
+
+  const matches = sortEmailRuleCandidates(resolveCustomGmailRulesForConversation(rules, message, {
+    ...defaultSemanticRoute("gmail_custom_rule_manage", parsed.operation === "archive" ? "remove" : parsed.operation, "Parsed custom Gmail rule management request."),
+    target: parsed.target
+  }, pendingAction));
+
+  if (matches.length === 0) {
+    return "I could not find a matching custom Gmail rule. Use /my_email_rules to check the exact rule.";
+  }
+
+  if (matches.length > 1) {
+    await replacePendingAction(userId, {
+      type: "custom_email_rule",
+      summary: `${parsed.operation === "archive" ? "Remove" : parsed.operation} custom Gmail rule`,
+      payload: {
+        operation: "clarify_rule_management",
+        intendedOperation: parsed.operation,
+        originalText: message,
+        candidateRules: matches.slice(0, 5).map(toEmailRuleSelectionCandidate)
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return [
+      "Which custom Gmail rule do you mean?",
+      ...matches.slice(0, 5).map((rule, index) => `${index + 1}. ${rule.name}`),
+      "Reply with the number or rule name, or cancel."
+    ].join("\n");
+  }
+
+  const rule = matches[0];
+
+  if (parsed.operation === "pause" || parsed.operation === "resume") {
+    const status = parsed.operation === "pause" ? "paused" : "active";
+    const updated = await updateEmailSignalRule(userId, rule.id, { status });
+    if (updated) {
+      await maybeRememberGmailRuleConversationContext(userId, [updated], updated);
+    }
+    return updated ? `Gmail rule ${status}: ${updated.name}` : "I could not update that Gmail rule.";
+  }
+
+  await replacePendingAction(userId, {
+    type: "custom_email_rule",
+    summary: `Archive Gmail rule: ${rule.name}`,
+    payload: {
+      operation: "archive_rule",
+      ruleId: rule.id,
+      ruleName: rule.name
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
+
+  return `Confirm remove Gmail rule: ${rule.name}? Reply yes to confirm or no to cancel.`;
+}
+
+async function getVisibleGmailEmailRules(userId: string): Promise<EmailSignalRule[]> {
+  const [rules, connections] = await Promise.all([getEmailSignalRules(userId), getIntegrationConnections(userId)]);
+  const gmailConnectionIds = new Set(
+    connections
+      .filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived")
+      .map((connection) => connection.id)
+  );
+
+  return rules.filter((rule) => rule.status !== "archived" && gmailConnectionIds.has(rule.connectionId));
+}
+
+function parseCustomGmailRuleManagement(
+  message: string,
+  route?: SemanticRouterResult
+): { operation: "pause" | "resume" | "archive"; target: string | null } | undefined {
+  if (
+    route &&
+    (route.operation === "pause" || route.operation === "resume" || route.operation === "remove")
+  ) {
+    return {
+      operation: route.operation === "remove" ? "archive" : route.operation,
+      target: route.target
+    };
+  }
+
+  const match = message.trim().match(/^(?:(?:also|tambien|también)\s+)?(?:(?:can|could|would)\s+(?:you|u)\s+(?:please\s+)?|(?:puedes|podrias|podrías)\s+)?(pause|resume|remove|delete|elimina|eliminar|borra|borrar|pausa|pausar|reanuda|reanudar|activa|activar)\s+(.+?)(?:\s+(?:gmail|email|mail)?\s*rules?)?$/i);
+  if (!match) {
+    return undefined;
+  }
+
+  const verb = match[1].toLowerCase();
+  const operation =
+    verb === "pause" || verb === "pausa" || verb === "pausar"
+      ? "pause"
+      : verb === "resume" || verb === "reanuda" || verb === "reanudar" || verb === "activa" || verb === "activar"
+        ? "resume"
+        : "archive";
+
+  return {
+    operation,
+    target: match[2].trim()
+  };
+}
+
+function isAllCustomGmailRulesTarget(message: string, target: string | null): boolean {
+  const text = normalizeForComparison(`${message} ${target ?? ""}`);
+  return /\b(all|every|todas|todos|totes|all active)\b/.test(text) && /\b(email|gmail|rule|rules|regla|reglas|custom|tracking)\b/.test(text);
+}
+
+function resolveCustomGmailRulesForConversation(
+  rules: EmailSignalRule[],
+  message: string,
+  route?: SemanticRouterResult,
+  pendingAction?: PendingAction
+): EmailSignalRule[] {
+  const targetCandidates = uniqueStrings([
+    route?.target && !isPronounRuleTarget(route.target) ? route.target : undefined,
+    extractGmailRuleQuestionTarget(message),
+    ...(route?.removeKeywordFilters ?? []),
+    ...extractLikelyRuleTargetsFromMessage(message)
+  ].filter((value): value is string => Boolean(value && value.trim())));
+
+  for (const target of targetCandidates) {
+    const matches = findSelectableEmailRulesByTarget(rules, target);
+    if (matches.length > 0) {
+      return matches;
+    }
+  }
+
+  const contextMatches = getCustomGmailRuleContextMatches(rules, pendingAction);
+  if (contextMatches.length > 0 && (hasRulePronoun(message, route) || rules.length > 1)) {
+    return contextMatches;
+  }
+
+  return rules.length === 1 ? rules : [];
+}
+
+function defaultSemanticRoute(
+  intent: SemanticRouterResult["intent"],
+  operation: SemanticRouterResult["operation"],
+  reason: string
+): SemanticRouterResult {
+  return {
+    intent,
+    operation,
+    confidence: 0.9,
+    reason,
+    language: "unknown",
+    sideEffectRisk: operation === "remove" ? "destructive" : operation === "status" || operation === "answer" || operation === "timing" ? "read" : "write",
+    requiresConfirmation: operation === "remove",
+    target: null,
+    keywordFilters: [],
+    senderFilters: [],
+    removeKeywordFilters: [],
+    goalHint: null,
+    shouldUnlinkGoal: false,
+    userFacingIssue: null
+  };
+}
+
+function getCustomGmailRuleContextMatches(rules: EmailSignalRule[], pendingAction?: PendingAction): EmailSignalRule[] {
+  if (!isPendingCustomGmailRuleContext(pendingAction) || !pendingAction || !isRecord(pendingAction.payload)) {
+    return [];
+  }
+
+  const focusedRuleId = typeof pendingAction.payload.focusedRuleId === "string" ? pendingAction.payload.focusedRuleId : undefined;
+  if (focusedRuleId) {
+    const focused = rules.find((rule) => rule.id === focusedRuleId);
+    if (focused) {
+      return [focused];
+    }
+  }
+
+  const contextRules = Array.isArray(pendingAction.payload.rules)
+    ? pendingAction.payload.rules.filter(isRecord)
+    : [];
+  const customRuleIds = contextRules
+    .filter((rule) => rule.adapterId === "custom_email_review")
+    .map((rule) => (typeof rule.id === "string" ? rule.id : ""))
+    .filter(Boolean);
+
+  if (customRuleIds.length === 1) {
+    const match = rules.find((rule) => rule.id === customRuleIds[0]);
+    return match ? [match] : [];
+  }
+
+  return [];
+}
+
+function isPronounRuleTarget(target: string): boolean {
+  return /^(it|this|that|this rule|that rule|esta|este|esa|ese|aquesta|aquest|aquella|aquell)$/i.test(target.trim());
+}
+
+function hasRulePronoun(message: string, route?: SemanticRouterResult): boolean {
+  const text = normalizeForComparison(`${message} ${route?.target ?? ""}`);
+  return /\b(it|this|that|that rule|this rule|these emails|those emails|esta regla|esa regla|aquesta regla|aquella regla)\b/.test(text);
+}
+
+function extractLikelyRuleTargetsFromMessage(message: string): string[] {
+  return uniqueStrings(
+    (message.match(/\b[A-Z][\p{L}0-9]{2,}(?:\s+(?:de|the)\s+[A-Z][\p{L}0-9]{2,}){0,3}/gu) ?? [])
+      .map(cleanEmailRuleTarget)
+      .filter(isUsefulCustomKeywordCandidate)
+  );
+}
+
+function extractGmailRuleQuestionTarget(message: string): string | undefined {
+  const proper = message.match(/\b[A-Z][a-zA-Z0-9]{2,}\b/g)?.find((item) => !/^(Gmail|Email|Mail|Inbox|Rule|Rules|Alecto|I)$/i.test(item));
+  if (proper) {
+    return proper;
+  }
+
+  const match = message.match(/\b(?:about|for|with|where|will|does|do)\s+(.+?)(?:\s+(?:email|emails|gmail|rule|tracking)\b|[?.]|$)/i);
+  return match ? cleanEmailRuleTarget(match[1]) : undefined;
+}
+
+function findEmailRulesByTarget(rules: EmailSignalRule[], target: string): EmailSignalRule[] {
+  const customMatches = findSelectableEmailRulesByTarget(rules.filter((rule) => rule.adapterId === "custom_email_review"), target);
+  if (customMatches.length > 0) {
+    return customMatches;
+  }
+
+  const targetKey = normalizeForComparison(cleanEmailRuleTarget(target));
+  return rules.filter((rule) => {
+    const haystack = normalizeForComparison(`${rule.name} ${rule.adapterId} ${rule.query ?? ""}`);
+    return targetKey.length > 2 && haystack.includes(targetKey);
+  });
+}
+
+function formatEmailRuleQueryForHumans(query: string | undefined): string {
+  if (!query) {
+    return "default adapter query";
+  }
+
+  const clean = query
+    .replace(/\bnewer_than:\d+d\b/gi, "")
+    .replace(/\bfrom:/gi, "from ")
+    .replace(/"/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return clean || "default adapter query";
 }
 
 function detectConversationSurfaceIntent(message: string): ConversationSurfaceIntent | undefined {
@@ -5793,14 +7715,6 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "integration_sync";
   }
 
-  if (/\b(what can gmail|how does gmail|gmail work|email tracking|gmail tracking|gmail rules|email rules)\b/.test(text)) {
-    return "gmail_capability_guidance";
-  }
-
-  if (/\b(endesa|receipt|receipts|bill|bills|invoice|invoices|custom gmail|custom email|keyword|keywords|filter|filters)\b/.test(text) && /\b(gmail|email|mail|inbox)\b/.test(text)) {
-    return "gmail_custom_rule_guidance";
-  }
-
   if (
     /\b(enable|turn on|activate|set up|setup|create)\b.*\b(job search|job|recruiter|application)\b.*\b(email rule|gmail rule|rule|gmail|email)\b/.test(text) ||
     /\b(enable|turn on|activate|set up|setup|create)\b.*\b(email rule|gmail rule|rule|gmail|email)\b.*\b(job search|job|recruiter|application)\b/.test(text)
@@ -5830,6 +7744,44 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
 
   if (/\b(check my messages|check messages|check inbox|check my inbox|any emails|any email)\b/.test(text)) {
     return "gmail_sync_guidance";
+  }
+
+  if (
+    /\b(show|list)\b.*\b(gmail|email)\b.*\brules?\b/.test(text) ||
+    /\b(what|which|que|qué|quines?)\b.*\b(gmail|email)\b.*\b(rules?|checks?|tracking)\b/.test(text) ||
+    /\b(gmail|email)\b.*\b(rules?|checks?|tracking)\b.*\b(have|tenemos|configured|on|active|enabled|running)\b/.test(text) ||
+    /\b(what|which)\b.*\b(gmail|email)\b.*\brules?\b.*\b(on|active|enabled|configured|have|running)\b/.test(text) ||
+    /\b(what|which)\b.*\brules?\b.*\b(gmail|email)\b.*\b(on|active|enabled|configured|have|running)\b/.test(text)
+  ) {
+    return "email_rules_list";
+  }
+
+  if (
+    /\b(pause|resume|remove|delete|elimina|eliminar|borra|borrar|pausa|pausar|reanuda|reanudar|activa|activar)\b.*\b(gmail|email|mail|rule|rules|regla|reglas|tracking|emails|correos)\b/.test(text) ||
+    /\b(reset|delete|remove|clear|archive)\b.*\b(all|every)\b.*\b(gmail|email|mail)\b.*\b(rules?|tracking|checks?)\b/.test(text) ||
+    /\b(elimina|eliminar|borra|borrar|pausa|pausar|reanuda|reanudar|activa|activar)\b.*\b(endesa|aigues|aigües|barcelona)\b/.test(text)
+  ) {
+    return "gmail_custom_rule_manage";
+  }
+
+  if (/\b(what can gmail|how does gmail|gmail work|email tracking|gmail tracking|gmail rules|email rules)\b/.test(text)) {
+    return "gmail_capability_guidance";
+  }
+
+  if (looksLikeGmailRuleQuestion(message)) {
+    return "gmail_rule_question";
+  }
+
+  if (/\b(add|remove|change|edit)\s+(?:a\s+)?keyword\b/.test(text) && /\b(gmail|email|rule|tracking)\b/.test(text)) {
+    return "gmail_custom_rule_edit_guidance";
+  }
+
+  if (looksLikeCustomGmailTrackingRequest(message)) {
+    return "gmail_custom_rule_request";
+  }
+
+  if (/\b(endesa|receipt|receipts|bill|bills|invoice|invoices|custom gmail|custom email|keyword|keywords|filter|filters)\b/.test(text) && /\b(gmail|email|mail|inbox)\b/.test(text)) {
+    return "gmail_custom_rule_guidance";
   }
 
   if (/\b(set up integrations|setup integrations|connect integrations)\b/.test(text)) {
@@ -6132,7 +8084,16 @@ async function createGuardianGuardrailReply(
     mode: "guardian",
     riskState: "RED",
     extractedEvents: [],
-    reply: "No. Hard stop. I am not helping you turn this into permission. Cooldown now. If it still matters later, bring a written thesis, exact size, invalidation point, and emotional state."
+    reply: "No. Hard stop. I am not helping you turn this into permission. Cooldown now. If it still matters later, bring a written thesis, exact size, invalidation point, and emotional state.",
+    routeDebug: {
+      routerSource: "deterministic_guardrail",
+      intent: "goal_guardrail",
+      handlerName: "createGuardianGuardrailReply",
+      semanticRouterAttempted: false,
+      semanticRouterUsed: false,
+      mutation: true,
+      reason: guardrail.reason
+    }
   };
 }
 
@@ -6253,12 +8214,14 @@ function formatIntegrationGuidance(message: string): string {
       "Ready today:",
       "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
       "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+      "- Custom tracking: sender and keyword rules. These go to review first and never auto-log.",
       "",
-      "Alecto will not scan Gmail until a rule is enabled. Custom keyword rules like Endesa bills are planned, but not ready yet.",
+      "Alecto will not scan Gmail until a rule is enabled.",
       "",
       "Say:",
       '- "enable job search rule for Gmail"',
       '- "enable work action rule for Gmail"',
+      '- "track Endesa bills from Gmail"',
       "",
       "Shortcut: /connect_gmail"
     ].join("\n");
@@ -6389,6 +8352,16 @@ async function handleConversationControl(
 ): Promise<ConversationControlResponse> {
   const detection = detectConversationControlIntent(text);
   const debug = options.debug ?? (await buildConversationControlDebugForUser(userId, text));
+
+  if (shouldDeferConversationControlToMessageProcessor(text, detection)) {
+    return {
+      handled: false,
+      debug: {
+        ...debug,
+        reason: "Message looks like Gmail/email-rule management or contextual reset; defer to message processor."
+      }
+    };
+  }
 
   if (detection.intent === "unknown" || detection.intent === "goal_guardrail") {
     return {
@@ -7624,6 +9597,54 @@ async function composeFinalAgentResponse(
   }
 }
 
+function shouldDeferConversationControlToMessageProcessor(
+  message: string,
+  detection: ReturnType<typeof detectConversationControlIntent>
+): boolean {
+  const text = normalizeForComparison(message);
+
+  if (!text) {
+    return false;
+  }
+
+  if (looksLikeEmailRuleOrGmailConversationText(text)) {
+    return true;
+  }
+
+  if (detection.intent === "archive_action" && looksLikeBulkPronounResetRequest(text)) {
+    return true;
+  }
+
+  return false;
+}
+
+function looksLikeEmailRuleOrGmailConversationText(text: string): boolean {
+  const hasEmailSurface = /\b(gmail|email|emails|mail|mails|inbox|correo|correos)\b/.test(text);
+  const hasEmailRuleSurface = /\b(rule|rules|regla|reglas|checks?|tracking|track|watch|monitor)\b/.test(text);
+  const hasEmailOperation =
+    /\b(sync|check|connect|setup|set up|status|settings|configure|show|list|what|which|que|qué|delete|remove|clear|reset|archive|pause|resume|enable|activate|elimina|eliminar|borra|borrar|pausa|pausar|reanuda|reanudar|activa|activar)\b/.test(
+      text
+    );
+
+  if ((hasEmailSurface || hasEmailRuleSurface) && hasEmailOperation) {
+    return true;
+  }
+
+  return (
+    /\b(endesa|aigues|aigües|barcelona)\b/.test(text) &&
+    /\b(rule|rules|regla|reglas|email|emails|gmail|tracking|track|watch|monitor|delete|remove|clear|reset|archive|pause|resume|elimina|eliminar|borra|borrar|pausa|pausar)\b/.test(
+      text
+    )
+  );
+}
+
+function looksLikeBulkPronounResetRequest(text: string): boolean {
+  return (
+    /\b(delete|remove|clear|archive|reset|elimina|eliminar|borra|borrar)\b/.test(text) &&
+    /\b(all|everything|every|them|em|all of them|all of em|todos|todas|totes|reset)\b/.test(text)
+  );
+}
+
 async function ingestText(userId: string, input: IngestTextBody) {
   const result = routeIngestion({
     userId,
@@ -7783,7 +9804,7 @@ async function syncGithubPublicConnection(connection: IntegrationConnection) {
 
 async function syncGmailConnection(connection: IntegrationConnection) {
   const startedAt = new Date();
-  const rules = await getActiveEmailSignalRulesForConnection(connection.userId, connection.id);
+  const rules = dedupeActiveEmailRulesForSync(await getActiveEmailSignalRulesForConnection(connection.userId, connection.id));
   const emailRuleDiagnostics = await buildEmailRuleDiagnostics(connection, rules);
   let errorStage: GmailErrorStage | undefined;
 
@@ -7918,6 +9939,26 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       syncLog
     };
   }
+}
+
+function dedupeActiveEmailRulesForSync(rules: EmailSignalRule[]): EmailSignalRule[] {
+  const seen = new Set<string>();
+  const deduped: EmailSignalRule[] = [];
+
+  for (const rule of rules) {
+    const key = isBuiltInEmailAdapter(rule.adapterId)
+      ? ["builtin", rule.connectionId, rule.adapterId, normalizeForComparison(rule.query ?? "")].join("|")
+      : `rule:${rule.id}`;
+
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    deduped.push(rule);
+  }
+
+  return deduped;
 }
 
 async function buildEmailRuleDiagnostics(
@@ -8205,6 +10246,31 @@ async function classifyEmailForRule(
   message: GmailMessage,
   text: string
 ): Promise<{ classification: ReturnType<typeof classifyJobSearchEmail>; llmStatus?: "classified" | "unavailable" | "error" }> {
+  if (rule.adapterId === "custom_email_review") {
+    return {
+      classification: {
+        decision: "needs_review",
+        eventType: undefined,
+        confidence: 0.8,
+        reason: "custom_email_match",
+        evidence: text.slice(0, 300),
+        extracted: {
+          customRuleName: rule.name,
+          query: rule.query,
+          goalId: rule.goalId,
+          subject: getGmailHeader(message, "subject"),
+          from: getGmailHeader(message, "from")
+        },
+        metadata: {
+          classifierMode: rule.classifierMode,
+          adapterId: rule.adapterId,
+          source: "gmail",
+          classifier: "rules"
+        }
+      }
+    };
+  }
+
   const rulesClassification = classifyEmailWithRules(rule.adapterId, text);
 
   if (!["job_search_email", "work_action_email"].includes(rule.adapterId)) {
@@ -10911,9 +12977,19 @@ async function resolvePendingDecisionReply(
   pendingAction: PendingAction,
   message: string
 ): Promise<string | undefined> {
+  if (isPendingCustomGmailRuleContext(pendingAction)) {
+    return undefined;
+  }
+
   if (isRejectionMessage(message)) {
     await rejectPendingAction(userId, pendingAction.id);
     return "Cancelled. I did not change anything.";
+  }
+
+  const customEmailRuleReply = await resolvePendingCustomEmailRuleReply(userId, pendingAction, message);
+
+  if (customEmailRuleReply) {
+    return customEmailRuleReply;
   }
 
   if (pendingAction.type === "action_target_clarification") {
@@ -11023,6 +13099,72 @@ async function resolvePendingDecisionReply(
   }
 
   return undefined;
+}
+
+async function resolvePendingCustomEmailRuleReply(
+  userId: string,
+  pendingAction: PendingAction,
+  message: string
+): Promise<string | undefined> {
+  if (pendingAction.type !== "custom_email_rule" || !isRecord(pendingAction.payload)) {
+    return undefined;
+  }
+
+  const operation = typeof pendingAction.payload.operation === "string" ? pendingAction.payload.operation : "";
+
+  if (operation !== "clarify_rule_management") {
+    return undefined;
+  }
+
+  const intendedOperation = typeof pendingAction.payload.intendedOperation === "string"
+    ? pendingAction.payload.intendedOperation
+    : "";
+  const candidates = readEmailRuleSelectionCandidates(pendingAction.payload.candidateRules);
+  const selected = selectEmailRuleCandidate(message, candidates);
+
+  if (!selected) {
+    return candidates.length > 0
+      ? `Reply with 1-${candidates.length}, the rule name, or cancel.`
+      : "That pending Gmail rule decision no longer has any options. Please ask again.";
+  }
+
+  const rule = (await getEmailSignalRules(userId)).find((item) => item.id === selected.id && item.status !== "archived");
+
+  if (!rule) {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "I could not find that Gmail rule anymore. Use /my_email_rules to check the current rules.";
+  }
+
+  if (intendedOperation === "pause" || intendedOperation === "resume") {
+    const status = intendedOperation === "pause" ? "paused" : "active";
+    const updated = await updateEmailSignalRule(userId, rule.id, { status });
+
+    await confirmPendingAction(userId, pendingAction.id);
+
+    if (updated) {
+      await maybeRememberGmailRuleConversationContext(userId, [updated], updated);
+    }
+
+    return updated ? `Gmail rule ${status}: ${updated.name}` : "I could not update that Gmail rule.";
+  }
+
+  if (intendedOperation === "archive") {
+    await replacePendingAction(userId, {
+      type: "custom_email_rule",
+      summary: `Archive Gmail rule: ${rule.name}`,
+      payload: {
+        operation: "archive_rule",
+        ruleId: rule.id,
+        ruleName: rule.name
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return `Confirm remove Gmail rule: ${rule.name}? Reply yes to confirm or no to cancel.`;
+  }
+
+  await rejectPendingAction(userId, pendingAction.id);
+  return "I could not complete that Gmail rule decision. Please ask again.";
 }
 
 async function resolveActionHygieneReply(
@@ -11317,14 +13459,44 @@ function ordinalSelectionIndex(text: string): number | undefined {
 
 function looksLikePendingDecisionReply(message: string): boolean {
   const trimmed = message.trim();
+  const hygieneReply = parseActionHygieneReply(trimmed);
+  const hygieneTarget = hygieneReply?.target ?? "";
+  const isNumberedHygieneReply = Boolean(
+    hygieneReply &&
+      (/^#?\d+$/.test(hygieneTarget) ||
+        /^(first|second|third|fourth|fifth)(\s+one)?$/i.test(hygieneTarget) ||
+        /^(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta)$/i.test(hygieneTarget))
+  );
+
   return (
     isConfirmationMessage(trimmed) ||
     isRejectionMessage(trimmed) ||
-    Boolean(parseActionHygieneReply(trimmed)) ||
+    isNumberedHygieneReply ||
     Boolean(parseNextWeekPlanReply(trimmed)) ||
     /^#?\d+$/.test(trimmed) ||
     /^(the\s+)?(first|second|third|fourth|fifth)(\s+one)?$/i.test(trimmed) ||
     /^(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta)$/i.test(trimmed)
+  );
+}
+
+function looksLikeExpiredPendingDecisionReply(message: string): boolean {
+  const trimmed = message.trim();
+
+  if (
+    isConfirmationMessage(trimmed) ||
+    isRejectionMessage(trimmed) ||
+    /^#?\d+$/.test(trimmed) ||
+    /^(the\s+)?(first|second|third|fourth|fifth)(\s+one)?$/i.test(trimmed) ||
+    /^(primero|primera|segundo|segunda|tercero|tercera|cuarto|cuarta|quinto|quinta)$/i.test(trimmed)
+  ) {
+    return true;
+  }
+
+  return (
+    /^(skip|cancel|show\s+plan)$/i.test(trimmed) ||
+    /^create\s+(?:all(?:\s+new)?|(?:#?\d+\s*(?:,|\band\b)?\s*)+)$/i.test(trimmed) ||
+    /^edit\s+#?\d+\s+to\s+.+$/i.test(trimmed) ||
+    /^remove\s+#?\d+$/i.test(trimmed)
   );
 }
 
@@ -11415,6 +13587,105 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
     return {
       reply: `Confirmed. Logged progress for ${goal.title}.`
     };
+  }
+
+  if (pendingAction.type === "custom_email_rule") {
+    const operation = typeof pendingAction.payload.operation === "string" ? pendingAction.payload.operation : "";
+
+    if (operation === "archive_rule") {
+      const ruleId = typeof pendingAction.payload.ruleId === "string" ? pendingAction.payload.ruleId : "";
+      const rule = await archiveEmailSignalRule(userId, ruleId);
+
+      if (!rule) {
+        throw new Error("Email rule not found.");
+      }
+
+      return {
+        reply: `Gmail rule removed: ${rule.name}`
+      };
+    }
+
+    if (operation === "archive_rules") {
+      const ruleIds = arrayOfStrings(pendingAction.payload.ruleIds);
+      const archivedRules = [];
+
+      for (const ruleId of ruleIds) {
+        const rule = await archiveEmailSignalRule(userId, ruleId);
+        if (rule) {
+          archivedRules.push(rule);
+        }
+      }
+
+      if (archivedRules.length === 0) {
+        throw new Error("Email rules not found.");
+      }
+
+      const ruleScope = typeof pendingAction.payload.ruleScope === "string" ? pendingAction.payload.ruleScope : "";
+      const label = ruleScope === "gmail_email_rules" ? "Gmail email rules" : "Custom Gmail rules";
+
+      return {
+        reply: [
+          `${label} removed: ${archivedRules.length}`,
+          ...formatGmailEmailRuleSelectionLines(archivedRules)
+        ].join("\n")
+      };
+    }
+
+    if (operation === "create_rule") {
+      const connectionId = typeof pendingAction.payload.connectionId === "string" ? pendingAction.payload.connectionId : "";
+      const displayName = typeof pendingAction.payload.displayName === "string" ? pendingAction.payload.displayName : "Custom Gmail tracking";
+      const queryPreview = typeof pendingAction.payload.queryPreview === "string" ? pendingAction.payload.queryPreview : "";
+      const goalId = typeof pendingAction.payload.goalId === "string" ? pendingAction.payload.goalId : undefined;
+
+      if (!connectionId || !queryPreview) {
+        throw new Error("Invalid custom_email_rule payload.");
+      }
+
+      const connection = await getIntegrationConnection(userId, connectionId);
+
+      if (!connection || connection.integrationId !== "gmail" || connection.status !== "active") {
+        return {
+          reply: "Gmail is not connected anymore. Say 'connect Gmail' and try again."
+        };
+      }
+
+      const existing = (await getEmailSignalRules(userId)).find(
+        (rule) =>
+          rule.status === "active" &&
+          rule.connectionId === connectionId &&
+          rule.adapterId === "custom_email_review" &&
+          normalizeForComparison(rule.query ?? "") === normalizeForComparison(queryPreview)
+      );
+
+      if (existing) {
+        return {
+          reply: `${existing.name} tracking is already on. New matches go to email review before anything is logged.`
+        };
+      }
+
+      const rule = await createEmailSignalRule(userId, {
+        connectionId,
+        goalId,
+        adapterId: "custom_email_review",
+        name: displayName,
+        query: queryPreview,
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      });
+
+      return {
+        reply: `${rule.name} tracking is on. New matches will go to email review before anything is logged.`
+      };
+    }
+
+    throw new Error("Invalid custom_email_rule operation.");
   }
 
   if (pendingAction.type === "goal_archive") {
@@ -11512,7 +13783,27 @@ async function findPendingAction(userId: string, pendingActionId: string) {
   return pendingActions.find((action) => action.id === pendingActionId && action.status === "pending");
 }
 
-function replyOnly(userId: string, message: string, response: string): ProcessMessageResult {
+function surfaceReplyIncludesMutation(reply: string): boolean {
+  return (
+    reply.startsWith("Daily loop updated.") ||
+    reply.startsWith("Email rule enabled:") ||
+    reply.startsWith("I can set up a review-first Gmail rule.") ||
+    reply.startsWith("Gmail rule active:") ||
+    reply.startsWith("Gmail rule paused:") ||
+    reply.startsWith("Confirm remove Gmail rule:") ||
+    (reply.startsWith("Confirm remove ") && reply.includes("Gmail email rule")) ||
+    reply.startsWith("Action hygiene:") ||
+    reply.startsWith("Plan ") ||
+    reply.startsWith("Weekly plan")
+  );
+}
+
+function replyOnly(
+  userId: string,
+  message: string,
+  response: string,
+  routeDebug?: ProcessRouteDebug
+): ProcessMessageResult {
   return {
     userId,
     message,
@@ -11520,7 +13811,8 @@ function replyOnly(userId: string, message: string, response: string): ProcessMe
     mode: "mirror",
     riskState: "GREEN",
     extractedEvents: [],
-    reply: response
+    reply: response,
+    routeDebug
   };
 }
 

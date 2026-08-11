@@ -61,7 +61,14 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] Natural planning phrases distinguish current-week requests (`plan this week`, `plan my week`) from next-week requests (`plan next week`) and ask clarification for ambiguous `make a plan` when there is no active plan/recent review context.
 - [x] `/insight` and `/weekly_insight` provide interpretive coaching reports.
 - [x] `/action_hygiene` asks the user to decide on stale/overdue tasks; it never archives automatically.
-- [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan this week`, `plan next week`, `clean up my tasks`, `show my goals`, and `connect Gmail` use the same underlying services as command shortcuts.
+- [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan this week`, `plan next week`, `clean up my tasks`, `show my goals`, `connect Gmail`, `what email rules are on`, `que reglas de email tenemos activas`, `enable job search rule for Gmail`, `create a rule for Endesa bills`, `track Endesa bills from Gmail`, `crea una regla de Gmail para facturas de Aigues de Barcelona`, `looks for only Aigues de Barcelona instead of Endesa`, `busca solo Aigues de Barcelona, no Endesa`, `make that rule look for only Aigues de Barcelona instead of Endesa`, `pause it`, `quan m'avisareu dels correus d'Endesa?`, `when will you let me know about new emails?`, and `sync Gmail` use the same underlying services as command shortcuts.
+- [x] Custom Gmail sender/keyword tracking is confirmation-first and review-only. The agent may propose a rule, but it must not scan Gmail before confirmation and must not auto-create Events or ActionItems from custom matches.
+- [x] Optional LLM semantic routing can catch normal user phrasing that deterministic rules miss across operator surfaces and Gmail rule conversations, especially English/Spanish/Catalan wording. It only returns structured intent; deterministic executors still apply or reject changes.
+- [x] Pending and active Gmail custom-rule conversations keep short-lived state: the user can edit keywords, use replacement language such as `instead of`, `en vez de`, `en lloc de`, ask where matches go, ask when sync/notification happens, correct/remove a goal link, pause/resume the focused rule, cancel, or confirm without falling into generic coaching.
+- [x] Ambiguous Gmail rule management asks and remembers a clarification. Example: `elimina Endesa` with `Endesa emails` and `Endesa bills` stores a pending rule-selection decision; `1`, `Endesa emails`, or `cancel` resolves it before generic routing, and removal still requires yes/no confirmation.
+- [x] Multi-rule custom Gmail cleanup asks for confirmation instead of guessing. Example: `elimina Aigues de Barcelona y Endesa` resolves matched active custom rules and archives them only after `yes`.
+- [x] Gmail rule list/reset phrasing is protected from action-control fallback. Examples: `what email rules do we have`, `delete all email rules`, and contextual `can u delete all of em?` after an email-rule list route to Gmail rule status/cleanup, not task archive matching.
+- [x] Utility/bill Gmail tracking must not attach to unrelated active goals just because of a shared word. Example: Endesa electricity bills should not link to `Improve strength and energy` unless a real utility/expense goal exists.
 - [x] First 5 Minutes Onboarding v1 replies act like a guide: `/start` gives short natural examples, setup output separates Ready/Needs attention/Optional/Best next step, and goal/action/daily-loop/integration setup suggests one safe next step without command memorization.
 - [x] `/debug_route`, `/debug_conversation_intent`, `/debug_daily_priorities`, `/debug_daily_coach`, `/debug_action_hygiene`, and `/debug_weekly_context` expose safe debugging views.
 
@@ -74,6 +81,8 @@ Examples:
 - Do not say an event was logged unless the Event exists.
 - Do not say a memory was saved unless the MemoryEntry or pending confirmation exists.
 - Do not create ActionItems for betting/trading requests; use guardian responses instead.
+- Do not answer Gmail setup questions as if a mutation happened. Questions about a rule should explain status, filters, goal link, review behavior, and sync behavior.
+- Do not treat Gmail rule context as permission to scan or auto-log. It only helps resolve references like `it` or `that rule`; normal Gmail rules still require explicit creation/confirmation and manual or scheduled sync.
 
 ## Evidence rule
 

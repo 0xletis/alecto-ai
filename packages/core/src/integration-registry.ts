@@ -95,6 +95,12 @@ export const emailAdapterRegistry: EmailAdapterDefinition[] = [
       'newer_than:7d ("can you review" OR "please review" OR "please send" OR "action required" OR deadline OR "due by" OR "blocked by" OR "waiting on you" OR "follow up on" OR "feedback requested")'
   },
   {
+    id: "custom_email_review",
+    domain: "custom",
+    description: "Review-first custom Gmail tracking rule for user-approved sender and keyword filters.",
+    status: "available"
+  },
+  {
     id: "finance_receipt_email",
     domain: "finance",
     description: "Planned adapter for finance and receipt emails.",

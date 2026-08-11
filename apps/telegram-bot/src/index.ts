@@ -1997,7 +1997,7 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
-    if (looksLikeMultiIntentText(inbound.text)) {
+    if (looksLikeMultiIntentText(inbound.text) && !shouldPreferMessageProcessorBeforeControl(inbound.text)) {
       const multi = await apiPost<MultiIntentResponse>(`/users/${inbound.userId}/conversation/multi-intent`, {
         text: inbound.text,
         now: inbound.timestamp.toISOString()
@@ -2029,14 +2029,16 @@ bot.on("message:text", async (ctx) => {
       return;
     }
 
-    const control = await apiPost<ConversationControlResponse>(`/users/${inbound.userId}/conversation/control`, {
-      text: inbound.text,
-      now: inbound.timestamp.toISOString()
-    });
+    if (!shouldPreferMessageProcessorBeforeControl(inbound.text)) {
+      const control = await apiPost<ConversationControlResponse>(`/users/${inbound.userId}/conversation/control`, {
+        text: inbound.text,
+        now: inbound.timestamp.toISOString()
+      });
 
-    if (control.handled) {
-      await ctx.reply(control.reply ?? "Done.");
-      return;
+      if (control.handled) {
+        await ctx.reply(control.reply ?? "Done.");
+        return;
+      }
     }
 
     const response = await apiPost<ProcessMessageResponse>("/messages/process", {
@@ -2797,7 +2799,7 @@ function formatGmailSyncSummary(response: IntegrationSyncResponse): string {
 }
 
 function noActiveEmailRulesMessage(): string {
-  return "Gmail is connected, but no email tracking rules are active. Say \"enable job search rule for Gmail\" or \"enable work action rule for Gmail\".";
+  return "Gmail is connected, but no email tracking rules are active. Say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\".";
 }
 
 function formatBatchIntegrationSyncResults(results: string[]): string {
@@ -3666,7 +3668,10 @@ function formatEmailRules(rules: EmailSignalRule[], connections: IntegrationConn
   }
 
   const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
-  return rules.map((rule) => formatEmailRule(rule, connectionById.get(rule.connectionId))).join("\n\n");
+  const duplicateInfoById = buildEmailRuleDuplicateInfo(rules);
+  return rules
+    .map((rule) => formatEmailRule(rule, connectionById.get(rule.connectionId), duplicateInfoById.get(rule.id)))
+    .join("\n\n");
 }
 
 function formatEmailReviews(reviews: EmailReviewItem[], showAll: boolean): string {
@@ -3780,7 +3785,11 @@ function parseSnoozeActionCommand(text: string): { actionId: string; value: stri
   return { actionId, value: value.match(/^\d+d$/i) ? `in ${value.slice(0, -1)} days` : value };
 }
 
-function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnection) {
+function formatEmailRule(
+  rule: EmailSignalRule,
+  connection?: IntegrationConnection,
+  duplicateInfo?: { count: number; primaryId: string; isPrimary: boolean }
+) {
   const connectionStatus = connection?.status ?? "missing";
   const staleWarning =
     rule.status === "active" && connectionStatus !== "active"
@@ -3793,6 +3802,11 @@ function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnecti
     `tracks: ${details.title}`,
     `status: ${rule.status}`,
     details.description,
+    duplicateInfo
+      ? duplicateInfo.isPrimary
+        ? `duplicateGroup: ${duplicateInfo.count} equivalent built-in rules; this is the kept rule`
+        : `duplicateOf: ${duplicateInfo.primaryId}`
+      : undefined,
     `connectionId: ${rule.connectionId}`,
     `connectionStatus: ${connectionStatus}`,
     staleWarning,
@@ -3806,13 +3820,85 @@ function formatEmailRule(rule: EmailSignalRule, connection?: IntegrationConnecti
     .join("\n");
 }
 
+function buildEmailRuleDuplicateInfo(
+  rules: EmailSignalRule[]
+): Map<string, { count: number; primaryId: string; isPrimary: boolean }> {
+  const groups = new Map<string, EmailSignalRule[]>();
+
+  for (const rule of rules) {
+    if (rule.status === "archived" || !isBuiltInEmailRule(rule.adapterId)) {
+      continue;
+    }
+
+    const key = [
+      rule.connectionId,
+      rule.adapterId,
+      normalizeForComparison(rule.query ?? "")
+    ].join("|");
+    groups.set(key, [...(groups.get(key) ?? []), rule]);
+  }
+
+  const duplicateInfo = new Map<string, { count: number; primaryId: string; isPrimary: boolean }>();
+
+  for (const group of groups.values()) {
+    if (group.length <= 1) {
+      continue;
+    }
+
+    const primary = [...group].sort((left, right) => {
+      const leftActive = left.status === "active" ? 1 : 0;
+      const rightActive = right.status === "active" ? 1 : 0;
+
+      if (leftActive !== rightActive) {
+        return rightActive - leftActive;
+      }
+
+      return optionalTime(right.updatedAt) - optionalTime(left.updatedAt);
+    })[0];
+
+    if (!primary) {
+      continue;
+    }
+
+    for (const rule of group) {
+      duplicateInfo.set(rule.id, {
+        count: group.length,
+        primaryId: primary.id,
+        isPrimary: rule.id === primary.id
+      });
+    }
+  }
+
+  return duplicateInfo;
+}
+
+function optionalTime(value?: string): number {
+  return value ? new Date(value).getTime() : 0;
+}
+
+function isBuiltInEmailRule(adapterId: string): boolean {
+  return adapterId === "job_search_email" || adapterId === "work_action_email";
+}
+
+function normalizeForComparison(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^\w\s@.+-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function formatEmailRuleEnabledReply(response: EmailRuleResponse, connection: IntegrationConnection): string {
   const rule = response.emailRule;
   const details = emailRuleDisplayDetails(rule);
   const alreadyExists = response.message?.includes("already exists");
+  const resumed = response.message?.includes("resumed");
 
   return [
-    `${details.title} is ${alreadyExists ? "already on" : "on"}.`,
+    `${details.title} is ${alreadyExists ? "already on" : resumed ? "back on" : "on"}.`,
+    response.message?.includes("Archived ") ? response.message.replace(/^.*?(Archived .*)$/, "$1") : undefined,
     "",
     "What I will watch for:",
     ...details.watchItems.map((item) => `- ${item}`),
@@ -3851,9 +3937,18 @@ function emailRuleDisplayDetails(rule: EmailSignalRule): {
     };
   }
 
+  if (rule.adapterId === "custom_email_review") {
+    return {
+      title: rule.name || "Custom Gmail tracking",
+      description: "Watches for emails matching custom sender and keyword filters.",
+      watchItems: rule.query ? [`search filter: ${truncateText(rule.query, 120)}`] : ["emails matching this custom rule"],
+      mode: "Custom matches go to email review only. Auto-log is off."
+    };
+  }
+
   return {
     title: rule.name || "Email tracking rule",
-    description: "Custom email tracking is not fully supported yet.",
+    description: "Email tracking rule.",
     watchItems: ["emails matching this rule"],
     mode: "Uncertain emails go to review."
   };
@@ -4061,6 +4156,47 @@ function readPendingCandidates(value: unknown): Array<{ title: string; dueAt?: s
       dueAt: typeof item.dueAt === "string" ? item.dueAt : undefined
     }))
     .filter((item) => item.title);
+}
+
+function shouldPreferMessageProcessorBeforeControl(message: string): boolean {
+  const text = normalizeTelegramRoutingText(message);
+
+  if (!text) {
+    return false;
+  }
+
+  const hasEmailSurface = /\b(gmail|email|emails|mail|mails|inbox|correo|correos)\b/.test(text);
+  const hasEmailRuleSurface = /\b(rule|rules|regla|reglas|checks?|tracking|track|watch|monitor)\b/.test(text);
+  const hasEmailOperation =
+    /\b(sync|check|connect|setup|set up|status|settings|configure|show|list|what|which|que|qué|delete|remove|clear|reset|archive|pause|resume|enable|activate|elimina|eliminar|borra|borrar|pausa|pausar|reanuda|reanudar|activa|activar)\b/.test(
+      text
+    );
+
+  if ((hasEmailSurface || hasEmailRuleSurface) && hasEmailOperation) {
+    return true;
+  }
+
+  if (
+    /\b(endesa|aigues|aigües|barcelona)\b/.test(text) &&
+    /\b(rule|rules|regla|reglas|email|emails|gmail|tracking|track|watch|monitor|delete|remove|clear|reset|archive|pause|resume|elimina|eliminar|borra|borrar|pausa|pausar)\b/.test(
+      text
+    )
+  ) {
+    return true;
+  }
+
+  return (
+    /\b(delete|remove|clear|archive|reset|elimina|eliminar|borra|borrar)\b/.test(text) &&
+    /\b(all|everything|every|them|em|all of them|all of em|todos|todas|totes|reset)\b/.test(text)
+  );
+}
+
+function normalizeTelegramRoutingText(value: string): string {
+  return value
+    .toLowerCase()
+    .trim()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ");
 }
 
 function formatEvent(event: Event, options: { alwaysShowStatus?: boolean } = {}) {
@@ -4896,6 +5032,8 @@ interface EmailSignalRule {
   createdBy: "system" | "user";
   lastSyncedAt?: string;
   lastError?: string;
+  createdAt?: string;
+  updatedAt?: string;
 }
 
 interface EmailReviewItem {

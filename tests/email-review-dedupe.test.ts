@@ -928,7 +928,9 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: syncUserId, message: "can you track Endesa bills from Gmail" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Custom Gmail tracking is not ready yet/);
+    assert.match(response.json().reply, /I can set up a review-first Gmail rule/);
+    assert.match(response.json().reply, /Endesa/);
+    assert.match(response.json().reply, /auto-log: off/);
     assert.doesNotMatch(response.json().reply, /I've logged|created|adapter:|access token|refresh token|ciphertext/i);
 
     delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
@@ -1030,6 +1032,1647 @@ test("Gmail encrypted token without encryption key returns safe sync error", asy
     else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
     await server.close();
     await prisma.user.deleteMany({ where: { id: tokenUserId } });
+  }
+});
+
+test("custom Gmail tracking rules are confirmation-first and review-only", async () => {
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const originalFetch = globalThis.fetch;
+  const userId = `custom-gmail-rule-${randomUUID()}`;
+  const broadUserId = `custom-gmail-broad-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+    await server.ready();
+    await prisma.user.createMany({
+      data: [{ id: userId }, { id: broadUserId }]
+    });
+    await prisma.goal.create({
+      data: {
+        userId,
+        title: "Track household bills",
+        category: "finance",
+        status: "active",
+        priority: "medium",
+        importanceScore: 25
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "custom@example.com",
+          token: encryptSecretJson({
+            accessToken: "custom-gmail-access-token",
+            refreshToken: "custom-gmail-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+    await prisma.integrationConnection.create({
+      data: {
+        userId: broadUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "broad@example.com",
+          token: encryptSecretJson({
+            accessToken: "broad-gmail-access-token",
+            refreshToken: "broad-gmail-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+
+    await prisma.pendingAction.create({
+      data: {
+        userId,
+        type: "custom_email_rule",
+        summary: "Expired Gmail tracking proposal",
+        payload: {
+          operation: "create_rule",
+          displayName: "Old Endesa tracking"
+        },
+        expiresAt: new Date(Date.now() - 60_000)
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "create a rule for Endesa bills as I wanna track the cost is always around the 60 euros" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /review-first Gmail rule/);
+    assert.match(response.json().reply, /name: Endesa bills/);
+    assert.match(response.json().reply, /looks for: .*Endesa/i);
+    assert.match(response.json().reply, /auto-log: off/);
+    assert.doesNotMatch(response.json().reply, /pending decision expired/i);
+    assert.doesNotMatch(response.json().reply, /access token|refresh token|ciphertext|"iv"|"tag"/i);
+
+    let activeRules = await prisma.emailSignalRule.findMany({
+      where: { userId, adapterId: "custom_email_review", status: "active" }
+    });
+    assert.equal(activeRules.length, 0);
+
+    let pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.equal(pending.payload.adapterId, "custom_email_review");
+    assert.equal(pending.payload.reviewBeforeLogging, true);
+    assert.match(String(pending.payload.queryPreview), /Endesa/);
+    assert.match(String(pending.payload.queryPreview), /bill|invoice|factura/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Endesa bills tracking is on/);
+    assert.match(response.json().reply, /email review/);
+
+    const rule = await prisma.emailSignalRule.findFirstOrThrow({
+      where: { userId, adapterId: "custom_email_review", status: "active" }
+    });
+    assert.equal(rule.reviewBeforeLogging, true);
+    assert.equal(rule.classifierMode, "rules");
+    assert.equal(rule.maxEventsPerSync, 5);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "track emails from client@example.com for dashboard project" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /client@example.com/);
+    assert.match(response.json().reply, /dashboard/i);
+    pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.deepEqual(pending.payload.senderFilters, ["client@example.com"]);
+    assert.match(String(pending.payload.queryPreview), /from:client@example.com/);
+    assert.match(String(pending.payload.queryPreview), /dashboard/);
+    await prisma.pendingAction.update({ where: { id: pending.id }, data: { status: "rejected" } });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: broadUserId, message: "watch every email" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /too broad/i);
+    assert.equal(
+      await prisma.pendingAction.count({ where: { userId: broadUserId, type: "custom_email_rule", status: "pending" } }),
+      0
+    );
+
+    const bodyText = "Your Endesa factura for electricity is ready. Payment due this month.";
+    globalThis.fetch = (async (input) => {
+      const url = String(input);
+      if (url.includes("/messages?")) {
+        return new Response(JSON.stringify({ messages: [{ id: "custom-message-1" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+
+      if (url.includes("/messages/custom-message-1")) {
+        return new Response(
+          JSON.stringify({
+            id: "custom-message-1",
+            threadId: "thread-custom-1",
+            snippet: "Endesa factura ready",
+            payload: {
+              mimeType: "text/plain",
+              headers: [
+                { name: "Subject", value: "Endesa factura" },
+                { name: "From", value: "Endesa <noreply@endesa.com>" }
+              ],
+              body: {
+                data: Buffer.from(bodyText, "utf8").toString("base64url")
+              }
+            }
+          }),
+          {
+            status: 200,
+            headers: { "content-type": "application/json" }
+          }
+        );
+      }
+
+      return new Response(JSON.stringify({}), { status: 404 });
+    }) as typeof fetch;
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "sync Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail sync: 1 messages checked, 1 new item/);
+
+    const review = await prisma.emailReviewItem.findFirstOrThrow({
+      where: { userId, ruleId: rule.id, adapterId: "custom_email_review", status: "pending" }
+    });
+    assert.equal(review.proposedEventType, null);
+    assert.equal(review.reason, "custom_email_match");
+    assert.equal(await prisma.event.count({ where: { userId, source: "gmail" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-reviews/${review.id}/approve`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().message, "Custom email review approved. No event or action was created.");
+    assert.equal(await prisma.event.count({ where: { userId, source: "gmail" } }), 0);
+    assert.equal(await prisma.actionItem.count({ where: { userId, source: "email_review" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "pause Endesa emails" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule paused: Endesa bills/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "remove Endesa rule" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove Gmail rule: Endesa bills/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Gmail rule removed: Endesa bills");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: rule.id } })).status, "archived");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "I want to track betting tips from Gmail so I can bet safely" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.doesNotMatch(response.json().reply, /Gmail rule|tracking is on|review-first/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [userId, broadUserId] } } });
+  }
+});
+
+test("semantic router edits pending Gmail rules and repairs misunderstood replies", async () => {
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `custom-gmail-semantic-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+    await server.ready();
+    await prisma.user.create({ data: { id: userId } });
+    await prisma.goal.createMany({
+      data: [
+        {
+          userId,
+          title: "Control impulsive betting",
+          category: "finance",
+          templateId: "finance.control_betting_trading",
+          status: "active",
+          priority: "critical",
+          importanceScore: 70
+        },
+        {
+          userId,
+          title: "Track energy consumption",
+          category: "home",
+          status: "active",
+          priority: "medium",
+          importanceScore: 25
+        }
+      ]
+    });
+    await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "semantic@example.com",
+          token: encryptSecretJson({
+            accessToken: "semantic-gmail-access-token",
+            refreshToken: "semantic-gmail-refresh-token",
+            expiresAt: Date.now() + 3_600_000,
+            tokenType: "Bearer",
+            scope: "gmail.readonly"
+          }),
+          tokenStorage: "encrypted",
+          hasRefreshToken: true
+        }
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "track Endesa bills from Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /review-first Gmail rule/);
+    assert.doesNotMatch(response.json().reply, /Control impulsive betting/);
+    assert.equal(response.json().routeDebug.routerSource, "deterministic_surface");
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_request");
+
+    let pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.notEqual(pending.payload.goalTitle, "Control impulsive betting");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId,
+        message: "only look for Endesa, and can you link it to a goal to have always less than 60 euros of spending per bill?"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated the pending Gmail rule/);
+    assert.match(response.json().reply, /looks for: Endesa/);
+    assert.doesNotMatch(response.json().reply, /Endesa word|bill, invoice, factura/);
+    assert.match(response.json().reply, /linked goal: Track energy consumption/);
+    assert.equal(response.json().routeDebug.routerSource, "deterministic_semantic");
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_edit_pending");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId,
+        message: "where this Endesa emails will be linked to? a goal? or will they be saved in actions?"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /still pending/i);
+    assert.match(response.json().reply, /Linked goal: Track energy consumption/);
+    assert.match(response.json().reply, /email review only/i);
+    assert.match(response.json().reply, /will not create actions or events automatically/i);
+    assert.equal(response.json().routeDebug.intent, "gmail_rule_question");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "make the looks for just Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated the pending Gmail rule/);
+    assert.match(response.json().reply, /looks for: Endesa/);
+    assert.doesNotMatch(response.json().reply, /bill, invoice, factura/);
+    assert.doesNotMatch(response.json().reply, /I've logged|Check-in saved|specific action/i);
+
+    pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.deepEqual(pending.payload.keywordFilters, ["Endesa"]);
+    assert.match(String(pending.payload.queryPreview), /Endesa/);
+    assert.doesNotMatch(String(pending.payload.queryPreview), /bill|invoice|factura/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId,
+        message: "the linked goal also is not control impulsive betting wtf this are Endesa bills, so its for energy consumption"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated the pending Gmail rule/);
+    assert.match(response.json().reply, /linked goal: Track energy consumption/);
+    assert.doesNotMatch(response.json().reply, /Control impulsive betting/);
+
+    pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.equal(pending.payload.goalTitle, "Track energy consumption");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "bro what are u doing" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /You are right to call that out/);
+    assert.match(response.json().reply, /pending Gmail rule/);
+    assert.doesNotMatch(response.json().reply, /I hear you|one check-in|YouTube|Check-in saved/i);
+
+    process.env.LLM_ROUTER_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_edit_pending",
+      operation: "edit_pending",
+      confidence: 0.94,
+      reason: "User wants the pending Gmail rule narrowed to one keyword.",
+      target: null,
+      keywordFilters: ["Endesa"],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "narrow that proposal down to Endesa alone" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated the pending Gmail rule/);
+    assert.match(response.json().reply, /looks for: Endesa/);
+    assert.equal(response.json().routeDebug.routerSource, "llm_semantic");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /tracking is on/);
+
+    const rule = await prisma.emailSignalRule.findFirstOrThrow({
+      where: { userId, adapterId: "custom_email_review", status: "active" }
+    });
+    assert.equal(rule.goalTitleSnapshot ?? "Track energy consumption", "Track energy consumption");
+    assert.equal(rule.goalId !== null, true);
+    assert.match(rule.query ?? "", /Endesa/);
+    assert.doesNotMatch(rule.query ?? "", /bill|invoice|factura/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "where will Endesa emails go?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule: Endesa emails/);
+    assert.match(response.json().reply, /Linked goal: Track energy consumption/);
+    assert.match(response.json().reply, /Custom rules never auto-log or create actions/);
+    assert.equal(response.json().routeDebug.intent, "gmail_rule_question");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "what email rules do we have on now" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Email rules currently on/);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.match(response.json().reply, /custom tracking, review first, auto-log off/);
+    assert.match(response.json().reply, /goal: Track energy consumption/);
+    assert.doesNotMatch(response.json().reply, /adapter:|custom_email_review|access token|refresh token|ciphertext/i);
+    assert.equal(response.json().routeDebug.intent, "email_rules_list");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "when will u let me know about the new emails" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Alecto checks Gmail when you say 'sync Gmail'/);
+    assert.match(response.json().reply, /Automatic sync:/);
+    assert.match(response.json().reply, /not instant arrival tracking yet/i);
+    assert.match(response.json().reply, /email review/i);
+    assert.doesNotMatch(response.json().reply, /I could not identify which Gmail rule/i);
+    assert.equal(response.json().routeDebug.intent, "gmail_rule_question");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "about the new endesa mails when will u let me know?when they arrive?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /For Endesa emails:/);
+    assert.match(response.json().reply, /sync Gmail/);
+    assert.doesNotMatch(response.json().reply, /I could not identify which Gmail rule/i);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "email_rules_list",
+      operation: "status",
+      confidence: 0.94,
+      reason: "Spanish request asks which email rules are currently active.",
+      language: "es",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "que reglas de email tenemos activas ahora" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Email rules currently/i);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.equal(response.json().routeDebug.routerSource, "llm_semantic");
+    assert.equal(response.json().routeDebug.intent, "email_rules_list");
+    assert.equal(response.json().routeDebug.language, "es");
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_rule_question",
+      operation: "timing",
+      confidence: 0.95,
+      reason: "Catalan question asks when Alecto will notify about Endesa email matches.",
+      language: "ca",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: "Endesa",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "quan m'avisareu dels nous correus d'Endesa?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /For Endesa emails:/);
+    assert.match(response.json().reply, /sync Gmail/);
+    assert.equal(response.json().routeDebug.routerSource, "llm_semantic");
+    assert.equal(response.json().routeDebug.intent, "gmail_rule_question");
+    assert.equal(response.json().routeDebug.language, "ca");
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_manage",
+      operation: "pause",
+      confidence: 0.93,
+      reason: "Spanish request asks to pause the Endesa email rule.",
+      language: "es",
+      sideEffectRisk: "write",
+      requiresConfirmation: false,
+      target: "Endesa",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "pausa los emails de Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule paused: Endesa emails/);
+    assert.equal(response.json().routeDebug.routerSource, "deterministic_surface");
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_manage",
+      operation: "resume",
+      confidence: 0.93,
+      reason: "Catalan request asks to resume the Endesa email rule.",
+      language: "ca",
+      sideEffectRisk: "write",
+      requiresConfirmation: false,
+      target: "Endesa",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "reactiva els correus d'Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule active: Endesa emails/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "track Aigues bills from Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I can set up a review-first Gmail rule/);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_edit_pending",
+      operation: "edit_pending",
+      confidence: 0.95,
+      reason: "User wants to replace Endesa with Aigues de Barcelona.",
+      language: "en",
+      sideEffectRisk: "write",
+      requiresConfirmation: true,
+      target: null,
+      keywordFilters: ["Aigues de Barcelona"],
+      senderFilters: [],
+      removeKeywordFilters: ["Endesa"],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "looks for only Aigues de Barceloa instead of Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated the pending Gmail rule/);
+    assert.match(response.json().reply, /looks for: Aigues de Barcelona/);
+    assert.doesNotMatch(response.json().reply, /instead of|Endesa/i);
+
+    pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.deepEqual(pending.payload.keywordFilters, ["Aigues de Barcelona"]);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_edit_pending",
+      operation: "edit_pending",
+      confidence: 0.94,
+      reason: "User wants the pending Gmail rule to look for Aigues de Barcelona.",
+      language: "en",
+      sideEffectRisk: "write",
+      requiresConfirmation: true,
+      target: null,
+      keywordFilters: ["Aigues de Barcelona"],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "look for Aigues the Barcelona" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /looks for: Aigues de Barcelona/);
+    assert.doesNotMatch(response.json().reply, /Aigues, Aigues/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_request",
+      operation: "create",
+      confidence: 0.93,
+      reason: "Spanish request asks to create a Gmail rule for utility invoices.",
+      language: "es",
+      sideEffectRisk: "write",
+      requiresConfirmation: true,
+      target: "Aigues de Barcelona",
+      keywordFilters: ["Aigues de Barcelona", "factura"],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: "consumo de energia",
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "crea una regla de Gmail para facturas de Aigües de Barcelona" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /review-first Gmail rule/);
+    assert.match(response.json().reply, /looks for: Aigues de Barcelona, factura/);
+    assert.match(response.json().reply, /linked goal: Track energy consumption/);
+    assert.doesNotMatch(response.json().reply, /Control impulsive betting/);
+    assert.equal(response.json().routeDebug.routerSource, "llm_semantic");
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_request");
+    assert.equal(response.json().routeDebug.language, "es");
+
+    pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.deepEqual(pending.payload.keywordFilters, ["Aigues de Barcelona", "factura"]);
+    assert.equal(pending.payload.goalTitle, "Track energy consumption");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "remove Endesa rule" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove Gmail rule: Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /too broad|open action|specific action/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_sync",
+      operation: "sync",
+      confidence: 0.99,
+      reason: "Bad mock tries to route risky text as Gmail sync.",
+      language: "es",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "quiero apostar 500 y sincroniza Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.doesNotMatch(response.json().reply, /Gmail sync|messages checked|email rules/i);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "daily_operator",
+      operation: "help",
+      confidence: 0.91,
+      reason: "User asks for the operating move in non-command language.",
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "give me the operating move for the next few hours" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Today|Status|Next move/);
+    assert.equal(response.json().routeDebug.routerSource, "llm_semantic");
+    assert.equal(response.json().routeDebug.intent, "daily_operator");
+  } finally {
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("semantic router edits active Gmail rules using recent conversation context", async () => {
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `custom-gmail-active-edit-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    process.env.LLM_ROUTER_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    await prisma.user.create({ data: { id: userId } });
+    const goal = await prisma.goal.create({
+      data: {
+        userId,
+        title: "Track energy consumption",
+        category: "home",
+        status: "active",
+        priority: "medium",
+        importanceScore: 25
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "active-edit@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        goalId: goal.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "email_rules_list",
+      operation: "status",
+      confidence: 0.94,
+      reason: "User asks which email rules are active.",
+      language: "en",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "what email rules do we have on now" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /adapter:|custom_email_review|access token|refresh token|ciphertext/i);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_edit",
+      operation: "edit",
+      confidence: 0.96,
+      reason: "User wants to replace the recently discussed Endesa rule filter.",
+      language: "en",
+      sideEffectRisk: "write",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: ["Aigues de Barcelona"],
+      senderFilters: [],
+      removeKeywordFilters: ["Endesa"],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "make that rule look for only Aigues de Barceloa instead of Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated Gmail rule: Aigues de Barcelona emails/);
+    assert.match(response.json().reply, /Looks for: Aigues de Barcelona/);
+    assert.match(response.json().reply, /Linked goal: Track energy consumption/);
+    assert.doesNotMatch(response.json().reply, /adapter:|custom_email_review|I've logged|Check-in saved/i);
+    assert.equal(response.json().routeDebug.routerSource, "llm_semantic");
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_edit");
+
+    let updatedRule = await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: rule.id } });
+    assert.equal(updatedRule.name, "Aigues de Barcelona emails");
+    assert.match(updatedRule.query ?? "", /Aigues de Barcelona/);
+    assert.doesNotMatch(updatedRule.query ?? "", /Endesa/);
+    assert.equal(updatedRule.goalId, goal.id);
+    assert.equal(await prisma.actionItem.count({ where: { userId } }), 0);
+    assert.equal(await prisma.event.count({ where: { userId } }), 0);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_rule_question",
+      operation: "timing",
+      confidence: 0.94,
+      reason: "User asks when Alecto will notify about the recently discussed rule.",
+      language: "en",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "when will you tell me about it?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /For Aigues de Barcelona emails:/);
+    assert.match(response.json().reply, /sync Gmail/);
+    assert.doesNotMatch(response.json().reply, /I could not identify/i);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_manage",
+      operation: "pause",
+      confidence: 0.93,
+      reason: "User wants to pause the recently discussed Gmail rule.",
+      language: "en",
+      sideEffectRisk: "write",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "pause it" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule paused: Aigues de Barcelona emails/);
+    updatedRule = await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: rule.id } });
+    assert.equal(updatedRule.status, "paused");
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_edit",
+      operation: "edit",
+      confidence: 0.95,
+      reason: "Spanish request asks to relink the current rule to energy consumption.",
+      language: "es",
+      sideEffectRisk: "write",
+      requiresConfirmation: false,
+      target: "Aigues de Barcelona",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: "consumo de energia",
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "vincula la regla de Aigues de Barcelona al objetivo de consumo de energia" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Updated Gmail rule: Aigues de Barcelona emails/);
+    assert.match(response.json().reply, /Linked goal: Track energy consumption/);
+    assert.equal(response.json().routeDebug.language, "es");
+  } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("ambiguous Gmail rule deletion stores clarification and resolves title or number", async () => {
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `custom-gmail-delete-clarify-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    process.env.LLM_ROUTER_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    await prisma.user.create({ data: { id: userId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "delete-clarify@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+    const endesaEmails = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const endesaBills = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa bills",
+        query: "newer_than:30d bill invoice factura Endesa",
+        status: "paused",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_manage",
+      operation: "remove",
+      confidence: 0.95,
+      reason: "Spanish request asks to remove matching Endesa Gmail rules.",
+      language: "es",
+      sideEffectRisk: "destructive",
+      requiresConfirmation: true,
+      target: "Endesa emails",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "Elimina Endesa emails" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove Gmail rule: Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /Which custom Gmail rule/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_manage",
+      operation: "remove",
+      confidence: 0.95,
+      reason: "Spanish request asks to remove matching Endesa Gmail rules.",
+      language: "es",
+      sideEffectRisk: "destructive",
+      requiresConfirmation: true,
+      target: "Endesa",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "elimina Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which custom Gmail rule do you mean/);
+    assert.match(response.json().reply, /1\. Endesa emails/);
+    assert.match(response.json().reply, /2\. Endesa bills/);
+
+    let pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, type: "custom_email_rule", status: "pending" },
+      orderBy: { createdAt: "desc" }
+    });
+    assert.equal(pending.payload.operation, "clarify_rule_management");
+    assert.equal(pending.payload.intendedOperation, "archive");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "Endesa emails" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove Gmail rule: Endesa emails/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesaEmails.id } })).status, "active");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesaBills.id } })).status, "paused");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "elimina Endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Which custom Gmail rule do you mean/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "1" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove Gmail rule: Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /For active Gmail rules|Alecto checks Gmail/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule removed: Endesa emails/);
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesaEmails.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesaBills.id } })).status, "paused");
+  } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("email rule list and reset phrases do not fall into action control", async () => {
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `custom-gmail-reset-routing-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    process.env.LLM_ROUTER_ENABLED = "false";
+    delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    delete process.env.OPENAI_API_KEY;
+    await prisma.user.create({ data: { id: userId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "reset-routing@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+
+    const createRule = (name: string, adapterId: string, status: "active" | "paused", query: string) =>
+      prisma.emailSignalRule.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          adapterId,
+          name,
+          query,
+          status,
+          fetchStrategy: "query",
+          lookbackDays: 30,
+          maxMessagesPerSync: 25,
+          maxEventsPerSync: 5,
+          classifierMode: "rules",
+          minAutoLogConfidence: adapterId === "custom_email_review" ? 1 : 0.9,
+          minReviewConfidence: 0.65,
+          reviewBeforeLogging: adapterId !== "job_search_email",
+          createdBy: "user"
+        }
+      });
+
+    const endesa = await createRule("Endesa emails", "custom_email_review", "active", "newer_than:30d Endesa");
+    const testando = await createRule("Testando emails", "custom_email_review", "active", "newer_than:30d testando@gmail.com");
+    const pausedEndesa = await createRule("Endesa bills", "custom_email_review", "paused", "newer_than:30d bill invoice factura Endesa");
+    const jobSearch = await createRule("Job search emails", "job_search_email", "active", "newer_than:30d interview");
+    const workAction = await createRule("Work action emails", "work_action_email", "active", "newer_than:7d \"please review\"");
+
+    let response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/conversation/control`,
+      payload: { text: "delete all email rules" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, false);
+    assert.doesNotMatch(response.json().reply ?? "", /I could not confidently match/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/conversation/control`,
+      payload: { text: "can u delete all of em? i want a reset" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().handled, false);
+    assert.doesNotMatch(response.json().reply ?? "", /I could not confidently match/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "what email rules do we have" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Email rules currently configured/);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /I could not confidently match/i);
+    assert.equal(response.json().routeDebug.intent, "email_rules_list");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "can u delete all of em? i want a reset" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 5 Gmail email rules/i);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.match(response.json().reply, /Testando emails/);
+    assert.doesNotMatch(response.json().reply, /I could not confidently match/i);
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_manage");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesa.id } })).status, "active");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: testando.id } })).status, "active");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "can u delete all email rules" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 5 Gmail email rules/i);
+    assert.doesNotMatch(response.json().reply, /I could not confidently match/i);
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_manage");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "what email rules do we have" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Email rules currently configured/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "turn all off and delete them" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 5 Gmail email rules/i);
+    assert.doesNotMatch(response.json().reply, /Could not confidently handle|I could not confidently match/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "delete email rules for Work action emails, Job search emails, Work action emails and Endesa bills" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 3 Gmail email rules/i);
+    assert.match(response.json().reply, /Work action emails/);
+    assert.match(response.json().reply, /Job search emails/);
+    assert.match(response.json().reply, /Endesa bills/);
+    assert.doesNotMatch(response.json().reply, /Could not handle|Could not confidently handle/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "can u delete all email rules" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 5 Gmail email rules/i);
+    assert.doesNotMatch(response.json().reply, /I could not confidently match/i);
+    assert.equal(response.json().routeDebug.intent, "gmail_custom_rule_manage");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail email rules removed: 5/);
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesa.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: testando.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: pausedEndesa.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: jobSearch.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: workAction.id } })).status, "archived");
+  } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("built-in Gmail email rules are displayed and reused without duplicate noise", async () => {
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `builtin-email-rule-dedupe-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    process.env.LLM_ROUTER_ENABLED = "false";
+    delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    delete process.env.OPENAI_API_KEY;
+    await prisma.user.create({ data: { id: userId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "builtin-dedupe@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+
+    const createRule = (name: string, adapterId: string, status: "active" | "paused", query: string) =>
+      prisma.emailSignalRule.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          adapterId,
+          name,
+          query,
+          status,
+          fetchStrategy: "query",
+          lookbackDays: 30,
+          maxMessagesPerSync: 25,
+          maxEventsPerSync: 5,
+          classifierMode: adapterId === "work_action_email" ? "hybrid" : "rules",
+          minAutoLogConfidence: adapterId === "work_action_email" ? 0.95 : 0.9,
+          minReviewConfidence: 0.65,
+          reviewBeforeLogging: adapterId !== "job_search_email",
+          createdBy: "user"
+        }
+      });
+
+    const workRuleA = await createRule("Work action emails", "work_action_email", "active", "newer_than:7d \"please review\"");
+    const workRuleB = await createRule("Work action emails", "work_action_email", "active", "newer_than:7d \"please review\"");
+    await createRule("Job search emails", "job_search_email", "active", "newer_than:30d interview");
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "what email rules do we have" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Work action emails.*2 duplicate rules; shown once/i);
+    assert.equal((response.json().reply.match(/Work action emails/g) ?? []).length, 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "delete all email rules" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 3 Gmail email rules/i);
+    assert.match(response.json().reply, /Work action emails - 2 duplicate rules/i);
+    assert.equal((response.json().reply.match(/Work action emails/g) ?? []).length, 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "no" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Cancelled/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${userId}/email-rules`,
+      payload: {
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Email rule already exists|Archived 1 duplicate email rule/);
+
+    const workRulesAfterEnable = await prisma.emailSignalRule.findMany({
+      where: { userId, adapterId: "work_action_email" }
+    });
+    assert.equal(workRulesAfterEnable.filter((rule) => rule.status === "active").length, 1);
+    assert.equal(workRulesAfterEnable.filter((rule) => rule.status === "archived").length, 1);
+
+    const activeRuleId = workRulesAfterEnable.find((rule) => rule.status === "active")?.id;
+    assert.ok(activeRuleId === workRuleA.id || activeRuleId === workRuleB.id);
+  } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("custom Gmail rule conversation handles bulk removal and utility tracking without false health goal link", async () => {
+  const userId = `custom-gmail-bulk-remove-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    await prisma.user.create({ data: { id: userId } });
+    await prisma.goal.create({
+      data: {
+        userId,
+        title: "Improve strength and energy",
+        category: "health",
+        templateId: "health.strength_energy",
+        status: "active"
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "bulk-remove@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+    const aigues = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Aigues Barcelona emails",
+        query: "newer_than:30d Aigues Barcelona",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const endesa = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const pausedEndesa = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa bills",
+        query: "newer_than:30d bill invoice factura Endesa",
+        status: "paused",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "elimina aigues de barcelona y endesa" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm remove 2 Gmail email rules/);
+    assert.match(response.json().reply, /Aigues Barcelona emails/);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /Endesa bills/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail email rules removed: 2/);
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: aigues.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: endesa.id } })).status, "archived");
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: pausedEndesa.id } })).status, "paused");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "track Endesa bills from Gmail" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Rule:/);
+    assert.match(response.json().reply, /Endesa/);
+    assert.doesNotMatch(response.json().reply, /linked goal: Improve strength and energy/i);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
 

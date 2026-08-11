@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 Legend:
 - `[x]` implemented and currently wired into the app
@@ -28,6 +28,8 @@ After every implementation pass:
 - [x] Channel-agnostic `NormalizedInboundMessage` abstraction
 - [x] Intent routing before business logic
 - [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, integration guidance, explicit email-rule enable requests, and explicit integration sync requests
+- [x] Optional LLM Semantic Router v4 for normal free-text understanding after deterministic safety/command/pending handling and before generic chat fallback; targets English/Spanish/Catalan phrasing, returns structured intent only, keeps short-lived Gmail-rule conversation context, and leaves all mutations to deterministic API executors
+- [x] `/messages/process` routeDebug metadata for API smoke tests: router source, intent, handler, semantic-router usage, mutation flag, confidence, language, side-effect risk, confirmation requirement, and compact reason
 - [x] User onboarding/setup simplification v1: shared API onboarding state/reply composer, `/start`, `/setup`, natural quickstart, missing setup, goals setup, daily-loop setup, and integration setup guidance
 - [x] First 5 Minutes Onboarding v1: guide-style `/start`, setup overview with Ready/Needs attention/Optional/Best next step, state-aware next-step suggestions, action/reminder onboarding, and explicit Gmail/GitHub setup boundaries
 - [x] Inbound message segmentation for single commands, command batches, reference text, and normal text
@@ -167,7 +169,7 @@ After every implementation pass:
 - [x] Natural `sync Gmail`, `sync email`, and `sync integrations` requests route through safe API sync behavior instead of generic chat
 - [x] Natural explicit email-rule requests such as `enable job search rule for Gmail` and `enable work action rule for Gmail` create/reuse active Gmail email rules through the same safe API path as `/enable_email_rule`
 - [x] Gmail setup/rule replies use human tracking labels and explain what the rule watches for instead of exposing adapter IDs in normal user output
-- [x] Natural Gmail setup/status wizard shows connection state, active tracking rules, manual vs scheduled sync, and goal-based rule recommendations
+- [x] Natural Gmail setup/status/list wizard shows connection state, active tracking rules, manual vs scheduled sync, email-rule timing behavior, and goal-based rule recommendations
 - [~] GitHub supports public repos only; no OAuth/private repo support
 - [ ] Wallet public-address fetcher
 - [ ] Health integrations
@@ -188,15 +190,32 @@ After every implementation pass:
 - [x] Gmail sync summaries and debug counters
 - [x] Natural Gmail/email sync requests use the same readonly sync path and preserve token/ciphertext redaction
 - [x] Natural Gmail email-rule enable requests require an active Gmail connection, preserve explicit rule approval, and do not auto-scan by themselves
-- [x] Natural Gmail guidance explains implemented tracking choices and safely says custom keyword/goal-specific rules are not ready yet
+- [x] Natural Gmail guidance explains implemented tracking choices, including confirmation-first custom sender/keyword tracking
 - [x] Gmail setup/status replies recommend job-search tracking for active career/job-search goals and work-action tracking for work/project-like goals
+- [x] Natural email-rule list requests such as `what email rules are on now` show active rules first and hide paused/error noise from the normal conversation view
+- [x] Custom Gmail sender/keyword rule builder v1 through natural chat, e.g. `track Endesa bills from Gmail` or `track emails from client@example.com for dashboard project`
+- [x] Custom Gmail rules are review-only: matches create EmailReviewItems and never auto-create Events or ActionItems
+- [x] Custom Gmail rule management through natural chat for clear pause/resume/remove requests, with confirmation before removal
+- [x] Pending custom Gmail rule conversation state: natural English/Spanish/Catalan edits to `looks for` keywords, replacement wording such as `Aigues de Barcelona instead of Endesa`, `solo Aigues de Barcelona, no Endesa`, and `en lloc de`, questions about where matches go, timing/sync questions, goal-link correction/removal, cancel, and confirmation before scanning
+- [x] Active custom Gmail rule editing through natural chat: after rule list/status/edit replies, Alecto keeps short-lived rule context so follow-ups such as `make that rule look for only Aigues de Barcelona instead of Endesa`, `when will you tell me about it?`, `pause it`, and Spanish/Catalan equivalents resolve to the focused rule
+- [x] Ambiguous custom Gmail rule management stores pending clarification before routing falls back. Example: `elimina Endesa` can be resolved by replying `1` or `Endesa emails`, then destructive removal asks for yes/no confirmation.
+- [x] Multi-rule Gmail removal asks a bulk confirmation and archives matched Gmail email rules only after confirmation. Example: `elimina Aigues de Barcelona y Endesa`.
+- [x] Gmail rule list/reset phrases avoid action-control and multi-intent fallback. Examples: `what email rules do we have`, `delete all email rules`, `turn all off and delete them`, and contextual `can u delete all of em?` after listing rules route to Gmail status/cleanup and never produce "I could not confidently match that to an open action."
+- [x] Built-in Gmail rule duplicate cleanup is implemented. Natural lists and destructive confirmations group equivalent duplicate job-search/work-action rules, Gmail sync ignores exact duplicate built-in rules, and enabling a built-in rule reuses/reactivates one existing rule while archiving duplicate built-in copies.
+- [x] Natural reset can archive all visible Gmail email rules, including job-search, work-action, custom, and paused rules, after confirmation. It does not delete the Gmail connection or historical email reviews/events.
+- [x] Exact custom Gmail rule names ending in `emails` are preserved during selection, so `Endesa emails` can resolve that rule instead of collapsing to the broader `Endesa` target.
+- [x] Utility/bill custom Gmail tracking avoids false health-goal links; Endesa/Aigues bill rules do not attach to `Improve strength and energy` unless an actual utility/expense goal exists.
+- [x] LLM semantic-router API smoke coverage for multilingual Gmail rule list, custom-rule creation, pending-rule edits, timing questions, pause/resume management, and guardrail precedence when an LLM mock misroutes risky text
+- [x] Expired pending confirmations no longer block fresh full-message requests such as `create a rule for Endesa bills`
+- [x] Conversation repair for bad routing around pending Gmail rules; Alecto acknowledges the specific pending-rule problem instead of falling into generic support/coaching
 - [x] Email review queue
 - [x] Review semantic dedupe
 - [x] Review approval/rejection
 - [x] Work-action review approval creates ActionItems instead of Events
 - [~] Gmail OAuth/account management remains local-MVP; production auth, key management, and secret rotation are not implemented
-- [~] LLM email classifier is optional and post-processed by strict allowlists
-- [ ] User-friendly custom Gmail keyword/sender/goal-specific rule builder
+- [~] LLM email classifier and semantic router are optional and post-processed by strict allowlists/executors; broader natural-language coverage has targeted API smoke tests but still needs a larger eval suite before production
+- [~] Conversation Orchestrator v2 modularization has started with `apps/api/src/conversation/email-rule-selection.ts`, but `apps/api/src/server.ts` remains oversized and still needs capability executors/services extracted.
+- [x] Editing filters on an existing custom Gmail rule through API conversation routing; destructive removal still requires confirmation
 - [ ] Gmail send/label modification
 - [ ] Additional planned adapters: finance receipts, learning deadlines, custom goal email signals
 

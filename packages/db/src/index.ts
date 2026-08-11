@@ -96,6 +96,7 @@ export type PendingActionType =
   | "action_target_clarification"
   | "next_week_plan"
   | "goal_progress_log"
+  | "custom_email_rule"
   | "memory_create"
   | "event_undo_last";
 export type PendingActionStatus = "pending" | "confirmed" | "rejected" | "expired";
@@ -1229,6 +1230,36 @@ export async function updateEmailSignalRule(
       minReviewConfidence: input.minReviewConfidence,
       reviewBeforeLogging: input.reviewBeforeLogging,
       lastError: input.status === "active" ? null : existingRule.lastError
+    }
+  });
+
+  return toEmailSignalRule(rule);
+}
+
+export async function updateEmailSignalRuleDefinition(
+  userId: string,
+  ruleId: string,
+  input: { name?: string; query?: string; goalId?: string | null }
+): Promise<EmailSignalRule | undefined> {
+  await ensureUser(userId);
+
+  const existingRule = await prisma.emailSignalRule.findFirst({
+    where: {
+      id: ruleId,
+      userId
+    }
+  });
+
+  if (!existingRule || normalizeEmailRuleStatus(existingRule.status) === "archived") {
+    return undefined;
+  }
+
+  const rule = await prisma.emailSignalRule.update({
+    where: { id: ruleId },
+    data: {
+      name: input.name,
+      query: input.query,
+      goalId: input.goalId
     }
   });
 

@@ -1,6 +1,6 @@
 # Product Capability Audit
 
-Last updated: 2026-08-10
+Last updated: 2026-08-11
 
 This is a product/architecture checkpoint. The implementation ledger remains `docs/07-implementation-status.md`.
 
@@ -15,7 +15,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | Capability | Status | User surface | Data source | LLM role | Proactive? | Production blocker |
 | --- | --- | --- | --- | --- | --- | --- |
 | Telegram chat | implemented | Telegram bot | Telegram messages | optional response/analysis | yes, via worker | operational hardening |
-| Normal message routing | implemented | natural text, slash commands | `NormalizedInboundMessage` | optional fallback only | no | more channel tests |
+| Normal message routing | implemented | natural text, slash commands | `NormalizedInboundMessage` | optional English/Spanish/Catalan semantic router/fallback with routeDebug metadata | no | broader semantic-router evals and cross-channel tests |
 | Conversation-first UX parity | implemented | natural help/setup/review/planning/action readouts, explicit email-rule enable requests, and explicit sync requests | existing services | none required | no | richer cross-channel tests |
 | First 5 Minutes Onboarding v1 | implemented | `/start`, `/setup`, natural setup/quickstart/goals/actions/daily-loop/integration messages | onboarding state from goals/actions/settings/integrations/hygiene | none | no | full guided wizard/settings UI |
 | Goals | implemented | `/goals`, `/create_goal`, natural goal creation | Postgres `Goal` | optional classification | no | simpler onboarding |
@@ -32,7 +32,7 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | Hygiene-session safety | implemented | natural replies such as `complete 1`, `snooze 2 tomorrow` | PendingAction + ActionItems | asks for missing time or confirmation | prevents fake cleanup success | richer multi-operation cleanup replies |
 | Weekly review/planning | implemented | `/weekly`, `/weekly_last`, `/plan_next_week`, natural `plan this week` / `plan next week` | actions/events/goals/reflections/hygiene | optional guarded draft for review; plan is deterministic with optional mock-gated suggestions | no | more real-user planning polish |
 | Weekly insight | implemented | `/weekly_insight` | active events/goals/memory/profile | optional polish | scheduled delivery available | overlaps with weekly review |
-| Gmail readonly | partial | `/connect_gmail`, natural Gmail setup/status/sync/rule enable, `/sync_gmail` | Gmail API | optional classifier | scheduled sync available | production OAuth/account management, key rotation, custom rule builder |
+| Gmail readonly | partial | `/connect_gmail`, natural Gmail setup/status/list/sync/rule enable/custom tracking, multilingual pending and active custom-rule edits/questions/timing answers, bulk custom-rule removal confirmations, `/sync_gmail` | Gmail API | optional semantic router/classifier | scheduled sync available | production OAuth/account management, key rotation, broader real-user evals |
 | Gmail review queue | implemented | `/email_reviews`, approve/reject | EmailReviewItem | optional classifier | no direct push yet | reviewer UX |
 | GitHub public sync | implemented | `/connect_github`, sync commands | public GitHub API | none | scheduled sync available | private/OAuth unsupported |
 | Worker proactive jobs | implemented | settings + worker | DB schedules/logs | none | yes | production scheduling/observability |
@@ -95,10 +95,24 @@ Expected natural alternatives:
 - `show my goals`
 - `connect Gmail`
 - `what can Gmail track`
+- `what email rules are on`
 - `show Gmail setup`
 - `Gmail status`
 - `enable job search rule for Gmail`
 - `enable work action rule for Gmail`
+- `create a rule for Endesa bills`
+- `track Endesa bills from Gmail`
+- `crea una regla de Gmail para facturas de Aigues de Barcelona`
+- `when will you let me know about new emails?`
+- `only look for Endesa`
+- `looks for only Aigues de Barcelona instead of Endesa`
+- `make that rule look for only Aigues de Barcelona instead of Endesa`
+- `pause it`
+- `busca solo Aigues de Barcelona, no Endesa`
+- `quan m'avisareu dels correus d'Endesa?`
+- `where will Endesa emails go?`
+- `pause Endesa emails`
+- `remove Endesa rule`
 - `sync Gmail`
 - `sync integrations`
 
@@ -228,10 +242,11 @@ The target product should work mostly without command memorization:
 6. Evening: Alecto sends an `/end_day`-style review and asks for remaining cleanup.
 7. Weekly: Alecto creates a `/weekly` operator review, points the user to `plan next week`, then `/plan_next_week` or natural planning proposes a confirmed action plan.
 8. The user approves selected actions; Alecto does not silently invent plans or mutate state.
+9. API smoke tests can inspect `routeDebug` on `/messages/process` to confirm whether a reply came from deterministic routing, LLM semantic routing, pending decisions, or guardrails.
 
 ## Current Autonomy Level
 
-- Can it read mail independently? **Partially.** Gmail can sync readonly after OAuth and explicit active email rules. Natural `show Gmail setup`, `Gmail status`, `what can Gmail track`, `enable job search rule for Gmail`, and `enable work action rule for Gmail` explain current state, goal-based recommendations, manual vs scheduled sync, and use the same rule creation path as `/enable_email_rule`; natural `sync Gmail` uses the same safe sync path. No active rule means no scanning. Custom keyword/sender/goal-specific Gmail rule building is not implemented yet.
+- Can it read mail independently? **Partially.** Gmail can sync readonly after OAuth and explicit active email rules. Natural `show Gmail setup`, `Gmail status`, `what can Gmail track`, `what email rules are on`, `what email rules do we have`, `enable job search rule for Gmail`, `enable work action rule for Gmail`, and custom requests such as `create a rule for Endesa bills`, `track Endesa bills from Gmail`, or Spanish/Catalan equivalents explain current state and use safe rule paths; natural `sync Gmail` uses the same safe sync path. No active rule means no scanning. Custom sender/keyword tracking is implemented as review-only v1 and requires confirmation before enabling. Pending proposals and active custom rules can be edited or questioned in natural language, including keyword replacement wording such as `looks for only Aigues de Barcelona instead of Endesa`, `busca solo Aigues de Barcelona, no Endesa`, follow-ups like `make that rule look for only Aigues de Barcelona instead of Endesa` or `pause it`, and sync/timing questions such as `when will you let me know about it?` or `quan m'avisareu dels correus d'Endesa?`. Ambiguous rule management such as `elimina Endesa` stores a pending clarification, accepts number/name replies, and still confirms before removal. Multi-target cleanup such as `elimina Aigues de Barcelona y Endesa` asks one confirmation for matched Gmail email rules. Contextual reset/delete-all phrasing after a rule list, such as `can u delete all of em?`, `turn all off and delete them`, or `delete all email rules`, asks to remove all visible Gmail email rules after confirmation and does not fall into action-control or multi-intent matching. Duplicate built-in job-search/work-action rules are grouped in natural output, ignored during sync as exact duplicates, and cleaned when the built-in rule is enabled again. The Gmail connection and historical email reviews/events are kept. Utility/bill tracking avoids false links to the health `energy` goal unless a real utility/expense goal exists.
 - Can it ask for updates alone? **Yes.** Worker can send daily check-ins, daily insights, weekly insights, and daily loop briefs.
 - Can it create actions from email? **Yes, with review.** `work_action_email` creates review items; approval creates ActionItems.
 - Can it send emails? **No.**
@@ -274,7 +289,8 @@ The target product should work mostly without command memorization:
 - [ ] better reflection relevance/ranking
 - [x] Planning UX Consolidation v1; `/weekly` points to planning, natural this-week/next-week planning is supported, grouped plan output separates cleanup/already scheduled/new actions, recurring system suggestions are semantically deduped, and reply examples only show creatable indexes
 - [ ] broader guardrails beyond betting/trading
-- [ ] eval set for routing, action control, and LLM coach validation
+- [~] API smoke tests cover key conversation routing paths, including multilingual Gmail custom-rule setup/edit/question/manage flows, list/reset phrasing, bulk custom-rule cleanup, utility-goal-link safety, and LLM semantic-router mock routing
+- [ ] broader eval set for routing, action control, Gmail rule wizard, multilingual conversation repair, and LLM coach validation
 
 ### Integrations
 
@@ -304,12 +320,19 @@ Risk:
 
 Why:
 - It makes external signals more useful.
-- Gmail already has OAuth, rules, review queue, and work/action adapters.
+- Gmail already has OAuth, rules, review queue, work/action adapters, and custom sender/keyword review-only tracking.
 - A good next step is proactive review notifications: "3 email items need approval."
+
+Suggested scope:
+- Make Gmail setup more goal-linked: job/work goals should suggest relevant Gmail tracking, while utility/expense goals should suggest custom sender/keyword tracking.
+- Add user-facing sync choices before increasing autonomy: manual only, every N minutes/hours, business-hours checks, or daily digest.
+- Notify when review items or action candidates exist; do not notify for empty syncs.
+- Keep custom rules review-first unless the user explicitly chooses stronger automation.
+- Treat full-inbox/all-mail LLM analysis and Gmail webhooks as later production work after OAuth/account settings, privacy copy, and cost controls are clearer.
 
 Risk:
 - More email automation increases privacy/security expectations.
-- Production OAuth/account linking, key management, and review-notification UX should come before broader Gmail autonomy.
+- Production OAuth/account linking, key management, broader rule-management UX, and review-notification UX should come before broader Gmail autonomy.
 
 ### 3. Production Onboarding And Settings UX
 
@@ -323,4 +346,4 @@ Risk:
 
 Build **Real-World Planning Polish** next only after another Telegram log pass.
 
-First 5 Minutes Onboarding v1 and Planning UX Consolidation v1 are now implemented for the local alpha. Gmail token encryption at rest is implemented for the local MVP. The next high-leverage work is smoothing observed operator-loop friction without adding integrations or auto-creating actions. Gmail Autonomy should wait until production OAuth/account management, key management/rotation, and review-notification UX are clearer.
+First 5 Minutes Onboarding v1 and Planning UX Consolidation v1 are now implemented for the local alpha. Gmail token encryption at rest, custom sender/keyword Gmail tracking v1, active Gmail rule editing, short-lived Gmail rule conversation context, bulk custom Gmail rule cleanup, and LLM Semantic Router v4 are implemented for the local MVP. The first Conversation Orchestrator v2 modularization slice has extracted Gmail rule selection helpers, but `server.ts` remains oversized and should continue being split into capability executors/services. The next high-leverage work is building a broader semantic-router eval set from real Telegram logs across English, Spanish, and Catalan, smoothing Gmail review/notification UX, and reducing observed operator-loop friction without adding integrations or auto-creating actions. Broader Gmail Autonomy should wait until production OAuth/account management, key management/rotation, broader rule-management UX, and review-notification UX are clearer.

@@ -53,7 +53,20 @@ export const ProcessMessageResultSchema = z.object({
   mode: AgentModeSchema,
   riskState: RiskStateSchema,
   extractedEvents: z.array(ExtractedEventSchema),
-  reply: z.string()
+  reply: z.string(),
+  routeDebug: z.object({
+    routerSource: z.string(),
+    intent: z.string(),
+    handlerName: z.string(),
+    semanticRouterAttempted: z.boolean().optional(),
+    semanticRouterUsed: z.boolean().optional(),
+    mutation: z.boolean().optional(),
+    confidence: z.number().min(0).max(1).optional(),
+    language: z.string().optional(),
+    sideEffectRisk: z.string().optional(),
+    requiresConfirmation: z.boolean().optional(),
+    reason: z.string().optional()
+  }).optional()
 });
 
 export const ProcessMessageAnalysisSchema = z.object({

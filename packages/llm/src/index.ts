@@ -4,4 +4,5 @@ export * from "./compose-response.js";
 export * from "./daily-coach.js";
 export * from "./openai-client.js";
 export * from "./polish-insight.js";
+export * from "./semantic-router.js";
 export * from "./types.js";

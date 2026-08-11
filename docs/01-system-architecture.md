@@ -33,9 +33,9 @@ The same core route should be usable later by WhatsApp, web, or API clients afte
 
 ## Main Apps And Packages
 
-- [x] `packages/core`: domain schemas and deterministic logic, including event ontology, risk states, check-ins, reminders, ingestion adapters, goal templates, intent routing, daily priority scoring, LLM daily coach validation, and conversation-control helpers
+- [x] `packages/core`: domain schemas and deterministic logic, including event ontology, risk states, check-ins, reminders, ingestion adapters, goal templates, intent routing, semantic-router schemas, daily priority scoring, LLM daily coach validation, and conversation-control helpers
 - [x] `packages/db`: Prisma schema, generated client, and repository functions
-- [x] `packages/llm`: optional OpenAI structured analysis helpers
+- [x] `packages/llm`: optional OpenAI structured analysis helpers, including semantic message routing
 - [x] `apps/api`: Fastify API; owns business mutations and orchestration
 - [x] `apps/telegram-bot`: thin Telegram adapter over API routes
 - [x] `apps/worker`: simple interval worker for proactive jobs
@@ -71,7 +71,14 @@ Normal inbound text is segmented before intent routing.
 7. Pasted job-search emails/text route through generic ingestion.
 8. Conversational action control handles complete/reschedule/snooze/archive/priority updates.
 9. Multi-intent orchestration can combine safe event logging, control actions, and read-only summaries.
-10. Remaining messages route to message processing / response composition.
+10. Optional LLM semantic router can classify normal free text that missed deterministic phrase rules across operator surfaces and Gmail rule conversations. It targets English, Spanish, and Catalan phrasing and returns structured intent only: intent, operation, confidence, language, side-effect risk, confirmation requirement, target, extracted filters, goal hint, and safe issue text. API executors still validate and apply or reject any mutation.
+11. Gmail rule conversations may store short-lived focused-rule context in the pending-action layer so follow-up references such as `that rule`, `it`, or `pause it` can resolve channel-neutrally. This context is not authorization to scan Gmail or mutate anything; it only helps deterministic executors resolve the target.
+12. Remaining messages route to message processing / response composition.
+
+`/messages/process` may include a non-user-facing `routeDebug` object for API smoke tests and local diagnostics. Telegram ignores it and sends only the reply text. The debug payload now includes semantic language/confidence/side-effect-risk fields when available so route quality can be tested without Telegram copy/paste loops.
+
+Implementation note:
+- [~] `apps/api/src/server.ts` still contains too much orchestration logic and should be split further. The first extraction slice now lives in `apps/api/src/conversation/email-rule-selection.ts` for Gmail rule target normalization, exact matching, multi-target resolution, and pending clarification selection.
 
 ## Integrations
 
