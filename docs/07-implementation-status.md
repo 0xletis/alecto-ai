@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-11
+Last updated: 2026-08-13
 
 Legend:
 - `[x]` implemented and currently wired into the app
@@ -153,7 +153,7 @@ After every implementation pass:
 - [x] Scheduled weekly insight delivery
 - [x] Scheduled daily loop morning/evening briefs
 - [x] Action reminder logs and due/snoozed reminders
-- [x] Scheduled integration sync, disabled by default with `INTEGRATION_SYNC_ENABLED=false`
+- [x] Scheduled integration sync, disabled by default with `INTEGRATION_SYNC_ENABLED=false`; Gmail background sync additionally requires explicit per-user scheduled mode and active Gmail rules
 - [~] Telegram delivery requires `telegramUserId`; no multi-channel notification routing yet
 
 ## Integrations
@@ -166,6 +166,7 @@ After every implementation pass:
 - [x] GitHub repo activity semantics when no author is configured
 - [x] GitHub safe 404/private/rate-limit errors
 - [x] Scheduled and manual integration sync
+- [x] Gmail background sync eligibility/debug route for safe operator inspection: global worker availability, connection status, mode, interval, active rule count, last background attempt, next due time, and reason
 - [x] Natural `sync Gmail`, `sync email`, and `sync integrations` requests route through safe API sync behavior instead of generic chat
 - [x] Natural explicit email-rule requests such as `enable job search rule for Gmail` and `enable work action rule for Gmail` create/reuse active Gmail email rules through the same safe API path as `/enable_email_rule`
 - [x] Gmail setup/rule replies use human tracking labels and explain what the rule watches for instead of exposing adapter IDs in normal user output
@@ -196,7 +197,7 @@ After every implementation pass:
 - [x] Shared Gmail setup/autonomy state service for conversation surfaces. It reports connection status, account email when available, active/paused rule summaries, pending review count, last sync, manual/scheduled mode, worker availability, review-notification preference, delivery availability, Gmail-relevant active goals, recommendations, unsupported preferences, and next best step without exposing secrets or raw provider data.
 - [x] Gmail autonomy preferences on Gmail connection config: `manual_only` vs `scheduled`, interval minutes, and review-waiting notification on/off. Natural changes such as `check Gmail every hour`, `make Gmail manual only`, and `notify me when Gmail reviews are waiting` ask for confirmation before DB mutation.
 - [x] Gmail autonomy confirmation focus is hardened: negative notification phrases disable notifications, unrelated Gmail questions cancel stale preference confirmations, and missing/paused custom-rule questions explain review-first/no-auto-log behavior instead of returning a generic "could not identify" message.
-- [x] Worker scheduled Gmail sync respects Gmail autonomy preferences: manual-only Gmail connections are skipped, per-connection scheduled intervals are honored when worker sync is enabled, and proactive Gmail review notifications are suppressed when the connection preference disables them.
+- [x] Worker scheduled Gmail sync respects Gmail autonomy preferences: Gmail stays manual-only unless the user explicitly chose scheduled checks, manual-only Gmail connections are skipped, per-connection scheduled intervals use `lastBackgroundSyncAttemptedAt` instead of manual `lastSyncedAt`, no-active-rule connections are skipped, failed background attempts store safe status/error without tight retry loops, and proactive Gmail review notifications are suppressed when the connection preference disables them.
 - [x] Natural Gmail digest and work-hours preference requests are recognized and answered honestly as not implemented; Alecto does not create fake settings.
 - [x] Natural email-rule list requests such as `what email rules are on now` show active rules first and hide paused/error noise from the normal conversation view
 - [x] Custom Gmail sender/keyword rule builder v1 through natural chat, e.g. `track Endesa bills from Gmail` or `track emails from client@example.com for dashboard project`

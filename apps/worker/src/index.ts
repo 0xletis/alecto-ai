@@ -4,7 +4,6 @@ import {
   createNotificationLog,
   getActionItemsEligibleForReminder,
   getActiveGoals,
-  getActiveIntegrationConnectionsForSync,
   getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
@@ -15,15 +14,7 @@ import {
   type ActionItemReminderType
 } from "@operator-agent/db";
 import { buildDailyCheckinPrompt } from "@operator-agent/core";
-import {
-  gmailReviewNotificationsEnabled,
-  gmailScheduledSyncRuntimeFromEnv,
-  shouldSyncGmailConnectionOnSchedule
-} from "@operator-agent/core";
-import {
-  formatIntegrationSyncNotifications,
-  type IntegrationSyncResponse
-} from "./integration-notifications.js";
+import { runScheduledIntegrationSync } from "./integration-sync.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -34,7 +25,6 @@ const apiBaseUrl = process.env.API_BASE_URL ?? "http://localhost:3000";
 const tickMs = 60_000;
 const integrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED === "true";
 const integrationSyncIntervalMinutes = Number(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15");
-const gmailScheduledSyncRuntime = gmailScheduledSyncRuntimeFromEnv();
 
 if (!telegramBotToken) {
   throw new Error("TELEGRAM_BOT_TOKEN is required.");
@@ -161,58 +151,13 @@ export async function runDailyEveningReviews(now = new Date(), settings?: Notifi
 }
 
 async function runIntegrationSync(now: Date) {
-  const intervalMs = Math.max(1, integrationSyncIntervalMinutes) * 60_000;
-  const connections = await getActiveIntegrationConnectionsForSync();
-  const notificationsByUser = new Map<string, string[]>();
-
-  for (const connection of connections) {
-    if (connection.integrationId === "gmail") {
-      if (!shouldSyncGmailConnectionOnSchedule(connection, now, gmailScheduledSyncRuntime)) {
-        continue;
-      }
-    } else if (connection.lastSyncedAt && now.getTime() - connection.lastSyncedAt.getTime() < intervalMs) {
-      continue;
-    }
-
-    try {
-      const response = await apiPost<IntegrationSyncResponse>(
-        `/users/${connection.userId}/integrations/${connection.id}/sync`,
-        {}
-      );
-      const messages = formatIntegrationSyncNotifications(response, {
-        gmailReviewNotificationsEnabled:
-          connection.integrationId === "gmail" ? gmailReviewNotificationsEnabled(connection.config) : true
-      });
-
-      if (messages.length > 0) {
-        notificationsByUser.set(connection.userId, [
-          ...(notificationsByUser.get(connection.userId) ?? []),
-          ...messages
-        ]);
-      }
-    } catch (error) {
-      console.error(`Integration sync failed for ${connection.id}`, error);
-
-      if (!connection.lastError) {
-        const reason = safeErrorMessage(error);
-        const prefix = connection.integrationId === "gmail" ? "Gmail sync failed" : "GitHub sync failed";
-        notificationsByUser.set(connection.userId, [
-          ...(notificationsByUser.get(connection.userId) ?? []),
-          reason.startsWith(prefix) ? reason : `${prefix}: ${reason}`
-        ]);
-      }
-    }
-  }
-
-  for (const [userId, messages] of notificationsByUser) {
-    const settings = await getOrCreateNotificationSettings(userId);
-
-    if (!settings.telegramUserId || messages.length === 0) {
-      continue;
-    }
-
-    await sendTelegramMessage(settings.telegramUserId, messages.slice(0, 5).join("\n"));
-  }
+  await runScheduledIntegrationSync({
+    now,
+    integrationSyncEnabled,
+    integrationSyncIntervalMinutes,
+    apiPost,
+    sendTelegramMessage
+  });
 }
 
 async function maybeSendDailyCheckin(item: NotificationSettings, now: Date) {
@@ -388,14 +333,6 @@ function parseApiError(text: string): string | undefined {
   } catch {
     return text.trim();
   }
-}
-
-function safeErrorMessage(error: unknown): string {
-  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
-    return error.message;
-  }
-
-  return "Integration sync failed.";
 }
 
 function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {

@@ -1515,6 +1515,114 @@ test("Gmail setup autonomy preferences are state-aware and confirmation-first", 
   }
 });
 
+test("Gmail status and debug output show scheduled background eligibility safely", async () => {
+  const server = buildServer();
+  const previousIntegrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED;
+  const previousIntegrationSyncInterval = process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;
+  const userId = `gmail-background-status-${randomUUID()}`;
+
+  try {
+    process.env.INTEGRATION_SYNC_ENABLED = "true";
+    process.env.INTEGRATION_SYNC_INTERVAL_MINUTES = "15";
+    await server.ready();
+    await prisma.user.create({ data: { id: userId } });
+    await prisma.notificationSettings.create({
+      data: {
+        userId,
+        telegramUserId: "12345",
+        timezone: "Europe/Madrid"
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        lastSyncedAt: new Date("2026-08-12T09:59:00.000Z"),
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "scheduled@example.com",
+          hasRefreshToken: true,
+          gmailAutonomy: {
+            syncMode: "scheduled",
+            syncIntervalMinutes: 60,
+            reviewNotificationEnabled: true,
+            lastBackgroundSyncAttemptedAt: "2026-08-12T09:30:00.000Z",
+            lastBackgroundSyncedAt: "2026-08-12T09:30:00.000Z",
+            lastBackgroundSyncStatus: "success"
+          },
+          token: {
+            ciphertext: "must-not-leak-ciphertext",
+            iv: "must-not-leak-iv",
+            tag: "must-not-leak-tag"
+          }
+        }
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"can you review\"",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "hybrid",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "Gmail status" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Mode: scheduled, about every hour/);
+    assert.match(response.json().reply, /Alecto checks active Gmail rules on the worker schedule/);
+    assert.match(response.json().reply, /Last background check:/);
+    assert.match(response.json().reply, /Next background check:/);
+    assert.doesNotMatch(response.json().reply, /INTEGRATION_SYNC_ENABLED|accessToken|refreshToken|ciphertext|"iv"|"tag"|must-not-leak/i);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${userId}/integrations/gmail/background-sync/debug?now=${encodeURIComponent("2026-08-12T10:00:00.000Z")}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.deepEqual(response.json(), {
+      globalBackgroundIntegrationSyncEnabled: true,
+      gmailConnected: true,
+      connectionId: connection.id,
+      connectionStatus: "active",
+      mode: "scheduled",
+      intervalMinutes: 60,
+      lastBackgroundSyncAttemptedAt: "2026-08-12T09:30:00.000Z",
+      lastBackgroundSyncedAt: "2026-08-12T09:30:00.000Z",
+      nextDueAt: "2026-08-12T10:30:00.000Z",
+      activeRuleCount: 1,
+      notificationPreference: "on",
+      deliveryAvailable: true,
+      eligible: false,
+      reason: "not_due"
+    });
+    assert.doesNotMatch(JSON.stringify(response.json()), /accessToken|refreshToken|ciphertext|"iv"|"tag"|must-not-leak/i);
+  } finally {
+    if (previousIntegrationSyncEnabled === undefined) delete process.env.INTEGRATION_SYNC_ENABLED;
+    else process.env.INTEGRATION_SYNC_ENABLED = previousIntegrationSyncEnabled;
+    if (previousIntegrationSyncInterval === undefined) delete process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;
+    else process.env.INTEGRATION_SYNC_INTERVAL_MINUTES = previousIntegrationSyncInterval;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
 test("Gmail autonomy notification direction, missing rule answers, and pending focus are safe", async () => {
   const previousIntegrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED;
   const previousIntegrationSyncInterval = process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;

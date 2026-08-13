@@ -1,9 +1,11 @@
 import {
   effectiveGmailSyncIntervalMinutes,
   effectiveGmailSyncMode,
+  evaluateGmailBackgroundSyncEligibility,
   gmailReviewNotificationsEnabled,
   gmailScheduledSyncRuntimeFromEnv,
   readGmailAutonomyPreferences,
+  type GmailBackgroundSyncEligibility,
   type GmailScheduledSyncRuntime,
   type GmailSyncMode
 } from "@operator-agent/core";
@@ -37,6 +39,10 @@ export interface GmailAutonomyState {
   ruleKinds: GmailRuleKind[];
   pendingEmailReviewCount: number;
   lastSyncedAt?: Date;
+  backgroundSync?: GmailBackgroundSyncEligibility;
+  lastBackgroundSyncAttemptedAt?: Date;
+  lastBackgroundSyncedAt?: Date;
+  nextBackgroundSyncAt?: Date;
   manualSyncAvailable: true;
   scheduledSyncAvailable: boolean;
   scheduledSyncEnabled: boolean;
@@ -82,6 +88,14 @@ export async function buildGmailAutonomyState(
   const preferences = readGmailAutonomyPreferences(primaryConnection?.config);
   const syncMode = primaryConnection ? effectiveGmailSyncMode(preferences, runtime) : "unknown";
   const syncIntervalMinutes = effectiveGmailSyncIntervalMinutes(preferences, runtime);
+  const backgroundSync = primaryConnection
+    ? evaluateGmailBackgroundSyncEligibility({
+        connection: primaryConnection,
+        now: new Date(),
+        runtime,
+        activeRuleCount: activeRules.length
+      })
+    : undefined;
   const recommendedRules = gmailRuleRecommendationsFromGoals(activeGoals, activeRules);
   const activeGoalsRelevantToGmail = relevantGmailGoals(activeGoals, activeRules);
   const lastSyncedAt = activeGmailConnections
@@ -99,6 +113,10 @@ export async function buildGmailAutonomyState(
     ruleKinds: [...new Set(activeRules.map(gmailRuleKind))],
     pendingEmailReviewCount,
     lastSyncedAt,
+    backgroundSync,
+    lastBackgroundSyncAttemptedAt: backgroundSync?.lastBackgroundSyncAttemptedAt,
+    lastBackgroundSyncedAt: backgroundSync?.lastBackgroundSyncedAt,
+    nextBackgroundSyncAt: backgroundSync?.nextDueAt,
     manualSyncAvailable: true,
     scheduledSyncAvailable: true,
     scheduledSyncEnabled: syncMode === "scheduled" && runtime.scheduledSyncEnabled,

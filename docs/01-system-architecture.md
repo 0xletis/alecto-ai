@@ -91,7 +91,7 @@ Current:
 
 Partial/local MVP:
 - [~] Gmail OAuth tokens are encrypted at rest in DB JSON config when `ALECTO_SECRET_ENCRYPTION_KEY` is set, sanitized from output, and legacy plaintext local tokens migrate on read/sync; production OAuth/account management and key rotation are still not implemented
-- [~] Scheduled integration sync is available but disabled by default through `INTEGRATION_SYNC_ENABLED=false`
+- [~] Scheduled integration sync is available but disabled by default through `INTEGRATION_SYNC_ENABLED=false`; Gmail additionally requires an explicit per-user scheduled preference and at least one active email rule
 
 Not implemented:
 - [ ] Gmail send/label mutations
@@ -108,7 +108,7 @@ The worker runs simple interval jobs. It does not use queues or a background job
 - [x] weekly insight delivery
 - [x] daily loop morning and evening delivery
 - [x] due/snoozed ActionItem reminders
-- [x] scheduled integration sync when enabled
+- [x] scheduled integration sync when enabled, including Gmail per-user manual-only/scheduled preference checks
 
 Duplicate proactive sends are controlled by `NotificationLog`, `ActionItemReminderLog`, integration dedupe keys, and per-job idempotency checks.
 

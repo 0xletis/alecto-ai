@@ -63,7 +63,9 @@ import {
   getSecretEncryptionKeyFromEnv,
   isEncryptedSecretJsonEnvelope,
   SecretEncryptionError,
+  evaluateGmailBackgroundSyncEligibility,
   writeGmailAutonomyPreferences,
+  writeGmailBackgroundSyncAttempt,
   UpdateIntegrationConnectionInputSchema,
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
@@ -2023,10 +2025,25 @@ export function buildServer() {
         });
       }
 
+      const body = isRecord(request.body) ? request.body : {};
+      const isBackgroundGmailSync = connection.integrationId === "gmail" && body.backgroundSync === true;
+      const backgroundAttemptedAt = isBackgroundGmailSync
+        ? parseOptionalDate(body.backgroundAttemptedAt) ?? new Date()
+        : undefined;
       const result =
         connection.integrationId === "github_public"
           ? await syncGithubPublicConnection(connection)
           : await syncGmailConnection(connection);
+
+      if (isBackgroundGmailSync && backgroundAttemptedAt) {
+        await recordGmailBackgroundSyncAttempt({
+          userId: connection.userId,
+          connectionId: connection.id,
+          attemptedAt: backgroundAttemptedAt,
+          status: result.status,
+          error: "error" in result ? result.error : undefined
+        });
+      }
 
       if (result.status === "error") {
         return reply.status(502).send({
@@ -2042,6 +2059,40 @@ export function buildServer() {
       }
 
       return result;
+    }
+  );
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>(
+    "/users/:userId/integrations/gmail/background-sync/debug",
+    async (request) => {
+      const state = await buildGmailAutonomyState(request.params.userId);
+      const now = parseOptionalNow(request.query.now) ?? new Date();
+      const connection = state.primaryConnection;
+      const eligibility = connection
+        ? evaluateGmailBackgroundSyncEligibility({
+            connection,
+            now,
+            runtime: state.runtime,
+            activeRuleCount: state.activeRules.length
+          })
+        : undefined;
+
+      return {
+        globalBackgroundIntegrationSyncEnabled: state.runtime.scheduledSyncEnabled,
+        gmailConnected: state.gmailConnected,
+        connectionId: connection?.id,
+        connectionStatus: connection?.status,
+        mode: state.syncMode,
+        intervalMinutes: state.syncIntervalMinutes,
+        lastBackgroundSyncAttemptedAt: eligibility?.lastBackgroundSyncAttemptedAt?.toISOString(),
+        lastBackgroundSyncedAt: eligibility?.lastBackgroundSyncedAt?.toISOString(),
+        nextDueAt: eligibility?.nextDueAt?.toISOString(),
+        activeRuleCount: state.activeRules.length,
+        notificationPreference: state.reviewNotificationEnabled ? "on" : "off",
+        deliveryAvailable: state.notificationDeliveryAvailable,
+        eligible: eligibility?.eligible ?? false,
+        reason: eligibility?.reason ?? "gmail_not_connected"
+      };
     }
   );
 
@@ -5941,6 +5992,7 @@ async function formatGmailSetupForConversation(userId: string): Promise<string> 
     "Alecto only scans Gmail through active rules.",
     `Mode: ${gmailSyncModeShortLabel(state)}.`,
     `Checks: ${gmailSyncModeSentence(state)}`,
+    ...formatGmailBackgroundScheduleLines(state),
     `Notifications: review-waiting notifications ${state.reviewNotificationEnabled ? "on" : "off"}; delivery ${state.deliveryChannel}.`,
     state.pendingEmailReviewCount > 0 ? pendingEmailReviewLine(state.pendingEmailReviewCount) : undefined,
     "",
@@ -7626,6 +7678,7 @@ async function formatGmailNotificationTimingForConversation(
       ? "That rule is not active right now, so it will not check Gmail until you resume it."
       : gmailSyncModeSentence(state),
     gmailAutomaticSyncDetail(state),
+    ...formatGmailBackgroundScheduleLines(state),
     "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
     "Only active Gmail rules are checked. Custom/work uncertain matches go to email review.",
     "Alecto cannot send emails or change labels.",
@@ -7646,6 +7699,60 @@ function gmailAutomaticSyncDetail(state: Awaited<ReturnType<typeof buildGmailAut
   }
 
   return "Automatic sync is off.";
+}
+
+function formatGmailBackgroundScheduleLines(state: Awaited<ReturnType<typeof buildGmailAutonomyState>>): string[] {
+  if (state.syncMode !== "scheduled" || !state.scheduledSyncEnabled) {
+    return [];
+  }
+
+  return [
+    state.lastBackgroundSyncAttemptedAt
+      ? `Last background check: ${formatRelativeTime(state.lastBackgroundSyncAttemptedAt)}.`
+      : "Last background check: not yet.",
+    state.nextBackgroundSyncAt
+      ? `Next background check: ${formatFutureRelativeTime(state.nextBackgroundSyncAt)}.`
+      : undefined
+  ].filter((line): line is string => Boolean(line));
+}
+
+function formatRelativeTime(value: Date, now = new Date()): string {
+  const diffMs = now.getTime() - value.getTime();
+
+  if (Math.abs(diffMs) < 60_000) {
+    return "just now";
+  }
+
+  if (diffMs < 0) {
+    return formatFutureRelativeTime(value, now);
+  }
+
+  return `${formatDurationMinutes(Math.max(1, Math.round(diffMs / 60_000)))} ago`;
+}
+
+function formatFutureRelativeTime(value: Date, now = new Date()): string {
+  const diffMs = value.getTime() - now.getTime();
+
+  if (diffMs <= 0) {
+    return "due now";
+  }
+
+  return `about ${formatDurationMinutes(Math.max(1, Math.ceil(diffMs / 60_000)))}`;
+}
+
+function formatDurationMinutes(minutes: number): string {
+  if (minutes < 60) {
+    return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+  }
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+
+  if (remainingMinutes === 0) {
+    return `${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+
+  return `${hours} hour${hours === 1 ? "" : "s"} ${remainingMinutes} minute${remainingMinutes === 1 ? "" : "s"}`;
 }
 
 function looksLikeGmailNotificationTimingQuestion(message: string): boolean {
@@ -10357,6 +10464,30 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       syncLog
     };
   }
+}
+
+async function recordGmailBackgroundSyncAttempt(input: {
+  userId: string;
+  connectionId: string;
+  attemptedAt: Date;
+  status: "success" | "error";
+  error?: string;
+}): Promise<void> {
+  const latestConnection = await getIntegrationConnection(input.userId, input.connectionId);
+
+  if (!latestConnection || latestConnection.integrationId !== "gmail") {
+    return;
+  }
+
+  await updateIntegrationConnectionConfig(
+    input.userId,
+    input.connectionId,
+    writeGmailBackgroundSyncAttempt(latestConnection.config, {
+      attemptedAt: input.attemptedAt,
+      status: input.status,
+      error: input.error
+    })
+  );
 }
 
 function dedupeActiveEmailRulesForSync(rules: EmailSignalRule[]): EmailSignalRule[] {
@@ -13092,6 +13223,10 @@ function parseOptionalNow(value: string | undefined): Date | undefined {
 
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+function parseOptionalDate(value: unknown): Date | undefined {
+  return typeof value === "string" ? parseOptionalNow(value) : undefined;
 }
 
 function startOfToday(): Date {
