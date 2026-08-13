@@ -213,6 +213,10 @@ import {
   gmailSyncModeSentence,
   gmailSyncModeShortLabel
 } from "./conversation/gmail-autonomy.js";
+import {
+  isConversationOrchestratorV2Enabled,
+  runConversationOrchestratorV2
+} from "./conversation/orchestrator-v2.js";
 
 type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
 
@@ -259,6 +263,48 @@ export function buildServer() {
     return { goalTemplate: template };
   });
 
+  server.post("/messages/process_v2", async (request, reply) => {
+    const parsed = ProcessMessageInputSchema.safeParse(request.body);
+
+    if (!parsed.success) {
+      return reply.status(400).send({
+        error: "Invalid request body",
+        issues: parsed.error.issues
+      });
+    }
+
+    await ensureUser(parsed.data.userId);
+    await expireOldPendingActions(parsed.data.userId);
+
+    const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message);
+
+    if (v2Result) {
+      return v2Result;
+    }
+
+    return replyOnly(parsed.data.userId, parsed.data.message, "Conversation Orchestrator v2 did not handle this message yet.", {
+      routerSource: "conversation_orchestrator_v2",
+      orchestrator: "v2",
+      v2Enabled: isConversationOrchestratorV2Enabled(),
+      intent: "not_migrated",
+      handlerName: "runConversationOrchestratorV2",
+      handledBy: "none",
+      skippedReason: "No v2 operation matched this message.",
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      llmPlannerUsed: false,
+      contextLoaded: false,
+      visibleContextType: "unknown",
+      visibleEntityCount: 0,
+      pendingConfirmation: false,
+      mutationExecuted: false,
+      semanticRouterAttempted: false,
+      semanticRouterUsed: false,
+      mutation: false,
+      reason: "This scope still uses legacy /messages/process."
+    });
+  });
+
   server.post("/messages/process", async (request, reply) => {
     const parsed = ProcessMessageInputSchema.safeParse(request.body);
 
@@ -271,6 +317,14 @@ export function buildServer() {
 
     await ensureUser(parsed.data.userId);
     await expireOldPendingActions(parsed.data.userId);
+
+    if (isConversationOrchestratorV2Enabled()) {
+      const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message);
+
+      if (v2Result) {
+        return v2Result;
+      }
+    }
 
     if (isStandaloneNowMessage(parsed.data.message)) {
       return replyOnly(parsed.data.userId, parsed.data.message, "What should I schedule now? Example: /action call Alex now");
@@ -324,7 +378,7 @@ export function buildServer() {
       return replyOnly(
         parsed.data.userId,
         parsed.data.message,
-        "Run /action_hygiene first, then reply with a cleanup command like: snooze 1 tomorrow."
+        "I don't have a visible cleanup item right now. Say 'clean up my tasks' first."
       );
     }
 
@@ -1028,8 +1082,9 @@ export function buildServer() {
     };
   });
 
-  server.get<{ Params: { userId: string } }>("/users/:userId/review/daily", async (request) => {
-    const todayRange = getLocalTodayRange(new Date(), await getUserTimezone(request.params.userId));
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/review/daily", async (request) => {
+    const now = parseOptionalNow(request.query.now) ?? new Date();
+    const todayRange = getLocalTodayRange(now, await getUserTimezone(request.params.userId));
 
     return {
       review: buildDailyReview({
@@ -1047,6 +1102,14 @@ export function buildServer() {
   server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/today", async (request) => ({
     brief: await generateDailyOperatorBrief(request.params.userId, { now: parseOptionalNow(request.query.now) })
   }));
+
+  server.get<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/operator-attention", async (request) => {
+    const now = parseOptionalNow(request.query.now) ?? new Date();
+
+    return {
+      attention: await buildOperatorAttentionState(request.params.userId, now)
+    };
+  });
 
   server.get<{ Params: { userId: string }; Querystring: { now?: string; markSent?: string; force?: string } }>(
     "/users/:userId/daily-loop/start-day",
@@ -1657,27 +1720,7 @@ export function buildServer() {
       const report = await analyzeActionHygiene(request.params.userId, now, timezone);
 
       if (request.query.debug !== "true") {
-        await replacePendingAction(request.params.userId, {
-          type: "action_hygiene",
-          summary: report.summary,
-          payload: {
-            originalText: "/action_hygiene",
-            now: now.toISOString(),
-            timezone,
-            candidates: report.suggestedCleanupCandidates.map((candidate) => candidate.actionId),
-            candidateActions: report.suggestedCleanupCandidates.map((candidate) => ({
-              ...toPendingActionCandidate({
-                id: candidate.actionId,
-                title: candidate.title,
-                status: "open",
-                dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
-                goalTitleSnapshot: candidate.linkedGoalTitle
-              }),
-              recommendedOptions: candidate.recommendedOptions
-            }))
-          },
-          expiresAt: pendingDecisionExpiry()
-        });
+        await storeActionHygieneSession(request.params.userId, "/action_hygiene", now, timezone, report, "legacy");
       }
 
       return {
@@ -2337,6 +2380,127 @@ async function buildAgentContext(userId: string) {
   };
 }
 
+async function buildOperatorAttentionState(
+  userId: string,
+  now = new Date(),
+  timezoneOverride?: string,
+  prefetched: {
+    actions?: ActionItem[];
+    activeGoals?: Goal[];
+    todayEvents?: StoredEvent[];
+    recentEvents?: StoredEvent[];
+    hygiene?: ActionHygieneReport;
+  } = {}
+): Promise<OperatorAttentionState> {
+  const timezone = timezoneOverride ?? await getUserTimezone(userId);
+  const todayRange = getLocalTodayRange(now, timezone);
+  const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  const [
+    actions,
+    activeGoals,
+    todayEvents,
+    recentEvents,
+    pendingReviews,
+    recentReviews,
+    emailRules,
+    gmailState,
+    latestWeeklyReview
+  ] = await Promise.all([
+    prefetched.actions ? Promise.resolve(prefetched.actions) : getActionItems(userId, { status: "all", limit: 100 }),
+    prefetched.activeGoals ? Promise.resolve(prefetched.activeGoals) : getActiveGoals(userId),
+    prefetched.todayEvents ? Promise.resolve(prefetched.todayEvents) : getEventsBetween(userId, todayRange.start, todayRange.end),
+    prefetched.recentEvents ? Promise.resolve(prefetched.recentEvents) : getEventsSince(userId, last24h),
+    getEmailReviewItems(userId, { status: "pending", limit: 50 }),
+    getEmailReviewItems(userId, { status: "all", limit: 50 }),
+    getEmailSignalRules(userId),
+    buildGmailAutonomyState(userId),
+    getLatestWeeklyReview(userId)
+  ]);
+  const visibleActions = actions.filter((action) => action.status !== "archived");
+  const openActions = visibleActions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
+  const overdueActions = openActions.filter((action) => action.dueAt && action.dueAt < now);
+  const dueSoonActions = openActions.filter((action) => isActionDueSoon(action, now));
+  const completedToday = visibleActions.filter((action) => action.status === "completed" && isWithinLocalDay(action.completedAt, todayRange));
+  const goalStatusesToday = activeGoals.map((goal) => buildGoalStatusToday(goal, todayEvents, openActions, completedToday));
+  const rankedOpenActions = sortDailyActionsByPriority(openActions, {
+    goals: activeGoals,
+    goalStatuses: goalStatusesToday,
+    recentEvents,
+    guardrailContext: {
+      hardGuardrailTriggeredToday: todayEvents.some((event) => event.type === "finance.betting.cooldown_triggered")
+    },
+    now,
+    timezone
+  });
+  const hygiene = prefetched.hygiene ?? await analyzeActionHygiene(userId, now, timezone);
+  const ruleById = new Map(emailRules.map((rule) => [rule.id, rule]));
+  const emailAttention = buildOperatorEmailAttentionSummary({
+    pendingReviews,
+    todayReviews: recentReviews.filter((review) => isWithinLocalDay(review.reviewedAt, todayRange)),
+    todayEvents,
+    actions: visibleActions,
+    activeGoals,
+    ruleById,
+    todayRange,
+    gmailSyncMode: gmailSyncModeShortLabel(gmailState),
+    reviewNotificationEnabled: gmailState.reviewNotificationEnabled
+  });
+  const risks = uniqueStrings([...buildOperatorRisks(recentEvents), ...buildOperatorGuardrailWatchouts(activeGoals)]);
+  const goalStatus = activeGoals.map((goal) => buildOperatorGoalStatus(goal, todayEvents, openActions, completedToday));
+  const actionAttention = buildOperatorActionAttentionSummary({
+    openActions,
+    overdueActions,
+    dueSoonActions,
+    rankedOpenActions,
+    hygiene
+  });
+  const goalAttention = buildOperatorGoalAttentionSummary(goalStatus, activeGoals);
+  const riskAttention = buildOperatorRiskAttentionSummary(risks, todayEvents);
+  const planningAttention = {
+    weeklyReviewDue: await shouldPromptWeeklyReview(userId, now, timezone),
+    latestWeeklyReviewDate: latestWeeklyReview?.reviewedEndLocalDate,
+    summary: latestWeeklyReview
+      ? `Latest weekly review covers ${latestWeeklyReview.weekStartLocalDate} to ${latestWeeklyReview.reviewedEndLocalDate}.`
+      : "No saved weekly review yet."
+  };
+  const topAttentionItems = buildTopOperatorAttentionItems({
+    rankedOpenActions,
+    overdueActions,
+    emailAttention,
+    risks,
+    hygiene,
+    planningAttention
+  });
+  const recommendedNextMove = pickAttentionNextMove(topAttentionItems, {
+    rankedOpenActions,
+    overdueActions,
+    emailAttention,
+    goalStatus,
+    now
+  });
+
+  return {
+    userId,
+    date: todayRange.date,
+    timezone,
+    topAttentionItems,
+    recommendedNextMove,
+    emailAttentionSummary: emailAttention,
+    actionAttentionSummary: actionAttention,
+    goalAttentionSummary: goalAttention,
+    riskAttentionSummary: riskAttention,
+    planningAttentionSummary: planningAttention,
+    suggestedUserReplies: buildOperatorSuggestedReplies(emailAttention),
+    confidence: topAttentionItems.length > 0 ? 0.88 : 0.72,
+    reasoning: [
+      `${openActions.length} open action${openActions.length === 1 ? "" : "s"}`,
+      `${overdueActions.length} overdue action${overdueActions.length === 1 ? "" : "s"}`,
+      `${emailAttention.pendingCount} pending Gmail review${emailAttention.pendingCount === 1 ? "" : "s"}`,
+      `${risks.length} risk watchout${risks.length === 1 ? "" : "s"}`
+    ]
+  };
+}
+
 async function generateDailyOperatorBrief(userId: string, options: { now?: Date } = {}): Promise<DailyOperatorBrief> {
   const now = options.now ?? new Date();
   const timezone = await getUserTimezone(userId);
@@ -2382,21 +2546,32 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
   const recentWins = buildOperatorRecentWins(todayEvents, completedToday, recentReviews, todayRange);
   const risks = uniqueStrings([...buildOperatorRisks(recentEvents), ...buildOperatorGuardrailWatchouts(activeGoals)]);
   const hygiene = await analyzeActionHygiene(userId, now, timezone);
+  const attention = await buildOperatorAttentionState(userId, now, timezone, {
+    actions,
+    activeGoals,
+    todayEvents,
+    recentEvents,
+    hygiene
+  });
   const topPriorities = buildOperatorTopPriorities({
     overdueActions,
     dueSoonActions,
     openActions: rankedActions,
     goalStatus,
     risks,
+    emailAttention: attention.emailAttentionSummary,
     priorityScores: rankedOpenActions.map((item) => item.score)
   });
-  const suggestedNextStep = pickOperatorNextStep({
-    overdueActions,
-    dueSoonActions,
-    openActions: rankedActions,
-    goalStatus,
-    now
-  });
+  const suggestedNextStep = attention.topAttentionItems[0]?.kind === "risk" && rankedActions.length > 0
+    ? pickOperatorNextStep({
+        overdueActions,
+        dueSoonActions,
+        openActions: rankedActions,
+        goalStatus,
+        emailAttention: attention.emailAttentionSummary,
+        now
+      })
+    : attention.recommendedNextMove;
   const briefContext = buildDailyBriefContext({
     date: todayRange.date,
     timezone,
@@ -2421,7 +2596,7 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
 
   return {
     date: todayRange.date,
-    summary: buildOperatorSummary({ openActions, overdueActions, activeGoals, todayEvents, risks }),
+    summary: buildOperatorSummary({ openActions, overdueActions, activeGoals, todayEvents, risks, emailAttention: attention.emailAttentionSummary }),
     coach: coachResult.coach,
     coachDebug: coachResult.debug,
     topPriorities,
@@ -2430,6 +2605,9 @@ async function generateDailyOperatorBrief(userId: string, options: { now?: Date 
     goalStatus,
     recentWins,
     risks,
+    emailAttention: attention.emailAttentionSummary.pendingCount > 0 || attention.emailAttentionSummary.handledTodayCount > 0
+      ? attention.emailAttentionSummary
+      : undefined,
     actionHygiene: hygiene.suggestedCleanupCandidates.length > 0 ? {
       summary: hygiene.summary,
       needsDecision: hygiene.suggestedCleanupCandidates.length
@@ -2455,12 +2633,16 @@ async function buildStartDayMessage(userId: string, now: Date): Promise<string> 
     .map((action) => action.title);
   const guardrail = brief.risks.find((risk) => /risk-control|guardrail|betting|trading|impulsive/i.test(risk));
   const hygiene = brief.actionHygiene;
+  const emailAttention = brief.emailAttention && brief.emailAttention.pendingCount > 0
+    ? `Email: ${brief.emailAttention.summary} Say "email reviews" to handle them.`
+    : undefined;
 
   return [
     `Today - ${brief.date}`,
     `First move: ${topAction ?? "Log one meaningful action."}`,
     overdue.length > 0 ? `Overdue: ${overdue.join(", ")}.` : undefined,
     alsoToday.length > 0 ? `Also today: ${alsoToday.join(", ")}.` : undefined,
+    emailAttention,
     hygiene ? `Hygiene: ${cleanupDecisionGrammar(hygiene.needsDecision)} Run /action_hygiene.` : undefined,
     brief.weeklyReviewDue ? "Weekly review due. Run /weekly." : undefined,
     brief.operatorReflection ? `Pattern: ${brief.operatorReflection}` : undefined,
@@ -2475,6 +2657,7 @@ async function buildEndDayMessage(userId: string, now: Date): Promise<string> {
   const brief = await generateDailyOperatorBrief(userId, { now });
   const completed = brief.recentWins.filter((win) => !/email review/i.test(win)).slice(0, 5);
   const hygiene = brief.actionHygiene;
+  const emailAttention = brief.emailAttention;
   const stillOpen = [...brief.overdueActions, ...brief.openActions]
     .filter((action, index, actions) => actions.findIndex((item) => item.id === action.id) === index)
     .slice(0, 5)
@@ -2487,6 +2670,15 @@ async function buildEndDayMessage(userId: string, now: Date): Promise<string> {
     "",
     "Still open:",
     stillOpen.length > 0 ? stillOpen.map((item) => `- ${item}`).join("\n") : "- No open action items.",
+    emailAttention && (emailAttention.pendingCount > 0 || emailAttention.handledTodayCount > 0)
+      ? [
+          "\nEmail signals:",
+          emailAttention.handledTodayCount > 0 ? `- ${emailAttention.handledTodayCount} Gmail review${emailAttention.handledTodayCount === 1 ? "" : "s"} handled today.` : undefined,
+          emailAttention.gmailDerivedActionItemsToday > 0 ? `- ${emailAttention.gmailDerivedActionItemsToday} Gmail-derived action item${emailAttention.gmailDerivedActionItemsToday === 1 ? "" : "s"} created today.` : undefined,
+          emailAttention.gmailDerivedEventsToday > 0 ? `- ${emailAttention.gmailDerivedEventsToday} Gmail-derived event${emailAttention.gmailDerivedEventsToday === 1 ? "" : "s"} logged today.` : undefined,
+          emailAttention.pendingCount > 0 ? `- ${emailAttention.pendingCount} Gmail review${emailAttention.pendingCount === 1 ? "" : "s"} still waiting.` : undefined
+        ].filter(Boolean).join("\n")
+      : undefined,
     hygiene ? "\nCleanup:\nReview overdue actions before tomorrow: /action_hygiene" : undefined,
     "",
     "Reply with what happened, what moved, or what to drop.",
@@ -2597,8 +2789,59 @@ async function analyzeActionHygiene(userId: string, now: Date, timezone: string)
     summary:
       suggestedCleanupCandidates.length > 0
         ? cleanupDecisionGrammar(suggestedCleanupCandidates.length)
+        : overdueActions.length > 0
+          ? cleanupDecisionGrammar(overdueActions.length)
         : "Action list is clean enough."
   };
+}
+
+async function createActionHygieneSession(
+  userId: string,
+  originalText: string,
+  now: Date,
+  createdBy: string
+): Promise<{ report: ActionHygieneReport; timezone: string }> {
+  const timezone = await getUserTimezone(userId);
+  const report = await analyzeActionHygiene(userId, now, timezone);
+
+  await storeActionHygieneSession(userId, originalText, now, timezone, report, createdBy);
+
+  return { report, timezone };
+}
+
+async function storeActionHygieneSession(
+  userId: string,
+  originalText: string,
+  now: Date,
+  timezone: string,
+  report: ActionHygieneReport,
+  createdBy: string
+): Promise<void> {
+  const visibleActions = actionHygieneVisibleActions(report);
+
+  await replacePendingAction(userId, {
+    type: "action_hygiene",
+    summary: report.summary,
+    payload: {
+      originalText,
+      now: now.toISOString(),
+      timezone,
+      visibleContextType: "action_hygiene_list",
+      createdBy,
+      candidates: visibleActions.map((candidate) => candidate.actionId),
+      candidateActions: visibleActions.map((candidate) => ({
+        ...toPendingActionCandidate({
+          id: candidate.actionId,
+          title: candidate.title,
+          status: "open",
+          dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
+          goalTitleSnapshot: candidate.linkedGoalTitle
+        }),
+        recommendedOptions: candidate.recommendedOptions
+      }))
+    },
+    expiresAt: pendingDecisionExpiry()
+  });
 }
 
 function analyzeActionHygieneItem(
@@ -2651,30 +2894,60 @@ function analyzeActionHygieneItem(
 }
 
 function formatActionHygieneReport(report: ActionHygieneReport): string {
-  if (report.suggestedCleanupCandidates.length === 0 && report.overdueActions.length === 0) {
+  const visibleActions = actionHygieneVisibleActions(report);
+
+  if (visibleActions.length === 0) {
     return `Action hygiene:\n${report.summary}`;
   }
-
-  const candidates = report.suggestedCleanupCandidates.length > 0 ? report.suggestedCleanupCandidates : report.overdueActions;
 
   return [
     "Action hygiene:",
     report.summary,
-    report.overdueActions.length > 0
-      ? ["Overdue:", ...report.overdueActions.slice(0, 10).map((action, index) => `${index + 1}. ${formatHygieneActionLine(action)}`)].join("\n")
+    visibleActions.some((action) => action.daysOverdue !== undefined && action.daysOverdue >= 1)
+      ? ["Overdue:", ...visibleActions.map((action, index) => `${index + 1}. ${formatHygieneActionLine(action)}`)].join("\n")
       : undefined,
     "",
     "Suggested cleanup:",
-    ...candidates.slice(0, 10).map((action) => `- ${action.title}: ${action.recommendedOptions.join(", ")}?`),
+    ...visibleActions.map((action, index) => `${index + 1}. ${action.title}: ${action.recommendedOptions.join(", ")}?`),
     "",
     "Reply with:",
-    '- "snooze 1 tomorrow"',
-    '- "archive 2"',
-    '- "complete 1"',
-    '- "keep 1"'
+    ...formatActionHygieneReplyExamples(visibleActions)
   ]
     .filter((line) => line !== undefined)
     .join("\n");
+}
+
+function actionHygieneVisibleActions(report: ActionHygieneReport): ActionHygieneAction[] {
+  return uniqueHygieneActions([
+    ...report.overdueActions,
+    ...report.suggestedCleanupCandidates
+  ]).slice(0, 10);
+}
+
+function formatActionHygieneReplyExamples(actions: ActionHygieneAction[]): string[] {
+  const examples: string[] = [];
+  const firstSnooze = actions.find((action) => action.recommendedOptions.includes("snooze"));
+  const firstComplete = actions.find((action) => action.recommendedOptions.includes("complete"));
+  const firstArchive = actions.find((action) => action.recommendedOptions.includes("archive"));
+  const firstKeep = actions.find((action) => action.recommendedOptions.includes("keep"));
+
+  if (firstSnooze) {
+    examples.push(`- "snooze ${actions.indexOf(firstSnooze) + 1} tomorrow"`);
+  }
+
+  if (firstComplete) {
+    examples.push(`- "complete ${actions.indexOf(firstComplete) + 1}"`);
+  }
+
+  if (firstArchive) {
+    examples.push(`- "archive ${actions.indexOf(firstArchive) + 1}"`);
+  }
+
+  if (firstKeep) {
+    examples.push(`- "keep ${actions.indexOf(firstKeep) + 1}"`);
+  }
+
+  return examples;
 }
 
 function formatActionHygieneDebug(report: ActionHygieneReport): string {
@@ -3231,6 +3504,11 @@ function stringFromRecord(record: Record<string, unknown>, key: string): string 
   return typeof value === "string" ? value : undefined;
 }
 
+function finiteNumberFromRecord(record: Record<string, unknown>, key: string): number {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 function sharesMeaningfulToken(left: string, right: string): boolean {
   const rightTokens = new Set(right.split(" ").filter((token) => token.length >= 4));
   return left.split(" ").some((token) => token.length >= 4 && rightTokens.has(token));
@@ -3258,11 +3536,12 @@ async function buildWeeklyReviewContext(
   const nextEnd = addDaysToLocalDateString(reviewedEnd, 1);
   const plannedRangeEnd = localDateStartUtc(nextEnd, timezone);
   const rangeEnd = now < plannedRangeEnd ? now : plannedRangeEnd;
-  const [activeGoals, actions, events, memories] = await Promise.all([
+  const [activeGoals, actions, events, memories, emailReviews] = await Promise.all([
     getActiveGoals(userId),
     getActionItems(userId, { status: "all", limit: 300 }),
     getEventsBetween(userId, rangeStart, rangeEnd),
-    getActiveMemories(userId)
+    getActiveMemories(userId),
+    getEmailReviewItems(userId, { status: "all", limit: 300 })
   ]);
   const actionInWeek = (action: ActionItem) =>
     isDateInRange(action.completedAt, rangeStart, rangeEnd) ||
@@ -3282,6 +3561,13 @@ async function buildWeeklyReviewContext(
   const goalsWithProgress = goalProgress.filter((goal) => goal.progressCount > 0);
   const goalsWithoutProgress = goalProgress.filter((goal) => goal.progressCount === 0 && !goal.isRiskControl);
   const dailyLoopCounts = await getWeeklyDailyLoopCounts(userId, weekStart, reviewedEnd);
+  const emailAttention = buildWeeklyEmailAttentionSummary({
+    emailReviews,
+    actions,
+    events,
+    rangeStart,
+    rangeEnd
+  });
 
   return {
     userId,
@@ -3300,6 +3586,7 @@ async function buildWeeklyReviewContext(
     snoozedOrRescheduledActions,
     archivedActions,
     guardrailEvents,
+    emailAttention,
     goalProgress,
     goalsWithProgress,
     goalsWithoutProgress,
@@ -3324,6 +3611,7 @@ async function generateAndSaveWeeklyReview(userId: string, context: WeeklyReview
     stalls: generated.stalls,
     goalProgress: generated.goalProgress,
     guardrailSummary: generated.guardrailSummary,
+    emailAttention: context.emailAttention,
     patterns: generated.patterns,
     recommendedNextWeekActions: generated.recommendedNextWeekActions,
     reflectionIds: generated.reflectionIds,
@@ -3470,9 +3758,22 @@ function weeklyReviewWins(context: WeeklyReviewContext): string[] {
   const workouts = countType(context.eventsByType, "health.workout_completed");
   const applications = countType(context.eventsByType, "career.application_sent");
   const customProgress = countType(context.eventsByType, "custom.goal_progress_logged");
+  const emailReviewsHandled = context.emailAttention.reviewsApproved + context.emailAttention.reviewsRejected;
 
   if (context.completedActions.length > 0) {
     wins.push(`Completed ${context.completedActions.length} action${context.completedActions.length === 1 ? "" : "s"}.`);
+  }
+
+  if (emailReviewsHandled > 0) {
+    wins.push(`Handled ${emailReviewsHandled} Gmail review${emailReviewsHandled === 1 ? "" : "s"}.`);
+  }
+
+  if (context.emailAttention.gmailDerivedActionItems > 0) {
+    wins.push(`Created ${context.emailAttention.gmailDerivedActionItems} action item${context.emailAttention.gmailDerivedActionItems === 1 ? "" : "s"} from Gmail review.`);
+  }
+
+  if (context.emailAttention.gmailDerivedEvents > 0) {
+    wins.push(`Logged ${context.emailAttention.gmailDerivedEvents} Gmail-derived event${context.emailAttention.gmailDerivedEvents === 1 ? "" : "s"}.`);
   }
 
   if (workouts > 0) {
@@ -3508,6 +3809,10 @@ function weeklyReviewStalls(context: WeeklyReviewContext): string[] {
 
   if (context.actionHygiene.suggestedCleanupCandidates.length > 0) {
     stalls.push(`Overdue/stale actions needing decisions: ${context.actionHygiene.suggestedCleanupCandidates.length}.`);
+  }
+
+  if (context.emailAttention.pendingReviews > 0) {
+    stalls.push(`${context.emailAttention.pendingReviews} Gmail review${context.emailAttention.pendingReviews === 1 ? "" : "s"} waiting for a decision.`);
   }
 
   return stalls.length > 0 ? stalls : ["No major stalls detected from logged data."];
@@ -3630,6 +3935,7 @@ function toWeeklyReviewMemory(memory: MemoryEntry): WeeklyReviewMemory {
     stalls: arrayOfStrings(data.stalls),
     goalProgress: Array.isArray(data.goalProgress) ? data.goalProgress : [],
     guardrailSummary: isRecord(data.guardrailSummary) ? data.guardrailSummary : {},
+    emailAttention: parseStoredWeeklyEmailAttentionSummary(data.emailAttention),
     patterns: arrayOfStrings(data.patterns).slice(0, 2),
     recommendedNextWeekActions: arrayOfStrings(data.recommendedNextWeekActions).slice(0, 3),
     reflectionIds: arrayOfStrings(data.reflectionIds),
@@ -3637,6 +3943,47 @@ function toWeeklyReviewMemory(memory: MemoryEntry): WeeklyReviewMemory {
     createdAt: memory.createdAt,
     updatedAt: memory.updatedAt
   };
+}
+
+function parseStoredWeeklyEmailAttentionSummary(value: unknown): WeeklyEmailAttentionSummary | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const byKind = isRecord(value.byKind) ? value.byKind : {};
+
+  return {
+    reviewsCreated: finiteNumberFromRecord(value, "reviewsCreated"),
+    reviewsApproved: finiteNumberFromRecord(value, "reviewsApproved"),
+    reviewsRejected: finiteNumberFromRecord(value, "reviewsRejected"),
+    pendingReviews: finiteNumberFromRecord(value, "pendingReviews"),
+    gmailDerivedActionItems: finiteNumberFromRecord(value, "gmailDerivedActionItems"),
+    gmailDerivedEvents: finiteNumberFromRecord(value, "gmailDerivedEvents"),
+    byKind: {
+      jobSearch: finiteNumberFromRecord(byKind, "jobSearch"),
+      workAction: finiteNumberFromRecord(byKind, "workAction"),
+      custom: finiteNumberFromRecord(byKind, "custom"),
+      other: finiteNumberFromRecord(byKind, "other")
+    }
+  };
+}
+
+function formatWeeklyEmailSignalsForReview(emailAttention: WeeklyEmailAttentionSummary | undefined): string {
+  if (!emailAttention) {
+    return "- No Gmail review summary stored for this weekly review.";
+  }
+
+  const lines = [
+    emailAttention.reviewsCreated > 0 ? `- ${emailAttention.reviewsCreated} Gmail review${emailAttention.reviewsCreated === 1 ? "" : "s"} created this reviewed period.` : undefined,
+    emailAttention.reviewsApproved + emailAttention.reviewsRejected > 0
+      ? `- ${emailAttention.reviewsApproved} approved, ${emailAttention.reviewsRejected} rejected.`
+      : undefined,
+    emailAttention.gmailDerivedActionItems > 0 ? `- ${emailAttention.gmailDerivedActionItems} action item${emailAttention.gmailDerivedActionItems === 1 ? "" : "s"} created from Gmail review.` : undefined,
+    emailAttention.gmailDerivedEvents > 0 ? `- ${emailAttention.gmailDerivedEvents} Gmail-derived event${emailAttention.gmailDerivedEvents === 1 ? "" : "s"} logged.` : undefined,
+    emailAttention.pendingReviews > 0 ? `- ${emailAttention.pendingReviews} Gmail review${emailAttention.pendingReviews === 1 ? "" : "s"} still waiting. Say "email reviews" to handle ${emailAttention.pendingReviews === 1 ? "it" : "them"}.` : undefined
+  ].filter(Boolean);
+
+  return lines.length > 0 ? lines.join("\n") : "- No Gmail review activity in this reviewed period.";
 }
 
 function formatWeeklyReview(review: WeeklyReviewMemory): string {
@@ -3658,6 +4005,9 @@ function formatWeeklyReview(review: WeeklyReviewMemory): string {
     "",
     "Guardrails:",
     `- ${typeof review.guardrailSummary.note === "string" ? review.guardrailSummary.note : "No guardrail summary."}`,
+    "",
+    "Email signals:",
+    formatWeeklyEmailSignalsForReview(review.emailAttention),
     "",
     "Patterns:",
     review.patterns.length > 0 ? review.patterns.map((pattern) => `- ${pattern}`).join("\n") : "- No active operator reflections included.",
@@ -3689,6 +4039,7 @@ function summarizeWeeklyReviewContext(context: WeeklyReviewContext) {
     },
     counts: weeklyContextCounts(context),
     eventsByType: context.eventsByType,
+    emailAttention: context.emailAttention,
     goalsWithProgress: context.goalsWithProgress.map((goal) => goal.title),
     goalsWithoutProgress: context.goalsWithoutProgress.map((goal) => goal.title),
     activeReflections: context.activeReflections.map((reflection) => typeof reflection.data?.title === "string" ? reflection.data.title : reflection.summary)
@@ -3707,6 +4058,10 @@ function formatWeeklyReviewContextDebug(context: WeeklyReviewContext): string {
     `overdue/stale actions: ${counts.overdueActions}`,
     `snoozes/reschedules: ${counts.snoozedOrRescheduledActions}`,
     `guardrail triggers: ${counts.guardrailTriggers}`,
+    `Gmail reviews created: ${counts.gmailReviewsCreated}`,
+    `Gmail reviews pending: ${counts.gmailReviewsPending}`,
+    `Gmail-derived actions: ${counts.gmailDerivedActionItems}`,
+    `Gmail-derived events: ${counts.gmailDerivedEvents}`,
     `goals with progress: ${context.goalsWithProgress.length}`,
     `goals without progress: ${context.goalsWithoutProgress.length}`,
     `active reflections: ${context.activeReflections.length}`,
@@ -3764,6 +4119,7 @@ async function buildNextWeekPlanContext(
     recentEventsSummary: weeklyContext.eventsByType,
     guardrailGoals: weeklyContext.activeGoals.filter(isRiskControlGoal),
     guardrailEvents: weeklyContext.guardrailEvents,
+    emailAttention: weeklyContext.emailAttention,
     futureActionsNextWeek,
     reviewedWeek: {
       weekStartLocalDate: weeklyContext.weekStartLocalDate,
@@ -3805,6 +4161,26 @@ function generateDeterministicNextWeekPlanSuggestions(context: NextWeekPlanConte
       creatable: false,
       dedupeKey: `weekly_plan.cleanup.${staleAction.actionId}`,
       notCreatableReason: "Use /action_hygiene or say a natural cleanup command like snooze, complete, or archive."
+    });
+  }
+
+  if (context.emailAttention.pendingReviews > 0) {
+    suggestions.push({
+      index: 0,
+      title: "Clear pending Gmail reviews",
+      reason: `${context.emailAttention.pendingReviews} Gmail review${context.emailAttention.pendingReviews === 1 ? " is" : "s are"} already waiting for a decision.`,
+      goalId: undefined,
+      goalTitle: undefined,
+      priority: context.emailAttention.byKind.workAction > 0 ? "high" : "medium",
+      actionPriority: "medium",
+      suggestedDueAt: localPlanDate(context, 0, 10 * 60),
+      actionType: "generic",
+      source: "weekly_plan",
+      duplicateRisk: true,
+      planKind: "cleanup",
+      creatable: false,
+      dedupeKey: "weekly_plan.email_reviews_cleanup",
+      notCreatableReason: "Say \"email reviews\" or \"show me the important emails\"; those reviews already exist."
     });
   }
 
@@ -4106,6 +4482,14 @@ function compactNextWeekPlanLlmContext(context: NextWeekPlanContext, determinist
       dueAt: action.dueAt,
       goalId: action.goalId
     })),
+    emailAttention: {
+      pendingReviews: context.emailAttention.pendingReviews,
+      reviewsCreated: context.emailAttention.reviewsCreated,
+      reviewsApproved: context.emailAttention.reviewsApproved,
+      reviewsRejected: context.emailAttention.reviewsRejected,
+      gmailDerivedActionItems: context.emailAttention.gmailDerivedActionItems,
+      gmailDerivedEvents: context.emailAttention.gmailDerivedEvents
+    },
     guardrailGoals: context.guardrailGoals.map((goal) => ({
       id: goal.id,
       title: goal.title,
@@ -4292,6 +4676,10 @@ function inferWeeklyPlanDedupeKey(title: string, goalTitle?: string): string | u
     return "weekly_plan.review_open_actions";
   }
 
+  if (/gmail|email|mail|correo|correu/.test(text) && /review|pending|waiting|important|clear/.test(text)) {
+    return "weekly_plan.email_reviews_cleanup";
+  }
+
   if (/meaningful.*progress|progress.*action/.test(text)) {
     return "weekly_plan.progress_action";
   }
@@ -4345,6 +4733,7 @@ function summarizeNextWeekPlanContext(context: NextWeekPlanContext) {
     staleActions: context.staleActions.length,
     activeReflections: context.activeReflections.length,
     futureActionsAlreadyScheduled: context.futureActionsNextWeek.length,
+    emailAttention: context.emailAttention,
     guardrailGoals: context.guardrailGoals.map((goal) => goal.title),
     recentEventsSummary: context.recentEventsSummary
   };
@@ -4359,6 +4748,9 @@ function formatNextWeekPlanContextDebug(context: NextWeekPlanContext): string {
     `goals with no progress: ${context.goalsWithNoProgress.length}`,
     `open actions: ${context.openActions.length}`,
     `stale actions: ${context.staleActions.length}`,
+    `Gmail reviews pending: ${context.emailAttention.pendingReviews}`,
+    `Gmail reviews created this reviewed period: ${context.emailAttention.reviewsCreated}`,
+    `Gmail-derived actions this reviewed period: ${context.emailAttention.gmailDerivedActionItems}`,
     `active reflections: ${context.activeReflections.length}`,
     `future actions already scheduled: ${context.futureActionsNextWeek.length}`,
     `guardrail goals: ${context.guardrailGoals.length}`,
@@ -4749,7 +5141,13 @@ function isCreatableNewPlanSuggestion(suggestion: NextWeekPlanSuggestion): boole
 function formatNextWeekPlanSuggestionLine(suggestion: NextWeekPlanSuggestion, timezone: string): string {
   const tags = [
     suggestion.planKind === "cleanup" ? "cleanup" : undefined,
-    suggestion.duplicateRisk ? suggestion.planKind === "cleanup" ? "already open" : "already covered" : undefined,
+    suggestion.duplicateRisk
+      ? suggestion.planKind === "cleanup" && suggestion.dedupeKey === "weekly_plan.email_reviews_cleanup"
+        ? "already waiting"
+        : suggestion.planKind === "cleanup"
+          ? "already open"
+          : "already covered"
+      : undefined,
     suggestion.creatable === false ? "not creatable" : undefined
   ].filter(Boolean).join(" - ");
   const suffix = tags ? ` - ${tags}` : "";
@@ -4766,6 +5164,10 @@ function formatNextWeekPlanSuggestionLine(suggestion: NextWeekPlanSuggestion, ti
 }
 
 function formatSkippedNextWeekPlanSuggestion(suggestion: NextWeekPlanSuggestion): string {
+  if (suggestion.dedupeKey === "weekly_plan.email_reviews_cleanup") {
+    return `${suggestion.title} is already an email review inbox item. Say "email reviews" or "show me the important emails" to handle it.`;
+  }
+
   if (suggestion.planKind === "cleanup" || suggestion.creatable === false) {
     return `${suggestion.title} is already an open action. Use /action_hygiene to complete, snooze, or archive it.`;
   }
@@ -4899,8 +5301,55 @@ function weeklyContextCounts(context: WeeklyReviewContext) {
     guardrailTriggers: context.guardrailEvents.length,
     activeGoals: context.activeGoals.length,
     activeReflections: context.activeReflections.length,
+    gmailReviewsCreated: context.emailAttention.reviewsCreated,
+    gmailReviewsApproved: context.emailAttention.reviewsApproved,
+    gmailReviewsRejected: context.emailAttention.reviewsRejected,
+    gmailReviewsPending: context.emailAttention.pendingReviews,
+    gmailDerivedActionItems: context.emailAttention.gmailDerivedActionItems,
+    gmailDerivedEvents: context.emailAttention.gmailDerivedEvents,
     morningBriefs: context.dailyLoopCounts.morningBriefs,
     eveningReviews: context.dailyLoopCounts.eveningReviews
+  };
+}
+
+function buildWeeklyEmailAttentionSummary(input: {
+  emailReviews: EmailReviewItem[];
+  actions: ActionItem[];
+  events: StoredEvent[];
+  rangeStart: Date;
+  rangeEnd: Date;
+}): WeeklyEmailAttentionSummary {
+  const reviewsCreated = input.emailReviews.filter((review) => isDateInRange(review.createdAt, input.rangeStart, input.rangeEnd));
+  const reviewsHandled = input.emailReviews.filter((review) => isDateInRange(review.reviewedAt, input.rangeStart, input.rangeEnd));
+  const byKind = reviewsCreated.reduce(
+    (counts, review) => {
+      const kind = emailReviewKind(review);
+      if (kind === "job_search") {
+        counts.jobSearch += 1;
+      } else if (kind === "work_action") {
+        counts.workAction += 1;
+      } else if (kind === "custom_tracking") {
+        counts.custom += 1;
+      } else {
+        counts.other += 1;
+      }
+      return counts;
+    },
+    { jobSearch: 0, workAction: 0, custom: 0, other: 0 }
+  );
+
+  return {
+    reviewsCreated: reviewsCreated.length,
+    reviewsApproved: reviewsHandled.filter((review) => review.status === "approved").length,
+    reviewsRejected: reviewsHandled.filter((review) => review.status === "rejected").length,
+    pendingReviews: input.emailReviews.filter((review) => review.status === "pending").length,
+    gmailDerivedActionItems: input.actions.filter(
+      (action) => action.source === "email_review" && isDateInRange(action.createdAt, input.rangeStart, input.rangeEnd)
+    ).length,
+    gmailDerivedEvents: input.events.filter(
+      (event) => event.source === "gmail" || event.provider === "gmail" || event.data.provider === "gmail"
+    ).length,
+    byKind
   };
 }
 
@@ -4970,12 +5419,16 @@ function buildOperatorSummary(input: {
   activeGoals: Awaited<ReturnType<typeof getActiveGoals>>;
   todayEvents: StoredEvent[];
   risks: string[];
+  emailAttention?: OperatorEmailAttentionSummary;
 }): string {
   const parts = [
     `${input.openActions.length} open action${input.openActions.length === 1 ? "" : "s"}`,
     input.overdueActions.length > 0 ? `${input.overdueActions.length} overdue` : undefined,
     `${input.activeGoals.length} active goal${input.activeGoals.length === 1 ? "" : "s"}`,
     `${input.todayEvents.length} event${input.todayEvents.length === 1 ? "" : "s"} logged today`,
+    input.emailAttention && input.emailAttention.pendingCount > 0
+      ? `${input.emailAttention.pendingCount} Gmail review${input.emailAttention.pendingCount === 1 ? "" : "s"} waiting`
+      : undefined,
     input.risks.length > 0 ? `${input.risks.length} risk watchout${input.risks.length === 1 ? "" : "s"}` : undefined
   ].filter(Boolean);
 
@@ -5215,6 +5668,8 @@ type ConversationSurfaceIntent =
   | "configure_actions"
   | "configure_daily_loop"
   | "configure_integrations"
+  | "operator_attention_query"
+  | "operator_next_move_query"
   | "daily_operator"
   | "start_day"
   | "daily_review"
@@ -5226,8 +5681,11 @@ type ConversationSurfaceIntent =
   | "show_goals"
   | "show_actions"
   | "show_memory"
+  | "email_attention_query"
   | "email_review_inbox"
   | "email_review_action"
+  | "email_review_summary"
+  | "goal_signal_query"
   | "email_rules_list"
   | "gmail_sync"
   | "integration_sync"
@@ -5280,6 +5738,15 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     return composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_integrations");
   }
 
+  if (intent === "operator_attention_query") {
+    return formatOperatorAttentionForConversation(await buildOperatorAttentionState(userId));
+  }
+
+  if (intent === "operator_next_move_query") {
+    const state = await buildOperatorAttentionState(userId);
+    return formatOperatorNextMoveForConversation(state);
+  }
+
   if (intent === "daily_operator") {
     return formatConversationTodayReply(await generateDailyOperatorBrief(userId));
   }
@@ -5297,7 +5764,12 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     const now = new Date();
     const context = await buildWeeklyReviewContext(userId, undefined, timezone, now);
     const existing = await getWeeklyReviewForWeek(userId, context.weekStartLocalDate);
-    const review = existing ? toWeeklyReviewMemory(existing) : await generateAndSaveWeeklyReview(userId, context);
+    const existingReview = existing ? toWeeklyReviewMemory(existing) : undefined;
+    const shouldRegenerate =
+      !existingReview ||
+      !existingReview.reviewedEndLocalDate ||
+      existingReview.reviewedEndLocalDate < context.reviewedEndLocalDate;
+    const review = shouldRegenerate ? await generateAndSaveWeeklyReview(userId, context) : existingReview;
     return appendWeeklyPlanningNextStep(formatWeeklyReview(review));
   }
 
@@ -5315,29 +5787,7 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
 
   if (intent === "action_hygiene") {
     const now = new Date();
-    const timezone = await getUserTimezone(userId);
-    const report = await analyzeActionHygiene(userId, now, timezone);
-    await replacePendingAction(userId, {
-      type: "action_hygiene",
-      summary: report.summary,
-      payload: {
-        originalText: message,
-        now: now.toISOString(),
-        timezone,
-        candidates: report.suggestedCleanupCandidates.map((candidate) => candidate.actionId),
-        candidateActions: report.suggestedCleanupCandidates.map((candidate) => ({
-          ...toPendingActionCandidate({
-            id: candidate.actionId,
-            title: candidate.title,
-            status: "open",
-            dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
-            goalTitleSnapshot: candidate.linkedGoalTitle
-          }),
-          recommendedOptions: candidate.recommendedOptions
-        }))
-      },
-      expiresAt: pendingDecisionExpiry()
-    });
+    const { report } = await createActionHygieneSession(userId, message, now, "legacy_conversation_surface");
     return formatActionHygieneReport(report);
   }
 
@@ -5351,6 +5801,10 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
 
   if (intent === "show_memory") {
     return formatMemoriesForConversation(await getActiveMemories(userId));
+  }
+
+  if (intent === "email_attention_query" || intent === "email_review_summary" || intent === "goal_signal_query") {
+    return formatEmailAttentionForConversation(await buildOperatorAttentionState(userId));
   }
 
   if (intent === "email_review_inbox") {
@@ -6661,6 +7115,16 @@ async function handleSemanticRouterIntent(
     reply = composeOnboardingReply(await buildOnboardingState(userId, new Date(), await getUserTimezone(userId)), "configure_integrations");
   }
 
+  if (route.intent === "operator_attention_query") {
+    handlerName = "buildOperatorAttentionState";
+    reply = formatOperatorAttentionForConversation(await buildOperatorAttentionState(userId));
+  }
+
+  if (route.intent === "operator_next_move_query") {
+    handlerName = "buildOperatorAttentionState";
+    reply = formatOperatorNextMoveForConversation(await buildOperatorAttentionState(userId));
+  }
+
   if (route.intent === "daily_operator") {
     handlerName = "generateDailyOperatorBrief";
     reply = formatConversationTodayReply(await generateDailyOperatorBrief(userId));
@@ -6673,7 +7137,7 @@ async function handleSemanticRouterIntent(
 
   if (route.intent === "daily_review") {
     handlerName = "buildConversationDailyReview";
-    reply = formatConversationDailyReview(await buildConversationDailyReview(userId));
+    reply = formatConversationDailyReview(await buildConversationDailyReview(userId, new Date()));
   }
 
   if (route.intent === "weekly_review") {
@@ -6682,9 +7146,14 @@ async function handleSemanticRouterIntent(
     const now = new Date();
     const context = await buildWeeklyReviewContext(userId, undefined, timezone, now);
     const existing = await getWeeklyReviewForWeek(userId, context.weekStartLocalDate);
-    const review = existing ? toWeeklyReviewMemory(existing) : await generateAndSaveWeeklyReview(userId, context);
+    const existingReview = existing ? toWeeklyReviewMemory(existing) : undefined;
+    const shouldRegenerate =
+      !existingReview ||
+      !existingReview.reviewedEndLocalDate ||
+      existingReview.reviewedEndLocalDate < context.reviewedEndLocalDate;
+    const review = shouldRegenerate ? await generateAndSaveWeeklyReview(userId, context) : existingReview;
     reply = appendWeeklyPlanningNextStep(formatWeeklyReview(review));
-    mutation = !existing;
+    mutation = shouldRegenerate;
   }
 
   if (route.intent === "current_week_plan" || route.intent === "next_week_plan" || route.intent === "ambiguous_plan") {
@@ -6700,29 +7169,7 @@ async function handleSemanticRouterIntent(
   if (route.intent === "action_hygiene") {
     handlerName = "analyzeActionHygiene";
     const now = new Date();
-    const timezone = await getUserTimezone(userId);
-    const report = await analyzeActionHygiene(userId, now, timezone);
-    await replacePendingAction(userId, {
-      type: "action_hygiene",
-      summary: report.summary,
-      payload: {
-        originalText: message,
-        now: now.toISOString(),
-        timezone,
-        candidates: report.suggestedCleanupCandidates.map((candidate) => candidate.actionId),
-        candidateActions: report.suggestedCleanupCandidates.map((candidate) => ({
-          ...toPendingActionCandidate({
-            id: candidate.actionId,
-            title: candidate.title,
-            status: "open",
-            dueAt: candidate.dueAt ? new Date(candidate.dueAt) : undefined,
-            goalTitleSnapshot: candidate.linkedGoalTitle
-          }),
-          recommendedOptions: candidate.recommendedOptions
-        }))
-      },
-      expiresAt: pendingDecisionExpiry()
-    });
+    const { report } = await createActionHygieneSession(userId, message, now, "legacy_semantic_surface");
     reply = formatActionHygieneReport(report);
     mutation = true;
   }
@@ -6740,6 +7187,11 @@ async function handleSemanticRouterIntent(
   if (route.intent === "show_memory") {
     handlerName = "formatMemoriesForConversation";
     reply = formatMemoriesForConversation(await getActiveMemories(userId));
+  }
+
+  if (route.intent === "email_attention_query" || route.intent === "email_review_summary" || route.intent === "goal_signal_query") {
+    handlerName = "buildOperatorAttentionState";
+    reply = formatEmailAttentionForConversation(await buildOperatorAttentionState(userId));
   }
 
   if (route.intent === "email_review_inbox") {
@@ -7021,12 +7473,52 @@ function detectDeterministicSemanticRouterIntent(message: string, pendingAction?
     };
   }
 
+  if (
+    /\b(anything important|what needs my attention|what should i handle|what should i focus on|what changed since yesterday|que tengo pendiente|qué tengo pendiente|que tinc pendent|què tinc pendent|hi ha alguna cosa important)\b/.test(text)
+  ) {
+    return {
+      intent: /\b(first|primero|primer|handle first|do first|next move)\b/.test(text) ? "operator_next_move_query" : "operator_attention_query",
+      operation: "review",
+      confidence: 0.9,
+      reason: "User asks for the current operator attention state.",
+      language: "unknown",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
+  }
+
   if (looksLikeEmailReviewInboxRequest(message)) {
     return {
       intent: "email_review_inbox",
       operation: "review",
       confidence: 0.94,
       reason: "User asks to show pending email review items.",
+      language: "unknown",
+      sideEffectRisk: "read",
+      requiresConfirmation: false,
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
+  }
+
+  if (looksLikeEmailAttentionQuery(message)) {
+    return {
+      intent: "email_attention_query",
+      operation: "review",
+      confidence: 0.9,
+      reason: "User asks whether Gmail/email items need action.",
       language: "unknown",
       sideEffectRisk: "read",
       requiresConfirmation: false,
@@ -7786,6 +8278,11 @@ async function manageCustomGmailRuleForConversation(
 
   const rules = await getVisibleGmailEmailRules(userId);
 
+  const contextualIgnoreReply = maybeHandleGmailRuleIgnoreWithoutVisibleReviewContext(message, rules, parsed.target);
+  if (contextualIgnoreReply) {
+    return contextualIgnoreReply;
+  }
+
   if (parsed.operation === "archive" && isAllCustomGmailRulesTarget(message, parsed.target)) {
     const selectedRules = sortEmailRuleCandidates(
       normalizeForComparison(`${message} ${parsed.target ?? ""}`).includes("custom")
@@ -7862,6 +8359,11 @@ async function manageCustomGmailRuleForConversation(
   }, pendingAction));
 
   if (matches.length === 0) {
+    const target = parsed.target ?? extractGmailRuleQuestionTarget(message) ?? extractLikelyRuleTargetsFromMessage(message)[0];
+    if (target && isCustomGmailRuleQuestionTarget(target)) {
+      return formatMissingEmailRuleManagementContext(target);
+    }
+
     return "I could not find a matching custom Gmail rule. Use /my_email_rules to check the exact rule.";
   }
 
@@ -7921,6 +8423,43 @@ async function getVisibleGmailEmailRules(userId: string): Promise<EmailSignalRul
   return rules.filter((rule) => rule.status !== "archived" && gmailConnectionIds.has(rule.connectionId));
 }
 
+function maybeHandleGmailRuleIgnoreWithoutVisibleReviewContext(
+  message: string,
+  rules: EmailSignalRule[],
+  routeTarget?: string | null
+): string | undefined {
+  if (!looksLikeIgnoreEmailItemsLanguage(message)) {
+    return undefined;
+  }
+
+  const target = routeTarget ?? extractGmailRuleQuestionTarget(message) ?? extractLikelyRuleTargetsFromMessage(message)[0];
+
+  if (!target || !isCustomGmailRuleQuestionTarget(target)) {
+    return undefined;
+  }
+
+  const matches = findEmailRulesByTarget(rules, target);
+
+  if (matches.length > 0) {
+    return [
+      `I don't see visible ${customGmailRuleSubject(target)} email reviews right now.`,
+      `I do see ${matches.length === 1 ? "a Gmail rule" : "Gmail rules"} for that: ${matches.slice(0, 3).map((rule) => rule.name).join(", ")}.`,
+      `Do you mean pause or remove ${matches.length === 1 ? "that rule" : "those rules"}?`
+    ].join("\n");
+  }
+
+  return formatMissingEmailRuleManagementContext(target);
+}
+
+function looksLikeIgnoreEmailItemsLanguage(message: string): boolean {
+  return /\b(ignore|reject|dismiss|clear|ignora|ignorar|rechaza|rechazar|descarta|descartar)\b/i.test(message);
+}
+
+function formatMissingEmailRuleManagementContext(target: string): string {
+  const subject = customGmailRuleSubject(target);
+  return `I don't see visible ${subject} reviews or an active ${subject} rule in this context. Say "email reviews" or "Gmail rules" first.`;
+}
+
 function parseCustomGmailRuleManagement(
   message: string,
   route?: SemanticRouterResult
@@ -7977,6 +8516,10 @@ function resolveCustomGmailRulesForConversation(
     if (matches.length > 0) {
       return matches;
     }
+  }
+
+  if (targetCandidates.length > 0) {
+    return [];
   }
 
   const contextMatches = getCustomGmailRuleContextMatches(rules, pendingAction);
@@ -8175,6 +8718,14 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "start_day";
   }
 
+  if (
+    /\b(anything important|what needs my attention|what should i handle|what should i focus on|what changed since yesterday|what is important|que tengo pendiente|qué tengo pendiente|que tinc pendent|què tinc pendent|hi ha alguna cosa important)\b/.test(text)
+  ) {
+    return /\b(first|primero|primer|handle first|do first|next move)\b/.test(text)
+      ? "operator_next_move_query"
+      : "operator_attention_query";
+  }
+
   if (/\b(what should i do today|what should i do now|show today|show my day|today plan|what is my plan today)\b/.test(text)) {
     return "daily_operator";
   }
@@ -8222,6 +8773,10 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
 
   if (looksLikeEmailReviewContextAction(message)) {
     return "email_review_action";
+  }
+
+  if (looksLikeEmailAttentionQuery(message)) {
+    return /\b(summary|resumen|resum)\b/.test(text) ? "email_review_summary" : "email_attention_query";
   }
 
   if (/\b(sync integrations|sync my integrations|update integrations|update my integrations|sync all integrations)\b/.test(text)) {
@@ -8619,8 +9174,8 @@ async function createGuardianGuardrailReply(
   };
 }
 
-async function buildConversationDailyReview(userId: string) {
-  const todayRange = getLocalTodayRange(new Date(), await getUserTimezone(userId));
+async function buildConversationDailyReview(userId: string, now = new Date()) {
+  const todayRange = getLocalTodayRange(now, await getUserTimezone(userId));
   return buildDailyReview({
     userId,
     activeGoals: await getActiveGoals(userId),
@@ -9444,6 +9999,7 @@ type PendingActionCandidate = {
   snoozedUntil?: string;
   goalId?: string;
   goalTitleSnapshot?: string;
+  recommendedOptions?: ActionHygieneOption[];
 };
 
 function toPendingActionCandidate(action: {
@@ -9511,6 +10067,7 @@ function formatConversationTodayReply(brief: DailyOperatorBrief): string {
     "",
     "Top priorities:",
     brief.topPriorities.length > 0 ? brief.topPriorities.map((item, index) => `${index + 1}. ${item}`).join("\n") : "No clear priorities yet.",
+    brief.emailAttention && brief.emailAttention.pendingCount > 0 ? `\nGmail:\n- ${brief.emailAttention.summary} Say "show me the important emails" to inspect them.` : undefined,
     brief.actionHygiene ? `\nAction hygiene:\n- ${cleanupDecisionGrammar(brief.actionHygiene.needsDecision)} Run /action_hygiene.` : undefined,
     brief.weeklyReviewDue ? "\nWeekly review:\n- Weekly review due. Run /weekly." : undefined,
     brief.operatorReflection ? `\nPattern:\n${brief.operatorReflection}` : undefined,
@@ -9520,11 +10077,323 @@ function formatConversationTodayReply(brief: DailyOperatorBrief): string {
   ].join("\n");
 }
 
+function formatOperatorAttentionForConversation(state: OperatorAttentionState): string {
+  if (state.topAttentionItems.length === 0) {
+    return [
+      "Nothing urgent is standing out.",
+      state.actionAttentionSummary.summary,
+      state.emailAttentionSummary.pendingCount > 0 ? state.emailAttentionSummary.summary : "No Gmail reviews are waiting.",
+      "",
+      `Next move: ${state.recommendedNextMove}`
+    ].join("\n");
+  }
+
+  return [
+    "What needs attention:",
+    ...state.topAttentionItems.slice(0, 4).map((item, index) => `${index + 1}. ${item.title} - ${item.summary}`),
+    state.emailAttentionSummary.pendingCount > 0 ? `\nGmail: ${state.emailAttentionSummary.summary}` : undefined,
+    "",
+    `Next move: ${state.recommendedNextMove}`,
+    state.suggestedUserReplies.length > 0 ? `You can say: ${state.suggestedUserReplies.slice(0, 3).join(" / ")}` : undefined
+  ].filter(Boolean).join("\n");
+}
+
+function formatOperatorNextMoveForConversation(state: OperatorAttentionState): string {
+  const top = state.topAttentionItems[0];
+
+  return [
+    `First: ${state.recommendedNextMove}`,
+    top ? `Why: ${top.summary}` : undefined,
+    state.emailAttentionSummary.pendingCount > 0 ? `Gmail waiting: ${state.emailAttentionSummary.summary}` : undefined
+  ].filter(Boolean).join("\n");
+}
+
+function formatEmailAttentionForConversation(state: OperatorAttentionState): string {
+  const email = state.emailAttentionSummary;
+
+  if (email.pendingCount === 0) {
+    return [
+      "No Gmail reviews are waiting.",
+      email.handledTodayCount > 0
+        ? `${email.handledTodayCount} Gmail review${email.handledTodayCount === 1 ? "" : "s"} handled today.`
+        : undefined,
+      `Mode: ${email.syncMode}. Review notifications: ${email.notificationPreference}.`,
+      "Alecto cannot reply to emails or change Gmail labels."
+    ].filter(Boolean).join("\n");
+  }
+
+  const lines = [
+    `${email.pendingCount} Gmail review${email.pendingCount === 1 ? "" : "s"} need attention.`,
+    email.workActionCount > 0 ? `- ${email.workActionCount} work-action email${email.workActionCount === 1 ? "" : "s"} may become task${email.workActionCount === 1 ? "" : "s"}.` : undefined,
+    email.jobSearchCount > 0 ? `- ${email.jobSearchCount} job-search email${email.jobSearchCount === 1 ? "" : "s"} waiting.` : undefined,
+    email.customCount > 0 ? `- ${email.customCount} custom tracking item${email.customCount === 1 ? "" : "s"} waiting.` : undefined,
+    email.otherCount > 0 ? `- ${email.otherCount} other email review${email.otherCount === 1 ? "" : "s"} waiting.` : undefined,
+    email.topReviewSubjects.length > 0 ? `Examples: ${email.topReviewSubjects.join("; ")}` : undefined,
+    "",
+    'Say "email reviews" or "show me the important emails" to inspect them.',
+    "Alecto cannot reply to emails or change Gmail labels."
+  ];
+
+  return lines.filter(Boolean).join("\n");
+}
+
 function dueLabelFromPriorityScore(score: DailyPriorityScore): string {
   return (
     score.factors.find((factor) => factor === "overdue" || factor.startsWith("due today") || factor.startsWith("due tomorrow") || factor === "due later this week") ??
     "not due"
   );
+}
+
+function buildOperatorEmailAttentionSummary(input: {
+  pendingReviews: EmailReviewItem[];
+  todayReviews: EmailReviewItem[];
+  todayEvents: StoredEvent[];
+  actions: ActionItem[];
+  activeGoals: Goal[];
+  ruleById: Map<string, EmailSignalRule>;
+  todayRange: ReturnType<typeof getLocalTodayRange>;
+  gmailSyncMode: string;
+  reviewNotificationEnabled: boolean;
+}): OperatorEmailAttentionSummary {
+  const pendingByKind = input.pendingReviews.reduce(
+    (counts, review) => {
+      const kind = emailReviewKind(review);
+      counts[kind] += 1;
+      return counts;
+    },
+    { job_search: 0, work_action: 0, custom_tracking: 0, other: 0 } as Record<EmailReviewKind, number>
+  );
+  const approvedToday = input.todayReviews.filter((review) => review.status === "approved").length;
+  const rejectedToday = input.todayReviews.filter((review) => review.status === "rejected").length;
+  const pendingCount = input.pendingReviews.length;
+  const hasCareerGoal = input.activeGoals.some((goal) => /career|job|developer/i.test(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`));
+  const priority: OperatorAttentionPriority =
+    pendingByKind.work_action > 0 || (pendingByKind.job_search > 0 && hasCareerGoal)
+      ? "high"
+      : pendingByKind.job_search > 0 || pendingByKind.custom_tracking > 0
+        ? "medium"
+        : "low";
+  const parts = [
+    pendingByKind.work_action > 0 ? `${pendingByKind.work_action} work-action` : undefined,
+    pendingByKind.job_search > 0 ? `${pendingByKind.job_search} job-search` : undefined,
+    pendingByKind.custom_tracking > 0 ? `${pendingByKind.custom_tracking} custom tracking` : undefined,
+    pendingByKind.other > 0 ? `${pendingByKind.other} other` : undefined
+  ].filter(Boolean);
+  const gmailDerivedActionItemsToday = input.actions.filter(
+    (action) => action.source === "email_review" && isWithinLocalDay(action.createdAt, input.todayRange)
+  ).length;
+  const gmailDerivedEventsToday = input.todayEvents.filter(
+    (event) => event.source === "gmail" || event.provider === "gmail" || event.data.provider === "gmail"
+  ).length;
+  const summary = pendingCount > 0
+    ? `${pendingCount} Gmail review${pendingCount === 1 ? "" : "s"} waiting: ${parts.join(", ")}.`
+    : input.todayReviews.length > 0
+      ? `${input.todayReviews.length} Gmail review${input.todayReviews.length === 1 ? "" : "s"} handled today.`
+      : "No Gmail reviews are waiting.";
+
+  return {
+    pendingCount,
+    workActionCount: pendingByKind.work_action,
+    jobSearchCount: pendingByKind.job_search,
+    customCount: pendingByKind.custom_tracking,
+    otherCount: pendingByKind.other,
+    handledTodayCount: input.todayReviews.length,
+    approvedTodayCount: approvedToday,
+    rejectedTodayCount: rejectedToday,
+    gmailDerivedActionItemsToday,
+    gmailDerivedEventsToday,
+    topReviewSubjects: input.pendingReviews.slice(0, 3).map((review) => sanitizeShortEmailSubject(review.subject)),
+    priority,
+    summary,
+    userFacingLine: pendingCount > 0 ? emailAttentionPriorityLine({ ...pendingByKind, pendingCount }) : undefined,
+    syncMode: input.gmailSyncMode,
+    notificationPreference: input.reviewNotificationEnabled ? "on" : "off"
+  };
+}
+
+function buildOperatorActionAttentionSummary(input: {
+  openActions: ActionItem[];
+  overdueActions: ActionItem[];
+  dueSoonActions: ActionItem[];
+  rankedOpenActions: Array<{ action: ActionItem; score: DailyPriorityScore }>;
+  hygiene: ActionHygieneReport;
+}): OperatorActionAttentionSummary {
+  return {
+    openCount: input.openActions.length,
+    overdueCount: input.overdueActions.length,
+    dueSoonCount: input.dueSoonActions.length,
+    hygieneNeedsDecision: input.hygiene.suggestedCleanupCandidates.length,
+    topActions: input.rankedOpenActions.slice(0, 3).map(({ action }) => ({
+      id: action.id,
+      title: action.title,
+      dueAt: action.dueAt?.toISOString(),
+      priority: action.priority
+    })),
+    summary: `${input.openActions.length} open action${input.openActions.length === 1 ? "" : "s"}; ${input.overdueActions.length} overdue.`
+  };
+}
+
+function buildOperatorGoalAttentionSummary(goalStatus: DailyOperatorBriefGoalStatus[], activeGoals: Goal[]): OperatorGoalAttentionSummary {
+  const noProgress = goalStatus.filter((goal) => goal.status === "no_progress" && !isRiskControlGoalStatus(goal));
+  const criticalNoProgress = noProgress.filter((status) => {
+    const goal = activeGoals.find((item) => item.id === status.goalId);
+    return goal?.priority === "critical";
+  });
+
+  return {
+    activeCount: activeGoals.length,
+    noProgressCount: noProgress.length,
+    criticalNoProgressCount: criticalNoProgress.length,
+    summary: `${activeGoals.length} active goal${activeGoals.length === 1 ? "" : "s"}; ${noProgress.length} with no progress today.`
+  };
+}
+
+function buildOperatorRiskAttentionSummary(risks: string[], todayEvents: StoredEvent[]): OperatorRiskAttentionSummary {
+  const guardrailTriggeredToday = todayEvents.some((event) => event.type === "finance.betting.cooldown_triggered");
+
+  return {
+    activeWatchouts: risks,
+    guardrailTriggeredToday,
+    summary: risks.length > 0 ? `${risks.length} risk watchout${risks.length === 1 ? "" : "s"}.` : "No risk watchouts from recent signals."
+  };
+}
+
+function buildTopOperatorAttentionItems(input: {
+  rankedOpenActions: Array<{ action: ActionItem; score: DailyPriorityScore }>;
+  overdueActions: ActionItem[];
+  emailAttention: OperatorEmailAttentionSummary;
+  risks: string[];
+  hygiene: ActionHygieneReport;
+  planningAttention: OperatorPlanningAttentionSummary;
+}): OperatorAttentionItem[] {
+  const items: OperatorAttentionItem[] = [];
+  const topAction = input.rankedOpenActions[0]?.action;
+
+  if (input.risks.length > 0) {
+    items.push({
+      kind: "risk",
+      title: "Risk guardrail",
+      summary: input.risks[0],
+      priority: "critical",
+      suggestedReply: "what should I do today"
+    });
+  }
+
+  if (topAction) {
+    items.push({
+      kind: "action",
+      title: topAction.title,
+      summary: input.overdueActions.some((action) => action.id === topAction.id) ? "Overdue action." : "Top scored open action.",
+      priority: input.overdueActions.some((action) => action.id === topAction.id) ? "high" : topAction.priority === "high" ? "high" : "medium",
+      sourceId: topAction.id
+    });
+  }
+
+  if (input.emailAttention.pendingCount > 0) {
+    items.push({
+      kind: "email_review",
+      title: `Handle ${input.emailAttention.pendingCount} Gmail review${input.emailAttention.pendingCount === 1 ? "" : "s"}`,
+      summary: input.emailAttention.userFacingLine ?? input.emailAttention.summary,
+      priority: input.emailAttention.priority,
+      suggestedReply: "show me the important emails"
+    });
+  }
+
+  if (input.hygiene.suggestedCleanupCandidates.length > 0) {
+    items.push({
+      kind: "hygiene",
+      title: "Clean up stale actions",
+      summary: input.hygiene.summary,
+      priority: "medium",
+      suggestedReply: "clean up my tasks"
+    });
+  }
+
+  if (input.planningAttention.weeklyReviewDue) {
+    items.push({
+      kind: "planning",
+      title: "Weekly review due",
+      summary: "Close the week before planning.",
+      priority: "medium",
+      suggestedReply: "review my week"
+    });
+  }
+
+  return items
+    .sort((left, right) => attentionPriorityRank(right.priority) - attentionPriorityRank(left.priority))
+    .slice(0, 5);
+}
+
+function pickAttentionNextMove(
+  items: OperatorAttentionItem[],
+  input: {
+    rankedOpenActions: Array<{ action: ActionItem; score: DailyPriorityScore }>;
+    overdueActions: ActionItem[];
+    emailAttention: OperatorEmailAttentionSummary;
+    goalStatus: DailyOperatorBriefGoalStatus[];
+    now: Date;
+  }
+): string {
+  const top = items[0];
+
+  if (top?.kind === "risk") {
+    return "Keep the guardrail locked first. Do not create risky actions.";
+  }
+
+  if (top?.kind === "email_review" && input.emailAttention.workActionCount > 0) {
+    return "Start with the work-action Gmail review.";
+  }
+
+  if (top?.kind === "email_review" && input.emailAttention.jobSearchCount > 0) {
+    return "Check the job-search Gmail review.";
+  }
+
+  if (top?.kind === "email_review") {
+    return "Clear the waiting Gmail reviews.";
+  }
+
+  return pickOperatorNextStep({
+    overdueActions: input.overdueActions,
+    dueSoonActions: [],
+    openActions: input.rankedOpenActions.map((item) => item.action),
+    goalStatus: input.goalStatus,
+    emailAttention: input.emailAttention,
+    now: input.now
+  });
+}
+
+function buildOperatorSuggestedReplies(emailAttention: OperatorEmailAttentionSummary): string[] {
+  const replies = ["what should I handle first?", "show my tasks"];
+
+  if (emailAttention.pendingCount > 0) {
+    replies.unshift("show me the important emails");
+    replies.push("email reviews");
+  }
+
+  return uniqueStrings(replies).slice(0, 4);
+}
+
+function attentionPriorityRank(priority: OperatorAttentionPriority): number {
+  return priority === "critical" ? 4 : priority === "high" ? 3 : priority === "medium" ? 2 : 1;
+}
+
+function emailAttentionPriorityLine(input: Record<EmailReviewKind, number> & { pendingCount: number }): string {
+  const parts = [
+    input.work_action > 0 ? `${input.work_action} work-action email${input.work_action === 1 ? "" : "s"} may become task${input.work_action === 1 ? "" : "s"}` : undefined,
+    input.job_search > 0 ? `${input.job_search} job-search email${input.job_search === 1 ? "" : "s"} waiting` : undefined,
+    input.custom_tracking > 0 ? `${input.custom_tracking} custom tracking item${input.custom_tracking === 1 ? "" : "s"} waiting` : undefined,
+    input.other > 0 ? `${input.other} other email review${input.other === 1 ? "" : "s"} waiting` : undefined
+  ].filter(Boolean);
+
+  return parts.join("; ") || `${input.pendingCount} Gmail review${input.pendingCount === 1 ? "" : "s"} waiting`;
+}
+
+function sanitizeShortEmailSubject(subject: string | undefined): string {
+  return (subject ?? "Email review")
+    .replace(/\b(accessToken|refreshToken|ciphertext|providerMessageId|raw)\b/gi, "[redacted]")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 90);
 }
 
 function buildOperatorTopPriorities(input: {
@@ -9533,12 +10402,18 @@ function buildOperatorTopPriorities(input: {
   openActions: ActionItem[];
   goalStatus: DailyOperatorBriefGoalStatus[];
   risks: string[];
+  emailAttention?: OperatorEmailAttentionSummary;
   priorityScores: DailyPriorityScore[];
 }): string[] {
   const priorities: string[] = [];
   const seenActionIds = new Set<string>();
   const seenActionTitles = new Set<string>();
   const scoresByActionId = new Map(input.priorityScores.map((score) => [score.actionId, score]));
+  const overdueActionIds = new Set(input.overdueActions.map((action) => action.id));
+  const emailPriority = input.emailAttention && input.emailAttention.pendingCount > 0
+    ? `Gmail reviews: ${input.emailAttention.userFacingLine ?? input.emailAttention.summary}`
+    : undefined;
+  let emailPriorityAdded = false;
 
   const addActionPriority = (action: ActionItem) => {
     const titleKey = normalizeManualActionTitleKey(action.title);
@@ -9552,7 +10427,27 @@ function buildOperatorTopPriorities(input: {
     priorities.push(formatPriorityAction(action, scoresByActionId.get(action.id)));
   };
 
-  input.openActions.forEach((action) => addActionPriority(action));
+  for (const action of input.openActions) {
+    addActionPriority(action);
+
+    if (!emailPriority || emailPriorityAdded) {
+      continue;
+    }
+
+    const shouldInsertEmail =
+      input.emailAttention?.priority === "high"
+        ? overdueActionIds.has(action.id) || input.overdueActions.length === 0
+        : input.emailAttention?.priority === "medium" && priorities.length >= 1;
+
+    if (shouldInsertEmail) {
+      priorities.push(emailPriority);
+      emailPriorityAdded = true;
+    }
+  }
+
+  if (emailPriority && !emailPriorityAdded) {
+    priorities.push(emailPriority);
+  }
 
   return uniqueStrings(priorities).slice(0, 3);
 }
@@ -9562,6 +10457,7 @@ function pickOperatorNextStep(input: {
   dueSoonActions: ActionItem[];
   openActions: ActionItem[];
   goalStatus: DailyOperatorBriefGoalStatus[];
+  emailAttention?: OperatorEmailAttentionSummary;
   now: Date;
 }): string {
   const topAction = input.openActions[0];
@@ -9575,6 +10471,18 @@ function pickOperatorNextStep(input: {
     }
 
     return `Next upcoming action: ${topAction.title}.`;
+  }
+
+  if ((input.emailAttention?.workActionCount ?? 0) > 0) {
+    return "Start with the work-action Gmail review.";
+  }
+
+  if ((input.emailAttention?.jobSearchCount ?? 0) > 0) {
+    return "Check the job-search Gmail review.";
+  }
+
+  if ((input.emailAttention?.pendingCount ?? 0) > 0) {
+    return "Clear the waiting Gmail reviews.";
   }
 
   const staleGoal = input.goalStatus.find((goal) => goal.status === "no_progress" && !isRiskControlGoalStatus(goal));
@@ -11352,7 +12260,12 @@ async function buildEmailReviewInboxResponse(
       return kindDelta;
     }
 
-    return right.updatedAt.getTime() - left.updatedAt.getTime();
+    const updatedDelta = right.updatedAt.getTime() - left.updatedAt.getTime();
+    if (updatedDelta !== 0) {
+      return updatedDelta;
+    }
+
+    return (left.subject ?? "").localeCompare(right.subject ?? "");
   });
   const items = orderedReviews.map((review, index) =>
     toEmailReviewInboxItem({
@@ -12203,6 +13116,19 @@ function looksLikeEmailReviewInboxRequest(message: string): boolean {
     /^(email reviews?|gmail reviews?|emails? to review|show email reviews?|show gmail reviews?)$/.test(text) ||
     /\b(what|which|any|show|review|revisa|mostra|ensenya|quins?|que|qué)\b.*\b(email|emails|gmail|correo|correos|correu|correus)\b.*\b(review|approval|pending|waiting|pendientes?|pendents?|revisar|aprobaci[oó]n)\b/.test(text) ||
     /\b(correos pendientes|correus pendents|emails waiting|gmail items need review|emails need review|needs email approval)\b/.test(text)
+  );
+}
+
+function looksLikeEmailAttentionQuery(message: string): boolean {
+  const text = normalizeForComparison(message);
+
+  if (!/\b(email|emails|gmail|mail|mails|inbox|correo|correos|correu|correus)\b/.test(text)) {
+    return false;
+  }
+
+  return (
+    /\b(need action|needs action|need my action|should handle|i should handle|important|came in|come in|anything from|reply|respond|pending|pendiente|pendientes|pendent|pendents|importante|importantes|importants?|accion|acción|accio|acció)\b/.test(text) ||
+    /\b(do i need to reply|do i need to respond|did any important emails|what emails need action|what came in from gmail|anything from gmail|que correos tengo pendientes|qué correos tengo pendientes|hi ha correus importants)\b/.test(text)
   );
 }
 
@@ -14551,6 +15477,19 @@ async function resolvePendingDecisionReply(
     return undefined;
   }
 
+  if (isRecentActionMutationContext(pendingAction)) {
+    if (looksLikeRecentMutationStatusQuestion(message)) {
+      return formatRecentActionMutationStatus(pendingAction);
+    }
+
+    if (isConfirmationMessage(message) || isRejectionMessage(message)) {
+      await rejectPendingAction(userId, pendingAction.id);
+      return "No pending change is waiting right now.";
+    }
+
+    return undefined;
+  }
+
   if (isRejectionMessage(message)) {
     await rejectPendingAction(userId, pendingAction.id);
     return "Cancelled. I did not change anything.";
@@ -14665,6 +15604,7 @@ async function resolvePendingDecisionReply(
   if (isConfirmationMessage(message)) {
     const applied = await applyPendingAction(userId, pendingAction);
     await confirmPendingAction(userId, pendingAction.id);
+    await maybeRememberRecentActionMutationStatus(userId, pendingAction, applied.reply);
     return applied.reply;
   }
 
@@ -14743,11 +15683,48 @@ async function resolveActionHygieneReply(
   message: string,
   now = new Date()
 ): Promise<string | undefined> {
-  if (
-    /\s+\band\b\s+/i.test(message.trim()) &&
-    /\b(?:complete|done|snooze|archive|delete|remove|keep)\b/i.test(message.trim())
-  ) {
-    return "Handle one hygiene action at a time. Try: complete 1 or snooze 2 tomorrow.";
+  const candidates = readPendingActionCandidates(pendingAction.payload.candidateActions);
+  const batchPlan = await planActionHygieneBatchReply(userId, pendingAction, message, candidates, now);
+
+  if (batchPlan) {
+    if (batchPlan.errors.length > 0) {
+      return batchPlan.errors.join("\n");
+    }
+
+    if (batchPlan.missingSnoozeTargets.length > 0) {
+      return [
+        "I can do that, but I need a snooze time for:",
+        ...batchPlan.missingSnoozeTargets.map((candidate) => `- ${candidate.title}`),
+        `Try: snooze ${batchPlan.missingSnoozeTargets[0]?.title ?? "that"} tomorrow.`
+      ].join("\n");
+    }
+
+    if (batchPlan.operations.length === 0) {
+      return "I did not find any visible hygiene actions to change.";
+    }
+
+    if (batchPlan.requiresConfirmation) {
+      await replacePendingAction(userId, {
+        type: "action_hygiene",
+        summary: `Apply ${batchPlan.operations.length} hygiene action change${batchPlan.operations.length === 1 ? "" : "s"}`,
+        payload: {
+          operation: "batch_update",
+          originalText: message,
+          now: now.toISOString(),
+          timezone: batchPlan.timezone,
+          operations: batchPlan.operations,
+          candidateActions: candidates
+        },
+        expiresAt: pendingDecisionExpiry()
+      });
+
+      return formatActionHygieneBatchConfirmation(batchPlan.operations, batchPlan.timezone);
+    }
+
+    const applied = await applyActionHygieneBatchOperations(userId, batchPlan.operations, batchPlan.timezone);
+    await maybeRememberRecentActionMutationStatusFromReply(userId, applied.reply);
+    await closeHygieneSessionIfDone(userId, pendingAction, now);
+    return applied.reply;
   }
 
   if (/^snooze\s+(.+)$/i.test(message.trim()) && !parseActionHygieneReply(message)) {
@@ -14759,8 +15736,6 @@ async function resolveActionHygieneReply(
   if (!parsed) {
     return undefined;
   }
-
-  const candidates = readPendingActionCandidates(pendingAction.payload.candidateActions);
 
   if (parsed.operation === "bulk_archive_unlinked_stale") {
     const report = await analyzeActionHygiene(userId, now, await getUserTimezone(userId));
@@ -14798,7 +15773,11 @@ async function resolveActionHygieneReply(
   if (!selected) {
     return candidates.length > 0
       ? `Reply with 1-${candidates.length}, the action title, or cancel.`
-      : "That hygiene session no longer has any options. Run /action_hygiene again.";
+      : formatNoVisibleHygieneContextReply(pendingAction);
+  }
+
+  if (!hygieneCandidateAllows(selected, parsed.operation)) {
+    return formatHygieneOperationUnavailable(selected, parsed.operation);
   }
 
   const action = await getActionItem(userId, selected.id);
@@ -14883,6 +15862,524 @@ async function resolveActionHygieneReply(
   return undefined;
 }
 
+function formatNoVisibleHygieneContextReply(pendingAction?: PendingAction): string {
+  const summary = typeof pendingAction?.summary === "string" ? pendingAction.summary : "";
+  const payloadSummary = typeof pendingAction?.payload?.summary === "string" ? pendingAction.payload.summary : "";
+  const text = `${summary} ${payloadSummary}`.toLowerCase();
+
+  if (text.includes("clean enough")) {
+    return "I don't have a visible cleanup item right now. Your action list is clean enough.";
+  }
+
+  return "I don't have a visible cleanup item right now. Say 'clean up my tasks' first.";
+}
+
+type HygieneOperation = "archive" | "complete" | "snooze" | "keep";
+
+type ActionHygieneBatchOperation = {
+  operation: HygieneOperation;
+  actionId: string;
+  title: string;
+  timeText?: string;
+  dueAt?: string;
+};
+
+type ActionHygieneBatchPlan = {
+  operations: ActionHygieneBatchOperation[];
+  missingSnoozeTargets: PendingActionCandidate[];
+  errors: string[];
+  requiresConfirmation: boolean;
+  timezone: string;
+};
+
+async function planActionHygieneBatchReply(
+  userId: string,
+  pendingAction: PendingAction,
+  message: string,
+  candidates: PendingActionCandidate[],
+  now: Date
+): Promise<ActionHygieneBatchPlan | undefined> {
+  const trimmed = normalizeHygieneBatchText(message);
+  const comparison = normalizeForComparison(trimmed);
+
+  if (
+    !/\b(archive|delete|remove|complete|done|snooze|keep|archiva|arxiva|elimina|borra|pospon|ajorna)\b/.test(comparison) ||
+    !(/\b(all|rest|except|menos|excepte|menys|and|y|i)\b/.test(comparison) || trimmed.includes(","))
+  ) {
+    return undefined;
+  }
+
+  const settings = await getOrCreateNotificationSettings(userId);
+  const plan: ActionHygieneBatchPlan = {
+    operations: [],
+    missingSnoozeTargets: [],
+    errors: [],
+    requiresConfirmation: true,
+    timezone: settings.timezone
+  };
+
+  if (candidates.length === 0) {
+    plan.errors.push(formatNoVisibleHygieneContextReply(pendingAction));
+    return plan;
+  }
+
+  if (tryPlanKeepOneArchiveRest(trimmed, candidates, plan)) {
+    return plan;
+  }
+
+  if (await tryPlanAllExceptReply(trimmed, candidates, settings, now, plan)) {
+    return plan;
+  }
+
+  if (await tryPlanAllReply(trimmed, candidates, settings, now, plan)) {
+    return plan;
+  }
+
+  if (/\s+(?:and|y|i)\s+(?:archive|delete|remove|complete|done|snooze|keep)\b/i.test(trimmed)) {
+    const operationSegments = trimmed
+      .split(/\s+(?:and|y|i)\s+/i)
+      .map((segment) => segment.trim())
+      .filter(Boolean);
+
+    for (const segment of operationSegments) {
+      await addHygieneBatchOperationFromSegment(segment, candidates, settings, now, plan);
+    }
+
+    return plan;
+  }
+
+  if (await tryPlanSharedSnoozeTargets(trimmed, candidates, settings, now, plan)) {
+    return plan;
+  }
+
+  if (/^(archive|delete|remove|complete|done|keep)\s+.+\b(and|y|i)\b.+$/i.test(trimmed)) {
+    await addHygieneBatchOperationFromSegment(trimmed, candidates, settings, now, plan);
+    return plan;
+  }
+
+  const segments = trimmed
+    .split(/\s*,\s*/g)
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+
+  if (segments.length <= 1) {
+    return undefined;
+  }
+
+  for (const segment of segments) {
+    await addHygieneBatchOperationFromSegment(segment, candidates, settings, now, plan);
+  }
+
+  return plan;
+}
+
+function normalizeHygieneBatchText(message: string): string {
+  return message
+    .trim()
+    .replace(/\bu\b/gi, "you")
+    .replace(/\bexpect\b/gi, "except")
+    .replace(/\s+/g, " ");
+}
+
+function tryPlanKeepOneArchiveRest(
+  message: string,
+  candidates: PendingActionCandidate[],
+  plan: ActionHygieneBatchPlan
+): boolean {
+  const match = message.match(/^keep\s+(.+?)\s*(?:,|\s+and\s+)?\s*archive\s+(?:the\s+)?rest$/i);
+  if (!match) {
+    return false;
+  }
+
+  const kept = selectPendingActionCandidate(match[1], candidates);
+  if (!kept) {
+    plan.errors.push(`I could not match "${match[1].trim()}" to one of the visible hygiene actions.`);
+    return true;
+  }
+
+  addHygieneBatchOperation(plan, kept, "keep");
+  for (const candidate of candidates.filter((item) => item.id !== kept.id)) {
+    addHygieneBatchOperation(plan, candidate, "archive");
+  }
+  return true;
+}
+
+async function tryPlanAllExceptReply(
+  message: string,
+  candidates: PendingActionCandidate[],
+  settings: Awaited<ReturnType<typeof getOrCreateNotificationSettings>>,
+  now: Date,
+  plan: ActionHygieneBatchPlan
+): Promise<boolean> {
+  const match = message.match(/^(archive|delete|remove|complete|done|snooze|keep)\s+all\s+(?:except|menos|excepte|menys)\s+(.+)$/i);
+  if (!match) {
+    return false;
+  }
+
+  const operation = hygieneOperationFromVerb(match[1]);
+  const { exceptionText, exceptionSnoozeTimeText, mentionedSnooze } = parseAllExceptException(match[2]);
+  const exception = selectPendingActionCandidate(exceptionText, candidates);
+
+  if (!exception) {
+    plan.errors.push(`I could not match "${exceptionText}" to one of the visible hygiene actions.`);
+    return true;
+  }
+
+  const rest = candidates.filter((candidate) => candidate.id !== exception.id);
+
+  if (operation === "snooze") {
+    if (!exceptionSnoozeTimeText) {
+      plan.missingSnoozeTargets.push(...rest);
+    } else {
+      await addSnoozeOperations(rest, exceptionSnoozeTimeText, settings, now, plan);
+    }
+  } else if (operation !== "keep") {
+    for (const candidate of rest) {
+      addHygieneBatchOperation(plan, candidate, operation);
+    }
+  }
+
+  if (mentionedSnooze) {
+    if (!exceptionSnoozeTimeText) {
+      plan.missingSnoozeTargets.push(exception);
+    } else {
+      await addSnoozeOperations([exception], exceptionSnoozeTimeText, settings, now, plan);
+    }
+  }
+
+  return true;
+}
+
+function parseAllExceptException(value: string): {
+  exceptionText: string;
+  exceptionSnoozeTimeText?: string;
+  mentionedSnooze: boolean;
+} {
+  const [beforeComma, ...afterComma] = value.split(/\s*,\s*/);
+  const rawException = beforeComma ?? value;
+  const tail = afterComma.join(", ");
+  const combined = `${rawException} ${tail}`.trim();
+  const snoozeMatch = combined.match(/\b(?:snooze|pospone|posponer|ajorna|ajornar)\b(?:\s+(?:that|it|them|ese|esa|aquest|aquesta))?\s*(?:to|until|for|a|hasta|fins)?\s*(.*)$/i);
+  const mentionedSnooze = Boolean(snoozeMatch);
+  const exceptionText = rawException
+    .replace(/\bthat\s+you\s+can\s+(?:snooze|pospone|posponer|ajorna|ajornar).*$/i, "")
+    .replace(/\b(?:snooze|pospone|posponer|ajorna|ajornar).*$/i, "")
+    .trim();
+  const exceptionSnoozeTimeText = snoozeMatch?.[1]?.trim() || undefined;
+
+  return {
+    exceptionText,
+    exceptionSnoozeTimeText,
+    mentionedSnooze
+  };
+}
+
+async function tryPlanAllReply(
+  message: string,
+  candidates: PendingActionCandidate[],
+  settings: Awaited<ReturnType<typeof getOrCreateNotificationSettings>>,
+  now: Date,
+  plan: ActionHygieneBatchPlan
+): Promise<boolean> {
+  const match = message.match(/^(archive|delete|remove|complete|done|snooze|keep)\s+all(?:\s+(?:to|until|for)\s+(.+))?$/i);
+  if (!match) {
+    return false;
+  }
+
+  const operation = hygieneOperationFromVerb(match[1]);
+  if (operation === "snooze") {
+    const timeText = match[2]?.trim();
+    if (!timeText) {
+      plan.missingSnoozeTargets.push(...candidates);
+    } else {
+      await addSnoozeOperations(candidates, timeText, settings, now, plan);
+    }
+  } else if (operation !== "keep") {
+    for (const candidate of candidates) {
+      addHygieneBatchOperation(plan, candidate, operation);
+    }
+  } else {
+    for (const candidate of candidates) {
+      addHygieneBatchOperation(plan, candidate, operation);
+    }
+  }
+
+  return true;
+}
+
+async function tryPlanSharedSnoozeTargets(
+  message: string,
+  candidates: PendingActionCandidate[],
+  settings: Awaited<ReturnType<typeof getOrCreateNotificationSettings>>,
+  now: Date,
+  plan: ActionHygieneBatchPlan
+): Promise<boolean> {
+  const match = message.match(/^snooze\s+(.+?)\s+(?:to|until|for)\s+(.+)$/i);
+  if (!match || !/\b(and|y|i)\b|,/.test(match[1])) {
+    return false;
+  }
+
+  const targets = splitHygieneTargetList(match[1]);
+  for (const target of targets) {
+    const selected = selectPendingActionCandidate(target, candidates);
+    if (!selected) {
+      plan.errors.push(`I could not match "${target}" to one of the visible hygiene actions.`);
+      continue;
+    }
+    await addSnoozeOperations([selected], match[2], settings, now, plan);
+  }
+
+  return true;
+}
+
+async function addHygieneBatchOperationFromSegment(
+  segment: string,
+  candidates: PendingActionCandidate[],
+  settings: Awaited<ReturnType<typeof getOrCreateNotificationSettings>>,
+  now: Date,
+  plan: ActionHygieneBatchPlan
+): Promise<void> {
+  const simpleMultiTarget = segment.match(/^(archive|delete|remove|complete|done|keep)\s+(.+)$/i);
+  if (simpleMultiTarget && /\b(and|y|i)\b/.test(normalizeForComparison(simpleMultiTarget[2]))) {
+    const operation = hygieneOperationFromVerb(simpleMultiTarget[1]);
+    for (const target of splitHygieneTargetList(simpleMultiTarget[2])) {
+      const selected = selectPendingActionCandidate(target, candidates);
+      if (!selected) {
+        plan.errors.push(`I could not match "${target}" to one of the visible hygiene actions.`);
+      } else {
+        addHygieneBatchOperation(plan, selected, operation);
+      }
+    }
+    return;
+  }
+
+  const missingSnooze = segment.match(/^snooze\s+(.+)$/i);
+  const parsed = parseActionHygieneReply(segment);
+
+  if (!parsed) {
+    if (missingSnooze) {
+      const selected = selectPendingActionCandidate(missingSnooze[1], candidates);
+      if (selected) {
+        plan.missingSnoozeTargets.push(selected);
+      } else {
+        plan.errors.push(`I could not match "${missingSnooze[1].trim()}" to one of the visible hygiene actions.`);
+      }
+      return;
+    }
+
+    plan.errors.push(`Could not handle "${segment}".`);
+    return;
+  }
+
+  const selected = selectPendingActionCandidate(parsed.target, candidates);
+  if (!selected) {
+    plan.errors.push(`I could not match "${parsed.target}" to one of the visible hygiene actions.`);
+    return;
+  }
+
+  if (parsed.operation === "bulk_archive_unlinked_stale") {
+    plan.errors.push(`Could not handle "${segment}" inside a batch.`);
+    return;
+  }
+
+  if (parsed.operation === "snooze") {
+    await addSnoozeOperations([selected], parsed.timeText, settings, now, plan);
+    return;
+  }
+
+  addHygieneBatchOperation(plan, selected, parsed.operation);
+}
+
+function splitHygieneTargetList(value: string): string[] {
+  return value
+    .split(/\s+(?:and|y|i)\s+|,/i)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+async function addSnoozeOperations(
+  candidates: PendingActionCandidate[],
+  timeText: string,
+  settings: Awaited<ReturnType<typeof getOrCreateNotificationSettings>>,
+  now: Date,
+  plan: ActionHygieneBatchPlan
+): Promise<void> {
+  const parsedTime = parseActionDueDate(timeText, {
+    now,
+    timezone: settings.timezone,
+    preferences: settings
+  });
+
+  if (parsedTime.invalidReason === "past_explicit_time") {
+    plan.errors.push("That snooze time has already passed.");
+    return;
+  }
+
+  if (!parsedTime.dueAt) {
+    plan.missingSnoozeTargets.push(...candidates);
+    return;
+  }
+
+  for (const candidate of candidates) {
+    addHygieneBatchOperation(plan, candidate, "snooze", timeText, parsedTime.dueAt.toISOString());
+  }
+}
+
+function addHygieneBatchOperation(
+  plan: ActionHygieneBatchPlan,
+  candidate: PendingActionCandidate,
+  operation: HygieneOperation,
+  timeText?: string,
+  dueAt?: string
+): void {
+  if (!hygieneCandidateAllows(candidate, operation)) {
+    plan.errors.push(formatHygieneOperationUnavailable(candidate, operation));
+    return;
+  }
+
+  plan.operations.push({
+    operation,
+    actionId: candidate.id,
+    title: candidate.title,
+    timeText,
+    dueAt
+  });
+}
+
+function hygieneCandidateAllows(candidate: PendingActionCandidate, operation: HygieneOperation): boolean {
+  return !candidate.recommendedOptions || candidate.recommendedOptions.length === 0 || candidate.recommendedOptions.includes(operation);
+}
+
+function formatHygieneOperationUnavailable(candidate: PendingActionCandidate, operation: HygieneOperation): string {
+  const options = candidate.recommendedOptions && candidate.recommendedOptions.length > 0
+    ? candidate.recommendedOptions
+    : ["complete", "snooze", "keep"] as ActionHygieneOption[];
+
+  if (operation === "archive") {
+    return `I can ${formatInlineOptions(options)} ${candidate.title}, but archive is not available for this item.`;
+  }
+
+  return `${candidate.title}: ${operation} is not available. I can ${formatInlineOptions(options)} this action.`;
+}
+
+function formatInlineOptions(options: ActionHygieneOption[]): string {
+  const unique = [...new Set(options)];
+  if (unique.length <= 1) {
+    return unique[0] ?? "keep";
+  }
+
+  return `${unique.slice(0, -1).join(", ")}, or ${unique[unique.length - 1]}`;
+}
+
+function hygieneOperationFromVerb(value: string): HygieneOperation {
+  const verb = value.toLowerCase();
+  if (verb === "done") {
+    return "complete";
+  }
+  if (verb === "delete" || verb === "remove" || verb === "archiva" || verb === "arxiva" || verb === "elimina" || verb === "borra") {
+    return "archive";
+  }
+  if (verb === "pospon" || verb === "ajorna") {
+    return "snooze";
+  }
+  return verb as HygieneOperation;
+}
+
+function formatActionHygieneBatchConfirmation(operations: ActionHygieneBatchOperation[], timezone: string): string {
+  return [
+    "I will:",
+    ...operations.map((operation) => `- ${formatActionHygieneBatchOperation(operation, timezone)}`),
+    "Confirm with \"yes\" or cancel."
+  ].join("\n");
+}
+
+function formatActionHygieneBatchOperation(operation: ActionHygieneBatchOperation, timezone: string): string {
+  if (operation.operation === "archive") {
+    return `archive ${operation.title}`;
+  }
+
+  if (operation.operation === "complete") {
+    return `complete ${operation.title}`;
+  }
+
+  if (operation.operation === "keep") {
+    return `keep ${operation.title}`;
+  }
+
+  const formatted = operation.dueAt ? formatLocalDateTime(new Date(operation.dueAt), timezone) : operation.timeText ?? "the chosen time";
+  return `snooze ${operation.title} to ${formatted}`;
+}
+
+async function applyActionHygieneBatchOperations(
+  userId: string,
+  operations: ActionHygieneBatchOperation[],
+  timezone: string
+): Promise<{ reply: string }> {
+  const done: string[] = [];
+  const skipped: string[] = [];
+
+  for (const operation of operations) {
+    const action = await getActionItem(userId, operation.actionId);
+
+    if (!action) {
+      skipped.push(`${operation.title}: no longer found`);
+      continue;
+    }
+
+    if (action.status === "archived" || action.status === "completed") {
+      skipped.push(`${action.title}: already ${action.status}`);
+      continue;
+    }
+
+    if (operation.operation === "archive") {
+      const archived = await archiveActionItem(userId, action.id);
+      if (archived) {
+        done.push(`Archived ${archived.title}`);
+      }
+      continue;
+    }
+
+    if (operation.operation === "complete") {
+      const completed = await completeActionItem(userId, action.id);
+      if (completed) {
+        const progressEvent = await createGoalProgressFromCompletedAction(userId, completed);
+        done.push(
+          progressEvent?.created
+            ? `Completed ${completed.title}; goal progress logged for ${progressEvent.goalTitle}`
+            : `Completed ${completed.title}`
+        );
+      }
+      continue;
+    }
+
+    if (operation.operation === "snooze") {
+      const dueAt = operation.dueAt ? new Date(operation.dueAt) : undefined;
+      if (!dueAt || Number.isNaN(dueAt.getTime())) {
+        skipped.push(`${action.title}: missing snooze time`);
+        continue;
+      }
+
+      const updated = await snoozeActionItem(userId, action.id, dueAt);
+      if (updated) {
+        done.push(`Snoozed ${updated.title} to ${formatLocalDateTime(updated.snoozedUntil, timezone)}`);
+      }
+      continue;
+    }
+
+    done.push(`Kept ${action.title}`);
+  }
+
+  return {
+    reply: [
+      done.length > 0 ? "Done:" : "No action changes were made.",
+      ...done.map((line) => `- ${line}`),
+      skipped.length > 0 ? "" : undefined,
+      skipped.length > 0 ? "Skipped:" : undefined,
+      ...skipped.map((line) => `- ${line}`)
+    ].filter((line) => line !== undefined).join("\n")
+  };
+}
+
 async function closeHygieneSessionIfDone(userId: string, pendingAction: PendingAction, now: Date): Promise<void> {
   const candidates = readPendingActionCandidates(pendingAction.payload.candidateActions);
   const remaining = await Promise.all(candidates.map((candidate) => getActionItem(userId, candidate.id)));
@@ -14917,14 +16414,31 @@ function readPendingActionCandidates(value: unknown): PendingActionCandidate[] {
       dueAt: typeof item.dueAt === "string" ? item.dueAt : undefined,
       snoozedUntil: typeof item.snoozedUntil === "string" ? item.snoozedUntil : undefined,
       goalId: typeof item.goalId === "string" ? item.goalId : undefined,
-      goalTitleSnapshot: typeof item.goalTitleSnapshot === "string" ? item.goalTitleSnapshot : undefined
+      goalTitleSnapshot: typeof item.goalTitleSnapshot === "string" ? item.goalTitleSnapshot : undefined,
+      recommendedOptions: readActionHygieneOptions(item.recommendedOptions)
     }))
     .filter((item) => item.id && item.title);
 }
 
+function readActionHygieneOptions(value: unknown): ActionHygieneOption[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const options = value.filter((option): option is ActionHygieneOption =>
+    option === "complete" || option === "snooze" || option === "archive" || option === "keep"
+  );
+
+  return options.length > 0 ? options : undefined;
+}
+
 function selectPendingActionCandidate(message: string, candidates: PendingActionCandidate[]): PendingActionCandidate | undefined {
   const trimmed = message.trim();
-  const numeric = trimmed.match(/^#?(\d+)$/);
+  if (candidates.length === 1 && /^(it|that|this|them|those|one|the one|este|esta|eso|ese|esa|aquest|aquesta|ho)$/i.test(trimmed)) {
+    return candidates[0];
+  }
+
+  const numeric = trimmed.match(/^(?:number\s+)?#?(\d+)$/i);
 
   if (numeric) {
     const index = Number(numeric[1]) - 1;
@@ -14937,18 +16451,83 @@ function selectPendingActionCandidate(message: string, candidates: PendingAction
     return candidates[ordinalIndex];
   }
 
-  const key = normalizeComparableText(trimmed);
+  const key = normalizeActionReferenceText(trimmed);
 
   if (!key) {
     return undefined;
   }
 
-  const matches = candidates.filter((candidate) => {
-    const titleKey = normalizeComparableText(candidate.title);
+  const exactMatches = candidates.filter((candidate) => {
+    const titleKey = normalizeActionReferenceText(candidate.title);
     return titleKey === key || titleKey.includes(key) || key.includes(titleKey);
   });
 
-  return matches.length === 1 ? matches[0] : undefined;
+  if (exactMatches.length === 1) {
+    return exactMatches[0];
+  }
+
+  const scored = candidates
+    .map((candidate) => ({ candidate, score: scorePendingActionCandidateReference(key, candidate) }))
+    .filter((item) => item.score >= 0.5)
+    .sort((left, right) => right.score - left.score);
+
+  if (scored.length === 0) {
+    return undefined;
+  }
+
+  if (scored.length === 1 || scored[0].score - scored[1].score >= 0.18) {
+    return scored[0].candidate;
+  }
+
+  return undefined;
+}
+
+function normalizeActionReferenceText(value: string): string {
+  return normalizeComparableText(value)
+    .replace(/\b(the|this|that|those|these|one|ones|task|tasks|action|actions|item|items|el|la|los|las|un|una|uno|de|del|dels|aquest|aquesta|aquell|aquella)\b/g, " ")
+    .replace(/\bdev\b/g, "developer")
+    .replace(/\bcv\b/g, "resume")
+    .replace(/\byt\b/g, "youtube")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function scorePendingActionCandidateReference(referenceKey: string, candidate: PendingActionCandidate): number {
+  const titleKey = normalizeActionReferenceText(candidate.title);
+  const goalKey = normalizeActionReferenceText(candidate.goalTitleSnapshot ?? "");
+  const haystack = `${titleKey} ${goalKey}`.trim();
+
+  if (!referenceKey || !haystack) {
+    return 0;
+  }
+
+  if (titleKey === referenceKey || haystack === referenceKey) {
+    return 1;
+  }
+
+  if (haystack.includes(referenceKey)) {
+    return 0.9;
+  }
+
+  const referenceTokens = meaningfulActionReferenceTokens(referenceKey);
+  const haystackTokens = meaningfulActionReferenceTokens(haystack);
+
+  if (referenceTokens.length === 0 || haystackTokens.length === 0) {
+    return 0;
+  }
+
+  const matched = referenceTokens.filter((token) =>
+    haystackTokens.some((candidateToken) => token === candidateToken || token.length >= 4 && candidateToken.startsWith(token) || candidateToken.length >= 4 && token.startsWith(candidateToken))
+  );
+
+  return matched.length / referenceTokens.length;
+}
+
+function meaningfulActionReferenceTokens(value: string): string[] {
+  return value
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3 && !/^(to|for|with|and|you|can|please|pls|done|complete|archive|delete|remove|snooze|keep|review|write|check|send|apply)$/.test(token));
 }
 
 function parseActionHygieneReply(message: string):
@@ -15081,7 +16660,9 @@ function looksLikeUnresolvedHygieneReply(message: string): boolean {
   return (
     /^snooze\s+(?:#?\d+|first|second|third|fourth|fifth|.+)$/i.test(trimmed) ||
     /^(complete|done|archive|delete|remove|keep)\s+(?:#?\d+|first|second|third|fourth|fifth)$/i.test(trimmed) ||
-    /\b(?:complete|done|snooze|archive|delete|remove|keep)\s+#?\d+\s+\band\b\s+(?:complete|done|snooze|archive|delete|remove|keep)\s+#?\d+/i.test(trimmed)
+    /\b(?:complete|done|snooze|archive|delete|remove|keep)\s+#?\d+\s+\band\b\s+(?:complete|done|snooze|archive|delete|remove|keep)\s+#?\d+/i.test(trimmed) ||
+    /^(?:archive|delete|remove|complete|done|snooze|keep)\s+all(?:\s+(?:except|menos|excepte|menys)\b.*)?$/i.test(trimmed) ||
+    /^(?:archive|delete|remove|complete|done|snooze|keep)\s+.+,\s*(?:archive|delete|remove|complete|done|snooze|keep)\s+.+$/i.test(trimmed)
   );
 }
 
@@ -15365,6 +16946,19 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
   }
 
   if (pendingAction.type === "action_hygiene") {
+    if (pendingAction.payload.operation === "batch_update") {
+      const timezone = typeof pendingAction.payload.timezone === "string" ? pendingAction.payload.timezone : await getUserTimezone(userId);
+      const operations = readActionHygieneBatchOperations(pendingAction.payload.operations);
+
+      if (operations.length === 0) {
+        return {
+          reply: "No action hygiene changes were waiting."
+        };
+      }
+
+      return applyActionHygieneBatchOperations(userId, operations, timezone);
+    }
+
     if (pendingAction.payload.operation !== "bulk_archive" || !Array.isArray(pendingAction.payload.actionIds)) {
       return {
         reply: "Run /action_hygiene again and choose one action."
@@ -15418,6 +17012,96 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
   throw new Error(`Unsupported pending action type: ${pendingAction.type}`);
 }
 
+function readActionHygieneBatchOperations(value: unknown): ActionHygieneBatchOperation[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(isRecord)
+    .flatMap((item): ActionHygieneBatchOperation[] => {
+      const operation = typeof item.operation === "string" ? item.operation : "";
+      if (operation !== "archive" && operation !== "complete" && operation !== "snooze" && operation !== "keep") {
+        return [];
+      }
+
+      const actionId = typeof item.actionId === "string" ? item.actionId : "";
+      const title = typeof item.title === "string" ? item.title : "";
+
+      if (!actionId || !title) {
+        return [];
+      }
+
+      return [{
+        operation,
+        actionId,
+        title,
+        timeText: typeof item.timeText === "string" ? item.timeText : undefined,
+        dueAt: typeof item.dueAt === "string" ? item.dueAt : undefined
+      }];
+    });
+}
+
+function isRecentActionMutationContext(pendingAction: PendingAction): boolean {
+  return (
+    pendingAction.type === "action_hygiene" &&
+    isRecord(pendingAction.payload) &&
+    pendingAction.payload.operation === "recent_mutation_status"
+  );
+}
+
+function looksLikeRecentMutationStatusQuestion(message: string): boolean {
+  const text = normalizeForComparison(message);
+  return (
+    /\b(did|do|done|changed|change|archive|archived|snooze|snoozed|complete|completed|happened|previous|last)\b/.test(text) &&
+    /\b(you|u|it|all|them|those|that|command|stuff|do|did|changed)\b/.test(text)
+  ) || /\b(que has cambiado|que hiciste|què has canviat|ho has fet|did you do it)\b/.test(text);
+}
+
+function formatRecentActionMutationStatus(pendingAction: PendingAction): string {
+  const recentReply = typeof pendingAction.payload.reply === "string" ? pendingAction.payload.reply : "";
+  const summary = typeof pendingAction.payload.summary === "string" ? pendingAction.payload.summary : "";
+
+  if (recentReply) {
+    return ["Last action changes:", recentReply].join("\n");
+  }
+
+  return summary ? `Last action changes: ${summary}` : "I do not have a recent action change recorded.";
+}
+
+async function maybeRememberRecentActionMutationStatus(
+  userId: string,
+  pendingAction: PendingAction,
+  reply: string
+): Promise<void> {
+  if (pendingAction.type !== "action_hygiene" && pendingAction.type !== "action_archive" && pendingAction.type !== "action_target_clarification") {
+    return;
+  }
+
+  await maybeRememberRecentActionMutationStatusFromReply(userId, reply);
+}
+
+async function maybeRememberRecentActionMutationStatusFromReply(userId: string, reply: string): Promise<void> {
+  if (!replyStartsWithActionMutation(reply)) {
+    return;
+  }
+
+  await replacePendingAction(userId, {
+    type: "action_hygiene",
+    summary: "Recent action changes",
+    payload: {
+      operation: "recent_mutation_status",
+      summary: "Recent action changes",
+      reply
+    },
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000)
+  });
+}
+
+function replyStartsWithActionMutation(reply: string): boolean {
+  return /^(Done:|Action archived:|Archived \d+ actions?:|Action completed:|Action snoozed until|Action rescheduled:)/.test(reply.trim());
+}
+
 async function findPendingAction(userId: string, pendingActionId: string) {
   const pendingActions = await getPendingActions(userId);
   return pendingActions.find((action) => action.id === pendingActionId && action.status === "pending");
@@ -15439,6 +17123,41 @@ function surfaceReplyIncludesMutation(reply: string): boolean {
     reply.startsWith("Plan ") ||
     reply.startsWith("Weekly plan")
   );
+}
+
+async function runConversationOrchestratorV2ForMessage(
+  userId: string,
+  message: string
+): Promise<ProcessMessageResult | undefined> {
+  const result = await runConversationOrchestratorV2({
+    userId,
+    message,
+    callbacks: {
+      getActiveGoals,
+      getLatestPendingAction,
+      showActionHygiene: async (callbackUserId, callbackMessage, callbackNow) => {
+        const { report } = await createActionHygieneSession(
+          callbackUserId,
+          callbackMessage,
+          callbackNow,
+          "conversation_orchestrator_v2"
+        );
+        return formatActionHygieneReport(report);
+      },
+      resolvePendingDecisionReply,
+      createRiskGuardrailReply: createGuardianGuardrailReply
+    }
+  });
+
+  if (!result.handled) {
+    return undefined;
+  }
+
+  if (result.processResult) {
+    return result.processResult;
+  }
+
+  return replyOnly(userId, message, result.reply ?? "I did not change anything.", result.routeDebug);
 }
 
 function replyOnly(
@@ -15600,6 +17319,7 @@ interface DailyOperatorBrief {
   goalStatus: DailyOperatorBriefGoalStatus[];
   recentWins: string[];
   risks: string[];
+  emailAttention?: OperatorEmailAttentionSummary;
   actionHygiene?: {
     summary: string;
     needsDecision: number;
@@ -15608,6 +17328,81 @@ interface DailyOperatorBrief {
   weeklyReviewDue?: boolean;
   suggestedNextStep: string;
   priorityDebug?: DailyOperatorBriefPriorityDebug[];
+}
+
+type OperatorAttentionPriority = "critical" | "high" | "medium" | "low";
+
+interface OperatorAttentionItem {
+  kind: "risk" | "action" | "email_review" | "goal" | "planning" | "hygiene";
+  title: string;
+  summary: string;
+  priority: OperatorAttentionPriority;
+  suggestedReply?: string;
+  sourceId?: string;
+}
+
+interface OperatorEmailAttentionSummary {
+  pendingCount: number;
+  workActionCount: number;
+  jobSearchCount: number;
+  customCount: number;
+  otherCount: number;
+  handledTodayCount: number;
+  approvedTodayCount: number;
+  rejectedTodayCount: number;
+  gmailDerivedActionItemsToday: number;
+  gmailDerivedEventsToday: number;
+  topReviewSubjects: string[];
+  priority: OperatorAttentionPriority;
+  summary: string;
+  userFacingLine?: string;
+  syncMode: string;
+  notificationPreference: "on" | "off";
+}
+
+interface OperatorActionAttentionSummary {
+  openCount: number;
+  overdueCount: number;
+  dueSoonCount: number;
+  hygieneNeedsDecision: number;
+  topActions: Array<{ id: string; title: string; dueAt?: string; priority: ActionItem["priority"] }>;
+  summary: string;
+}
+
+interface OperatorGoalAttentionSummary {
+  activeCount: number;
+  noProgressCount: number;
+  criticalNoProgressCount: number;
+  summary: string;
+}
+
+interface OperatorRiskAttentionSummary {
+  activeWatchouts: string[];
+  guardrailTriggeredToday: boolean;
+  summary: string;
+}
+
+interface OperatorPlanningAttentionSummary {
+  weeklyReviewDue: boolean;
+  latestWeeklyReviewDate?: string;
+  summary: string;
+}
+
+interface OperatorAttentionState {
+  userId: string;
+  date: string;
+  timezone: string;
+  topAttentionItems: OperatorAttentionItem[];
+  recommendedNextMove: string;
+  emailAttentionSummary: OperatorEmailAttentionSummary;
+  actionAttentionSummary: OperatorActionAttentionSummary;
+  goalAttentionSummary: OperatorGoalAttentionSummary;
+  riskAttentionSummary: OperatorRiskAttentionSummary;
+  planningAttentionSummary: OperatorPlanningAttentionSummary;
+  suggestedUserReplies: string[];
+  missingClarification?: string;
+  confidence: number;
+  reasoning: string[];
 }
 
 interface WeeklyReviewContext {
@@ -15627,6 +17422,7 @@ interface WeeklyReviewContext {
   snoozedOrRescheduledActions: ActionItem[];
   archivedActions: ActionItem[];
   guardrailEvents: StoredEvent[];
+  emailAttention: WeeklyEmailAttentionSummary;
   goalProgress: WeeklyGoalProgress[];
   goalsWithProgress: WeeklyGoalProgress[];
   goalsWithoutProgress: WeeklyGoalProgress[];
@@ -15635,6 +17431,21 @@ interface WeeklyReviewContext {
   dailyLoopCounts: {
     morningBriefs: number;
     eveningReviews: number;
+  };
+}
+
+interface WeeklyEmailAttentionSummary {
+  reviewsCreated: number;
+  reviewsApproved: number;
+  reviewsRejected: number;
+  pendingReviews: number;
+  gmailDerivedActionItems: number;
+  gmailDerivedEvents: number;
+  byKind: {
+    jobSearch: number;
+    workAction: number;
+    custom: number;
+    other: number;
   };
 }
 
@@ -15672,6 +17483,7 @@ interface WeeklyReviewMemory {
   stalls: string[];
   goalProgress: unknown[];
   guardrailSummary: Record<string, unknown>;
+  emailAttention?: WeeklyEmailAttentionSummary;
   patterns: string[];
   recommendedNextWeekActions: string[];
   reflectionIds: string[];
@@ -15766,6 +17578,7 @@ interface NextWeekPlanContext {
   recentEventsSummary: Record<string, number>;
   guardrailGoals: Goal[];
   guardrailEvents: StoredEvent[];
+  emailAttention: WeeklyEmailAttentionSummary;
   futureActionsNextWeek: ActionItem[];
   reviewedWeek: {
     weekStartLocalDate: string;

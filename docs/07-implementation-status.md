@@ -28,7 +28,10 @@ After every implementation pass:
 - [x] Channel-agnostic `NormalizedInboundMessage` abstraction
 - [x] Intent routing before business logic
 - [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, integration guidance, explicit email-rule enable requests, and explicit integration sync requests
+- [x] Channel-neutral operator attention state/API: `GET /users/:userId/operator-attention` composes actions, goals, events, risks, hygiene, Gmail reviews, and latest weekly-review status for natural attention/email-attention questions and operator-loop surfaces
 - [x] Optional LLM Semantic Router v4 for normal free-text understanding after deterministic safety/command/pending handling and before generic chat fallback; targets English/Spanish/Catalan phrasing, returns structured intent only, keeps short-lived Gmail-rule conversation context, and leaves all mutations to deterministic API executors
+- [~] Conversation Orchestrator v2 Phase 1: new operation-planning architecture under `/messages/process_v2` and disabled-by-default `/messages/process` flag. It builds `ConversationContext`, `AvailableOperations`, an OperationPlanner contract, deterministic validation/execution, and execution-result response composition. Current migrated scopes are action hygiene list creation and replies, all-except cleanup batches, recent mutation questions, natural confirmation variants, cross-domain visible-context safety, reference-text safety, and betting/trading risk precedence. The runtime planner is deterministic today; the LLM operation planner module is not called by these paths yet.
+- [x] Short-lived interaction context for visible action/hygiene lists, recent action mutation status, focused Gmail rules, pending Gmail proposals, email review lists, and plan sessions through the existing pending-action layer
 - [x] `/messages/process` routeDebug metadata for API smoke tests: router source, intent, handler, semantic-router usage, mutation flag, confidence, language, side-effect risk, confirmation requirement, and compact reason
 - [x] User onboarding/setup simplification v1: shared API onboarding state/reply composer, `/start`, `/setup`, natural quickstart, missing setup, goals setup, daily-loop setup, and integration setup guidance
 - [x] First 5 Minutes Onboarding v1: guide-style `/start`, setup overview with Ready/Needs attention/Optional/Best next step, state-aware next-step suggestions, action/reminder onboarding, and explicit Gmail/GitHub setup boundaries
@@ -112,12 +115,15 @@ After every implementation pass:
 - [x] Multi-intent conversational orchestrator
 - [x] Action hygiene analyzer, `/action_hygiene`, `/debug_action_hygiene`, and hygiene-session replies
 - [x] Hygiene reply hardening: sessions stay active across completed/snoozed candidates, incomplete snooze replies ask for a time, and generic chat cannot fake cleanup success
+- [x] Conversational Action/Hygiene Control v2: visible-number and natural-label resolution for hygiene/action lists, batch archive/complete/snooze/keep plans, all-except cleanup replies, confirmation before destructive batches, and short-lived recent mutation answers
+- [x] Conversation Orchestrator v2 golden transcript coverage for v2-owned action hygiene list creation/replies, normal `/messages/process` opt-in ownership, action hygiene batches, all-except cleanup, single-item pronoun replies, recent mutation status questions, English/Spanish/Catalan references, natural confirmation variants, cross-domain Endesa safety, and betting/trading risk precedence
 - [~] Snooze history/count is inferred from available state where possible; no full action history model yet
 
 ## Daily And Weekly Operator Loop
 
 - [x] `/today` daily operator brief
 - [x] Natural daily operator requests such as `what should I do today` and `start my day`
+- [x] Natural attention requests such as `anything important?`, `what needs my attention?`, `what should I handle first?`, `what emails need action?`, and Spanish/Catalan Gmail-attention variants route to operator/email attention summaries instead of generic coaching
 - [x] Daily priority scoring with goal priority weights
 - [x] `/debug_daily_priorities`
 - [x] Optional LLM Daily Coach with strict validation and deterministic fallback
@@ -128,7 +134,9 @@ After every implementation pass:
 - [x] Local timezone day/week handling, defaulting to `Europe/Madrid`
 - [x] Weekly operator review: `/weekly`, `/weekly force`, `/weekly_last`, `/debug_weekly_context`
 - [x] Week-to-date weekly review display for current week
+- [x] Natural `/review` and `/today` use consistent user-local day ranges; natural weekly review refreshes stale current-week memories through the reviewed local date
 - [x] Weekly review stored as `MemoryEntry` with `data.kind="weekly_review"`
+- [x] Pending Gmail reviews are included in `/today`, `/start_day`, `/end_day`, `/weekly`, `/debug_weekly_context`, and next-week planning context as review inbox work, not as fake ActionItems
 - [x] `/plan_next_week` proposes 3-7 next-week ActionItems and creates only explicitly selected items
 - [x] Plan-next-week output distinguishes ActionItem priority from linked goal priority
 - [x] Plan-next-week cleanup suggestions are non-creatable and point back to `/action_hygiene` or natural action control instead of creating meta cleanup tasks
@@ -213,11 +221,13 @@ After every implementation pass:
 - [x] Natural reset can archive all visible Gmail email rules, including job-search, work-action, custom, and paused rules, after confirmation. It does not delete the Gmail connection or historical email reviews/events.
 - [x] Exact custom Gmail rule names ending in `emails` are preserved during selection, so `Endesa emails` can resolve that rule instead of collapsing to the broader `Endesa` target.
 - [x] Utility/bill custom Gmail tracking avoids false health-goal links; Endesa/Aigues bill rules do not attach to `Improve strength and energy` unless an actual utility/expense goal exists.
+- [x] Gmail-rule cross-context safety for targeted follow-ups. A target-specific request such as `ignore the Endesa ones` does not fall back to unrelated visible rule context such as work-action emails; it asks the user to show email reviews or Gmail rules when no matching Endesa context is visible.
 - [x] LLM semantic-router API smoke coverage for multilingual Gmail rule list, custom-rule creation, pending-rule edits, timing questions, pause/resume management, and guardrail precedence when an LLM mock misroutes risky text
 - [x] Expired pending confirmations no longer block fresh full-message requests such as `create a rule for Endesa bills`
 - [x] Conversation repair for bad routing around pending Gmail rules; Alecto acknowledges the specific pending-rule problem instead of falling into generic support/coaching
 - [x] Email review queue
 - [x] Email Review Inbox v1: `/email_reviews`, `email reviews`, `show Gmail reviews`, `what emails need review`, `correos pendientes`, and Catalan variants show grouped pending reviews with human labels and short-lived visible numbers instead of adapter IDs or permanent IDs
+- [x] Operator-loop Gmail review visibility: pending/handled Gmail reviews and Gmail-derived action/event counts can appear in attention summaries, daily/start/end-day replies, weekly review/debug context, and planning as non-creatable cleanup guidance
 - [x] Email review context actions: after showing the inbox, `show 1`, `approve 1`, `reject 2`, `approve all job-search reviews`, `reject all Endesa reviews`, `reject all the rest reviews from Endesa`, and `turn 3 into an action tomorrow` resolve only against the visible pending review context and expire safely
 - [x] Email Review Inbox visible numbers now follow display order across groups; `show 1` and `reject 5` resolve to the number the user saw
 - [x] Bulk email review operations re-check current DB status and only mutate still-pending visible reviews. Already approved, rejected, action-converted, or missing reviews are reported separately as already handled.
@@ -230,7 +240,7 @@ After every implementation pass:
 - [x] Work-action review approval creates ActionItems instead of Events
 - [~] Gmail OAuth/account management remains local-MVP; production auth, key management, and secret rotation are not implemented
 - [~] LLM email classifier and semantic router are optional and post-processed by strict allowlists/executors; broader natural-language coverage has targeted API smoke tests but still needs a larger eval suite before production
-- [~] Conversation Orchestrator v2 modularization has started with `apps/api/src/conversation/email-rule-selection.ts`, but `apps/api/src/server.ts` remains oversized and still needs capability executors/services extracted.
+- [~] Conversation Orchestrator v2 modularization has started under `apps/api/src/conversation/` with context, operation catalog, planner, validator, executor, response composer, Gmail autonomy, and email-rule selection helpers. `apps/api/src/server.ts` remains oversized and still needs capability executors/services extracted.
 - [x] Editing filters on an existing custom Gmail rule through API conversation routing; destructive removal still requires confirmation
 - [ ] Gmail send/label modification
 - [ ] Gmail webhooks, full-inbox/all-mail LLM monitoring, per-rule sync schedules, business-hours Gmail checks, and daily Gmail digest

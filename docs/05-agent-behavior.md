@@ -43,7 +43,8 @@ The agent must label inferred patterns as inferences, not facts.
 - [x] Multi-line command batches execute supported commands line by line.
 - [x] Pasted logs, code fences, Codex prompts, and debug output are treated as reference text and have no side effects.
 - [x] Pending decision replies such as `yes`, `no`, `1`, or `second one` resolve before normal routing.
-- [x] Guardrail/risk intent wins before action creation or generic chat.
+- [x] Guardrail/risk intent wins before action creation, attention summaries, planning, or generic chat.
+- [x] Visible action/hygiene context is used before broad fuzzy matching, so replies like `archive 1`, `the dev jobs one`, and `archive all except the read one` only target the recent visible list.
 - [x] Conversation-first surface routing maps natural operator requests to existing services: help/capabilities, setup state, daily operator brief, daily review, weekly review, this-week/next-week planning, action hygiene, goals, actions, memories, and integration guidance.
 - [x] Onboarding/setup routing is conversation-first: `/start`, `/setup`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up daily loop`, and `set up integrations` use shared API onboarding composers.
 - [x] Explicit memory phrases create memory through the message processor.
@@ -55,15 +56,20 @@ The agent must label inferred patterns as inferences, not facts.
 ## Current Operator Behaviors
 
 - [x] `/today` gives a concise daily operator brief using actions, goals, events, risks, hygiene, weekly-review status, and optional validated LLM coach text.
+- [x] Natural attention questions such as `anything important?`, `what needs my attention?`, `what should I handle first?`, `what emails need action?`, `hay correos importantes de Gmail?`, and `anything for my job search?` use a shared operator-attention state. They can surface urgent actions, risks, hygiene, goal gaps, planning status, and pending Gmail reviews without creating new tasks.
 - [x] `/start_day`, `/end_day`, and `/tomorrow` support the daily operating loop.
 - [x] `/weekly` creates a saved weekly operator review memory.
+- [x] `/today` and `/review` use the same user-local day boundary. Natural weekly review refreshes current-week saved reviews when the reviewed local date has advanced.
 - [x] `/plan_next_week` turns weekly review context into proposed next-week actions and waits for explicit create/skip/edit replies.
 - [x] Natural planning phrases distinguish current-week requests (`plan this week`, `plan my week`) from next-week requests (`plan next week`) and ask clarification for ambiguous `make a plan` when there is no active plan/recent review context.
 - [x] `/insight` and `/weekly_insight` provide interpretive coaching reports.
 - [x] `/action_hygiene` asks the user to decide on stale/overdue tasks; it never archives automatically.
+- [x] Conversational Action/Hygiene Control v2 can process visible-list cleanup batches such as `archive 1, snooze 2 tomorrow`, `archive all except the read one`, and `keep the dev jobs one, archive the rest`. It asks for missing snooze times, asks confirmation before destructive batches, and uses deterministic ActionItem services for the final mutation.
+- [~] Conversation Orchestrator v2 Phase 1 is the new architecture path for context-bound natural operations. It builds a channel-neutral `ConversationContext`, exposes an `AvailableOperations` catalog, plans operations deterministically, validates them, executes through existing services, and composes replies from actual execution results. It owns action hygiene list creation plus cleanup replies when enabled. It is currently wired for `/messages/process_v2` and optional `/messages/process` usage through `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`; legacy routing still owns surfaces not yet migrated.
 - [x] Natural phrases such as `what can you do`, `help me set up`, `what should I do today`, `review my week`, `plan this week`, `plan next week`, `clean up my tasks`, `show my goals`, `connect Gmail`, `what email rules are on`, `que reglas de email tenemos activas`, `email reviews`, `correos pendientes`, `enable job search rule for Gmail`, `create a rule for Endesa bills`, `track Endesa bills from Gmail`, `crea una regla de Gmail para facturas de Aigues de Barcelona`, `looks for only Aigues de Barcelona instead of Endesa`, `busca solo Aigues de Barcelona, no Endesa`, `make that rule look for only Aigues de Barcelona instead of Endesa`, `pause it`, `quan m'avisareu dels correus d'Endesa?`, `when will you let me know about new emails?`, and `sync Gmail` use the same underlying services as command shortcuts.
 - [x] Custom Gmail sender/keyword tracking is confirmation-first and review-only. The agent may propose a rule, but it must not scan Gmail before confirmation and must not auto-create Events or ActionItems from custom matches.
 - [x] Email Review Inbox v1 is review-first and user-controlled. `email reviews`, `show Gmail reviews`, `what emails need review`, Spanish/Catalan pending-email phrases, and `/email_reviews` show grouped pending items with short-lived visible numbers in display order. Follow-ups such as `show 1`, `approve 1`, `reject 2`, `reject all the rest reviews from Endesa`, and `turn 3 into an action tomorrow` resolve only against that visible context and only mutate reviews that are still pending.
+- [x] Pending Gmail review items are part of the operator loop. `/today`, `/start_day`, `/end_day`, `/weekly`, and weekly planning can mention review work, but they do not convert reviews into fake ActionItems. Planning cleanup suggestions for Gmail reviews are non-creatable and point back to `email reviews`.
 - [x] Gmail sync replies and scheduled sync notifications surface pending review work without dumping emails. Manual sync replies in-band and does not reset the background schedule; scheduled sync can send one bundled "Gmail reviews are waiting" notification when new review items are created.
 - [x] Optional LLM semantic routing can catch normal user phrasing that deterministic rules miss across operator surfaces and Gmail rule conversations, especially English/Spanish/Catalan wording. It only returns structured intent; deterministic executors still apply or reject changes.
 - [x] Pending and active Gmail custom-rule conversations keep short-lived state: the user can edit keywords, use replacement language such as `instead of`, `en vez de`, `en lloc de`, ask where matches go, ask when sync/notification happens, correct/remove a goal link, pause/resume the focused rule, cancel, or confirm without falling into generic coaching.
@@ -87,11 +93,14 @@ Examples:
 - Do not say an event was logged unless the Event exists.
 - Do not say a memory was saved unless the MemoryEntry or pending confirmation exists.
 - Do not create ActionItems for betting/trading requests; use guardian responses instead.
+- Do not create meta ActionItems for pending Gmail review cleanup. Surface reviews as inbox items and route the user to `email reviews`.
+- Do not let an unrelated pending context hijack a new domain-specific request. For example, an Endesa Gmail-rule/review follow-up must not mutate a work-action rule, and an action hygiene status question must not route to email review handling.
 - Do not answer Gmail setup questions as if a mutation happened. Questions about a rule should explain status, filters, goal link, review behavior, and sync behavior.
 - Do not claim Gmail background checks are active unless Gmail is connected, at least one Gmail rule is active, the user explicitly selected scheduled checks, and the worker runtime allows scheduled sync. If the preference is saved but local worker sync is disabled, say so plainly and keep manual `sync Gmail` available.
 - Do not keep a Gmail preference confirmation alive after the user moves on to another Gmail question. Let the question answer normally and require the user to ask for the preference change again.
 - Do not treat Gmail rule context as permission to scan or auto-log. It only helps resolve references like `it` or `that rule`; normal Gmail rules still require explicit creation/confirmation and manual or scheduled sync.
 - Do not treat email review visible numbers as permanent IDs. They are short-lived context from the last inbox display, and expired context must ask the user to run `email reviews` again.
+- Do not let LLM or planner output mutate state directly. Operation plans must pass deterministic validation and deterministic executors first.
 - Do not bulk-approve or bulk-reject email review items from stale visible context without checking current DB status. Already approved, rejected, or action-converted reviews must be reported as already handled, not mutated again.
 - Do not create Events or ActionItems from custom Gmail reviews unless the user explicitly approves a supported outcome or asks to turn a specific visible review into an action.
 

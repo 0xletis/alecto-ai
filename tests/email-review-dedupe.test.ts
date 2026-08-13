@@ -4267,6 +4267,104 @@ test("custom Gmail rule conversation handles bulk removal and utility tracking w
   }
 });
 
+test("explicit custom Gmail target never falls back to unrelated visible rule context", async () => {
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `gmail-cross-domain-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    await server.ready();
+    process.env.LLM_ROUTER_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_custom_rule_manage",
+      operation: "remove",
+      confidence: 0.92,
+      reason: "User wants to ignore/remove Endesa email items.",
+      language: "en",
+      sideEffectRisk: "destructive",
+      requiresConfirmation: true,
+      target: "Endesa",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+
+    await prisma.user.create({ data: { id: userId } });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "cross-domain@example.com",
+          hasRefreshToken: true
+        }
+      }
+    });
+    const workRule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"please review\"",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 7,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "hybrid",
+        minAutoLogConfidence: 0.95,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    await prisma.pendingAction.create({
+      data: {
+        userId,
+        type: "custom_email_rule",
+        status: "pending",
+        summary: "Gmail rule context",
+        payload: {
+          operation: "rule_context",
+          focusedRuleId: workRule.id,
+          rules: [{ id: workRule.id, name: workRule.name, adapterId: workRule.adapterId }]
+        },
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000)
+      }
+    });
+
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "ignore the Endesa ones" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I don't see visible Endesa reviews or an active Endesa rule/i);
+    assert.doesNotMatch(response.json().reply, /Work action emails/);
+    assert.equal((await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: workRule.id } })).status, "active");
+  } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
 test("risky action command text routes to guardrail response without creating ActionItem", async () => {
   const server = buildServer();
   const actionUserId = `action-risk-command-${randomUUID()}`;
@@ -4323,6 +4421,133 @@ test("risky action command text routes to guardrail response without creating Ac
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("betting phrased as a daily advice question hard-stops before today routing", async () => {
+  const server = buildServer();
+  const actionUserId = `bet-daily-question-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  await prisma.goal.create({
+    data: {
+      userId: actionUserId,
+      title: "Control impulsive betting",
+      category: "finance",
+      templateId: "finance.control_betting_trading"
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "what should I do today to win a bet?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.match(response.json().reply, /Hard stop/);
+    assert.doesNotMatch(response.json().reply, /Today -/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
+  }
+});
+
+test("/today and /review use the same user-local day event window", async () => {
+  const server = buildServer();
+  const reviewUserId = `daily-review-window-${randomUUID()}`;
+  const now = "2026-08-13T10:00:00+02:00";
+  await prisma.user.create({ data: { id: reviewUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: reviewUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  await prisma.event.create({
+    data: {
+      userId: reviewUserId,
+      type: "health.workout_completed",
+      timestamp: new Date("2026-08-12T22:30:00.000Z"),
+      source: "manual",
+      data: { duration_minutes: 30 },
+      confidence: 1,
+      evidence: ["trained 30 min"]
+    }
+  });
+
+  try {
+    const today = await server.inject({
+      method: "GET",
+      url: `/users/${reviewUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(today.statusCode, 200);
+    assert.match(today.json().brief.summary, /1 event logged today/);
+
+    const review = await server.inject({
+      method: "GET",
+      url: `/users/${reviewUserId}/review/daily?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(review.statusCode, 200);
+    assert.match(review.json().review.summary, /30 minutes of training/);
+    assert.doesNotMatch(review.json().review.summary, /No events logged yet today/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reviewUserId } });
+  }
+});
+
+test("natural weekly review refreshes stale week-to-date memory", async () => {
+  const server = buildServer();
+  const reviewUserId = `weekly-natural-refresh-${randomUUID()}`;
+  await prisma.user.create({ data: { id: reviewUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: reviewUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  await prisma.memoryEntry.create({
+    data: {
+      userId: reviewUserId,
+      type: "pattern",
+      status: "active",
+      summary: "Old Monday-only weekly review.",
+      source: "system_inferred",
+      confidence: 1,
+      data: {
+        kind: "weekly_review",
+        status: "generated",
+        weekStartLocalDate: "2026-08-10",
+        weekEndLocalDate: "2026-08-16",
+        reviewedEndLocalDate: "2026-08-10",
+        timezone: "Europe/Madrid",
+        wins: ["No wins yet"],
+        stalls: ["No progress logged"],
+        goalProgress: [],
+        guardrailSummary: { note: "No guardrail triggers logged this reviewed period." },
+        patterns: [],
+        recommendedNextWeekActions: [],
+        reflectionIds: [],
+        source: "deterministic"
+      }
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: reviewUserId, message: "review my week" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Weekly review so far - 2026-08-10 to 2026-08-13/);
+    assert.doesNotMatch(response.json().reply, /2026-08-10 to 2026-08-10/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: reviewUserId } });
   }
 });
 
@@ -9271,7 +9496,7 @@ test("action hygiene sessions stay active and never fake snooze success", async 
       payload: { userId: hygieneUserId, message: "complete 1 and snooze 2" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Handle one hygiene action at a time/);
+    assert.match(response.json().reply, /need a snooze time/i);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: firstAction.id } })).status, "open");
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: secondAction.id } })).status, "open");
 
@@ -9306,6 +9531,228 @@ test("action hygiene sessions stay active and never fake snooze success", async 
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: hygieneUserId } });
+  }
+});
+
+test("action hygiene batch replies use visible numbers, confirm before mutation, and remember results", async () => {
+  const server = buildServer();
+  const hygieneUserId = `action-hygiene-batch-${randomUUID()}`;
+  const now = "2026-08-13T10:00:00+02:00";
+  await prisma.user.create({ data: { id: hygieneUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: hygieneUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  const titles = [
+    "Review homepage",
+    "Apply to 3 developer jobs",
+    "Write 5 bullets for the YouTube script",
+    "Read 20 minutes on 3 days",
+    "Do 2 strength sessions"
+  ];
+
+  for (let index = 0; index < titles.length; index += 1) {
+    await prisma.actionItem.create({
+      data: {
+        userId: hygieneUserId,
+        source: "manual",
+        title: titles[index],
+        priority: "medium",
+        status: "open",
+        dueAt: new Date(`2026-08-0${index + 1}T07:00:00.000Z`)
+      }
+    });
+  }
+
+  try {
+    const hygiene = await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(hygiene.statusCode, 200);
+    const candidates = hygiene.json().report.suggestedCleanupCandidates as Array<{ actionId: string; title: string }>;
+    assert.ok(candidates.length >= 5);
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId: hygieneUserId,
+        message: "archive 1, snooze 2 tomorrow, archive 3, snooze 4 tomorrow, archive 5"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I will:/);
+    assert.match(response.json().reply, new RegExp(candidates[0].title));
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[0].actionId } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Done:/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[0].actionId } })).status, "archived");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[1].actionId } })).status, "snoozed");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[2].actionId } })).status, "archived");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: {
+        userId: hygieneUserId,
+        message: "did u also do all the archive 1, snooze 2, archive 3, snooze 4, archive 5"
+      }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Last action changes:/);
+    assert.match(response.json().reply, /Archived|Snoozed/);
+    assert.doesNotMatch(response.json().reply, /email reviews/i);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: hygieneUserId } });
+  }
+});
+
+test("action hygiene all-except replies handle missing snooze time and safe batch mutation", async () => {
+  const server = buildServer();
+  const hygieneUserId = `action-hygiene-except-${randomUUID()}`;
+  const now = "2026-08-13T10:00:00+02:00";
+  await prisma.user.create({ data: { id: hygieneUserId } });
+  await prisma.notificationSettings.create({
+    data: {
+      userId: hygieneUserId,
+      timezone: "Europe/Madrid",
+      telegramUserId: "12345"
+    }
+  });
+  const homepage = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Review homepage",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-01T07:00:00.000Z")
+    }
+  });
+  const read = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Read 20 minutes on 3 days",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-02T07:00:00.000Z")
+    }
+  });
+  const devJobs = await prisma.actionItem.create({
+    data: {
+      userId: hygieneUserId,
+      source: "manual",
+      title: "Apply to 3 developer jobs",
+      priority: "medium",
+      status: "open",
+      dueAt: new Date("2026-08-03T07:00:00.000Z")
+    }
+  });
+
+  try {
+    await server.inject({
+      method: "GET",
+      url: `/users/${hygieneUserId}/actions/hygiene?now=${encodeURIComponent(now)}`
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "archive all except the read 20 minutes that u can snooze" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /need a snooze time/i);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: homepage.id } })).status, "open");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: read.id } })).status, "open");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "archive all except the read 20 minutes, snooze that to tomorrow" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I will:/);
+    assert.match(response.json().reply, /archive Review homepage/);
+    assert.match(response.json().reply, /snooze Read 20 minutes on 3 days/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: hygieneUserId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Done:/);
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: homepage.id } })).status, "archived");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: read.id } })).status, "snoozed");
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: devJobs.id } })).status, "archived");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: hygieneUserId } });
+  }
+});
+
+test("pending action target clarification accepts natural visible labels", async () => {
+  const server = buildServer();
+  const actionUserId = `action-choice-label-${randomUUID()}`;
+  await prisma.user.create({ data: { id: actionUserId } });
+  const devJobs = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Apply to 3 developer jobs",
+      priority: "medium",
+      status: "open"
+    }
+  });
+  const car = await prisma.actionItem.create({
+    data: {
+      userId: actionUserId,
+      source: "manual",
+      title: "Check cheap car listings",
+      priority: "medium",
+      status: "open"
+    }
+  });
+  await prisma.pendingAction.create({
+    data: {
+      userId: actionUserId,
+      type: "action_target_clarification",
+      status: "pending",
+      summary: "Clarify action target",
+      payload: {
+        intendedOperation: "archive_action",
+        candidateActions: [
+          { id: devJobs.id, title: devJobs.title, status: devJobs.status },
+          { id: car.id, title: car.title, status: car.status }
+        ]
+      },
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000)
+    }
+  });
+
+  try {
+    const response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: actionUserId, message: "the dev jobs one" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Confirm archive action: Apply to 3 developer jobs/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: actionUserId } });
   }
 });
 
@@ -10692,6 +11139,283 @@ test("next-week plan skips, debugs without side effects, dedupes future actions,
     }
     await server.close();
     await prisma.user.deleteMany({ where: { id: planUserId } });
+  }
+});
+
+test("operator attention surfaces pending Gmail reviews in conversation, today, weekly, and planning without creating fake tasks", async () => {
+  const server = buildServer();
+  const operatorUserId = `operator-attention-email-${randomUUID()}`;
+  const now = "2026-08-13T10:00:00.000Z";
+
+  try {
+    await server.ready();
+    await prisma.user.create({ data: { id: operatorUserId } });
+    const goal = await prisma.goal.create({
+      data: {
+        userId: operatorUserId,
+        title: "Find a new developer job",
+        category: "career",
+        templateId: "career.job_search",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId: operatorUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "operator@example.com",
+          hasRefreshToken: true,
+          gmailAutonomy: {
+            syncMode: "manual_only",
+            reviewNotificationEnabled: true
+          }
+        }
+      }
+    });
+    const workRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: operatorUserId,
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"can you review\"",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 7,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "hybrid",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const customRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: operatorUserId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "Endesa",
+        status: "active",
+        fetchStrategy: "query",
+        lookbackDays: 30,
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    await prisma.emailReviewItem.createMany({
+      data: [
+        {
+          userId: operatorUserId,
+          connectionId: connection.id,
+          ruleId: workRule.id,
+          adapterId: "work_action_email",
+          provider: "gmail",
+          providerMessageId: randomUUID(),
+          externalId: `gmail-review:${workRule.id}:${randomUUID()}`,
+          subject: "Dashboard review",
+          from: "Client <client@example.com>",
+          snippet: "Can you review the dashboard today?",
+          evidence: "Can you review the dashboard today?",
+          proposedEventType: "work_action_required",
+          confidence: 0.86,
+          reason: "Work action requires review.",
+          extracted: { project: "dashboard" },
+          status: "pending",
+          createdAt: new Date("2026-08-13T08:00:00.000Z")
+        },
+        {
+          userId: operatorUserId,
+          connectionId: connection.id,
+          ruleId: customRule.id,
+          adapterId: "custom_email_review",
+          provider: "gmail",
+          providerMessageId: randomUUID(),
+          externalId: `gmail-review:${customRule.id}:${randomUUID()}`,
+          subject: "Endesa factura",
+          from: "Endesa <billing@endesa.example>",
+          snippet: "Factura disponible.",
+          evidence: "Factura disponible.",
+          proposedEventType: "custom_email_review",
+          confidence: 0.78,
+          reason: "Custom tracking match.",
+          extracted: { customRuleName: "Endesa emails" },
+          status: "pending",
+          createdAt: new Date("2026-08-13T08:05:00.000Z")
+        }
+      ]
+    });
+    await prisma.emailReviewItem.create({
+      data: {
+        userId: operatorUserId,
+        connectionId: connection.id,
+        ruleId: workRule.id,
+        adapterId: "work_action_email",
+        provider: "gmail",
+        providerMessageId: randomUUID(),
+        externalId: `gmail-review:${workRule.id}:${randomUUID()}`,
+        subject: "Approved work email",
+        from: "Client <client@example.com>",
+        snippet: "Handled.",
+        evidence: "Handled.",
+        proposedEventType: "work_action_required",
+        confidence: 0.9,
+        reason: "Approved work action.",
+        extracted: { project: "dashboard" },
+        status: "approved",
+        reviewedAt: new Date("2026-08-13T08:15:00.000Z"),
+        createdAt: new Date("2026-08-13T07:55:00.000Z")
+      }
+    });
+    await prisma.actionItem.create({
+      data: {
+        userId: operatorUserId,
+        source: "email_review",
+        sourceId: "approved-review",
+        sourceProvider: "gmail",
+        sourceRuleId: workRule.id,
+        title: "Review dashboard",
+        status: "completed",
+        priority: "medium",
+        goalId: goal.id,
+        goalTitleSnapshot: goal.title,
+        completedAt: new Date("2026-08-13T08:20:00.000Z"),
+        createdAt: new Date("2026-08-13T08:16:00.000Z"),
+        actionType: "work_action_required",
+        evidence: "Approved Gmail review."
+      }
+    });
+    await prisma.event.create({
+      data: {
+        userId: operatorUserId,
+        type: "career.recruiter_reply_received",
+        timestamp: new Date("2026-08-13T08:30:00.000Z"),
+        source: "gmail",
+        provider: "gmail",
+        data: { goalId: goal.id, provider: "gmail", ruleId: workRule.id },
+        confidence: 0.9,
+        evidence: { subject: "Recruiter reply" }
+      }
+    });
+
+    let response = await server.inject({
+      method: "GET",
+      url: `/users/${operatorUserId}/operator-attention?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().attention.emailAttentionSummary.pendingCount, 2);
+    assert.equal(response.json().attention.emailAttentionSummary.workActionCount, 1);
+    assert.equal(response.json().attention.emailAttentionSummary.customCount, 1);
+    assert.match(response.json().attention.recommendedNextMove, /work-action Gmail review|Gmail reviews/i);
+    assert.doesNotMatch(JSON.stringify(response.json()), /accessToken|refreshToken|ciphertext|"iv"|"tag"|raw provider/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: operatorUserId, message: "anything important?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /What needs attention/);
+    assert.match(response.json().reply, /Gmail review/);
+    assert.equal(response.json().routeDebug.intent, "operator_attention_query");
+    assert.equal(await prisma.actionItem.count({ where: { userId: operatorUserId, status: "open" } }), 0);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: operatorUserId, message: "what emails need action?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /2 Gmail reviews need attention/);
+    assert.match(response.json().reply, /work-action email/);
+    assert.match(response.json().reply, /custom tracking item/);
+    assert.match(response.json().reply, /Alecto cannot reply to emails or change Gmail labels/);
+    assert.equal(response.json().routeDebug.intent, "email_attention_query");
+    assert.doesNotMatch(response.json().reply, /work_action_email|custom_email_review|accessToken|refreshToken|ciphertext|"iv"|"tag"/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: operatorUserId, message: "hay correos importantes de Gmail?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /2 Gmail reviews need attention/);
+    assert.equal(response.json().routeDebug.intent, "email_attention_query");
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${operatorUserId}/today?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().brief.summary, /2 Gmail reviews waiting/);
+    assert.ok(response.json().brief.topPriorities.some((line: string) => /Gmail reviews/.test(line)));
+    assert.match(response.json().brief.suggestedNextStep, /work-action Gmail review|Gmail reviews/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${operatorUserId}/weekly-review`,
+      payload: { now, force: true }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Email signals:/);
+    assert.match(response.json().message, /3 Gmail reviews? created|3 Gmail review/);
+    assert.match(response.json().message, /2 Gmail reviews still waiting/);
+    assert.equal(response.json().review.emailAttention.pendingReviews, 2);
+
+    response = await server.inject({
+      method: "GET",
+      url: `/users/${operatorUserId}/weekly-review/context?now=${encodeURIComponent(now)}`
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().context.counts.gmailReviewsPending, 2);
+    assert.match(response.json().message, /Gmail reviews pending: 2/);
+
+    response = await server.inject({
+      method: "POST",
+      url: `/users/${operatorUserId}/next-week-plan`,
+      payload: { now }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().message, /Clear pending Gmail reviews/);
+    assert.match(response.json().message, /not creatable/i);
+    const gmailCleanup = response.json().suggestions.find((suggestion: { dedupeKey?: string }) => suggestion.dedupeKey === "weekly_plan.email_reviews_cleanup");
+    assert.equal(gmailCleanup.creatable, false);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: operatorUserId, message: "create all new" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Clear pending Gmail reviews is already an email review inbox item/);
+    assert.equal(
+      await prisma.actionItem.count({ where: { userId: operatorUserId, title: "Clear pending Gmail reviews" } }),
+      0
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: operatorUserId, message: "I want to bet 500 because it is safe" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.doesNotMatch(response.json().reply, /Gmail reviews need attention|What needs attention/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: operatorUserId } });
   }
 });
 

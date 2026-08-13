@@ -25,11 +25,12 @@ It is usable by the founder over Telegram, with real local persistence, proactiv
 | User profile/tone | implemented | `/profile`, `/set_style` | `UserOperatingProfile` | optional wording | no | settings UI |
 | Risk guardrails | implemented | natural text, action commands, insights | message + events + profile | cannot override RED | no | broader crisis protocols |
 | Actions/reminders | implemented | `/action`, `/actions`, natural tasks | `ActionItem` | no required LLM | yes | scheduler robustness |
-| Natural action control | implemented | natural complete/move/snooze/archive | ActionItems/goals | no required LLM | no | ambiguity coverage |
+| Natural action control | implemented | natural complete/move/snooze/archive, visible-list replies | ActionItems/goals/PendingAction context | optional router only | no | broader evals and executor extraction |
 | Multi-intent orchestration | implemented | natural multi-part messages | message segments + services | no required LLM | no | more regression tests |
-| Daily loop | implemented | `/today`, `/start_day`, `/end_day`, `/tomorrow` | actions/goals/events/risks | optional Daily Coach | yes | UX consolidation |
+| Daily loop | implemented | `/today`, `/start_day`, `/end_day`, `/tomorrow` | actions/goals/events/risks/Gmail reviews | optional Daily Coach | yes | UX consolidation |
+| Operator attention | implemented | natural `anything important?`, `what needs my attention?`, `what emails need action?`, API `/operator-attention` | actions/goals/events/risks/hygiene/Gmail reviews/latest weekly review | optional semantic routing only | no | broader multilingual evals |
 | Action hygiene | implemented | `/action_hygiene` | ActionItems | none | surfaced in daily loop | history/snooze analytics |
-| Hygiene-session safety | implemented | natural replies such as `complete 1`, `snooze 2 tomorrow` | PendingAction + ActionItems | asks for missing time or confirmation | prevents fake cleanup success | richer multi-operation cleanup replies |
+| Hygiene-session safety | implemented | natural replies such as `complete 1`, `snooze 2 tomorrow`, `archive all except the read one` | PendingAction + ActionItems | asks for missing time or confirmation | prevents fake cleanup success | full standalone interaction context store |
 | Weekly review/planning | implemented | `/weekly`, `/weekly_last`, `/plan_next_week`, natural `plan this week` / `plan next week` | actions/events/goals/reflections/hygiene | optional guarded draft for review; plan is deterministic with optional mock-gated suggestions | no | more real-user planning polish |
 | Weekly insight | implemented | `/weekly_insight` | active events/goals/memory/profile | optional polish | scheduled delivery available | overlaps with weekly review |
 | Gmail readonly | partial | `/connect_gmail`, natural Gmail setup/status/list/sync/rule enable/custom tracking, natural autonomy preferences, multilingual pending and active custom-rule edits/questions/timing answers, bulk custom-rule removal confirmations, `/sync_gmail` | Gmail API | optional semantic router/classifier with hard deterministic filters first | manual sync or explicit per-user scheduled background sync when the worker master switch is enabled; bundled review notifications if enabled | production OAuth/account management, key rotation, broader real-user evals |
@@ -83,11 +84,20 @@ Expected natural alternatives:
 - `I need to call Alex tomorrow`
 - `move YouTube script to tomorrow afternoon`
 - `done with apply to 2 jobs`
+- `archive 1, snooze 2 tomorrow`
+- `archive all except the read one`
+- `the dev jobs one`
 - `slept 6h, energy 5, anxiety 7, trained 30 min`
 - `remember that I hate generic motivation`
 - `what can you do`
 - `help me set up`
 - `what should I do today`
+- `anything important?`
+- `what needs my attention?`
+- `what should I handle first?`
+- `what emails need action?`
+- `hay correos importantes de Gmail?`
+- `anything for my job search?`
 - `review my week`
 - `plan this week`
 - `plan next week`
@@ -230,13 +240,13 @@ No commands are currently removed or deprecated at runtime. There are no known u
 | `/review` | factual daily event summary | active events/check-ins/goals | no | deterministic | "What did I log today?" |
 | `/insight` | interpretive daily coaching | events/goals/memory/profile/risk | no | deterministic with optional polish | "What does today mean?" |
 | `/daily_insight` | alias of `/insight` | same as `/insight` | no | same as `/insight` | user preference/clarity |
-| `/today` | daily operator brief | actions/goals/events/risks/hygiene | no | deterministic with optional validated Daily Coach | "What should I do now/today?" |
-| `/start_day` | morning operating brief | actions/goals/risks/hygiene | can mark sent in worker/debug path | deterministic | start-of-day execution |
-| `/end_day` | evening review | completed/open actions/events/risks | can mark sent in worker/debug path | deterministic | close the day |
+| `/today` | daily operator brief | actions/goals/events/risks/hygiene/Gmail reviews | no | deterministic with optional validated Daily Coach | "What should I do now/today?" |
+| `/start_day` | morning operating brief | actions/goals/risks/hygiene/Gmail reviews | can mark sent in worker/debug path | deterministic | start-of-day execution |
+| `/end_day` | evening review | completed/open actions/events/risks/Gmail reviews | can mark sent in worker/debug path | deterministic | close the day |
 | `/tomorrow` | next-day prep | tomorrow actions and open priorities | no | deterministic | prepare tomorrow |
-| `/weekly` | saved weekly operator review | actions/events/goals/reflections/guardrails | yes, `MemoryEntry` weekly review | deterministic with guarded optional LLM draft | create durable weekly record |
-| `/plan_next_week` | confirmed next-week planning | weekly review/goals/actions/hygiene/guardrails | yes, selected `ActionItem`s only after explicit user reply | deterministic with optional mock-gated suggestion parse | turn review into next-week execution |
-| natural `plan this week` / `plan my week` | confirmed remaining-week planning | weekly review/goals/actions/hygiene/guardrails | yes, selected `ActionItem`s only after explicit user reply | deterministic with optional mock-gated suggestion parse | create a current-week action plan without command memorization |
+| `/weekly` | saved weekly operator review | actions/events/goals/reflections/guardrails/Gmail reviews | yes, `MemoryEntry` weekly review | deterministic with guarded optional LLM draft | create durable weekly record |
+| `/plan_next_week` | confirmed next-week planning | weekly review/goals/actions/hygiene/guardrails/Gmail reviews | yes, selected `ActionItem`s only after explicit user reply; Gmail-review cleanup is non-creatable | deterministic with optional mock-gated suggestion parse | turn review into next-week execution |
+| natural `plan this week` / `plan my week` | confirmed remaining-week planning | weekly review/goals/actions/hygiene/guardrails/Gmail reviews | yes, selected `ActionItem`s only after explicit user reply; Gmail-review cleanup is non-creatable | deterministic with optional mock-gated suggestion parse | create a current-week action plan without command memorization |
 | `/weekly_insight` | interpretive weekly insight | active weekly events/goals/memory/profile | no | deterministic with optional polish | quick weekly coaching read |
 
 ## Message-First Happy Path
@@ -246,12 +256,13 @@ The target product should work mostly without command memorization:
 1. Morning: Alecto sends a `/start_day`-style brief with the first move, top open actions, and guardrail watchouts.
 2. During the day: the user replies naturally with updates, tasks, reschedules, completions, or reflections.
 3. Alecto routes natural help/setup/review/planning/readout requests to the existing services; it logs events/actions only when appropriate, asks clarification when ambiguous, and asks confirmation before destructive changes.
-4. Due actions and snoozed actions resurface automatically through reminders.
-5. Email/GitHub sync quietly gathers approved signals; Gmail review items wait for user approval before becoming events or actions.
-6. Evening: Alecto sends an `/end_day`-style review and asks for remaining cleanup.
-7. Weekly: Alecto creates a `/weekly` operator review, points the user to `plan next week`, then `/plan_next_week` or natural planning proposes a confirmed action plan.
-8. The user approves selected actions; Alecto does not silently invent plans or mutate state.
-9. API smoke tests can inspect `routeDebug` on `/messages/process` to confirm whether a reply came from deterministic routing, LLM semantic routing, pending decisions, or guardrails.
+4. Visible list replies use the last relevant action, hygiene, Gmail-rule, email-review, or planning context before global matching.
+5. Due actions and snoozed actions resurface automatically through reminders.
+6. Email/GitHub sync quietly gathers approved signals; Gmail review items wait for user approval before becoming events or actions and surface in natural attention, `/today`, `/start_day`, `/end_day`, `/weekly`, and planning as inbox work.
+7. Evening: Alecto sends an `/end_day`-style review and asks for remaining cleanup.
+8. Weekly: Alecto creates a `/weekly` operator review, points the user to `plan next week`, then `/plan_next_week` or natural planning proposes a confirmed action plan.
+9. The user approves selected actions; Alecto does not silently invent plans or mutate state.
+10. API smoke tests can inspect `routeDebug` on `/messages/process` to confirm whether a reply came from deterministic routing, LLM semantic routing, pending decisions, or guardrails.
 
 ## Current Autonomy Level
 
@@ -263,7 +274,7 @@ The target product should work mostly without command memorization:
 - Can it use LLMs? **Yes, optionally.** OpenAI is env-gated and validated.
 - Can it operate without LLMs? **Yes.** Deterministic fallback is required and implemented.
 - Can it work for users today? **For a technical/founder local alpha user, yes.** For general users, no.
-- What blocks production? **Auth/security, production OAuth/account linking, key management/rotation, onboarding, UX simplification, scheduling/observability, and product packaging.**
+- What blocks production? **Auth/security, production OAuth/account linking, key management/rotation, onboarding, UX simplification, broader operator-attention evals, scheduling/observability, and product packaging.**
 
 ## Production Readiness Checklist
 
@@ -297,8 +308,10 @@ The target product should work mostly without command memorization:
 - [ ] semantic memory/vector search
 - [ ] better reflection relevance/ranking
 - [x] Planning UX Consolidation v1; `/weekly` points to planning, natural this-week/next-week planning is supported, grouped plan output separates cleanup/already scheduled/new actions, recurring system suggestions are semantically deduped, and reply examples only show creatable indexes
+- [x] Conversational Action/Hygiene Control v2 covers visible-list references, cleanup batches, all-except replies, recent action mutation status, and cross-domain context safety
+- [~] Conversation Orchestrator v2 Phase 1 covers a clean deterministic operation-planning path for selected scopes: `/messages/process_v2`, optional `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true` for `/messages/process`, `ConversationContext`, `AvailableOperations`, structured planner contract, validator/executors, response composer, v2-owned action hygiene list creation/replies, and golden transcript tests for action hygiene, recent mutation status, cross-domain safety, natural confirmations, Spanish/Catalan references, and risk precedence. The LLM operation planner contract exists but is not runtime-active on these paths yet.
 - [ ] broader guardrails beyond betting/trading
-- [~] API smoke tests cover key conversation routing paths, including multilingual Gmail custom-rule setup/edit/question/manage flows, list/reset phrasing, bulk custom-rule cleanup, utility-goal-link safety, and LLM semantic-router mock routing
+- [~] API smoke tests cover key conversation routing paths, including multilingual Gmail custom-rule setup/edit/question/manage flows, list/reset phrasing, bulk custom-rule cleanup, utility-goal-link safety, LLM semantic-router mock routing, and Conversation Orchestrator v2 Phase 1 golden transcripts
 - [ ] broader eval set for routing, action control, Gmail rule wizard, multilingual conversation repair, and LLM coach validation
 
 ### Integrations
@@ -355,4 +368,4 @@ Risk:
 
 Build **Real-World Planning Polish** next only after another Telegram log pass.
 
-First 5 Minutes Onboarding v1 and Planning UX Consolidation v1 are now implemented for the local alpha. Gmail token encryption at rest, custom sender/keyword Gmail tracking v1, active Gmail rule editing, short-lived Gmail rule conversation context, bulk custom Gmail rule cleanup, Email Review Inbox v1, Gmail Setup + Autonomy Preferences v1, bundled scheduled review-waiting notifications, and LLM Semantic Router v4 are implemented for the local MVP. The first Conversation Orchestrator v2 modularization slice has extracted Gmail rule selection helpers, but `server.ts` remains oversized and should continue being split into capability executors/services. The next high-leverage work is building a broader semantic-router eval set from real Telegram logs across English, Spanish, and Catalan, smoothing Gmail review inbox/autonomy UX, and reducing observed operator-loop friction without adding integrations or auto-creating actions. Broader Gmail autonomy such as business-hours checks, daily digest, full-inbox LLM monitoring, and webhooks should wait until production OAuth/account management, key management/rotation, privacy copy, and cost controls are clearer.
+First 5 Minutes Onboarding v1, Planning UX Consolidation v1, Operator Loop Integration + Natural Understanding v1, and Conversational Action/Hygiene Control v2 are now implemented for the local alpha. Gmail token encryption at rest, custom sender/keyword Gmail tracking v1, active Gmail rule editing, short-lived Gmail rule conversation context, bulk custom Gmail rule cleanup, Email Review Inbox v1, Gmail Setup + Autonomy Preferences v1, bundled scheduled review-waiting notifications, natural operator/email attention, and LLM Semantic Router v4 are implemented for the local MVP. Conversation Orchestrator v2 Phase 1 now exists as a modular operation-planning path for selected context-bound scopes, but legacy `/messages/process` routing still owns most surfaces unless the opt-in flag is enabled and `server.ts` remains oversized. The next high-leverage work is migrating more surfaces into reusable conversation context/executor modules, building a broader semantic-router and operator-attention eval set from real Telegram logs across English, Spanish, and Catalan, smoothing Gmail review inbox/autonomy UX, and reducing observed operator-loop friction without adding integrations or auto-creating actions. Broader Gmail autonomy such as business-hours checks, daily digest, full-inbox LLM monitoring, and webhooks should wait until production OAuth/account management, key management/rotation, privacy copy, and cost controls are clearer.

@@ -70,6 +70,9 @@ Status:
 - [x] Custom Gmail sender/keyword tracking v1 with confirmation-first setup and review-only output
 - [x] Gmail Setup + Autonomy Preferences v1 with state-aware Gmail setup/status/timing replies, goal-linked recommendations, manual-only vs scheduled preference, worker-executed scheduled background sync when globally enabled, review-waiting notification preference, and honest no-op answers for digest/work-hours/webhook requests
 - [x] Optional LLM semantic router v4 for English/Spanish/Catalan Gmail custom-rule create/edit/question/management flows, broader operator surface routing, email-rule list/timing questions, short-lived active-rule context, replacement corrections such as `instead of` / `en vez de` / `en lloc de`, routeDebug language/confidence/side-effect-risk observability, and conversation repair without direct DB mutation
+- [x] Operator Loop Integration + Natural Understanding v1: pending Gmail reviews feed shared operator attention, `/today`, `/start_day`, `/end_day`, `/weekly`, and planning as inbox work; natural attention/email questions route to existing services without fake mutations
+- [x] Conversational Action/Hygiene Control v2: visible action/hygiene list references, multi-operation cleanup batches, all-except cleanup replies, short-lived recent mutation status answers, Gmail-rule cross-context safety, and stricter betting/trading risk precedence
+- [~] Conversation Orchestrator v2 Phase 1: `/messages/process_v2` plus opt-in `/messages/process` flag, with `ConversationContext`, `AvailableOperations`, OperationPlanner contract, deterministic validator/executors, and response composer for migrated action-hygiene list/reply, recent-mutation, cross-context, and risk scopes. The LLM operation planner contract exists, but these paths are deterministic at runtime today.
 - [ ] wallet public-address fetcher
 - [ ] basic web settings page
 - [ ] production OAuth/account management
@@ -99,7 +102,8 @@ Likely high-leverage next items:
 - refine first-run onboarding into a fuller guided setup session only after more real alpha usage
 - keep weekly planning regression-tested as the bridge from weekly review into confirmed current-week/next-week ActionItems
 - polish the planning loop from real Telegram usage now that Planning UX Consolidation v1 is implemented
-- keep polishing Gmail setup, custom-rule management, and Email Review Inbox from real Telegram usage; v1 supports grouped review handling, manual/scheduled Gmail preference, worker-executed background sync when the master switch is enabled, review-notification preference, and bundled worker notifications, but Gmail webhooks, full-inbox monitoring, per-rule schedules, digest/work-hours preferences, and broader multilingual evals are still later work
+- keep migrating surfaces into Conversation Orchestrator v2 and extracting executors/context helpers out of `apps/api/src/server.ts`; Phase 1 proves the pattern but does not yet migrate Gmail rules, email reviews, planning, daily loop, or generic chat fully
+- keep polishing Gmail setup, custom-rule management, Email Review Inbox, and operator-attention wording from real Telegram usage; v1 supports grouped review handling, manual/scheduled Gmail preference, worker-executed background sync when the master switch is enabled, review-notification preference, bundled worker notifications, and daily/weekly/planning review visibility, but Gmail webhooks, full-inbox monitoring, per-rule schedules, digest/work-hours preferences, and broader multilingual evals are still later work
 - expand the semantic-router eval set from real Telegram logs across English, Spanish, and Catalan, keeping guardrails and executors deterministic
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until production OAuth/account management, key management, and secret rotation are implemented
