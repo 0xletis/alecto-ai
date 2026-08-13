@@ -5,6 +5,10 @@ import {
   type EmailSyncSummary,
   type IntegrationSyncResponse
 } from "../apps/worker/src/integration-notifications.js";
+import {
+  gmailScheduledSyncRuntimeFromEnv,
+  shouldSyncGmailConnectionOnSchedule
+} from "../packages/core/src/index.ts";
 
 function emailSummary(partial: Partial<EmailSyncSummary>): EmailSyncSummary {
   return {
@@ -79,4 +83,53 @@ test("scheduled Gmail sync can report new reviews and logged events in one compa
     '1 Gmail review is waiting: 1 work-action. Say "email reviews" to handle it.',
     "Gmail: 2 job-search email events logged."
   ]);
+});
+
+test("scheduled Gmail sync review notification respects disabled preference", () => {
+  const messages = formatIntegrationSyncNotifications(
+    gmailResponse([
+      emailSummary({ adapterId: "work_action_email", reviewItemsCreated: 2 })
+    ]),
+    { gmailReviewNotificationsEnabled: false }
+  );
+
+  assert.deepEqual(messages, []);
+});
+
+test("scheduled Gmail sync helper respects manual-only mode and per-connection interval", () => {
+  const now = new Date("2026-08-12T10:00:00.000Z");
+  const runtime = gmailScheduledSyncRuntimeFromEnv({
+    INTEGRATION_SYNC_ENABLED: "true",
+    INTEGRATION_SYNC_INTERVAL_MINUTES: "15"
+  });
+
+  assert.equal(
+    shouldSyncGmailConnectionOnSchedule({
+      integrationId: "gmail",
+      status: "active",
+      config: { gmailAutonomy: { syncMode: "manual_only" } },
+      lastSyncedAt: null
+    }, now, runtime),
+    false
+  );
+
+  assert.equal(
+    shouldSyncGmailConnectionOnSchedule({
+      integrationId: "gmail",
+      status: "active",
+      config: { gmailAutonomy: { syncMode: "scheduled", syncIntervalMinutes: 60 } },
+      lastSyncedAt: new Date("2026-08-12T09:30:00.000Z")
+    }, now, runtime),
+    false
+  );
+
+  assert.equal(
+    shouldSyncGmailConnectionOnSchedule({
+      integrationId: "gmail",
+      status: "active",
+      config: { gmailAutonomy: { syncMode: "scheduled", syncIntervalMinutes: 60 } },
+      lastSyncedAt: new Date("2026-08-12T08:30:00.000Z")
+    }, now, runtime),
+    true
+  );
 });

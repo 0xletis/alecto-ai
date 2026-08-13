@@ -16,6 +16,11 @@ import {
 } from "@operator-agent/db";
 import { buildDailyCheckinPrompt } from "@operator-agent/core";
 import {
+  gmailReviewNotificationsEnabled,
+  gmailScheduledSyncRuntimeFromEnv,
+  shouldSyncGmailConnectionOnSchedule
+} from "@operator-agent/core";
+import {
   formatIntegrationSyncNotifications,
   type IntegrationSyncResponse
 } from "./integration-notifications.js";
@@ -29,6 +34,7 @@ const apiBaseUrl = process.env.API_BASE_URL ?? "http://localhost:3000";
 const tickMs = 60_000;
 const integrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED === "true";
 const integrationSyncIntervalMinutes = Number(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15");
+const gmailScheduledSyncRuntime = gmailScheduledSyncRuntimeFromEnv();
 
 if (!telegramBotToken) {
   throw new Error("TELEGRAM_BOT_TOKEN is required.");
@@ -160,7 +166,11 @@ async function runIntegrationSync(now: Date) {
   const notificationsByUser = new Map<string, string[]>();
 
   for (const connection of connections) {
-    if (connection.lastSyncedAt && now.getTime() - connection.lastSyncedAt.getTime() < intervalMs) {
+    if (connection.integrationId === "gmail") {
+      if (!shouldSyncGmailConnectionOnSchedule(connection, now, gmailScheduledSyncRuntime)) {
+        continue;
+      }
+    } else if (connection.lastSyncedAt && now.getTime() - connection.lastSyncedAt.getTime() < intervalMs) {
       continue;
     }
 
@@ -169,7 +179,10 @@ async function runIntegrationSync(now: Date) {
         `/users/${connection.userId}/integrations/${connection.id}/sync`,
         {}
       );
-      const messages = formatIntegrationSyncNotifications(response);
+      const messages = formatIntegrationSyncNotifications(response, {
+        gmailReviewNotificationsEnabled:
+          connection.integrationId === "gmail" ? gmailReviewNotificationsEnabled(connection.config) : true
+      });
 
       if (messages.length > 0) {
         notificationsByUser.set(connection.userId, [

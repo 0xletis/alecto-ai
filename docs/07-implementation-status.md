@@ -193,6 +193,11 @@ After every implementation pass:
 - [x] Natural Gmail email-rule enable requests require an active Gmail connection, preserve explicit rule approval, and do not auto-scan by themselves
 - [x] Natural Gmail guidance explains implemented tracking choices, including confirmation-first custom sender/keyword tracking
 - [x] Gmail setup/status replies recommend job-search tracking for active career/job-search goals and work-action tracking for work/project-like goals
+- [x] Shared Gmail setup/autonomy state service for conversation surfaces. It reports connection status, account email when available, active/paused rule summaries, pending review count, last sync, manual/scheduled mode, worker availability, review-notification preference, delivery availability, Gmail-relevant active goals, recommendations, unsupported preferences, and next best step without exposing secrets or raw provider data.
+- [x] Gmail autonomy preferences on Gmail connection config: `manual_only` vs `scheduled`, interval minutes, and review-waiting notification on/off. Natural changes such as `check Gmail every hour`, `make Gmail manual only`, and `notify me when Gmail reviews are waiting` ask for confirmation before DB mutation.
+- [x] Gmail autonomy confirmation focus is hardened: negative notification phrases disable notifications, unrelated Gmail questions cancel stale preference confirmations, and missing/paused custom-rule questions explain review-first/no-auto-log behavior instead of returning a generic "could not identify" message.
+- [x] Worker scheduled Gmail sync respects Gmail autonomy preferences: manual-only Gmail connections are skipped, per-connection scheduled intervals are honored when worker sync is enabled, and proactive Gmail review notifications are suppressed when the connection preference disables them.
+- [x] Natural Gmail digest and work-hours preference requests are recognized and answered honestly as not implemented; Alecto does not create fake settings.
 - [x] Natural email-rule list requests such as `what email rules are on now` show active rules first and hide paused/error noise from the normal conversation view
 - [x] Custom Gmail sender/keyword rule builder v1 through natural chat, e.g. `track Endesa bills from Gmail` or `track emails from client@example.com for dashboard project`
 - [x] Custom Gmail rules are review-only: matches create EmailReviewItems and never auto-create Events or ActionItems
@@ -217,6 +222,7 @@ After every implementation pass:
 - [x] Bulk email review operations re-check current DB status and only mutate still-pending visible reviews. Already approved, rejected, action-converted, or missing reviews are reported separately as already handled.
 - [x] Gmail sync replies include pending email review counts and user-friendly new-review/new-event summaries without raw bodies, provider payloads, tokens, ciphertext, IVs, or tags
 - [x] Scheduled integration sync can send one bundled Telegram notification when new Gmail review items are created, e.g. grouped job-search/work-action/custom counts; unchanged pending reviews do not produce a new notification
+- [x] Scheduled Gmail review notifications respect the Gmail connection review-notification preference. Manual sync still replies in-band.
 - [x] Custom Gmail review approval remains review-only by default; explicit `turn N into an action` can create an ActionItem from a visible custom review
 - [x] Review semantic dedupe
 - [x] Review approval/rejection
@@ -226,6 +232,7 @@ After every implementation pass:
 - [~] Conversation Orchestrator v2 modularization has started with `apps/api/src/conversation/email-rule-selection.ts`, but `apps/api/src/server.ts` remains oversized and still needs capability executors/services extracted.
 - [x] Editing filters on an existing custom Gmail rule through API conversation routing; destructive removal still requires confirmation
 - [ ] Gmail send/label modification
+- [ ] Gmail webhooks, full-inbox/all-mail LLM monitoring, per-rule sync schedules, business-hours Gmail checks, and daily Gmail digest
 - [ ] Additional planned adapters: finance receipts, learning deadlines, custom goal email signals
 
 ## Known Stubs Or Deferred Work

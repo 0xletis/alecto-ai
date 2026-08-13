@@ -27,6 +27,7 @@ export const SemanticRouterIntentSchema = z.enum([
   "daily_loop_settings",
   "gmail_capability_guidance",
   "gmail_setup",
+  "gmail_autonomy_preference",
   "gmail_sync",
   "gmail_sync_guidance",
   "enable_job_search_email_rule",

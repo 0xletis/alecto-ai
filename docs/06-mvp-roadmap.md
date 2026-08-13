@@ -68,6 +68,7 @@ Status:
 - [~] OpenAI analysis/composition is optional and has deterministic fallback
 - [x] Gmail token encryption at rest for the local MVP when `ALECTO_SECRET_ENCRYPTION_KEY` is configured, with legacy plaintext migration on read/sync
 - [x] Custom Gmail sender/keyword tracking v1 with confirmation-first setup and review-only output
+- [x] Gmail Setup + Autonomy Preferences v1 with state-aware Gmail setup/status/timing replies, goal-linked recommendations, manual-only vs scheduled preference, review-waiting notification preference, and honest no-op answers for digest/work-hours/webhook requests
 - [x] Optional LLM semantic router v4 for English/Spanish/Catalan Gmail custom-rule create/edit/question/management flows, broader operator surface routing, email-rule list/timing questions, short-lived active-rule context, replacement corrections such as `instead of` / `en vez de` / `en lloc de`, routeDebug language/confidence/side-effect-risk observability, and conversation repair without direct DB mutation
 - [ ] wallet public-address fetcher
 - [ ] basic web settings page
@@ -98,7 +99,7 @@ Likely high-leverage next items:
 - refine first-run onboarding into a fuller guided setup session only after more real alpha usage
 - keep weekly planning regression-tested as the bridge from weekly review into confirmed current-week/next-week ActionItems
 - polish the planning loop from real Telegram usage now that Planning UX Consolidation v1 is implemented
-- keep polishing Gmail setup, custom-rule management, and Email Review Inbox from real Telegram usage; v1 supports grouped review handling and bundled worker notifications, but Gmail webhooks, full-inbox monitoring, per-rule schedules, richer notification preferences, and broader multilingual evals are still later work
+- keep polishing Gmail setup, custom-rule management, and Email Review Inbox from real Telegram usage; v1 supports grouped review handling, manual/scheduled Gmail preference, review-notification preference, and bundled worker notifications, but Gmail webhooks, full-inbox monitoring, per-rule schedules, digest/work-hours preferences, and broader multilingual evals are still later work
 - expand the semantic-router eval set from real Telegram logs across English, Spanish, and Catalan, keeping guardrails and executors deterministic
 - harden tests around the daily operating loop and multi-intent routing as new behavior is added
 - keep Gmail token storage clearly marked as local-MVP until production OAuth/account management, key management, and secret rotation are implemented

@@ -801,9 +801,10 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: notConnectedUserId, message: "connect Gmail" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Step 1: connect Gmail with readonly access/);
+    assert.match(response.json().reply, /Status: not connected/);
+    assert.match(response.json().reply, /readonly/);
     assert.match(response.json().reply, /\/connect_gmail/);
-    assert.match(response.json().reply, /will not scan Gmail until you enable a rule/);
+    assert.match(response.json().reply, /Scanning: off until Gmail is connected and at least one rule is enabled/);
 
     response = await server.inject({
       method: "POST",
@@ -823,9 +824,9 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
     assert.match(response.json().reply, /Gmail setup/);
     assert.match(response.json().reply, /Status: connected/);
     assert.match(response.json().reply, /No active email tracking rules/);
-    assert.match(response.json().reply, /Recommended: enable job search rule for Gmail/);
-    assert.match(response.json().reply, /Automatic sync:/);
-    assert.match(response.json().reply, /Manual sync: say 'sync Gmail'/);
+    assert.match(response.json().reply, /Job-search email tracking/);
+    assert.match(response.json().reply, /Mode: manual only/);
+    assert.match(response.json().reply, /Checks: Alecto checks Gmail when you say ['"]sync Gmail['"]/);
     assert.doesNotMatch(response.json().reply, /adapter:|job_search_email|access token|refresh token|ciphertext/i);
 
     response = await server.inject({
@@ -872,7 +873,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Active tracking:\n- Job-search email tracking/);
-    assert.match(response.json().reply, /Next step: say 'sync Gmail'/);
+    assert.match(response.json().reply, /Next step: Say 'sync Gmail'/);
     assert.doesNotMatch(response.json().reply, /adapter:|job_search_email|no-rule-access-token|no-rule-refresh-token|ciphertext/i);
 
     response = await server.inject({
@@ -1118,7 +1119,7 @@ test("Gmail timing questions route to sync guidance before custom rule creation 
       });
       assert.equal(response.statusCode, 200);
       assert.match(response.json().reply, /Alecto checks Gmail when you say 'sync Gmail'/);
-      assert.match(response.json().reply, /Automatic sync:/);
+      assert.match(response.json().reply, /Automatic sync is off/);
       assert.match(response.json().reply, /not instant arrival tracking yet/i);
       assert.match(response.json().reply, /^For active Gmail rules:/);
       assert.doesNotMatch(response.json().reply, /^For Work action emails:/);
@@ -1136,6 +1137,664 @@ test("Gmail timing questions route to sync guidance before custom rule creation 
     assert.equal(riskResponse.json().riskState, "RED");
     assert.doesNotMatch(riskResponse.json().reply, /sync Gmail|email rules/i);
   } finally {
+    if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
+    else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
+    if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
+    else process.env.LLM_ROUTER_MOCK_RESPONSE = previousRouterMock;
+    if (previousOpenAIKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousOpenAIKey;
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [userId, riskUserId] } } });
+  }
+});
+
+test("Gmail setup autonomy preferences are state-aware and confirmation-first", async () => {
+  const server = buildServer();
+  const previousIntegrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED;
+  const previousIntegrationSyncInterval = process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;
+  const disconnectedUserId = `gmail-autonomy-disconnected-${randomUUID()}`;
+  const noRuleUserId = `gmail-autonomy-no-rule-${randomUUID()}`;
+  const configuredUserId = `gmail-autonomy-configured-${randomUUID()}`;
+  const riskUserId = `gmail-autonomy-risk-${randomUUID()}`;
+
+  try {
+    process.env.INTEGRATION_SYNC_ENABLED = "false";
+    process.env.INTEGRATION_SYNC_INTERVAL_MINUTES = "15";
+    await server.ready();
+    await prisma.user.createMany({
+      data: [
+        { id: disconnectedUserId },
+        { id: noRuleUserId },
+        { id: configuredUserId },
+        { id: riskUserId }
+      ]
+    });
+    const noRuleConnection = await prisma.integrationConnection.create({
+      data: {
+        userId: noRuleUserId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "norule@example.com",
+          hasRefreshToken: true,
+          accessToken: "must-not-leak",
+          refreshToken: "must-not-leak-refresh"
+        }
+      }
+    });
+    await prisma.goal.createMany({
+      data: [
+        {
+          userId: noRuleUserId,
+          title: "Find a new developer job",
+          category: "career",
+          templateId: "career.job_search",
+          status: "active"
+        },
+        {
+          userId: noRuleUserId,
+          title: "Improve strength and energy",
+          category: "health",
+          templateId: "health.strength_energy",
+          status: "active"
+        },
+        {
+          userId: noRuleUserId,
+          title: "Track Endesa bills",
+          category: "finance",
+          status: "active"
+        }
+      ]
+    });
+    await prisma.notificationSettings.create({
+      data: {
+        userId: configuredUserId,
+        telegramUserId: "12345",
+        timezone: "Europe/Madrid"
+      }
+    });
+    const configuredConnection = await prisma.integrationConnection.create({
+      data: {
+        userId: configuredUserId,
+        integrationId: "gmail",
+        status: "active",
+        lastSyncedAt: new Date("2026-08-12T08:00:00.000Z"),
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "configured@example.com",
+          hasRefreshToken: true,
+          gmailAutonomy: {
+            syncMode: "scheduled",
+            syncIntervalMinutes: 60,
+            reviewNotificationEnabled: false
+          },
+          token: {
+            ciphertext: "must-not-leak-ciphertext",
+            iv: "must-not-leak-iv",
+            tag: "must-not-leak-tag"
+          }
+        }
+      }
+    });
+    const utilityGoal = await prisma.goal.create({
+      data: {
+        userId: configuredUserId,
+        title: "Track energy expenses",
+        category: "finance",
+        status: "active"
+      }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId: configuredUserId,
+        connectionId: configuredConnection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"can you review\"",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "hybrid",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const customRule = await prisma.emailSignalRule.create({
+      data: {
+        userId: configuredUserId,
+        connectionId: configuredConnection.id,
+        goalId: utilityGoal.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    await prisma.emailReviewItem.create({
+      data: {
+        userId: configuredUserId,
+        connectionId: configuredConnection.id,
+        ruleId: customRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "gmail-review-autonomy",
+        externalId: `gmail-review:autonomy:${randomUUID()}`,
+        subject: "Endesa factura",
+        from: "Endesa <noreply@endesa.com>",
+        snippet: "Factura ready",
+        proposedEventType: "custom_email_review",
+        confidence: 0.7,
+        reason: "Custom tracking match.",
+        evidence: "Endesa factura",
+        extracted: {},
+        status: "pending"
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: riskUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        status: "active"
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: disconnectedUserId, message: "show Gmail setup" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Status: not connected/);
+    assert.match(response.json().reply, /readonly/);
+    assert.doesNotMatch(response.json().reply, /accessToken|refreshToken|ciphertext|"iv"|"tag"/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: noRuleUserId, message: "show Gmail setup" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /No active email tracking rules/);
+    assert.match(response.json().reply, /Job-search email tracking/);
+    assert.match(response.json().reply, /Custom sender\/keyword tracking/);
+    assert.doesNotMatch(response.json().reply, /Improve strength and energy/);
+    assert.doesNotMatch(response.json().reply, /accessToken|refreshToken|must-not-leak/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "Gmail status" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /connected as configured@example.com/);
+    assert.match(response.json().reply, /Mode: scheduled preference saved, background sync off/);
+    assert.match(response.json().reply, /review-waiting notifications off/);
+    assert.match(response.json().reply, /1 email review is waiting/);
+    assert.match(response.json().reply, /Work-action email tracking/);
+    assert.match(response.json().reply, /Endesa emails/);
+    assert.doesNotMatch(response.json().reply, /adapter:|work_action_email|custom_email_review|accessToken|refreshToken|ciphertext|"iv"|"tag"|must-not-leak/i);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "when do u check my gmail?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Automatic sync preference is saved, but background sync is disabled/);
+    assert.match(response.json().reply, /Only active Gmail rules are checked/);
+    assert.match(response.json().reply, /Alecto cannot send emails or change labels/);
+    assert.equal(response.json().routeDebug.intent, "gmail_sync_guidance");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "check Gmail every hour" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /set Gmail to scheduled checks every hour/);
+    assert.match(response.json().reply, /Confirm with "yes" or cancel/);
+    assert.equal(response.json().routeDebug.intent, "gmail_autonomy_preference");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail preference saved: checks every hour/);
+    assert.match(response.json().reply, /Background sync is currently disabled/);
+    let updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: configuredConnection.id } });
+    assert.equal((updatedConnection.config as { gmailAutonomy: { syncMode: string } }).gmailAutonomy.syncMode, "scheduled");
+    assert.equal((updatedConnection.config as { gmailAutonomy: { syncIntervalMinutes: number } }).gmailAutonomy.syncIntervalMinutes, 60);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "make Gmail manual only" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /make Gmail manual only/);
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail is set to manual only/);
+    updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: configuredConnection.id } });
+    assert.equal((updatedConnection.config as { gmailAutonomy: { syncMode: string } }).gmailAutonomy.syncMode, "manual_only");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "notify me when Gmail reviews are waiting" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /turn Gmail review notifications on/);
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail review notifications are on/);
+    updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: configuredConnection.id } });
+    assert.equal((updatedConnection.config as { gmailAutonomy: { reviewNotificationEnabled: boolean } }).gmailAutonomy.reviewNotificationEnabled, true);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "will you notify me about emails?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Review notifications are on/);
+    assert.equal(
+      await prisma.pendingAction.count({
+        where: {
+          userId: configuredUserId,
+          status: "pending",
+          type: "custom_email_rule",
+          payload: {
+            path: ["operation"],
+            equals: "gmail_autonomy_preference"
+          }
+        }
+      }),
+      0
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "daily Gmail digest" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Daily Gmail digest is not implemented yet/);
+    assert.equal(
+      await prisma.pendingAction.count({
+        where: {
+          userId: configuredUserId,
+          status: "pending",
+          type: "custom_email_rule",
+          payload: {
+            path: ["operation"],
+            equals: "gmail_autonomy_preference"
+          }
+        }
+      }),
+      0
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "only check work emails during work hours" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Work-hours Gmail checking is not implemented yet/);
+    assert.equal(
+      await prisma.pendingAction.count({
+        where: {
+          userId: configuredUserId,
+          status: "pending",
+          type: "custom_email_rule",
+          payload: {
+            path: ["operation"],
+            equals: "gmail_autonomy_preference"
+          }
+        }
+      }),
+      0
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: configuredUserId, message: "will work emails become tasks automatically?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Work-action emails do not become tasks automatically/);
+    assert.match(response.json().reply, /approval can create an ActionItem/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: riskUserId, message: "check Gmail every hour for betting signals" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.doesNotMatch(response.json().reply, /Gmail|scheduled checks|review notifications/i);
+    assert.equal(await prisma.pendingAction.count({ where: { userId: riskUserId, type: "custom_email_rule", status: "pending" } }), 0);
+
+    assert.equal(noRuleConnection.integrationId, "gmail");
+  } finally {
+    if (previousIntegrationSyncEnabled === undefined) delete process.env.INTEGRATION_SYNC_ENABLED;
+    else process.env.INTEGRATION_SYNC_ENABLED = previousIntegrationSyncEnabled;
+    if (previousIntegrationSyncInterval === undefined) delete process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;
+    else process.env.INTEGRATION_SYNC_INTERVAL_MINUTES = previousIntegrationSyncInterval;
+    await server.close();
+    await prisma.user.deleteMany({
+      where: { id: { in: [disconnectedUserId, noRuleUserId, configuredUserId, riskUserId] } }
+    });
+  }
+});
+
+test("Gmail autonomy notification direction, missing rule answers, and pending focus are safe", async () => {
+  const previousIntegrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED;
+  const previousIntegrationSyncInterval = process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;
+  const previousRouterEnabled = process.env.LLM_ROUTER_ENABLED;
+  const previousRouterMock = process.env.LLM_ROUTER_MOCK_RESPONSE;
+  const previousOpenAIKey = process.env.OPENAI_API_KEY;
+  const userId = `gmail-autonomy-focus-${randomUUID()}`;
+  const riskUserId = `gmail-autonomy-focus-risk-${randomUUID()}`;
+  const server = buildServer();
+
+  try {
+    process.env.INTEGRATION_SYNC_ENABLED = "true";
+    process.env.INTEGRATION_SYNC_INTERVAL_MINUTES = "15";
+    process.env.LLM_ROUTER_ENABLED = "true";
+    process.env.OPENAI_API_KEY = "test-key";
+    process.env.LLM_ROUTER_MOCK_RESPONSE = JSON.stringify({
+      intent: "gmail_autonomy_preference",
+      operation: "edit",
+      confidence: 0.99,
+      reason: "Bad mock tries to override deterministic notification direction.",
+      language: "en",
+      sideEffectRisk: "write",
+      requiresConfirmation: true,
+      target: "Gmail reviews",
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    });
+    await server.ready();
+    await prisma.user.createMany({ data: [{ id: userId }, { id: riskUserId }] });
+    await prisma.notificationSettings.create({
+      data: {
+        userId,
+        telegramUserId: "12345",
+        timezone: "Europe/Madrid"
+      }
+    });
+    const connection = await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: {
+          provider: "gmail",
+          scope: "gmail.readonly",
+          email: "focus@example.com",
+          hasRefreshToken: true,
+          gmailAutonomy: {
+            reviewNotificationEnabled: true
+          }
+        }
+      }
+    });
+    await prisma.goal.create({
+      data: {
+        userId: riskUserId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        status: "active"
+      }
+    });
+
+    let response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "don't notify me about Gmail reviews" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /turn Gmail review notifications off/);
+    assert.equal(response.json().routeDebug.routerSource, "deterministic_surface");
+    assert.equal(response.json().routeDebug.intent, "gmail_autonomy_preference");
+    let pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, status: "pending", type: "custom_email_rule" }
+    });
+    assert.equal((pending.payload as { reviewNotificationEnabled?: boolean }).reviewNotificationEnabled, false);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail review notifications are off/);
+    let updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: connection.id } });
+    assert.equal((updatedConnection.config as { gmailAutonomy: { reviewNotificationEnabled: boolean } }).gmailAutonomy.reviewNotificationEnabled, false);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "notify me when Gmail reviews are waiting" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /turn Gmail review notifications on/);
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail review notifications are on/);
+    updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: connection.id } });
+    assert.equal((updatedConnection.config as { gmailAutonomy: { reviewNotificationEnabled: boolean } }).gmailAutonomy.reviewNotificationEnabled, true);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "check Gmail manually only" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /make Gmail manual only/);
+    assert.equal(await prisma.pendingAction.count({ where: { userId, status: "pending", type: "custom_email_rule" } }), 1);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "Gmail status" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail setup/);
+    assert.equal(
+      await prisma.pendingAction.count({
+        where: {
+          userId,
+          status: "pending",
+          type: "custom_email_rule",
+          payload: { path: ["operation"], equals: "gmail_autonomy_preference" }
+        }
+      }),
+      0
+    );
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /pending decision expired|Please ask again/i);
+    updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: connection.id } });
+    assert.notEqual((updatedConnection.config as { gmailAutonomy?: { syncMode?: string } }).gmailAutonomy?.syncMode, "manual_only");
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "check Gmail manually only" }
+    });
+    assert.equal(response.statusCode, 200);
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "check Gmail every hour" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /scheduled checks every hour/);
+    pending = await prisma.pendingAction.findFirstOrThrow({
+      where: { userId, status: "pending", type: "custom_email_rule" }
+    });
+    assert.equal((pending.payload as { syncMode?: string }).syncMode, "scheduled");
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "yes" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail scheduled checks are set to every hour/);
+    updatedConnection = await prisma.integrationConnection.findUniqueOrThrow({ where: { id: connection.id } });
+    assert.equal((updatedConnection.config as { gmailAutonomy: { syncMode: string } }).gmailAutonomy.syncMode, "scheduled");
+    assert.equal((updatedConnection.config as { gmailAutonomy: { syncIntervalMinutes: number } }).gmailAutonomy.syncIntervalMinutes, 60);
+
+    await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "newer_than:7d \"can you review\"",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "hybrid",
+        minAutoLogConfidence: 0.9,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "where do Endesa emails go?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I don't see an active Endesa Gmail rule right now/);
+    assert.match(response.json().reply, /goes to email reviews first/);
+    assert.match(response.json().reply, /does not auto-log/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "does Endesa auto-log?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I don't see an active Endesa Gmail rule right now/);
+    assert.match(response.json().reply, /does not auto-log/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "where do endesa mails go?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I don't see an active endesa Gmail rule right now/i);
+    assert.doesNotMatch(response.json().reply, /Gmail rule: Work action emails/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "does endesa auto-log?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /I don't see an active endesa Gmail rule right now/i);
+    assert.doesNotMatch(response.json().reply, /Gmail rule: Work action emails/);
+
+    const endesaRule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa emails",
+        query: "newer_than:30d Endesa",
+        status: "active",
+        fetchStrategy: "query",
+        maxMessagesPerSync: 25,
+        maxEventsPerSync: 5,
+        classifierMode: "rules",
+        minAutoLogConfidence: 1,
+        minReviewConfidence: 0.65,
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "does Endesa auto-log?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Gmail rule: Endesa emails/);
+    assert.match(response.json().reply, /Custom rules never auto-log/);
+
+    await prisma.emailSignalRule.update({ where: { id: endesaRule.id }, data: { status: "paused" } });
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId, message: "where do Endesa emails go?" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Endesa tracking is paused/);
+    assert.match(response.json().reply, /When active, custom Gmail matches go to email reviews first and do not auto-log/);
+
+    response = await server.inject({
+      method: "POST",
+      url: "/messages/process",
+      payload: { userId: riskUserId, message: "notify me when betting tips arrive" }
+    });
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.equal(await prisma.pendingAction.count({ where: { userId: riskUserId, status: "pending" } }), 0);
+  } finally {
+    if (previousIntegrationSyncEnabled === undefined) delete process.env.INTEGRATION_SYNC_ENABLED;
+    else process.env.INTEGRATION_SYNC_ENABLED = previousIntegrationSyncEnabled;
+    if (previousIntegrationSyncInterval === undefined) delete process.env.INTEGRATION_SYNC_INTERVAL_MINUTES;
+    else process.env.INTEGRATION_SYNC_INTERVAL_MINUTES = previousIntegrationSyncInterval;
     if (previousRouterEnabled === undefined) delete process.env.LLM_ROUTER_ENABLED;
     else process.env.LLM_ROUTER_ENABLED = previousRouterEnabled;
     if (previousRouterMock === undefined) delete process.env.LLM_ROUTER_MOCK_RESPONSE;
@@ -2337,7 +2996,7 @@ test("semantic router edits pending Gmail rules and repairs misunderstood replie
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Alecto checks Gmail when you say 'sync Gmail'/);
-    assert.match(response.json().reply, /Automatic sync:/);
+    assert.match(response.json().reply, /Automatic sync is off/);
     assert.match(response.json().reply, /not instant arrival tracking yet/i);
     assert.match(response.json().reply, /email review/i);
     assert.doesNotMatch(response.json().reply, /I could not identify which Gmail rule/i);
@@ -3858,7 +4517,7 @@ test("conversation-first surface routes natural operator requests without leakin
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /readonly access/);
-    assert.match(response.json().reply, /will not scan Gmail until a rule is enabled/);
+    assert.match(response.json().reply, /only scans Gmail through active rules/);
     assert.match(response.json().reply, /go to review/);
     assert.doesNotMatch(response.json().reply, /secret-access-token|secret-refresh-token|raw/i);
 

@@ -48,7 +48,7 @@ export interface EvaluateGoalGuardrailsInput {
 }
 
 const directFinancialRiskPattern =
-  /\b(quiero apostar|voy a apostar|i want to bet|i'?m going to bet|plan to bet|plan for betting|bet safely|place bet|make a bet|remind me to bet|add action to bet|move (?:my )?bet|reschedule (?:my )?bet|snooze (?:my )?bet|push (?:my )?bet|mark (?:my )?(?:bet|betting) task done|bet of \d+|bet\s+\d+|apuesta\s+\d+|apostar\s+\d+|quiero tradear|voy a tradear|i want to trade|plan to trade|trade safely|move (?:my )?trade|reschedule (?:my )?trade|snooze (?:my )?trade|mark (?:my )?trading task done|open\s+\d+x\s+(?:long|short)|\d+x\s+(?:long|short)|long|short|leverage)\b/i;
+  /\b(quiero apostar|voy a apostar|i want to bet|i'?m going to bet|plan to bet|plan for betting|bet safely|place bet|make a bet|remind me to bet|add action to bet|move (?:my )?bet|reschedule (?:my )?bet|snooze (?:my )?bet|push (?:my )?bet|mark (?:my )?(?:bet|betting) task done|betting signals?|signals? for betting|betting tips?|bet of \d+|bet\s+\d+|apuesta\s+\d+|apostar\s+\d+|quiero tradear|voy a tradear|i want to trade|plan to trade|trade safely|trading signals?|signals? for trading|trading tips?|move (?:my )?trade|reschedule (?:my )?trade|snooze (?:my )?trade|mark (?:my )?trading task done|open\s+\d+x\s+(?:long|short)|\d+x\s+(?:long|short)|long|short|leverage)\b/i;
 const financialRiskKeywordPattern = /\b(bet|betting|gamble|gambling|apuesta|apostar|polymarket|trade|trading|long|short|leverage)\b/i;
 const certaintyRiskPattern = /\b(safe|sure|guaranteed|seguro|casi seguro|free money)\b/i;
 

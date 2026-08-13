@@ -63,6 +63,7 @@ import {
   getSecretEncryptionKeyFromEnv,
   isEncryptedSecretJsonEnvelope,
   SecretEncryptionError,
+  writeGmailAutonomyPreferences,
   UpdateIntegrationConnectionInputSchema,
   UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
@@ -203,6 +204,13 @@ import {
   splitEmailRuleTargets,
   toEmailRuleSelectionCandidate
 } from "./conversation/email-rule-selection.js";
+import {
+  buildGmailAutonomyState,
+  formatIntervalMinutes,
+  gmailRuleBehaviorLabel,
+  gmailSyncModeSentence,
+  gmailSyncModeShortLabel
+} from "./conversation/gmail-autonomy.js";
 
 type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
 
@@ -276,32 +284,37 @@ export function buildServer() {
       return createGuardianGuardrailReply(parsed.data.userId, parsed.data.message, earlyGuardrail);
     }
 
-    const latestPendingAction = await getLatestPendingAction(parsed.data.userId);
+    let latestPendingAction = await getLatestPendingAction(parsed.data.userId);
 
     if (latestPendingAction) {
-      const pendingReply = await resolvePendingDecisionReply(parsed.data.userId, latestPendingAction, parsed.data.message);
+      if (shouldReleasePendingGmailAutonomyFocus(latestPendingAction, parsed.data.message)) {
+        await rejectPendingAction(parsed.data.userId, latestPendingAction.id);
+        latestPendingAction = undefined;
+      } else {
+        const pendingReply = await resolvePendingDecisionReply(parsed.data.userId, latestPendingAction, parsed.data.message);
 
-      if (pendingReply) {
-        return replyOnly(parsed.data.userId, parsed.data.message, pendingReply, {
-          routerSource: "pending_decision",
-          intent: latestPendingAction.type,
-          handlerName: "resolvePendingDecisionReply",
-          mutation:
-            isConfirmationMessage(parsed.data.message) ||
-            isRejectionMessage(parsed.data.message) ||
-            (latestPendingAction.type === "email_review_context" && looksLikeEmailReviewContextAction(parsed.data.message)),
-          reason: "Resolved existing pending decision before normal routing."
-        });
+        if (pendingReply) {
+          return replyOnly(parsed.data.userId, parsed.data.message, pendingReply, {
+            routerSource: "pending_decision",
+            intent: latestPendingAction.type,
+            handlerName: "resolvePendingDecisionReply",
+            mutation:
+              isConfirmationMessage(parsed.data.message) ||
+              isRejectionMessage(parsed.data.message) ||
+              (latestPendingAction.type === "email_review_context" && looksLikeEmailReviewContextAction(parsed.data.message)),
+            reason: "Resolved existing pending decision before normal routing."
+          });
+        }
       }
     } else if (looksLikeExpiredPendingDecisionReply(parsed.data.message)) {
       return replyOnly(parsed.data.userId, parsed.data.message, "That pending decision expired. Please ask again.");
     }
 
-  if (isPendingCustomGmailRuleCreate(latestPendingAction)) {
-    const pendingGmailRoute = await handleSemanticRouterIntent(parsed.data.userId, parsed.data.message, latestPendingAction);
+    if (isPendingCustomGmailRuleCreate(latestPendingAction)) {
+      const pendingGmailRoute = await handleSemanticRouterIntent(parsed.data.userId, parsed.data.message, latestPendingAction);
 
-    if (pendingGmailRoute) {
-      return replyOnly(parsed.data.userId, parsed.data.message, pendingGmailRoute.reply, pendingGmailRoute.routeDebug);
+      if (pendingGmailRoute) {
+        return replyOnly(parsed.data.userId, parsed.data.message, pendingGmailRoute.reply, pendingGmailRoute.routeDebug);
       }
     }
 
@@ -5169,6 +5182,7 @@ type ConversationSurfaceIntent =
   | "integration_sync"
   | "gmail_sync_guidance"
   | "gmail_setup"
+  | "gmail_autonomy_preference"
   | "gmail_capability_guidance"
   | "gmail_custom_rule_guidance"
   | "gmail_custom_rule_request"
@@ -5318,8 +5332,12 @@ async function handleConversationSurfaceIntent(userId: string, message: string):
     return formatGmailSetupForConversation(userId);
   }
 
+  if (intent === "gmail_autonomy_preference") {
+    return handleGmailAutonomyPreferenceForConversation(userId, message);
+  }
+
   if (intent === "gmail_capability_guidance") {
-    return formatGmailCapabilityGuidance();
+    return formatGmailCapabilityGuidance(userId);
   }
 
   if (intent === "gmail_custom_rule_guidance") {
@@ -5531,11 +5549,12 @@ function noActiveGmailRulesMessage(): string {
 }
 
 async function formatEmailRulesForConversation(userId: string, message?: string): Promise<string> {
-  const [connections, rules, goals, pendingReviewCount] = await Promise.all([
+  const [connections, rules, goals, pendingReviewCount, autonomyState] = await Promise.all([
     getIntegrationConnections(userId),
     getEmailSignalRules(userId),
     getGoals(userId),
-    getPendingEmailReviewCount(userId)
+    getPendingEmailReviewCount(userId),
+    buildGmailAutonomyState(userId)
   ]);
   const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived");
 
@@ -5576,7 +5595,8 @@ async function formatEmailRulesForConversation(userId: string, message?: string)
     pausedLines.length > 0 ? "Paused/error:" : undefined,
     ...pausedLines.map((line) => `- ${line}`),
     "",
-    `${gmailScheduledSyncDescription()} Manual sync: say 'sync Gmail'.`,
+    `Mode: ${gmailSyncModeShortLabel(autonomyState)}. Manual sync: say 'sync Gmail'.`,
+    `Review notifications: ${autonomyState.reviewNotificationEnabled ? "on" : "off"}.`,
     pendingEmailReviewLine(pendingReviewCount),
     hiddenInactiveCount > 0 ? `${hiddenInactiveCount} paused/error rule${hiddenInactiveCount === 1 ? " is" : "s are"} hidden here.` : undefined,
     "Full IDs and settings: /my_email_rules"
@@ -5882,118 +5902,60 @@ function choosePrimaryBuiltInEmailRule(rules: EmailSignalRule[]): EmailSignalRul
 }
 
 async function formatGmailSetupForConversation(userId: string): Promise<string> {
-  const [connections, rules, goals, pendingReviewCount] = await Promise.all([
-    getIntegrationConnections(userId),
-    getEmailSignalRules(userId),
-    getActiveGoals(userId),
-    getPendingEmailReviewCount(userId)
-  ]);
-  const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail");
-  const activeGmailConnections = gmailConnections.filter((connection) => connection.status === "active");
-  const activeConnectionIds = new Set(activeGmailConnections.map((connection) => connection.id));
-  const activeRules = rules.filter((rule) => rule.status === "active" && activeConnectionIds.has(rule.connectionId));
-  const recommendedRules = gmailRuleRecommendationsFromGoals(goals, activeRules);
-  const syncLine = gmailScheduledSyncDescription();
+  const state = await buildGmailAutonomyState(userId);
 
-  if (activeGmailConnections.length === 0) {
+  if (!state.gmailConnected) {
     return [
-      "Gmail is not connected yet.",
+      "Gmail setup",
       "",
-      "Step 1: connect Gmail with readonly access.",
-      "Use: /connect_gmail",
+      "Status: not connected.",
+      "Access: readonly access after connection. Alecto cannot send emails or change labels.",
+      "Scanning: off until Gmail is connected and at least one rule is enabled.",
       "",
-      "Step 2: choose what to track.",
-      ...recommendedRules.map((recommendation) => `- ${recommendation}`),
+      "What Gmail can track today:",
+      "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
+      "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+      "- Custom tracking: sender and keyword rules. These go to review first and never auto-log.",
       "",
-      "Alecto will not scan Gmail until you enable a rule.",
-      syncLine
-    ].join("\n");
+      formatGmailRecommendations(state.recommendedRules),
+      "",
+      "No webhooks yet. This is not instant arrival tracking.",
+      `Next step: ${state.nextBestStep} Use /connect_gmail.`
+    ].filter((line) => line !== undefined).join("\n");
   }
 
-  const ruleLines =
-    activeRules.length > 0
-      ? activeRules.map(formatGmailSetupRuleLine)
-      : ["No active email tracking rules."];
-
-  const nextStep =
-    activeRules.length === 0
-      ? recommendedRules.length > 0
-        ? `Next step: ${recommendedRules[0].replace(/^Recommended: /, "")}`
-        : "Next step: say 'enable job search rule for Gmail' or 'enable work action rule for Gmail'."
-      : "Next step: say 'sync Gmail' when you want to check now.";
+  const activeRuleLines =
+    state.activeRules.length > 0
+      ? groupEmailRulesForHumanDisplay(state.activeRules).map((group) => formatGmailSetupRuleLine(group.primary, group.rules.length))
+      : ["- No active email tracking rules."];
+  const pausedRuleLines =
+    state.pausedRules.length > 0
+      ? groupEmailRulesForHumanDisplay(state.pausedRules).map((group) => formatGmailSetupRuleLine(group.primary, group.rules.length))
+      : [];
 
   return [
     "Gmail setup",
     "",
-    "Status: connected.",
+    `Status: connected${state.gmailAccount ? ` as ${state.gmailAccount}` : ""}.`,
     "Access: readonly access. Alecto cannot send emails or change labels.",
-    "Alecto will not scan Gmail until a rule is enabled.",
+    "Alecto only scans Gmail through active rules.",
+    `Mode: ${gmailSyncModeShortLabel(state)}.`,
+    `Checks: ${gmailSyncModeSentence(state)}`,
+    `Notifications: review-waiting notifications ${state.reviewNotificationEnabled ? "on" : "off"}; delivery ${state.deliveryChannel}.`,
+    state.pendingEmailReviewCount > 0 ? pendingEmailReviewLine(state.pendingEmailReviewCount) : undefined,
+    "",
     "Active tracking:",
-    ...ruleLines,
+    ...activeRuleLines,
+    pausedRuleLines.length > 0 ? "" : undefined,
+    pausedRuleLines.length > 0 ? "Paused/error tracking:" : undefined,
+    ...pausedRuleLines,
     "",
-    "What is available today:",
-    "- Job search: recruiter replies, interviews, rejections, offers, application confirmations.",
-    "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
+    formatGmailRecommendations(state.recommendedRules),
     "",
-    recommendedRules.length > 0 ? "Recommendations from your goals:" : undefined,
-    ...(recommendedRules.length > 0 ? recommendedRules.map((recommendation) => `- ${recommendation}`) : []),
-    "",
-    syncLine,
-    "Manual sync: say 'sync Gmail'.",
-    "",
-    pendingEmailReviewLine(pendingReviewCount),
-    pendingReviewCount > 0 ? "" : undefined,
-    "Customize:",
-    "- Pause a rule: /pause_email_rule RULE_ID",
-    "- Delete a rule: /delete_email_rule RULE_ID",
-    "- Custom rules can use sender and keyword filters. Say: \"track Endesa bills from Gmail\".",
-    "",
-    nextStep
+    "Review behavior: custom/work matches go to review; clear job-search matches can auto-log if that rule is on.",
+    "Not available yet: instant webhooks, daily Gmail digest, work-hours-only checks, Gmail send/label actions.",
+    `Next step: ${state.nextBestStep}`
   ].filter((line) => line !== undefined).join("\n");
-}
-
-function gmailRuleRecommendationsFromGoals(goals: Goal[], activeRules: EmailSignalRule[]): string[] {
-  const activeAdapterIds = new Set(activeRules.map((rule) => rule.adapterId));
-  const recommendations: string[] = [];
-  const hasJobGoal = goals.some((goal) => {
-    const text = normalizeForComparison(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`);
-    return goal.status === "active" && (text.includes("job") || text.includes("career") || text.includes("application") || text.includes("developer"));
-  });
-  const hasWorkLikeGoal = goals.some((goal) => {
-    const text = normalizeForComparison(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`);
-    return (
-      goal.status === "active" &&
-      (text.includes("work") ||
-        text.includes("project") ||
-        text.includes("client") ||
-        text.includes("youtube") ||
-        text.includes("creative") ||
-        text.includes("deep work"))
-    );
-  });
-
-  if (hasJobGoal && !activeAdapterIds.has("job_search_email")) {
-    recommendations.push("Recommended: enable job search rule for Gmail.");
-  }
-
-  if (hasWorkLikeGoal && !activeAdapterIds.has("work_action_email")) {
-    recommendations.push("Recommended: enable work action rule for Gmail.");
-  }
-
-  if (recommendations.length === 0 && activeRules.length === 0) {
-    recommendations.push("Recommended: start with job-search or work-action tracking if either matches your goals.");
-  }
-
-  return recommendations;
-}
-
-function gmailScheduledSyncDescription(): string {
-  if (process.env.INTEGRATION_SYNC_ENABLED === "true") {
-    const interval = Number.parseInt(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15", 10);
-    return `Automatic sync: on, about every ${Number.isFinite(interval) && interval > 0 ? interval : 15} minutes.`;
-  }
-
-  return "Automatic sync: off.";
 }
 
 function emailRuleTitleForAdapter(adapterId: string): string {
@@ -6012,15 +5974,24 @@ function emailRuleTitleForAdapter(adapterId: string): string {
   return "Email tracking rule";
 }
 
-function formatGmailSetupRuleLine(rule: EmailSignalRule): string {
-  if (rule.adapterId === "custom_email_review") {
-    return `- ${rule.name} (review first, auto-log off)`;
-  }
-
-  return `- ${emailRuleTitleForAdapter(rule.adapterId)} (${rule.reviewBeforeLogging ? "review first" : "auto-log clear matches"})`;
+function formatGmailSetupRuleLine(rule: EmailSignalRule, duplicateCount = 1): string {
+  const title = rule.adapterId === "custom_email_review" ? rule.name : emailRuleTitleForAdapter(rule.adapterId);
+  const status = rule.status !== "active" ? `, ${rule.status}` : "";
+  const duplicate = duplicateCount > 1 ? `, ${duplicateCount} duplicate rules shown once` : "";
+  return `- ${title} - ${gmailRuleBehaviorLabel(rule)}${status}${duplicate}`;
 }
 
-function formatGmailCapabilityGuidance(): string {
+async function formatGmailCapabilityGuidance(userId: string): Promise<string> {
+  const state = await buildGmailAutonomyState(userId);
+  const activeLine =
+    state.gmailConnected && state.activeRules.length > 0
+      ? [
+          "",
+          "Active now:",
+          ...groupEmailRulesForHumanDisplay(state.activeRules).map((group) => `- ${formatGmailSetupRuleLine(group.primary, group.rules.length).replace(/^- /, "")}`)
+        ]
+      : [];
+
   return [
     "Gmail works through explicit tracking rules. It does not read your whole inbox by default.",
     "",
@@ -6029,11 +6000,26 @@ function formatGmailCapabilityGuidance(): string {
     "- Work actions: requests, deadlines, follow-ups, feedback, blockers. These go to review first.",
     "- Custom tracking: sender and keyword rules. These go to review first and never auto-log.",
     "",
-    "Say:",
-    '- "enable job search rule for Gmail"',
-    '- "enable work action rule for Gmail"',
-    '- "track Endesa bills from Gmail"',
-    '- "sync Gmail"',
+    ...activeLine,
+    "",
+    `Mode: ${gmailSyncModeShortLabel(state)}.`,
+    state.pendingEmailReviewCount > 0 ? pendingEmailReviewLine(state.pendingEmailReviewCount) : undefined,
+    formatGmailRecommendations(state.recommendedRules),
+    "",
+    "Custom rules and work-action matches go to email review before anything becomes an action or event.",
+    "No webhooks yet. This is not instant arrival tracking.",
+    `Next step: ${state.nextBestStep}`
+  ].filter((line) => line !== undefined).join("\n");
+}
+
+function formatGmailRecommendations(recommendations: Array<{ label: string; reason: string; example: string }>): string {
+  if (recommendations.length === 0) {
+    return "Recommended: nothing obvious missing from your active Gmail rules.";
+  }
+
+  return [
+    "Recommended:",
+    ...recommendations.map((recommendation) => `- ${recommendation.label}: ${recommendation.reason} ${recommendation.example}`)
   ].join("\n");
 }
 
@@ -6049,6 +6035,226 @@ function formatGmailCustomRuleGuidance(): string {
     "",
     "Matches go to email review only. Auto-log is off."
   ].join("\n");
+}
+
+type GmailAutonomyPreferenceRequest =
+  | { kind: "manual_only" }
+  | { kind: "scheduled"; intervalMinutes: number }
+  | { kind: "review_notifications"; enabled: boolean }
+  | { kind: "daily_digest"; enabled: boolean; unsupported: true }
+  | { kind: "work_hours"; unsupported: true };
+
+async function handleGmailAutonomyPreferenceForConversation(
+  userId: string,
+  message: string,
+  _route?: SemanticRouterResult
+): Promise<string> {
+  const preference = parseGmailAutonomyPreference(message);
+
+  if (!preference) {
+    return formatGmailSetupForConversation(userId);
+  }
+
+  if (preference.kind === "daily_digest") {
+    return preference.enabled
+      ? "Daily Gmail digest is not implemented yet. Today I can show reviews when you say \"email reviews\" and notify when scheduled sync creates new review items."
+      : "Daily Gmail digest is not implemented yet, so there is no digest to turn off. Today I can show reviews when you say \"email reviews\".";
+  }
+
+  if (preference.kind === "work_hours") {
+    return "Work-hours Gmail checking is not implemented yet. Today I can use manual sync or scheduled worker mode for active Gmail rules.";
+  }
+
+  const state = await buildGmailAutonomyState(userId);
+
+  if (!state.gmailConnected || !state.primaryConnection) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const payload =
+    preference.kind === "manual_only"
+      ? {
+          operation: "gmail_autonomy_preference",
+          connectionId: state.primaryConnection.id,
+          preferenceKind: "manual_only",
+          syncMode: "manual_only"
+        }
+      : preference.kind === "scheduled"
+        ? {
+            operation: "gmail_autonomy_preference",
+            connectionId: state.primaryConnection.id,
+            preferenceKind: "scheduled",
+            syncMode: "scheduled",
+            syncIntervalMinutes: preference.intervalMinutes
+          }
+        : {
+            operation: "gmail_autonomy_preference",
+            connectionId: state.primaryConnection.id,
+            preferenceKind: preference.enabled ? "review_notifications_on" : "review_notifications_off",
+            reviewNotificationEnabled: preference.enabled
+          };
+
+  await replacePendingAction(userId, {
+    type: "custom_email_rule",
+    summary: gmailAutonomyPendingSummary(preference),
+    payload,
+    expiresAt: pendingDecisionExpiry()
+  });
+
+  return gmailAutonomyConfirmationPrompt(preference, state);
+}
+
+function isUnsupportedGmailAutonomyPreference(preference: GmailAutonomyPreferenceRequest | undefined): boolean {
+  return preference?.kind === "daily_digest" || preference?.kind === "work_hours";
+}
+
+function gmailAutonomyPendingSummary(preference: GmailAutonomyPreferenceRequest): string {
+  if (preference.kind === "manual_only") {
+    return "Set Gmail to manual-only checks";
+  }
+
+  if (preference.kind === "scheduled") {
+    return `Set Gmail scheduled checks every ${formatIntervalMinutes(preference.intervalMinutes)}`;
+  }
+
+  if (preference.kind === "review_notifications") {
+    return preference.enabled ? "Turn Gmail review notifications on" : "Turn Gmail review notifications off";
+  }
+
+  return "Unsupported Gmail preference";
+}
+
+function gmailAutonomyConfirmationPrompt(
+  preference: Exclude<GmailAutonomyPreferenceRequest, { unsupported: true }>,
+  state: Awaited<ReturnType<typeof buildGmailAutonomyState>>
+): string {
+  if (preference.kind === "manual_only") {
+    return [
+      "I can make Gmail manual only.",
+      "Alecto will check active Gmail rules only when you say \"sync Gmail\".",
+      "This does not change your rules or email reviews.",
+      "Confirm with \"yes\" or cancel."
+    ].join("\n");
+  }
+
+  if (preference.kind === "scheduled") {
+    return [
+      `I can set Gmail to scheduled checks every ${formatIntervalMinutes(preference.intervalMinutes)} for active rules.`,
+      "This is not instant email tracking; no webhooks yet.",
+      "Custom/work uncertain matches still go to email reviews.",
+      state.runtime.scheduledSyncEnabled
+        ? "Review notifications use one bundled message when new reviews are waiting."
+        : "Background sync is disabled in this local environment, so this saves the preference but will not run automatically until background sync is enabled.",
+      "Confirm with \"yes\" or cancel."
+    ].join("\n");
+  }
+
+  return [
+    preference.enabled
+      ? "I can turn Gmail review notifications on."
+      : "I can turn Gmail review notifications off.",
+    "This only affects proactive scheduled-sync review-waiting messages.",
+    "Manual sync still replies in chat.",
+    state.notificationDeliveryAvailable ? `Delivery: ${state.deliveryChannel}.` : "Notification delivery is not configured yet.",
+    "Confirm with \"yes\" or cancel."
+  ].join("\n");
+}
+
+function parseGmailAutonomyPreference(message: string): GmailAutonomyPreferenceRequest | undefined {
+  const text = normalizeForComparison(message);
+
+  if (!/\b(gmail|email|emails|mail|mails|inbox|review|reviews)\b/.test(text)) {
+    return undefined;
+  }
+
+  if (/\b(digest|resumen)\b/.test(text) && /\b(gmail|email|emails|mail|mails)\b/.test(text)) {
+    const enabled = !/\b(turn off|disable|stop|no|dont|don't|do not|quita|desactiva)\b/.test(text);
+    return { kind: "daily_digest", enabled, unsupported: true };
+  }
+
+  if (/\b(work hours|working hours|business hours|horario laboral|laboral hours|laboral)\b/.test(text)) {
+    return { kind: "work_hours", unsupported: true };
+  }
+
+  if (
+    /\b(manual only|manually only|manual-only|only manually)\b/.test(text) ||
+    /\b(make|set|check|keep)\b.*\b(gmail|email|mail)\b.*\bmanual\b/.test(text) ||
+    /\b(gmail|email|mail)\b.*\bmanual\b.*\bonly\b/.test(text)
+  ) {
+    return { kind: "manual_only" };
+  }
+
+  const notificationOff =
+    /\b(don t|dont|do not|stop|disable|turn off|no|quita|desactiva|deja de)\b.*\b(notify|notification|notifications|tell me|let me know|avis\w*|notifi\w*)\b/.test(text) ||
+    /\b(notify|notification|notifications|tell me|let me know|avis\w*|notifi\w*)\b.*\b(off|disabled|no|not)\b/.test(text);
+
+  if (notificationOff && /\b(gmail|email|mail|review|reviews)\b/.test(text)) {
+    return { kind: "review_notifications", enabled: false };
+  }
+
+  if (/\b(will|do|does|can|could)\s+(you|u)\b.*\b(notify|notification|notifications|tell me|let me know)\b/.test(text)) {
+    return undefined;
+  }
+
+  const notificationOn =
+    /\b(notify me|tell me|let me know|notification|notifications|avisa|avisame|avísame)\b.*\b(gmail|email|mail|review|reviews|waiting|arrive|new)\b/.test(text) ||
+    /\b(turn on|enable)\b.*\b(gmail|email|mail)\b.*\b(notification|notifications)\b/.test(text);
+
+  if (notificationOn) {
+    return { kind: "review_notifications", enabled: true };
+  }
+
+  const everyMinutes = text.match(/\bevery\s+(\d+)\s+minutes?\b|\bcada\s+(\d+)\s+minutos?\b/);
+  if (everyMinutes) {
+    const minutes = Number.parseInt(everyMinutes[1] ?? everyMinutes[2] ?? "", 10);
+    if (Number.isFinite(minutes) && minutes > 0) {
+      return { kind: "scheduled", intervalMinutes: minutes };
+    }
+  }
+
+  const everyHours = text.match(/\bevery\s+(\d+)\s+hours?\b|\bcada\s+(\d+)\s+horas?\b/);
+  if (everyHours) {
+    const hours = Number.parseInt(everyHours[1] ?? everyHours[2] ?? "", 10);
+    if (Number.isFinite(hours) && hours > 0) {
+      return { kind: "scheduled", intervalMinutes: hours * 60 };
+    }
+  }
+
+  if (/\b(every hour|hourly|cada hora)\b/.test(text)) {
+    return { kind: "scheduled", intervalMinutes: 60 };
+  }
+
+  if (/\b(daily|once a day|once per day|every day|cada dia|cada día|una vez al dia|una vez al día)\b/.test(text)) {
+    return { kind: "scheduled", intervalMinutes: 24 * 60 };
+  }
+
+  return undefined;
+}
+
+function looksLikeGmailAutonomyPreference(message: string): boolean {
+  return Boolean(parseGmailAutonomyPreference(message));
+}
+
+function isPendingGmailAutonomyPreference(pendingAction: PendingAction | undefined): boolean {
+  return Boolean(
+    pendingAction &&
+      pendingAction.status === "pending" &&
+      pendingAction.type === "custom_email_rule" &&
+      isRecord(pendingAction.payload) &&
+      pendingAction.payload.operation === "gmail_autonomy_preference"
+  );
+}
+
+function shouldReleasePendingGmailAutonomyFocus(pendingAction: PendingAction | undefined, message: string): boolean {
+  if (!isPendingGmailAutonomyPreference(pendingAction)) {
+    return false;
+  }
+
+  if (isConfirmationMessage(message) || isRejectionMessage(message)) {
+    return false;
+  }
+
+  return true;
 }
 
 interface CustomGmailRuleProposal {
@@ -6523,12 +6729,18 @@ async function handleSemanticRouterIntent(
 
   if (route.intent === "gmail_capability_guidance") {
     handlerName = "formatGmailCapabilityGuidance";
-    reply = formatGmailCapabilityGuidance();
+    reply = await formatGmailCapabilityGuidance(userId);
   }
 
   if (route.intent === "gmail_setup") {
     handlerName = "formatGmailSetupForConversation";
     reply = await formatGmailSetupForConversation(userId);
+  }
+
+  if (route.intent === "gmail_autonomy_preference") {
+    handlerName = "handleGmailAutonomyPreferenceForConversation";
+    reply = await handleGmailAutonomyPreferenceForConversation(userId, message, route);
+    mutation = reply.startsWith("I can set Gmail") || reply.startsWith("I can turn") || reply.startsWith("I can make Gmail");
   }
 
   if (route.intent === "gmail_sync") {
@@ -6716,6 +6928,26 @@ function detectDeterministicSemanticRouterIntent(message: string, pendingAction?
         userFacingIssue: null
       };
     }
+  }
+
+  if (looksLikeGmailAutonomyPreference(message)) {
+    const preference = parseGmailAutonomyPreference(message);
+    return {
+      intent: "gmail_autonomy_preference",
+      operation: "edit",
+      confidence: 0.94,
+      reason: "User asks to change Gmail checking or notification preferences.",
+      language: "unknown",
+      sideEffectRisk: "write",
+      requiresConfirmation: !isUnsupportedGmailAutonomyPreference(preference),
+      target: null,
+      keywordFilters: [],
+      senderFilters: [],
+      removeKeywordFilters: [],
+      goalHint: null,
+      shouldUnlinkGoal: false,
+      userFacingIssue: null
+    };
   }
 
   if (/\b(wtf|what are you doing|bro what|that's wrong|this is wrong|not good|you misunderstood|wrong goal|wrong rule)\b/.test(text)) {
@@ -7234,6 +7466,10 @@ async function answerGmailRuleQuestionForConversation(
       : [];
 
   if (matches.length === 0) {
+    if (isCustomGmailRuleQuestionTarget(target)) {
+      return formatMissingCustomGmailRuleQuestion(target);
+    }
+
     if (rules.length === 0) {
       return "No Gmail rules are active yet. Say what to track, for example: track Endesa bills from Gmail.";
     }
@@ -7251,9 +7487,17 @@ async function answerGmailRuleQuestionForConversation(
   }
 
   const rule = matches[0];
-  const goals = await getGoals(userId);
+  const [goals, state] = await Promise.all([getGoals(userId), buildGmailAutonomyState(userId)]);
   const goal = rule.goalId ? goals.find((item) => item.id === rule.goalId) : undefined;
   await maybeRememberGmailRuleConversationContext(userId, [rule], rule);
+
+  if (rule.status !== "active" && rule.adapterId === "custom_email_review") {
+    return [
+      `${customGmailRuleSubject(rule.name)} tracking is ${rule.status}.`,
+      "When active, custom Gmail matches go to email reviews first and do not auto-log.",
+      `Say "resume ${customGmailRuleSubject(rule.name)} emails" to turn it back on.`
+    ].join("\n");
+  }
 
   return [
     `Gmail rule: ${rule.name}`,
@@ -7261,13 +7505,51 @@ async function answerGmailRuleQuestionForConversation(
     `Looks for: ${formatEmailRuleQueryForHumans(rule.query)}`,
     `Linked goal: ${goal?.title ?? "none"}`,
     "Where matches go: email review first.",
-    rule.adapterId === "custom_email_review"
-      ? "Custom rules never auto-log or create actions."
-      : rule.reviewBeforeLogging
-        ? "Matches wait for your approval before becoming events or actions."
-        : "Clear matches can be logged automatically; uncertain matches go to review.",
-    `${gmailScheduledSyncDescription()} Manual sync: say 'sync Gmail'.`
+    gmailRuleOutcomeExplanation(rule),
+    gmailSyncModeSentence(state),
+    gmailAutomaticSyncDetail(state)
   ].join("\n");
+}
+
+function isCustomGmailRuleQuestionTarget(target: string | undefined): target is string {
+  if (!target) {
+    return false;
+  }
+
+  const cleanTarget = normalizeForComparison(cleanEmailRuleTarget(target));
+  return Boolean(cleanTarget) && cleanTarget !== "work action" && cleanTarget !== "job search" && target !== "work_action_email" && target !== "job_search_email";
+}
+
+function customGmailRuleSubject(value: string): string {
+  return cleanEmailRuleTarget(value) || value.trim() || "That";
+}
+
+function formatMissingCustomGmailRuleQuestion(target: string): string {
+  const subject = customGmailRuleSubject(target);
+
+  return [
+    `I don't see an active ${subject} Gmail rule right now.`,
+    "Custom Gmail tracking goes to email reviews first and does not auto-log.",
+    `Say "track ${subject} bills from Gmail" if you want to set it up.`
+  ].join("\n");
+}
+
+function gmailRuleOutcomeExplanation(rule: EmailSignalRule): string {
+  if (rule.adapterId === "custom_email_review") {
+    return "Custom rules never auto-log or create actions. You can turn a review into an action after you inspect it.";
+  }
+
+  if (rule.adapterId === "work_action_email") {
+    return "Work-action emails do not become tasks automatically. They wait in email review; approval can create an ActionItem.";
+  }
+
+  if (rule.adapterId === "job_search_email") {
+    return rule.reviewBeforeLogging
+      ? "Job-search matches wait for your approval before becoming career events."
+      : "Clear job-search matches can become career events. Uncertain matches go to review.";
+  }
+
+  return rule.reviewBeforeLogging ? "Matches wait for your approval before becoming events or actions." : "Clear matches can be logged automatically; uncertain matches go to review.";
 }
 
 async function formatGmailNotificationTimingForConversation(
@@ -7276,30 +7558,27 @@ async function formatGmailNotificationTimingForConversation(
   pendingAction?: PendingAction,
   route?: SemanticRouterResult
 ): Promise<string> {
+  const state = await buildGmailAutonomyState(userId);
+
   if (isPendingCustomGmailRuleCreate(pendingAction) && pendingAction && isRecord(pendingAction.payload)) {
     const displayName = stringFromRecord(pendingAction.payload, "displayName") ?? "Custom Gmail tracking";
 
     return [
       `${displayName} is still pending, so it is not scanning Gmail yet.`,
-      "After you confirm, Alecto checks Gmail when you say 'sync Gmail'.",
-      `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
+      `After you confirm, ${gmailSyncModeSentence(state)}`,
+      gmailAutomaticSyncDetail(state),
       "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
-      "Matches go to email review first; they do not become actions or events automatically."
+      "Matches go to email review first; they do not become actions or events automatically.",
+      "Alecto cannot send emails or change labels."
     ].join("\n");
   }
 
-  const [connections, pendingReviewCount] = await Promise.all([
-    getIntegrationConnections(userId),
-    getPendingEmailReviewCount(userId)
-  ]);
-  const gmailConnected = connections.some((connection) => connection.integrationId === "gmail" && connection.status === "active");
-
-  if (!gmailConnected) {
+  if (!state.gmailConnected) {
     return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
   }
 
-  const visibleRules = (await getEmailSignalRules(userId)).filter((rule) => rule.status !== "archived");
-  const rules = visibleRules.filter((rule) => rule.status === "active");
+  const visibleRules = state.visibleRules;
+  const rules = state.activeRules;
   const target = route?.target ?? extractGmailRuleQuestionTarget(message);
   const customMatches = resolveCustomGmailRulesForConversation(
     visibleRules.filter((rule) => rule.adapterId === "custom_email_review"),
@@ -7309,20 +7588,26 @@ async function formatGmailNotificationTimingForConversation(
   );
   const targetMatches = target ? findEmailRulesByTarget(visibleRules, target) : [];
   const hasSpecificRuleMatch = targetMatches.length > 0 || customMatches.length > 0;
+
+  if (!hasSpecificRuleMatch && isCustomGmailRuleQuestionTarget(target)) {
+    return formatMissingCustomGmailRuleQuestion(target);
+  }
+
   const matches = targetMatches.length > 0
     ? targetMatches
     : customMatches.length > 0
       ? customMatches
       : rules.length > 0
         ? rules
-        : visibleRules;
+      : visibleRules;
 
   if (visibleRules.length === 0) {
     return [
       noActiveGmailRulesMessage(),
-      "Alecto checks Gmail when you say 'sync Gmail', but no active rule means no Gmail scanning.",
-      `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
-      "This is not instant arrival tracking yet. Gmail webhooks are not implemented."
+      `${gmailSyncModeSentence(state)}, but no active rule means no Gmail scanning.`,
+      gmailAutomaticSyncDetail(state),
+      "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
+      "Alecto cannot send emails or change labels."
     ].join("\n");
   }
 
@@ -7339,12 +7624,28 @@ async function formatGmailNotificationTimingForConversation(
     ruleLine,
     matches.length === 1 && matches[0].status !== "active"
       ? "That rule is not active right now, so it will not check Gmail until you resume it."
-      : "Alecto checks Gmail when you say 'sync Gmail'.",
-    `${gmailScheduledSyncDescription()} If automatic sync is off, nothing checks in the background.`,
+      : gmailSyncModeSentence(state),
+    gmailAutomaticSyncDetail(state),
     "This is not instant arrival tracking yet. Gmail webhooks are not implemented.",
-    "New custom/work uncertain matches go to email review. Check them with /email_reviews.",
-    pendingEmailReviewLine(pendingReviewCount)
+    "Only active Gmail rules are checked. Custom/work uncertain matches go to email review.",
+    "Alecto cannot send emails or change labels.",
+    state.reviewNotificationEnabled
+      ? "Review notifications are on for scheduled sync."
+      : "Review notifications are off. Manual sync still replies in chat.",
+    pendingEmailReviewLine(state.pendingEmailReviewCount)
   ].filter(Boolean).join("\n");
+}
+
+function gmailAutomaticSyncDetail(state: Awaited<ReturnType<typeof buildGmailAutonomyState>>): string {
+  if (state.syncMode === "scheduled" && state.scheduledSyncEnabled) {
+    return `Automatic sync is on for active Gmail rules, about every ${formatIntervalMinutes(state.syncIntervalMinutes)}.`;
+  }
+
+  if (state.syncMode === "scheduled") {
+    return "Automatic sync preference is saved, but background sync is disabled in this local environment.";
+  }
+
+  return "Automatic sync is off.";
 }
 
 function looksLikeGmailNotificationTimingQuestion(message: string): boolean {
@@ -7649,13 +7950,55 @@ function extractLikelyRuleTargetsFromMessage(message: string): string[] {
 }
 
 function extractGmailRuleQuestionTarget(message: string): string | undefined {
+  const text = normalizeForComparison(message);
+
+  if (/\b(work action|work actions|work email|work emails|work mails|work tracking)\b/.test(text)) {
+    return "work_action_email";
+  }
+
+  if (/\b(job search|job email|job emails|job mails|recruiter|application emails|career emails)\b/.test(text)) {
+    return "job_search_email";
+  }
+
+  const explicitCustomTarget = extractCustomGmailRuleQuestionEntity(message);
+  if (explicitCustomTarget) {
+    return explicitCustomTarget;
+  }
+
   const proper = message.match(/\b[A-Z][a-zA-Z0-9]{2,}\b/g)?.find((item) => !/^(Gmail|Email|Mail|Inbox|Rule|Rules|Alecto|I)$/i.test(item));
   if (proper) {
     return proper;
   }
 
-  const match = message.match(/\b(?:about|for|with|where|will|does|do)\s+(.+?)(?:\s+(?:email|emails|gmail|rule|tracking)\b|[?.]|$)/i);
+  const match = message.match(/\b(?:about|for|with)\s+(.+?)(?:\s+(?:email|emails|gmail|rule|tracking)\b|[?.]|$)/i);
   return match ? cleanEmailRuleTarget(match[1]) : undefined;
+}
+
+function extractCustomGmailRuleQuestionEntity(message: string): string | undefined {
+  const patterns = [
+    /\bwhere\s+(?:do|does|will|would|can|could)?\s*(.+?)\s+(?:email|emails|mail|mails)\s+(?:go|land|arrive|show|appear)\b/i,
+    /\bwhen\s+(?:do|does|will|would|can|could)?\s*(.+?)\s+(?:email|emails|mail|mails)\s+(?:arrive|come|come in|notify|show|go)\b/i,
+    /\b(?:does|do|will|would|can|could)\s+(.+?)\s+(?:auto[\s-]?log|automatically log|create actions?|create events?|go to reviews?|be reviewed)\b/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = message.match(pattern);
+    const target = match ? cleanEmailRuleTarget(match[1] ?? "") : "";
+    if (isLikelyCustomGmailQuestionEntity(target)) {
+      return target;
+    }
+  }
+
+  return undefined;
+}
+
+function isLikelyCustomGmailQuestionEntity(target: string): boolean {
+  const key = normalizeForComparison(target);
+  if (!isUsefulCustomKeywordCandidate(target)) {
+    return false;
+  }
+
+  return !/\b(u|you|your|me|my|i|we|us|they|them|gmail|email|mail|mails|inbox|check|sync|scan|read|look|notify|tell|let|know|automatic|automatically|background|new|review|reviews|rule|rules|go|arrive|arrives)\b/.test(key);
 }
 
 function findEmailRulesByTarget(rules: EmailSignalRule[], target: string): EmailSignalRule[] {
@@ -7792,9 +8135,14 @@ function detectConversationSurfaceIntent(message: string): ConversationSurfaceIn
     return "enable_work_action_email_rule";
   }
 
+  if (looksLikeGmailAutonomyPreference(message)) {
+    return "gmail_autonomy_preference";
+  }
+
   if (
     /^(connect gmail|set up gmail|setup gmail|gmail setup|show gmail setup|gmail status|show gmail status|configure gmail|gmail settings)$/.test(text) ||
-    /\b(gmail|email)\b.*\b(setup|set up|status|settings|configure)\b/.test(text)
+    /\b(gmail|email)\b.*\b(setup|set up|status|settings|configure|configured|watching)\b/.test(text) ||
+    /\b(how does gmail work|should gmail help with my goals|what gmail tracking is on)\b/.test(text)
   ) {
     return "gmail_setup";
   }
@@ -14773,6 +15121,75 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
       };
     }
 
+    if (operation === "gmail_autonomy_preference") {
+      const connectionId = typeof pendingAction.payload.connectionId === "string" ? pendingAction.payload.connectionId : "";
+      const connection = await getIntegrationConnection(userId, connectionId);
+
+      if (!connection || connection.integrationId !== "gmail" || connection.status !== "active") {
+        return {
+          reply: "Gmail is not connected anymore. Say 'connect Gmail' and try again."
+        };
+      }
+
+      const syncMode =
+        pendingAction.payload.syncMode === "manual_only" || pendingAction.payload.syncMode === "scheduled"
+          ? pendingAction.payload.syncMode
+          : undefined;
+      const syncIntervalMinutes =
+        typeof pendingAction.payload.syncIntervalMinutes === "number"
+          ? pendingAction.payload.syncIntervalMinutes
+          : typeof pendingAction.payload.syncIntervalMinutes === "string"
+            ? Number.parseInt(pendingAction.payload.syncIntervalMinutes, 10)
+            : undefined;
+      const reviewNotificationEnabled =
+        typeof pendingAction.payload.reviewNotificationEnabled === "boolean"
+          ? pendingAction.payload.reviewNotificationEnabled
+          : undefined;
+      const updatedConfig = writeGmailAutonomyPreferences(connection.config, {
+        syncMode,
+        syncIntervalMinutes,
+        reviewNotificationEnabled
+      });
+      const updatedConnection = await updateIntegrationConnectionConfig(userId, connection.id, updatedConfig);
+
+      if (!updatedConnection) {
+        throw new Error("Gmail connection not found.");
+      }
+
+      const state = await buildGmailAutonomyState(userId);
+      const preferenceKind = typeof pendingAction.payload.preferenceKind === "string" ? pendingAction.payload.preferenceKind : "";
+
+      if (preferenceKind === "manual_only") {
+        return {
+          reply: "Gmail is set to manual only. I will check active rules when you say \"sync Gmail\"."
+        };
+      }
+
+      if (preferenceKind === "scheduled") {
+        const interval = typeof syncIntervalMinutes === "number" && Number.isFinite(syncIntervalMinutes)
+          ? syncIntervalMinutes
+          : state.syncIntervalMinutes;
+        return {
+          reply: state.runtime.scheduledSyncEnabled
+            ? `Gmail scheduled checks are set to every ${formatIntervalMinutes(interval)} for active rules.`
+            : `Gmail preference saved: checks every ${formatIntervalMinutes(interval)}. Background sync is currently disabled in this local environment, so I will only check when you say "sync Gmail" until background sync is enabled.`
+        };
+      }
+
+      if (preferenceKind === "review_notifications_on" || preferenceKind === "review_notifications_off") {
+        const enabled = preferenceKind === "review_notifications_on";
+        return {
+          reply: enabled
+            ? "Gmail review notifications are on. Scheduled sync will send one bundled message when new reviews are waiting."
+            : "Gmail review notifications are off. Manual sync will still reply in chat."
+        };
+      }
+
+      return {
+        reply: "Gmail preference updated."
+      };
+    }
+
     throw new Error("Invalid custom_email_rule operation.");
   }
 
@@ -14878,6 +15295,9 @@ function surfaceReplyIncludesMutation(reply: string): boolean {
     reply.startsWith("I can set up a review-first Gmail rule.") ||
     reply.startsWith("Gmail rule active:") ||
     reply.startsWith("Gmail rule paused:") ||
+    reply.startsWith("I can make Gmail") ||
+    reply.startsWith("I can set Gmail") ||
+    reply.startsWith("I can turn Gmail review notifications") ||
     reply.startsWith("Confirm remove Gmail rule:") ||
     (reply.startsWith("Confirm remove ") && reply.includes("Gmail email rule")) ||
     reply.startsWith("Action hygiene:") ||

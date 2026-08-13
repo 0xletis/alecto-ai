@@ -59,13 +59,20 @@ export type GmailErrorStage =
   | "classification"
   | "event_creation";
 
-export function formatIntegrationSyncNotifications(response: IntegrationSyncResponse): string[] {
+export interface IntegrationSyncNotificationOptions {
+  gmailReviewNotificationsEnabled?: boolean;
+}
+
+export function formatIntegrationSyncNotifications(
+  response: IntegrationSyncResponse,
+  options: IntegrationSyncNotificationOptions = {}
+): string[] {
   if (response.integrationId === "gmail" && response.emailSummaries?.length) {
     const eventTotal = response.emailSummaries.reduce((sum, summary) => sum + summary.eventsCreated, 0);
     const reviewTotal = response.emailSummaries.reduce((sum, summary) => sum + summary.reviewItemsCreated, 0);
     const messages: string[] = [];
 
-    if (reviewTotal > 0) {
+    if (reviewTotal > 0 && options.gmailReviewNotificationsEnabled !== false) {
       const groupSummary = formatGmailReviewGroupSummary(response.emailSummaries);
       messages.push(
         `${reviewTotal} Gmail review${reviewTotal === 1 ? "" : "s"} ${reviewTotal === 1 ? "is" : "are"} waiting${groupSummary ? `: ${groupSummary}` : ""}. Say "email reviews" to handle ${reviewTotal === 1 ? "it" : "them"}.`
