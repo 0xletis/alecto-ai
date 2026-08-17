@@ -6,6 +6,40 @@ import { buildServer } from "../apps/api/src/server.ts";
 
 const now = "2026-08-13T10:00:00+02:00";
 
+test("messages/process_v2 exposes explicit v2 ownership when a scope is unmigrated", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-unhandled-debug-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withEnvOverrides(
+      {
+        CONVERSATION_ORCHESTRATOR_V2_ENABLED: "true",
+        LLM_OPERATION_PLANNER_ENABLED: "false"
+      },
+      () => processV2(server, userId, "hello, just checking")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Conversation Orchestrator v2 did not handle this message yet.");
+    assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(response.json().routeDebug.handledBy, "none");
+    assert.equal(response.json().routeDebug.v2SkippedReason, "No v2 operation matched this message.");
+    assert.equal(response.json().routeDebug.plannerUsed, "none");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
+    assert.equal(response.json().routeDebug.legacySemanticAttempted, false);
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+    assert.equal(response.json().routeDebug.mutationExecuted, false);
+    assert.equal(response.json().routeDebug.operationPlanValidated, false);
+    assert.equal(response.json().routeDebug.policyPrecheckResult, "passed");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
 test("conversation orchestrator v2 stores the exact one-item hygiene list it renders", async () => {
   const server = buildServer();
   const userId = `orchestrator-v2-visible-invariant-${randomUUID()}`;
@@ -18,6 +52,7 @@ test("conversation orchestrator v2 stores the exact one-item hygiene list it ren
     assert.match(response.json().reply, /1\. Do 2 strength sessions/);
     assert.doesNotMatch(response.json().reply, /archive 1|archive 2/);
     assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(response.json().routeDebug.policyPrecheckResult, "passed");
     assert.equal(response.json().routeDebug.visibleContextType, "action_hygiene_list");
     assert.equal(response.json().routeDebug.visibleEntityCount, 1);
     assert.equal(response.json().routeDebug.contextCreatedBy, "conversation_orchestrator_v2");
@@ -877,6 +912,7 @@ test("conversation orchestrator v2 keeps risk guardrail ahead of LLM planner", a
     assert.equal(response.json().riskState, "RED");
     assert.match(response.json().reply, /Hard stop/);
     assert.equal(response.json().routeDebug.handledBy, "risk_guardrail");
+    assert.equal(response.json().routeDebug.policyPrecheckResult, "blocked_by_guardrail");
     assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
     assert.equal(response.json().routeDebug.llmPlannerUsed, false);
     assert.equal(await prisma.actionItem.count({ where: { userId } }), 0);

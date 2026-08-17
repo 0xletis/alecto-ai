@@ -68,6 +68,7 @@ export const ProcessMessageResultSchema = z.object({
     llmPlannerUsed: z.boolean().optional(),
     llmPlannerFailedReason: z.string().optional(),
     operationPlanValidated: z.boolean().optional(),
+    policyPrecheckResult: z.string().optional(),
     contextLoaded: z.boolean().optional(),
     visibleContextType: z.string().optional(),
     visibleEntityCount: z.number().int().nonnegative().optional(),

@@ -50,7 +50,6 @@ import {
   PendingMemoryCreatePayloadSchema,
   processMessage,
   processMessageFromAnalysis,
-  ProcessMessageInputSchema,
   routeIntent,
   parsedDailyCheckInToAnswers,
   parseDailyCheckinText,
@@ -218,6 +217,7 @@ import {
   runConversationOrchestratorV2
 } from "./conversation/orchestrator-v2.js";
 import { shouldUseLLMOperationPlanner } from "./conversation/operation-planner.js";
+import { registerMessageRoutes } from "./routes/messages.js";
 
 type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
 
@@ -264,18 +264,11 @@ export function buildServer() {
     return { goalTemplate: template };
   });
 
-  server.post("/messages/process_v2", async (request, reply) => {
-    const parsed = ProcessMessageInputSchema.safeParse(request.body);
-
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid request body",
-        issues: parsed.error.issues
-      });
-    }
-
-    await ensureUser(parsed.data.userId);
-    await expireOldPendingActions(parsed.data.userId);
+  registerMessageRoutes(server, {
+    processV2: async (input) => {
+      const parsed = { data: input };
+      await ensureUser(parsed.data.userId);
+      await expireOldPendingActions(parsed.data.userId);
 
     const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message, {
       returnUnhandled: true
@@ -295,7 +288,7 @@ export function buildServer() {
       handledBy: "none",
       skippedReason: "No v2 operation matched this message.",
       v2SkippedReason: "No v2 operation matched this message.",
-      plannerUsed: "none",
+      plannerUsed: "deterministic",
       llmPlannerAttempted: false,
       llmPlannerUsed: false,
       contextLoaded: false,
@@ -308,22 +301,14 @@ export function buildServer() {
       legacySemanticAttempted: false,
       legacySemanticUsed: false,
       mutation: false,
+      policyPrecheckResult: "passed",
       reason: "This scope still uses legacy /messages/process."
     });
-  });
-
-  server.post("/messages/process", async (request, reply) => {
-    const parsed = ProcessMessageInputSchema.safeParse(request.body);
-
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid request body",
-        issues: parsed.error.issues
-      });
-    }
-
-    await ensureUser(parsed.data.userId);
-    await expireOldPendingActions(parsed.data.userId);
+    },
+    process: async (input) => {
+      const parsed = { data: input };
+      await ensureUser(parsed.data.userId);
+      await expireOldPendingActions(parsed.data.userId);
 
     if (isConversationOrchestratorV2Enabled()) {
       const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message);
@@ -578,6 +563,7 @@ export function buildServer() {
       ...result,
       reply: composed.reply
     } satisfies ProcessMessageResult;
+    }
   });
 
   server.get<{ Params: { userId: string }; Querystring: { includeArchived?: string } }>(
@@ -7349,6 +7335,7 @@ async function handleSemanticRouterIntent(
       legacySemanticAttempted: true,
       legacySemanticUsed: true,
       operationPlanValidated: false,
+      policyPrecheckResult: "passed",
       mutation,
       mutationExecuted: mutation,
       confidence: route.confidence,
@@ -9186,6 +9173,7 @@ async function createGuardianGuardrailReply(
       semanticRouterAttempted: false,
       semanticRouterUsed: false,
       mutation: true,
+      policyPrecheckResult: "blocked_by_guardrail",
       reason: guardrail.reason
     }
   };

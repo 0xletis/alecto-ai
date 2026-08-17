@@ -1,6 +1,6 @@
 # Implementation Status
 
-Last updated: 2026-08-13
+Last updated: 2026-08-18
 
 Legend:
 - `[x]` implemented and currently wired into the app
@@ -10,6 +10,7 @@ Legend:
 This file is the current handoff map for humans and orchestrator agents. When code changes add, remove, or materially alter behavior, update this file and the relevant README/docs section before finishing the implementation.
 
 For product-level capability grouping and command-surface consolidation, read `docs/08-product-capability-audit.md`.
+For route ownership, split-brain risks, and the server extraction plan, read `docs/09-architecture-inventory.md`.
 
 ## Documentation Maintenance Rule
 
@@ -30,7 +31,9 @@ After every implementation pass:
 - [x] Conversation-first UX parity for natural help, setup, daily/weekly review, planning, hygiene, goals/actions/memory, integration guidance, explicit email-rule enable requests, and explicit integration sync requests
 - [x] Channel-neutral operator attention state/API: `GET /users/:userId/operator-attention` composes actions, goals, events, risks, hygiene, Gmail reviews, and latest weekly-review status for natural attention/email-attention questions and operator-loop surfaces
 - [x] Optional LLM Semantic Router v4 for normal free-text understanding after deterministic safety/command/pending handling and before generic chat fallback; targets English/Spanish/Catalan phrasing, returns structured intent only, keeps short-lived Gmail-rule conversation context, and leaves all mutations to deterministic API executors
-- [~] Conversation Orchestrator v2 Phase 1: new operation-planning architecture under `/messages/process_v2` and disabled-by-default `/messages/process` flag. It builds `ConversationContext`, `AvailableOperations`, an OperationPlanner contract, deterministic validation/execution, and execution-result response composition. Current migrated scopes are action hygiene list creation and replies, all-except cleanup batches, recent mutation questions, explicit memory requests, selected operator-attention/read surfaces, natural confirmation variants, cross-domain visible-context safety, reference-text safety, conservative progress logging for CV/application and workout reports in English/Spanish/Catalan, and betting/trading risk precedence. Runtime is deterministic by default. `LLM_OPERATION_PLANNER_ENABLED=true` plus `OPENAI_API_KEY` or mock env calls the real LLM operation planner for these selected scopes; invalid JSON, schema errors, provider errors, timeouts, or low confidence fall back safely and routeDebug reports planner status.
+- [~] Conversation Orchestrator v2 Phase 1: new operation-planning architecture under `/messages/process_v2` and disabled-by-default `/messages/process` flag. It builds `ConversationContext`, `AvailableOperations`, an OperationPlanner contract, deterministic validation/execution, and execution-result response composition. Current migrated scopes are action hygiene list creation and replies, all-except cleanup batches, recent mutation questions, explicit memory requests, selected operator-attention/read surfaces, natural confirmation variants, cross-domain visible-context safety, reference-text safety, conservative progress logging for CV/application and workout reports in English/Spanish/Catalan, and betting/trading risk precedence. Runtime is deterministic by default. `LLM_OPERATION_PLANNER_ENABLED=true` plus `OPENAI_API_KEY` or mock env calls the real LLM operation planner for these selected scopes; invalid JSON, schema errors, provider errors, timeouts, or low confidence fall back safely and routeDebug reports planner status, policy precheck, v2 skip reason, handled owner, validation, mutation execution, and legacy semantic attempted/used fields.
+- [x] Architecture inventory v1 in `docs/09-architecture-inventory.md`: entry points, routing order, route ownership map, `server.ts` map, split-brain risks, ConversationContext audit, LLM OperationPlanner audit, and risk/guardrail generalization plan
+- [~] API route modularization started beyond conversation helpers: `/messages/process` and `/messages/process_v2` Fastify registration now lives in `apps/api/src/routes/messages.ts`; the actual process handlers still depend on `apps/api/src/server.ts` helper glue until more surfaces are extracted.
 - [x] Short-lived interaction context for visible action/hygiene lists, recent action mutation status, focused Gmail rules, pending Gmail proposals, email review lists, and plan sessions through the existing pending-action layer
 - [x] `/messages/process` routeDebug metadata for API smoke tests: router source, intent, handler, semantic-router usage, mutation flag, confidence, language, side-effect risk, confirmation requirement, and compact reason
 - [x] User onboarding/setup simplification v1: shared API onboarding state/reply composer, `/start`, `/setup`, natural quickstart, missing setup, goals setup, daily-loop setup, and integration setup guidance
@@ -240,7 +243,7 @@ After every implementation pass:
 - [x] Work-action review approval creates ActionItems instead of Events
 - [~] Gmail OAuth/account management remains local-MVP; production auth, key management, and secret rotation are not implemented
 - [~] LLM email classifier and semantic router are optional and post-processed by strict allowlists/executors; broader natural-language coverage has targeted API smoke tests but still needs a larger eval suite before production
-- [~] Conversation Orchestrator v2 modularization has started under `apps/api/src/conversation/` with context, operation catalog, optional LLM planner runtime bridge, validator, executor, response composer, Gmail autonomy, and email-rule selection helpers. `apps/api/src/server.ts` remains oversized and still needs capability executors/services extracted.
+- [~] Conversation Orchestrator v2 modularization has started under `apps/api/src/conversation/` with context, operation catalog, optional LLM planner runtime bridge, validator, executor, response composer, Gmail autonomy, and email-rule selection helpers. Message route registration moved to `apps/api/src/routes/messages.ts`. `apps/api/src/server.ts` remains oversized and still needs capability executors/services extracted.
 - [x] Editing filters on an existing custom Gmail rule through API conversation routing; destructive removal still requires confirmation
 - [ ] Gmail send/label modification
 - [ ] Gmail webhooks, full-inbox/all-mail LLM monitoring, per-rule sync schedules, business-hours Gmail checks, and daily Gmail digest
