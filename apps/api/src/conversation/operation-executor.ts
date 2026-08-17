@@ -8,6 +8,12 @@ import type { PendingAction } from "@operator-agent/db";
 
 export interface ConversationExecutorCallbacks {
   showActionHygiene(userId: string, message: string, now: Date): Promise<string>;
+  showToday?(userId: string): Promise<string>;
+  showOperatorAttention?(userId: string): Promise<string>;
+  showEmailReviews?(userId: string): Promise<string>;
+  showGmailStatus?(userId: string): Promise<string>;
+  logProgressFromMessage?(userId: string, message: string): Promise<string>;
+  createMemoryFromMessage?(userId: string, summary: string, originalMessage: string): Promise<string>;
   resolvePendingDecisionReply(
     userId: string,
     pendingAction: PendingAction,
@@ -76,6 +82,49 @@ async function executeOneOperation(
     return input.callbacks.showActionHygiene(input.userId, input.message, input.context.createdAt);
   }
 
+  if (operation.name === "show_today") {
+    return input.callbacks.showToday?.(input.userId);
+  }
+
+  if (operation.name === "show_operator_attention") {
+    return input.callbacks.showOperatorAttention?.(input.userId);
+  }
+
+  if (operation.name === "show_email_reviews") {
+    return input.callbacks.showEmailReviews?.(input.userId);
+  }
+
+  if (operation.name === "show_gmail_status") {
+    return input.callbacks.showGmailStatus?.(input.userId);
+  }
+
+  if (operation.name === "log_progress") {
+    const evidence = typeof operation.fields.evidence === "string" && operation.fields.evidence.trim()
+      ? operation.fields.evidence
+      : input.message;
+    return input.callbacks.logProgressFromMessage?.(input.userId, evidence);
+  }
+
+  if (operation.name === "create_memory") {
+    const summary = typeof operation.fields.summary === "string" && operation.fields.summary.trim()
+      ? operation.fields.summary
+      : input.message;
+    return input.callbacks.createMemoryFromMessage?.(input.userId, summary, input.message);
+  }
+
+  if (
+    operation.name === "archive_action" ||
+    operation.name === "complete_action" ||
+    operation.name === "snooze_action" ||
+    operation.name === "keep_action"
+  ) {
+    if (!input.pendingAction) {
+      return "I don't have a visible cleanup item right now. Say 'clean up my tasks' first.";
+    }
+
+    return input.callbacks.resolvePendingDecisionReply(input.userId, input.pendingAction, legacyActionInstruction(operation));
+  }
+
   if (operation.name === "answer_recent_mutation_status") {
     const recent = input.context.recentMutations[0];
 
@@ -86,7 +135,7 @@ async function executeOneOperation(
       }
     }
 
-    return recent?.reply ? ["Last action changes:", recent.reply].join("\n") : "I do not have a recent action change recorded.";
+    return recent?.reply ? recent.reply : "I do not have a recent change recorded.";
   }
 
   if (operation.name === "confirm_pending" || operation.name === "cancel_pending") {
@@ -116,4 +165,44 @@ async function executeOneOperation(
   }
 
   return undefined;
+}
+
+function legacyActionInstruction(operation: ConversationPlannedOperation): string {
+  const target = operationTargetToLegacyReference(operation);
+
+  if (operation.name === "archive_action") {
+    return `archive ${target}`;
+  }
+
+  if (operation.name === "complete_action") {
+    return `complete ${target}`;
+  }
+
+  if (operation.name === "keep_action") {
+    return `keep ${target}`;
+  }
+
+  const timeText = typeof operation.fields.timeText === "string" ? operation.fields.timeText : "";
+  return `snooze ${target}${timeText ? ` ${timeText}` : ""}`;
+}
+
+function operationTargetToLegacyReference(operation: ConversationPlannedOperation): string {
+  const target = operation.target;
+  if (!target) {
+    return "it";
+  }
+
+  if (target.referenceType === "visible_number") {
+    return target.value;
+  }
+
+  if (target.referenceType === "all_visible") {
+    return "all";
+  }
+
+  if (target.referenceType === "all_except_visible") {
+    return `all except ${target.value}`;
+  }
+
+  return target.value;
 }

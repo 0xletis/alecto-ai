@@ -48,7 +48,7 @@ export function allOperationDefinitions(): AvailableOperationDefinition[] {
     operation("edit_plan_suggestion", true, false, ["plan_suggestion"], ["plan_suggestions"], ["target"], "Edit a pending plan suggestion."),
     operation("skip_plan", true, false, [], ["plan_suggestions"], [], "Skip a pending plan."),
     operation("create_goal", true, true, [], ["any"], ["title"], "Create a goal after confirmation."),
-    operation("create_memory", true, true, [], ["any"], ["summary"], "Create a memory after confirmation."),
+    operation("create_memory", true, false, [], ["any"], ["summary"], "Create a memory from an explicit remember request."),
     operation("log_progress", true, false, [], ["any"], ["evidence"], "Log progress when explicitly supported."),
     operation("risk_guardrail_response", true, false, [], ["any"], [], "Return a hard risk guardrail response."),
     operation("request_clarification", false, false, [], ["any"], ["reply"], "Ask for clarification without mutation."),

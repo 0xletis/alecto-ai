@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
 import {
   findGmailSemanticDuplicateEvent,
   findGmailSemanticDuplicateReviewItem,
@@ -4499,6 +4499,7 @@ test("/today and /review use the same user-local day event window", async () => 
 });
 
 test("natural weekly review refreshes stale week-to-date memory", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-08-13T08:00:00.000Z") });
   const server = buildServer();
   const reviewUserId = `weekly-natural-refresh-${randomUUID()}`;
   await prisma.user.create({ data: { id: reviewUserId } });
@@ -4546,6 +4547,7 @@ test("natural weekly review refreshes stale week-to-date memory", async () => {
     assert.match(response.json().reply, /Weekly review so far - 2026-08-10 to 2026-08-13/);
     assert.doesNotMatch(response.json().reply, /2026-08-10 to 2026-08-10/);
   } finally {
+    mock.timers.reset();
     await server.close();
     await prisma.user.deleteMany({ where: { id: reviewUserId } });
   }

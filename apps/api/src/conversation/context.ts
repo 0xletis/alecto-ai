@@ -62,6 +62,13 @@ function outputTypeFromPendingAction(pendingAction?: PendingAction): Conversatio
     return "unknown";
   }
 
+  if (
+    pendingAction.type === "action_hygiene" &&
+    pendingAction.payload.operation === "recent_mutation_status"
+  ) {
+    return "unknown";
+  }
+
   if (pendingAction.type === "action_hygiene") {
     return "action_hygiene_list";
   }

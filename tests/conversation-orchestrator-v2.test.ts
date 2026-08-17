@@ -377,18 +377,18 @@ test("conversation orchestrator v2 handles all-except hygiene language and recen
 
     response = await processV2(server, userId, "did u archive the rest?");
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Last action changes:/);
+    assert.match(response.json().reply, /Done:/);
     assert.match(response.json().reply, /Archived Review homepage/);
     assert.match(response.json().reply, /Snoozed Read 20 minutes on 3 days/);
     assert.doesNotMatch(response.json().reply, /Gmail|email rule/i);
 
     response = await processV2(server, userId, "qué has cambiado?");
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Last action changes:/);
+    assert.match(response.json().reply, /Done:/);
 
     response = await processV2(server, userId, "què has canviat?");
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Last action changes:/);
+    assert.match(response.json().reply, /Done:/);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });
@@ -583,6 +583,624 @@ test("conversation orchestrator v2 accepts natural confirmation variants only in
   }
 });
 
+test("conversation orchestrator v2 uses mocked LLM planner when enabled", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-planner-${randomUUID()}`;
+
+  try {
+    await createProtectedOneDayOverdueAction(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("action_hygiene", [{
+        name: "show_action_hygiene",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "User asked to clean up tasks."
+      }]),
+      () => processV2(server, userId, "mirame las tareas viejas")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /1\. Do 2 strength sessions/);
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, true);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, true);
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+    assert.equal(response.json().routeDebug.visibleEntityCount, 1);
+    assert.equal(response.json().routeDebug.contextCreatedBy, "conversation_orchestrator_v2");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 falls back when LLM planner returns invalid JSON", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-invalid-${randomUUID()}`;
+
+  try {
+    await createProtectedOneDayOverdueAction(userId);
+
+    const response = await withLLMPlannerMock("{not json", () => processV2(server, userId, "clean up my tasks"));
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /1\. Do 2 strength sessions/);
+    assert.equal(response.json().routeDebug.plannerUsed, "fallback");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, true);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
+    assert.equal(response.json().routeDebug.llmPlannerFailedReason, "invalid_json");
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 debug preserves LLM failure when no fallback plan exists", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-no-plan-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withLLMPlannerMock("{not json", () => processV2(server, userId, "mensaje extraño sin ruta"));
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Conversation Orchestrator v2 did not handle this message yet.");
+    assert.equal(response.json().routeDebug.plannerUsed, "fallback");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, true);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
+    assert.equal(response.json().routeDebug.llmPlannerFailedReason, "invalid_json");
+    assert.equal(response.json().routeDebug.operationPlanValidated, false);
+    assert.equal(response.json().routeDebug.mutationExecuted, false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 stays deterministic when LLM planner flag is disabled", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-disabled-${randomUUID()}`;
+
+  try {
+    await createProtectedOneDayOverdueAction(userId);
+
+    const response = await withEnvOverrides(
+      {
+        CONVERSATION_ORCHESTRATOR_V2_ENABLED: "true",
+        LLM_OPERATION_PLANNER_ENABLED: "false",
+        LLM_OPERATION_PLANNER_MOCK_RESPONSE: llmPlan("action_hygiene", [{
+          name: "show_action_hygiene",
+          fields: {},
+          mutates: false,
+          requiresConfirmation: false,
+          reason: "Would be ignored while disabled."
+        }])
+      },
+      () => processV2(server, userId, "clean up my tasks")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.plannerUsed, "deterministic");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 turns low-confidence LLM plans into clarification", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-low-confidence-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("unclear", [], {
+        confidence: 0.42,
+        clarificationQuestion: "Which action do you mean?"
+      }),
+      () => processV2(server, userId, "haz eso")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().reply, "Which action do you mean?");
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.llmPlannerUsed, true);
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+    assert.equal(response.json().routeDebug.mutationExecuted, false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 reports provider and timeout fallbacks safely", async () => {
+  const server = buildServer();
+
+  try {
+    const throwUserId = `orchestrator-v2-llm-throw-${randomUUID()}`;
+    await createProtectedOneDayOverdueAction(throwUserId);
+
+    let response = await withLLMPlannerMock(
+      llmPlan("action_hygiene", [{
+        name: "show_action_hygiene",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "Mock would throw before this."
+      }]),
+      () => processV2(server, throwUserId, "clean up my tasks"),
+      { LLM_OPERATION_PLANNER_MOCK_THROW: "true" }
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.plannerUsed, "fallback");
+    assert.equal(response.json().routeDebug.llmPlannerFailedReason, "provider_error");
+    assert.match(response.json().reply, /Do 2 strength sessions/);
+
+    const timeoutUserId = `orchestrator-v2-llm-timeout-${randomUUID()}`;
+    await createProtectedOneDayOverdueAction(timeoutUserId);
+
+    response = await withLLMPlannerMock(
+      llmPlan("action_hygiene", [{
+        name: "show_action_hygiene",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "Mock would time out before this."
+      }]),
+      () => processV2(server, timeoutUserId, "clean up my tasks"),
+      {
+        LLM_OPERATION_PLANNER_MOCK_DELAY_MS: "25",
+        LLM_OPERATION_PLANNER_TIMEOUT_MS: "1"
+      }
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.plannerUsed, "fallback");
+    assert.equal(response.json().routeDebug.llmPlannerFailedReason, "timeout");
+    assert.match(response.json().reply, /Do 2 strength sessions/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { contains: "orchestrator-v2-llm-throw-" } } });
+    await prisma.user.deleteMany({ where: { id: { contains: "orchestrator-v2-llm-timeout-" } } });
+  }
+});
+
+test("conversation orchestrator v2 lets LLM route pronoun hygiene mutations through deterministic executor", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-snooze-${randomUUID()}`;
+
+  try {
+    await createProtectedOneDayOverdueAction(userId);
+    await withV2Enabled(() => processV2(server, userId, "clean up my tasks"));
+
+    const response = await withLLMPlannerMock(
+      llmPlan("action_hygiene_reply", [{
+        name: "snooze_action",
+        target: {
+          referenceType: "visible_number",
+          value: "1",
+          entityType: "action"
+        },
+        fields: { timeText: "tomorrow" },
+        mutates: true,
+        requiresConfirmation: false,
+        reason: "User wants to snooze the visible action."
+      }]),
+      () => processV2(server, userId, "posponlo hasta mañana")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Action snoozed until/);
+    assert.match(response.json().reply, /Do 2 strength sessions/);
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.llmPlannerUsed, true);
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+    assert.equal(response.json().routeDebug.mutationExecuted, true);
+    assert.equal(await prisma.actionItem.count({ where: { userId, status: "snoozed" } }), 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 blocks unsupported LLM operations before mutation", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-invalid-operation-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("action_hygiene_reply", [{
+        name: "archive_action",
+        target: {
+          referenceType: "visible_number",
+          value: "1",
+          entityType: "action"
+        },
+        fields: {},
+        mutates: true,
+        requiresConfirmation: true,
+        reason: "Mock planner tried to mutate an unavailable target."
+      }]),
+      () => processV2(server, userId, "archive it")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /could not safely match/i);
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.operationPlanValidated, false);
+    assert.equal(response.json().routeDebug.mutationExecuted, false);
+    assert.equal(await prisma.actionItem.count({ where: { userId } }), 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 keeps risk guardrail ahead of LLM planner", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-risk-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+    await prisma.goal.create({
+      data: {
+        userId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+
+    const response = await withLLMPlannerMock(
+      llmPlan("show_today", [{
+        name: "show_today",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "This must not run for risk messages."
+      }]),
+      () => processV2(server, userId, "I want to bet 500 because it is safe")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.match(response.json().reply, /Hard stop/);
+    assert.equal(response.json().routeDebug.handledBy, "risk_guardrail");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
+    assert.equal(await prisma.actionItem.count({ where: { userId } }), 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("conversation orchestrator v2 lets LLM route supported progress logging", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-llm-progress-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("log_progress", [{
+        name: "log_progress",
+        fields: { evidence: "trained 30 min" },
+        mutates: true,
+        requiresConfirmation: false,
+        reason: "User explicitly reported training progress."
+      }]),
+      () => processV2(server, userId, "he entrenado 30 min")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Logged 30 minutes of training/);
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+    assert.equal(response.json().routeDebug.mutationExecuted, true);
+    assert.equal(await prisma.event.count({ where: { userId, type: "health.workout_completed" } }), 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("messages/process lets v2 LLM own multilingual CV and training progress before legacy semantic", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-process-progress-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const progressMessage = "I sent two CVs and trained 45 minutes";
+    const response = await withLLMPlannerMock(
+      llmPlan("log_progress", [{
+        name: "log_progress",
+        fields: { evidence: progressMessage },
+        mutates: true,
+        requiresConfirmation: false,
+        reason: "User reported job-search and training progress."
+      }]),
+      () => processMessage(server, userId, progressMessage)
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(response.json().routeDebug.orchestrator, "v2");
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.llmOperationPlannerEnabled, true);
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, true);
+    assert.equal(response.json().routeDebug.llmPlannerUsed, true);
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+    assert.equal(response.json().routeDebug.mutationExecuted, true);
+    assert.match(response.json().reply, /Logged 2 CVs sent/);
+    assert.match(response.json().reply, /Logged 45 minutes of training/);
+    assert.equal(await prisma.event.count({ where: { userId, type: "career.application_sent" } }), 1);
+    assert.equal(await prisma.event.count({ where: { userId, type: "health.workout_completed" } }), 1);
+
+    const statusResponse = await withLLMPlannerMock(
+      llmPlan("answer_recent_mutation_status", [{
+        name: "answer_recent_mutation_status",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "User asked what changed recently."
+      }], { confidence: 0.9 }),
+      () => processMessage(server, userId, "qué has cambiado?")
+    );
+
+    assert.equal(statusResponse.statusCode, 200);
+    assert.equal(statusResponse.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(statusResponse.json().routeDebug.plannerUsed, "llm");
+    assert.equal(statusResponse.json().routeDebug.legacySemanticUsed, false);
+    assert.equal(statusResponse.json().routeDebug.contextLoaded, false);
+    assert.equal(statusResponse.json().routeDebug.contextCreatedBy, undefined);
+    assert.match(statusResponse.json().reply, /I logged:/);
+    assert.match(statusResponse.json().reply, /2 CVs sent/);
+    assert.match(statusResponse.json().reply, /45 minutes of training/);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("messages/process logs Spanish and Catalan CV/training aliases through v2 LLM planner", async () => {
+  const server = buildServer();
+
+  const cases = [
+    {
+      userId: `orchestrator-v2-process-progress-es-${randomUUID()}`,
+      message: "he enviado dos CVs y fui al gym 45 minutos"
+    },
+    {
+      userId: `orchestrator-v2-process-progress-ca-${randomUUID()}`,
+      message: "avui he enviat 2 CVs i he entrenat 45 minuts"
+    }
+  ];
+
+  try {
+    for (const testCase of cases) {
+      await createUserWithTimezone(testCase.userId);
+
+      const response = await withLLMPlannerMock(
+        llmPlan("log_progress", [{
+          name: "log_progress",
+          fields: { evidence: testCase.message },
+          mutates: true,
+          requiresConfirmation: false,
+          reason: "User reported job-search and training progress."
+        }]),
+        () => processMessage(server, testCase.userId, testCase.message)
+      );
+
+      assert.equal(response.statusCode, 200);
+      assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+      assert.equal(response.json().routeDebug.plannerUsed, "llm");
+      assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+      assert.match(response.json().reply, /Logged 2 CVs sent/);
+      assert.match(response.json().reply, /Logged 45 minutes of training/);
+      assert.equal(await prisma.event.count({ where: { userId: testCase.userId, type: "career.application_sent" } }), 1);
+      assert.equal(await prisma.event.count({ where: { userId: testCase.userId, type: "health.workout_completed" } }), 1);
+    }
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: cases.map((testCase) => testCase.userId) } } });
+  }
+});
+
+test("messages/process composes multiple successful v2 operations under one Done section", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-process-multi-done-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("log_progress", [
+        {
+          name: "log_progress",
+          fields: { evidence: "I sent two CVs" },
+          mutates: true,
+          requiresConfirmation: false,
+          reason: "User reported job-search progress."
+        },
+        {
+          name: "log_progress",
+          fields: { evidence: "trained 45 minutes" },
+          mutates: true,
+          requiresConfirmation: false,
+          reason: "User reported training progress."
+        }
+      ]),
+      () => processMessage(server, userId, "I sent two CVs and trained 45 minutes")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.llmPlannerUsed, true);
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+    assert.equal(response.json().routeDebug.mutationExecuted, true);
+    assert.equal(
+      response.json().reply,
+      "Done:\n- Logged 2 CVs sent.\n- Logged 45 minutes of training."
+    );
+    assert.equal((response.json().reply.match(/^Done:/gm) ?? []).length, 1);
+    assert.equal(await prisma.event.count({ where: { userId, type: "career.application_sent" } }), 1);
+    assert.equal(await prisma.event.count({ where: { userId, type: "health.workout_completed" } }), 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("messages/process lets v2 create explicit memories before action hygiene or legacy semantic", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-process-memory-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("create_memory", [{
+        name: "create_memory",
+        fields: { summary: "I prefer blunt feedback." },
+        mutates: true,
+        requiresConfirmation: false,
+        reason: "User explicitly asked Alecto to remember a preference."
+      }]),
+      () => processMessage(server, userId, "remember I prefer blunt feedback")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+    assert.equal(response.json().routeDebug.operationPlanValidated, true);
+    assert.equal(response.json().routeDebug.mutationExecuted, true);
+    assert.doesNotMatch(response.json().reply, /Action hygiene|clean enough/i);
+    assert.equal(response.json().reply, "Got it — I’ll remember that you prefer blunt feedback.");
+    assert.equal(await prisma.memoryEntry.count({ where: { userId } }), 1);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("messages/process lets v2 answer operator attention without action hygiene misroute", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-process-attention-${randomUUID()}`;
+
+  try {
+    await createProtectedOneDayOverdueAction(userId);
+
+    const response = await withLLMPlannerMock(
+      llmPlan("operator_attention_query", [{
+        name: "show_operator_attention",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "User asked what to do now."
+      }]),
+      () => processMessage(server, userId, "what should I do now?")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(response.json().routeDebug.plannerUsed, "llm");
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+    assert.doesNotMatch(response.json().reply, /^Action hygiene:/i);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("messages/process keeps hard guardrails ahead of v2 LLM and legacy semantic", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-process-risk-${randomUUID()}`;
+
+  try {
+    await createUserWithTimezone(userId);
+    await prisma.goal.create({
+      data: {
+        userId,
+        title: "Control impulsive betting",
+        category: "finance",
+        templateId: "finance.control_betting_trading",
+        priority: "critical",
+        importanceScore: 70
+      }
+    });
+
+    const response = await withLLMPlannerMock(
+      llmPlan("show_today", [{
+        name: "show_today",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "This must not run."
+      }]),
+      () => processMessage(server, userId, "what should I do today to win a bet?")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().riskState, "RED");
+    assert.match(response.json().reply, /Hard stop/);
+    assert.equal(response.json().routeDebug.handledBy, "risk_guardrail");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("messages/process uses deterministic v2 action hygiene when LLM planner is disabled", async () => {
+  const server = buildServer();
+  const userId = `orchestrator-v2-process-disabled-${randomUUID()}`;
+
+  try {
+    await createProtectedOneDayOverdueAction(userId);
+
+    const response = await withEnvOverrides(
+      {
+        CONVERSATION_ORCHESTRATOR_V2_ENABLED: "true",
+        LLM_OPERATION_PLANNER_ENABLED: "false",
+        LLM_OPERATION_PLANNER_MOCK_RESPONSE: llmPlan("action_hygiene", [{
+          name: "show_action_hygiene",
+          fields: {},
+          mutates: false,
+          requiresConfirmation: false,
+          reason: "Ignored while disabled."
+        }])
+      },
+      () => processMessage(server, userId, "clean up my tasks")
+    );
+
+    assert.equal(response.statusCode, 200);
+    assert.match(response.json().reply, /Do 2 strength sessions/);
+    assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
+    assert.equal(response.json().routeDebug.plannerUsed, "deterministic");
+    assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
+    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
 async function createUserWithTimezone(userId: string): Promise<void> {
   await prisma.user.create({ data: { id: userId } });
   await prisma.notificationSettings.create({
@@ -675,6 +1293,76 @@ async function withV2Enabled<T>(callback: () => Promise<T>): Promise<T> {
       process.env.CONVERSATION_ORCHESTRATOR_V2_ENABLED = previous;
     }
   }
+}
+
+async function withLLMPlannerMock<T>(
+  mockResponse: string,
+  callback: () => Promise<T>,
+  extraEnv: Record<string, string | undefined> = {}
+): Promise<T> {
+  return withEnvOverrides(
+    {
+      CONVERSATION_ORCHESTRATOR_V2_ENABLED: "true",
+      LLM_OPERATION_PLANNER_ENABLED: "true",
+      LLM_OPERATION_PLANNER_MOCK_RESPONSE: mockResponse,
+      LLM_OPERATION_PLANNER_MAX_RETRIES: "0",
+      ...extraEnv
+    },
+    callback
+  );
+}
+
+async function withEnvOverrides<T>(overrides: Record<string, string | undefined>, callback: () => Promise<T>): Promise<T> {
+  const previous = new Map<string, string | undefined>();
+
+  for (const [key, value] of Object.entries(overrides)) {
+    previous.set(key, process.env[key]);
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+
+  try {
+    return await callback();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
+function llmPlan(
+  intent: string,
+  operations: Array<{
+    name: string;
+    target?: Record<string, unknown>;
+    fields?: Record<string, unknown>;
+    mutates: boolean;
+    requiresConfirmation: boolean;
+    reason: string;
+  }>,
+  options: {
+    confidence?: number;
+    clarificationQuestion?: string;
+  } = {}
+): string {
+  return JSON.stringify({
+    intent,
+    operations,
+    needsConfirmation: operations.some((operation) => operation.requiresConfirmation),
+    clarificationQuestion: options.clarificationQuestion,
+    confidence: options.confidence ?? 0.92,
+    language: "en",
+    safetyNotes: [],
+    responseHints: [],
+    source: "llm"
+  });
 }
 
 async function actionStatus(actionId: string): Promise<string> {

@@ -26,6 +26,7 @@ export interface PlanConversationOperationsWithLLMInput {
   }>;
   timezone?: string;
   profileStyle?: string;
+  operatorStateSummary?: Record<string, unknown>;
 }
 
 export interface PlanConversationOperationsWithLLMOptions {
@@ -37,12 +38,22 @@ export async function planConversationOperationsWithLLM(
   input: PlanConversationOperationsWithLLMInput,
   options: PlanConversationOperationsWithLLMOptions = {}
 ): Promise<ConversationOperationPlan> {
-  if (process.env.CONVERSATION_ORCHESTRATOR_V2_MOCK_RESPONSE) {
-    return normalizeConversationOperationPlan(JSON.parse(process.env.CONVERSATION_ORCHESTRATOR_V2_MOCK_RESPONSE));
+  const mockDelayMs = Number(process.env.LLM_OPERATION_PLANNER_MOCK_DELAY_MS ?? 0);
+  if (Number.isFinite(mockDelayMs) && mockDelayMs > 0) {
+    await delay(mockDelayMs);
+  }
+
+  if (process.env.LLM_OPERATION_PLANNER_MOCK_THROW === "true") {
+    throw new Error("Mock operation planner LLM failure.");
+  }
+
+  const mockResponse = process.env.LLM_OPERATION_PLANNER_MOCK_RESPONSE ?? process.env.CONVERSATION_ORCHESTRATOR_V2_MOCK_RESPONSE;
+  if (mockResponse) {
+    return normalizeConversationOperationPlan(JSON.parse(mockResponse));
   }
 
   const client = createOpenAIClient({ apiKey: options.apiKey });
-  const model = options.model ?? process.env.CONVERSATION_ORCHESTRATOR_V2_MODEL ?? process.env.OPENAI_MODEL ?? defaultModel;
+  const model = options.model ?? process.env.LLM_OPERATION_PLANNER_MODEL ?? process.env.CONVERSATION_ORCHESTRATOR_V2_MODEL ?? process.env.OPENAI_MODEL ?? defaultModel;
 
   const response = await client.responses.create({
     model,
@@ -65,7 +76,8 @@ export async function planConversationOperationsWithLLM(
             context: sanitizeContextForPlanner(input.context),
             availableOperations: input.availableOperations,
             timezone: input.timezone,
-            profileStyle: input.profileStyle
+            profileStyle: input.profileStyle,
+            operatorStateSummary: input.operatorStateSummary ?? {}
           })
         }]
       }
@@ -83,6 +95,10 @@ export async function planConversationOperationsWithLLM(
   return normalizeConversationOperationPlan(JSON.parse(response.output_text));
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function buildOperationPlannerPrompt(): string {
   return [
     "You are Alecto's Conversation Orchestrator v2 operation planner.",
@@ -91,9 +107,17 @@ function buildOperationPlannerPrompt(): string {
     "Deterministic code will validate ownership, visibility, safety, dates, confirmation, and execute allowed operations.",
     "Use only operation names from availableOperations.",
     "Targets should reference visible entities by number or id when possible.",
+    "Use operatorStateSummary only as safe context; never invent entities from it.",
     "If the user refers to 'it', 'that', 'the rest', or 'all except', resolve against visibleEntities in context.",
     "For destructive operations, set needsConfirmation true and requiresConfirmation true on the operation.",
     "If the message is cross-domain and no matching visible entity exists, use request_clarification.",
+    "For explicit progress reports, use log_progress with fields.evidence equal to the relevant user text.",
+    "Map CV, CVs, resume, resumes, applications, applied to jobs, sent applications, mandado/enviado/enviat CVs to job-search application progress.",
+    "Map trained, training, entrenado, entrenat, gym/gimnasio with minutes to workout progress.",
+    "For explicit remember/don't forget/recuerda/recorda requests, use create_memory with a concise fields.summary.",
+    "For 'what changed?', 'did you log that?', 'que has cambiado?', or 'què has canviat?', use answer_recent_mutation_status.",
+    "For 'what should I do now?' or 'anything important?', use show_operator_attention. For today's brief, use show_today.",
+    "Only use show_action_hygiene for explicit stale/cleanup/task-cleanup requests.",
     "Hard betting/trading guardrails run before execution. Never plan or suggest betting/trading actions.",
     "Understand English, Spanish, and Catalan by meaning, not literal keywords.",
     "Return only JSON matching the schema."

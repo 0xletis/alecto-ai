@@ -54,9 +54,17 @@ export function validateConversationOperationPlan(input: {
         failureReasons.push(`${operation.name}: target is not visible`);
         continue;
       }
+
+      if (!visible.allowedOperations.includes(operation.name)) {
+        failureReasons.push(`${operation.name}: operation is not allowed for target`);
+        continue;
+      }
     }
 
-    validOperations.push(operation);
+    validOperations.push({
+      ...operation,
+      mutates: definition.mutates
+    });
   }
 
   if (validOperations.length === 0) {

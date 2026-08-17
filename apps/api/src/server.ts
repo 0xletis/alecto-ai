@@ -217,6 +217,7 @@ import {
   isConversationOrchestratorV2Enabled,
   runConversationOrchestratorV2
 } from "./conversation/orchestrator-v2.js";
+import { shouldUseLLMOperationPlanner } from "./conversation/operation-planner.js";
 
 type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
 
@@ -276,7 +277,9 @@ export function buildServer() {
     await ensureUser(parsed.data.userId);
     await expireOldPendingActions(parsed.data.userId);
 
-    const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message);
+    const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message, {
+      returnUnhandled: true
+    });
 
     if (v2Result) {
       return v2Result;
@@ -286,10 +289,12 @@ export function buildServer() {
       routerSource: "conversation_orchestrator_v2",
       orchestrator: "v2",
       v2Enabled: isConversationOrchestratorV2Enabled(),
+      llmOperationPlannerEnabled: shouldUseLLMOperationPlanner(),
       intent: "not_migrated",
       handlerName: "runConversationOrchestratorV2",
       handledBy: "none",
       skippedReason: "No v2 operation matched this message.",
+      v2SkippedReason: "No v2 operation matched this message.",
       plannerUsed: "none",
       llmPlannerAttempted: false,
       llmPlannerUsed: false,
@@ -300,6 +305,8 @@ export function buildServer() {
       mutationExecuted: false,
       semanticRouterAttempted: false,
       semanticRouterUsed: false,
+      legacySemanticAttempted: false,
+      legacySemanticUsed: false,
       mutation: false,
       reason: "This scope still uses legacy /messages/process."
     });
@@ -7331,9 +7338,19 @@ async function handleSemanticRouterIntent(
       routerSource,
       intent: route.intent,
       handlerName,
+      orchestrator: "legacy",
+      v2Enabled: isConversationOrchestratorV2Enabled(),
+      llmOperationPlannerEnabled: shouldUseLLMOperationPlanner(),
+      handledBy: "legacy_semantic",
+      v2SkippedReason: isConversationOrchestratorV2Enabled() ? "No v2 operation matched this message." : undefined,
+      plannerUsed: "legacy",
       semanticRouterAttempted,
       semanticRouterUsed: true,
+      legacySemanticAttempted: true,
+      legacySemanticUsed: true,
+      operationPlanValidated: false,
       mutation,
+      mutationExecuted: mutation,
       confidence: route.confidence,
       language: route.language,
       sideEffectRisk: route.sideEffectRisk,
@@ -17125,9 +17142,49 @@ function surfaceReplyIncludesMutation(reply: string): boolean {
   );
 }
 
+async function buildOperationPlannerStateSummary(userId: string): Promise<Record<string, unknown>> {
+  const [timezone, goals, actions, pendingEmailReviews, recentEvents] = await Promise.all([
+    getUserTimezone(userId),
+    getActiveGoals(userId),
+    getActionItems(userId, { status: "open", limit: 12 }),
+    getPendingEmailReviewCount(userId),
+    getRecentEvents(userId, 8)
+  ]);
+
+  return {
+    timezone,
+    activeGoals: goals.slice(0, 8).map((goal) => ({
+      id: goal.id,
+      title: goal.title,
+      category: goal.category,
+      priority: goal.priority ?? "medium"
+    })),
+    openActions: actions.slice(0, 12).map((action) => ({
+      id: action.id,
+      title: action.title,
+      status: action.status,
+      priority: action.priority,
+      dueAt: action.dueAt?.toISOString(),
+      snoozedUntil: action.snoozedUntil?.toISOString(),
+      goalId: action.goalId,
+      goalTitle: action.goalTitleSnapshot
+    })),
+    pendingEmailReviews: {
+      count: pendingEmailReviews
+    },
+    recentEvents: recentEvents.slice(0, 8).map((event) => ({
+      id: event.id,
+      type: event.type,
+      source: event.source,
+      createdAt: event.createdAt.toISOString()
+    }))
+  };
+}
+
 async function runConversationOrchestratorV2ForMessage(
   userId: string,
-  message: string
+  message: string,
+  options: { returnUnhandled?: boolean } = {}
 ): Promise<ProcessMessageResult | undefined> {
   const result = await runConversationOrchestratorV2({
     userId,
@@ -17135,6 +17192,8 @@ async function runConversationOrchestratorV2ForMessage(
     callbacks: {
       getActiveGoals,
       getLatestPendingAction,
+      getUserTimezone,
+      getPlannerStateSummary: buildOperationPlannerStateSummary,
       showActionHygiene: async (callbackUserId, callbackMessage, callbackNow) => {
         const { report } = await createActionHygieneSession(
           callbackUserId,
@@ -17144,12 +17203,29 @@ async function runConversationOrchestratorV2ForMessage(
         );
         return formatActionHygieneReport(report);
       },
+      showToday: async (callbackUserId) => formatConversationTodayReply(await generateDailyOperatorBrief(callbackUserId)),
+      showOperatorAttention: async (callbackUserId) =>
+        formatOperatorAttentionForConversation(await buildOperatorAttentionState(callbackUserId)),
+      showEmailReviews: async (callbackUserId) =>
+        (await buildEmailReviewInboxResponse(callbackUserId, { storeContext: true })).message,
+      showGmailStatus: formatGmailSetupForConversation,
+      logProgressFromMessage: logProgressFromConversationMessage,
+      createMemoryFromMessage: createMemoryFromConversationMessage,
       resolvePendingDecisionReply,
       createRiskGuardrailReply: createGuardianGuardrailReply
     }
   });
 
   if (!result.handled) {
+    if (options.returnUnhandled && result.routeDebug) {
+      return replyOnly(
+        userId,
+        message,
+        "Conversation Orchestrator v2 did not handle this message yet.",
+        result.routeDebug
+      );
+    }
+
     return undefined;
   }
 
@@ -17159,6 +17235,91 @@ async function runConversationOrchestratorV2ForMessage(
 
   return replyOnly(userId, message, result.reply ?? "I did not change anything.", result.routeDebug);
 }
+
+async function logProgressFromConversationMessage(userId: string, message: string): Promise<string> {
+  const events = await createEventsFromExtracted(userId, extractEvents(message));
+
+  if (events.length === 0) {
+    return "I did not find a supported progress event to log.";
+  }
+
+  const reply = ["Done:", ...events.map((event) => `- ${formatConversationProgressEventDone(event)}`)].join("\n");
+  const recentStatus = ["I logged:", ...events.map((event) => `- ${formatConversationProgressEventStatus(event)}`)].join("\n");
+  await rememberRecentMutationStatus(userId, recentStatus);
+  return reply;
+}
+
+async function createMemoryFromConversationMessage(userId: string, summary: string, originalMessage: string): Promise<string> {
+  const explicit = extractExplicitMemory(originalMessage);
+  const normalizedSummary = explicit?.summary ?? normalizeMemorySummary(summary.replace(/[.!?]+$/g, ""));
+  const memory = await createMemory(userId, {
+    type: explicit?.type ?? inferMemoryType(normalizedSummary),
+    summary: normalizedSummary,
+    source: "explicit_user_request",
+    confidence: 1,
+    evidence: {
+      message: originalMessage
+    }
+  });
+  const reply = `Got it — I’ll remember that ${formatMemorySummaryForUser(memory.summary)}.`;
+
+  await rememberRecentMutationStatus(userId, `I saved this to memory:\n- ${memory.summary}`);
+  return reply;
+}
+
+function formatMemorySummaryForUser(summary: string): string {
+  const trimmed = summary.trim().replace(/[.!?]+$/g, "");
+  const firstPerson = trimmed
+    .replace(/^user prefers\b/i, "you prefer")
+    .replace(/^user likes\b/i, "you like")
+    .replace(/^user wants\b/i, "you want")
+    .replace(/^user needs\b/i, "you need")
+    .replace(/^user has\b/i, "you have")
+    .replace(/^user is\b/i, "you are")
+    .replace(/^user\b/i, "you")
+    .replace(/^i\b/i, "you")
+    .replace(/^my\b/i, "your");
+
+  return firstPerson.charAt(0).toLowerCase() + firstPerson.slice(1);
+}
+
+function formatConversationProgressEventDone(event: StoredEvent): string {
+  if (event.type === "career.application_sent" && typeof event.data.count === "number") {
+    return `Logged ${event.data.count} CV${event.data.count === 1 ? "" : "s"} sent.`;
+  }
+
+  if (event.type === "health.workout_completed" && typeof event.data.duration_minutes === "number") {
+    return `Logged ${event.data.duration_minutes} minutes of training.`;
+  }
+
+  return formatMultiIntentEventDone(event);
+}
+
+function formatConversationProgressEventStatus(event: StoredEvent): string {
+  if (event.type === "career.application_sent" && typeof event.data.count === "number") {
+    return `${event.data.count} CV${event.data.count === 1 ? "" : "s"} sent`;
+  }
+
+  if (event.type === "health.workout_completed" && typeof event.data.duration_minutes === "number") {
+    return `${event.data.duration_minutes} minutes of training`;
+  }
+
+  return event.type;
+}
+
+async function rememberRecentMutationStatus(userId: string, reply: string): Promise<void> {
+  await replacePendingAction(userId, {
+    type: "action_hygiene",
+    summary: "Recent changes",
+    payload: {
+      operation: "recent_mutation_status",
+      summary: "Recent changes",
+      reply
+    },
+    expiresAt: new Date(Date.now() + 15 * 60 * 1000)
+  });
+}
+
 
 function replyOnly(
   userId: string,

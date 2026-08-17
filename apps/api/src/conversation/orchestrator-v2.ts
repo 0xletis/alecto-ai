@@ -5,16 +5,19 @@ import {
   type ProcessMessageResult
 } from "@operator-agent/core";
 import type { PendingAction } from "@operator-agent/db";
+import { planConversationOperationsWithLLM } from "@operator-agent/llm";
 import { buildConversationContext } from "./context.js";
 import { buildAvailableOperationsCatalog } from "./operation-catalog.js";
 import { executeConversationOperations, type ConversationExecutorCallbacks } from "./operation-executor.js";
-import { planConversationOperations } from "./operation-planner.js";
+import { planConversationOperations, shouldUseLLMOperationPlanner } from "./operation-planner.js";
 import { validateConversationOperationPlan } from "./operation-validator.js";
 import { composeConversationResponse } from "./response-composer.js";
 
 export interface ConversationOrchestratorV2Callbacks extends ConversationExecutorCallbacks {
   getActiveGoals(userId: string): Promise<Goal[]>;
   getLatestPendingAction(userId: string): Promise<PendingAction | undefined>;
+  getUserTimezone?(userId: string): Promise<string | undefined>;
+  getPlannerStateSummary?(userId: string): Promise<Record<string, unknown>>;
   createRiskGuardrailReply(
     userId: string,
     message: string,
@@ -55,8 +58,10 @@ export async function runConversationOrchestratorV2(input: {
         handlerName: "runConversationOrchestratorV2",
         handledBy: "v2",
         plannerUsed: "none",
+        llmOperationPlannerEnabled: shouldUseLLMOperationPlanner(),
         llmPlannerAttempted: false,
         llmPlannerUsed: false,
+        operationPlanValidated: false,
         contextLoaded: false,
         visibleContextType: "unknown",
         visibleEntityCount: 0,
@@ -64,6 +69,8 @@ export async function runConversationOrchestratorV2(input: {
         mutationExecuted: false,
         semanticRouterAttempted: false,
         semanticRouterUsed: false,
+        legacySemanticAttempted: false,
+        legacySemanticUsed: false,
         mutation: false,
         reason: segment.reason
       }
@@ -91,13 +98,17 @@ export async function runConversationOrchestratorV2(input: {
           v2Enabled: isConversationOrchestratorV2Enabled(),
           handledBy: "risk_guardrail",
           plannerUsed: "none",
+          llmOperationPlannerEnabled: shouldUseLLMOperationPlanner(),
           llmPlannerAttempted: false,
           llmPlannerUsed: false,
+          operationPlanValidated: false,
           contextLoaded: false,
           visibleContextType: "unknown",
           visibleEntityCount: 0,
           pendingConfirmation: false,
-          mutationExecuted: true
+          mutationExecuted: true,
+          legacySemanticAttempted: false,
+          legacySemanticUsed: false
         }
       },
       mutation: true
@@ -111,11 +122,22 @@ export async function runConversationOrchestratorV2(input: {
     now: input.now
   });
   const availableOperations = buildAvailableOperationsCatalog(context);
-  const plan = await planConversationOperations({
+  const shouldPrepareLLMContext = shouldUseLLMOperationPlanner();
+  const [timezone, operatorStateSummary] = shouldPrepareLLMContext
+    ? await Promise.all([
+        input.callbacks.getUserTimezone?.(input.userId),
+        input.callbacks.getPlannerStateSummary?.(input.userId)
+      ])
+    : [undefined, undefined];
+  const planning = await planConversationOperations({
     message: input.message,
     context,
-    availableOperations
+    availableOperations,
+    timezone,
+    operatorStateSummary,
+    llmPlanner: planConversationOperationsWithLLM
   });
+  const plan = planning.plan;
 
   if (!plan) {
     return {
@@ -126,9 +148,13 @@ export async function runConversationOrchestratorV2(input: {
         handlerName: "planConversationOperations",
         handledBy: "none",
         skippedReason: "No v2 operation matched this message.",
-        plannerUsed: "none",
+        plannerUsed: planning.plannerUsed,
         context,
-        mutationExecuted: false
+        mutationExecuted: false,
+        llmPlannerAttempted: planning.llmPlannerAttempted,
+        llmPlannerUsed: planning.llmPlannerUsed,
+        llmPlannerFailedReason: planning.llmPlannerFailedReason,
+        operationPlanValidated: false
       })
     };
   }
@@ -149,9 +175,13 @@ export async function runConversationOrchestratorV2(input: {
           intent: plan.intent,
           handlerName: "validateConversationOperationPlan",
           handledBy: "v2",
-          plannerUsed: plan.source,
+          plannerUsed: planning.plannerUsed,
           context,
-          mutationExecuted: false
+          mutationExecuted: false,
+          llmPlannerAttempted: planning.llmPlannerAttempted,
+          llmPlannerUsed: planning.llmPlannerUsed,
+          llmPlannerFailedReason: planning.llmPlannerFailedReason,
+          operationPlanValidated: false
         }),
         intent: plan.intent,
         reason: validation.failureReasons.join("; ")
@@ -188,9 +218,13 @@ export async function runConversationOrchestratorV2(input: {
         intent: plan.intent,
         handlerName: "runConversationOrchestratorV2",
         handledBy: "v2",
-        plannerUsed: plan.source,
+        plannerUsed: planning.plannerUsed,
         context: debugContext,
-        mutationExecuted: didExecuteRealMutation(reply, execution.mutated)
+        mutationExecuted: didExecuteRealMutation(reply, execution.mutated),
+        llmPlannerAttempted: planning.llmPlannerAttempted,
+        llmPlannerUsed: planning.llmPlannerUsed,
+        llmPlannerFailedReason: planning.llmPlannerFailedReason,
+        operationPlanValidated: true
       }),
       intent: plan.intent,
       reason: plan.operations.map((operation) => operation.reason ?? operation.name).join("; ")
@@ -203,29 +237,41 @@ function buildRouteDebug(input: {
   handlerName: string;
   handledBy: string;
   skippedReason?: string;
-  plannerUsed: "deterministic" | "llm" | "legacy" | "none";
+  plannerUsed: "deterministic" | "llm" | "fallback" | "legacy" | "none";
   context: ReturnType<typeof buildConversationContext>;
   mutationExecuted: boolean;
+  llmPlannerAttempted?: boolean;
+  llmPlannerUsed?: boolean;
+  llmPlannerFailedReason?: string;
+  operationPlanValidated?: boolean;
 }) {
+  const contextLoaded = input.context.lastAssistantOutputType !== "unknown";
+
   return {
     routerSource: "conversation_orchestrator_v2",
     orchestrator: "v2",
     v2Enabled: isConversationOrchestratorV2Enabled(),
+    llmOperationPlannerEnabled: shouldUseLLMOperationPlanner(),
     intent: input.intent,
     handlerName: input.handlerName,
     handledBy: input.handledBy,
     skippedReason: input.skippedReason,
+    v2SkippedReason: input.skippedReason,
     plannerUsed: input.plannerUsed,
-    llmPlannerAttempted: false,
-    llmPlannerUsed: input.plannerUsed === "llm",
-    contextLoaded: input.context.lastAssistantOutputType !== "unknown",
+    llmPlannerAttempted: input.llmPlannerAttempted ?? false,
+    llmPlannerUsed: input.llmPlannerUsed ?? input.plannerUsed === "llm",
+    llmPlannerFailedReason: input.llmPlannerFailedReason,
+    operationPlanValidated: input.operationPlanValidated,
+    contextLoaded,
     visibleContextType: input.context.lastAssistantOutputType,
     visibleEntityCount: input.context.visibleEntities.length,
-    contextCreatedBy: input.context.contextCreatedBy,
+    contextCreatedBy: contextLoaded ? input.context.contextCreatedBy : undefined,
     pendingConfirmation: Boolean(input.context.pendingConfirmation),
     mutationExecuted: input.mutationExecuted,
     semanticRouterAttempted: false,
     semanticRouterUsed: false,
+    legacySemanticAttempted: false,
+    legacySemanticUsed: false,
     mutation: input.mutationExecuted
   };
 }

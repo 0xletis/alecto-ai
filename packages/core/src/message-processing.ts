@@ -62,9 +62,12 @@ export const ProcessMessageResultSchema = z.object({
     v2Enabled: z.boolean().optional(),
     handledBy: z.string().optional(),
     skippedReason: z.string().optional(),
+    v2SkippedReason: z.string().optional(),
     plannerUsed: z.string().optional(),
     llmPlannerAttempted: z.boolean().optional(),
     llmPlannerUsed: z.boolean().optional(),
+    llmPlannerFailedReason: z.string().optional(),
+    operationPlanValidated: z.boolean().optional(),
     contextLoaded: z.boolean().optional(),
     visibleContextType: z.string().optional(),
     visibleEntityCount: z.number().int().nonnegative().optional(),
@@ -73,6 +76,9 @@ export const ProcessMessageResultSchema = z.object({
     mutationExecuted: z.boolean().optional(),
     semanticRouterAttempted: z.boolean().optional(),
     semanticRouterUsed: z.boolean().optional(),
+    legacySemanticAttempted: z.boolean().optional(),
+    legacySemanticUsed: z.boolean().optional(),
+    llmOperationPlannerEnabled: z.boolean().optional(),
     mutation: z.boolean().optional(),
     confidence: z.number().min(0).max(1).optional(),
     language: z.string().optional(),
@@ -211,21 +217,26 @@ export function routeIntent(message: string): MessageIntent {
 export function extractEvents(message: string): ExtractedEvent[] {
   const events: ExtractedEvent[] = [];
 
+  const countPattern = "(\\d+|one|two|three|four|five|six|seven|eight|nine|ten|uno|una|dos|dues|tres|cuatro|quatre|cinco|cinc|seis|sis|siete|set|ocho|vuit|nueve|nou|diez|deu)";
   const applicationMatch =
-    message.match(/\b(?:sent|mandado)\s+(\d+)\s+(?:cvs?|applications?)\b/i) ??
-    message.match(/\b(?:applied\s+to|apliqu[eé]\s+a|postul[eé]\s+a)\s+(\d+)\s+(?:jobs?|roles?|applications?|cvs?|trabajos?)\b/i) ??
-    message.match(/\b(\d+)\s+applications?\b/i);
+    message.match(new RegExp(`\\b(?:sent|submitted|mand[eé]|mandado|envi[eé]|enviado|enviat)\\s+${countPattern}\\s+(?:cvs?|resumes?|applications?|solicitudes|candidaturas)\\b`, "i")) ??
+    message.match(new RegExp(`\\b(?:applied\\s+to|apliqu[eé]\\s+a|aplicado\\s+a|postul[eé]\\s+a)\\s+${countPattern}\\s+(?:jobs?|roles?|applications?|cvs?|trabajos?|feinas?|feines?)\\b`, "i")) ??
+    message.match(new RegExp(`\\b${countPattern}\\s+(?:cvs?|resumes?|applications?|job\\s+applications?|solicitudes|candidaturas)\\b`, "i"));
 
   if (applicationMatch?.[1]) {
+    const count = parseSmallCount(applicationMatch[1]);
+
     events.push({
       type: "career.application_sent",
-      data: { count: Number(applicationMatch[1]) },
+      data: { count },
       confidence: 0.9,
       evidence: [applicationMatch[0]]
     });
   }
 
-  const workoutMatch = message.match(/\b(?:trained|entrenado|gym)\s+(\d+)\s*(?:minutes?|mins?|min)\b/i);
+  const workoutMatch = message.match(
+    /\b(?:trained|training|entren[eé]|entrenado|entrenat|gym|gimnasio)\b(?:\s+\w+){0,4}?\s+(\d+)\s*(?:minutes?|mins?|min|minutos?|minuts?)\b/i
+  );
 
   if (workoutMatch?.[1]) {
     events.push({
@@ -259,6 +270,52 @@ export function extractEvents(message: string): ExtractedEvent[] {
   }
 
   return events;
+}
+
+function parseSmallCount(value: string): number {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) {
+    return numeric;
+  }
+
+  const normalized = value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/\p{Diacritic}/gu, "");
+
+  const counts: Record<string, number> = {
+    one: 1,
+    uno: 1,
+    una: 1,
+    two: 2,
+    dos: 2,
+    dues: 2,
+    three: 3,
+    tres: 3,
+    four: 4,
+    cuatro: 4,
+    quatre: 4,
+    five: 5,
+    cinco: 5,
+    cinc: 5,
+    six: 6,
+    seis: 6,
+    sis: 6,
+    seven: 7,
+    siete: 7,
+    set: 7,
+    eight: 8,
+    ocho: 8,
+    vuit: 8,
+    nine: 9,
+    nueve: 9,
+    nou: 9,
+    ten: 10,
+    diez: 10,
+    deu: 10
+  };
+
+  return counts[normalized] ?? 1;
 }
 
 export function assessRisk(

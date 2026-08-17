@@ -1,8 +1,11 @@
 import {
   ConversationOperationPlanSchema,
+  extractEvents,
   type ConversationContext,
+  type ConversationOperationName,
   type ConversationOperationPlan,
-  type ConversationPlannedOperation
+  type ConversationPlannedOperation,
+  type ConversationVisibleEntityType
 } from "@operator-agent/core";
 import type { AvailableOperationDefinition } from "./operation-catalog.js";
 
@@ -10,17 +13,91 @@ export interface PlanConversationOperationsInput {
   message: string;
   context: ConversationContext;
   availableOperations: AvailableOperationDefinition[];
+  timezone?: string;
+  profileStyle?: string;
+  operatorStateSummary?: Record<string, unknown>;
+  llmPlanner?: (input: LLMOperationPlannerInput) => Promise<ConversationOperationPlan>;
+}
+
+export interface LLMOperationPlannerInput {
+  userId: string;
+  message: string;
+  context: ConversationContext;
+  availableOperations: Array<{
+    name: ConversationOperationName;
+    mutates: boolean;
+    requiresConfirmation: boolean;
+    validEntityTypes: ConversationVisibleEntityType[];
+    allowedContextScopes: string[];
+    requiredFields: string[];
+    description: string;
+  }>;
+  timezone?: string;
+  profileStyle?: string;
+  operatorStateSummary?: Record<string, unknown>;
+}
+
+export interface ConversationPlannerRuntimeResult {
+  plan?: ConversationOperationPlan;
+  plannerUsed: "llm" | "deterministic" | "fallback" | "none";
+  llmPlannerAttempted: boolean;
+  llmPlannerUsed: boolean;
+  llmPlannerFailedReason?: string;
 }
 
 export async function planConversationOperations(
   input: PlanConversationOperationsInput
-): Promise<ConversationOperationPlan | undefined> {
+): Promise<ConversationPlannerRuntimeResult> {
   const deterministic = planDeterministicOperations(input);
-  if (deterministic) {
-    return deterministic;
+
+  if (deterministic && isDeterministicPrecheckPlan(deterministic)) {
+    return {
+      plan: deterministic,
+      plannerUsed: "deterministic",
+      llmPlannerAttempted: false,
+      llmPlannerUsed: false
+    };
   }
 
-  return undefined;
+  if (shouldUseLLMOperationPlanner() && input.llmPlanner) {
+    const llmResult = await tryPlanWithLLM(input);
+
+    if (llmResult.plan) {
+      return llmResult;
+    }
+
+    if (deterministic) {
+      return {
+        plan: deterministic,
+        plannerUsed: "fallback",
+        llmPlannerAttempted: llmResult.llmPlannerAttempted,
+        llmPlannerUsed: false,
+        llmPlannerFailedReason: llmResult.llmPlannerFailedReason
+      };
+    }
+
+    return {
+      plannerUsed: "fallback",
+      llmPlannerAttempted: llmResult.llmPlannerAttempted,
+      llmPlannerUsed: false,
+      llmPlannerFailedReason: llmResult.llmPlannerFailedReason
+    };
+  }
+
+  if (deterministic) {
+    return {
+      plan: deterministic,
+      plannerUsed: "deterministic",
+      llmPlannerAttempted: false,
+      llmPlannerUsed: false
+    };
+  }
+
+  return {
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    llmPlannerUsed: false
+  };
 }
 
 export function planDeterministicOperations(
@@ -60,6 +137,53 @@ export function planDeterministicOperations(
         mutates: true,
         requiresConfirmation: false,
         reason: "User cancelled the current pending decision."
+      }]
+    });
+  }
+
+  if (looksLikeExplicitMemoryRequest(normalized)) {
+    return operationPlan({
+      intent: "create_memory",
+      language,
+      confidence: 0.94,
+      operations: [{
+        name: "create_memory",
+        fields: {
+          summary: memorySummaryFromMessage(trimmed) ?? trimmed
+        },
+        mutates: true,
+        requiresConfirmation: false,
+        reason: "User explicitly asked Alecto to remember something."
+      }]
+    });
+  }
+
+  if (looksLikeTodayRequest(normalized)) {
+    return operationPlan({
+      intent: "daily_operator",
+      language,
+      confidence: 0.9,
+      operations: [{
+        name: "show_today",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "User asked for today's operator brief."
+      }]
+    });
+  }
+
+  if (looksLikeOperatorAttentionRequest(normalized)) {
+    return operationPlan({
+      intent: "operator_attention_query",
+      language,
+      confidence: 0.88,
+      operations: [{
+        name: "show_operator_attention",
+        fields: {},
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "User asked what needs attention next."
       }]
     });
   }
@@ -115,6 +239,21 @@ export function planDeterministicOperations(
     });
   }
 
+  if (extractEvents(trimmed).length > 0) {
+    return operationPlan({
+      intent: "log_progress",
+      language,
+      confidence: 0.9,
+      operations: [{
+        name: "log_progress",
+        fields: { evidence: trimmed },
+        mutates: true,
+        requiresConfirmation: false,
+        reason: "User explicitly reported supported progress events."
+      }]
+    });
+  }
+
   if (looksLikeRecentMutationQuestion(normalized)) {
     return operationPlan({
       intent: "answer_recent_mutation_status",
@@ -150,11 +289,178 @@ export function planDeterministicOperations(
   return undefined;
 }
 
+function isDeterministicPrecheckPlan(plan: ConversationOperationPlan): boolean {
+  return plan.intent === "confirm_pending" || plan.intent === "cancel_pending";
+}
+
+export function shouldUseLLMOperationPlanner(): boolean {
+  if (process.env.LLM_OPERATION_PLANNER_ENABLED !== "true") {
+    return false;
+  }
+
+  return Boolean(
+    process.env.OPENAI_API_KEY ||
+    process.env.LLM_OPERATION_PLANNER_MOCK_RESPONSE ||
+    process.env.CONVERSATION_ORCHESTRATOR_V2_MOCK_RESPONSE
+  );
+}
+
+async function tryPlanWithLLM(input: PlanConversationOperationsInput): Promise<ConversationPlannerRuntimeResult> {
+  if (!input.llmPlanner) {
+    return {
+      plannerUsed: "fallback",
+      llmPlannerAttempted: false,
+      llmPlannerUsed: false,
+      llmPlannerFailedReason: "planner_unavailable"
+    };
+  }
+
+  const timeoutMs = positiveIntegerFromEnv("LLM_OPERATION_PLANNER_TIMEOUT_MS", 3000);
+  const maxRetries = Math.max(0, positiveIntegerFromEnv("LLM_OPERATION_PLANNER_MAX_RETRIES", 0));
+  let lastFailure: string | undefined;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      const plan = await withTimeout(
+        input.llmPlanner({
+          userId: input.context.userId,
+          message: input.message,
+          context: input.context,
+          availableOperations: input.availableOperations,
+          timezone: input.timezone,
+          profileStyle: input.profileStyle,
+          operatorStateSummary: input.operatorStateSummary
+        }),
+        timeoutMs
+      );
+
+      return {
+        plan: normalizeLLMPlanForRuntime(plan),
+        plannerUsed: "llm",
+        llmPlannerAttempted: true,
+        llmPlannerUsed: true
+      };
+    } catch (error) {
+      lastFailure = safeLLMPlannerFailureReason(error);
+
+      if (lastFailure === "invalid_json" || lastFailure === "schema_validation") {
+        break;
+      }
+    }
+  }
+
+  return {
+    plannerUsed: "fallback",
+    llmPlannerAttempted: true,
+    llmPlannerUsed: false,
+    llmPlannerFailedReason: lastFailure ?? "planner_error"
+  };
+}
+
+function normalizeLLMPlanForRuntime(plan: ConversationOperationPlan): ConversationOperationPlan {
+  const source: ConversationOperationPlan["source"] = "llm";
+
+  if (plan.confidence < 0.55) {
+    return operationPlan({
+      intent: "request_clarification",
+      language: plan.language,
+      confidence: plan.confidence,
+      source,
+      operations: [{
+        name: "request_clarification",
+        fields: {
+          reply: plan.clarificationQuestion ?? "I need one more detail before changing anything."
+        },
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "LLM operation plan confidence was too low."
+      }]
+    });
+  }
+
+  if (plan.operations.length === 0 && plan.clarificationQuestion?.trim()) {
+    return operationPlan({
+      intent: plan.intent || "request_clarification",
+      language: plan.language,
+      confidence: plan.confidence,
+      source,
+      operations: [{
+        name: "request_clarification",
+        fields: {
+          reply: plan.clarificationQuestion
+        },
+        mutates: false,
+        requiresConfirmation: false,
+        reason: "LLM operation plan requested clarification."
+      }]
+    });
+  }
+
+  return ConversationOperationPlanSchema.parse({
+    ...plan,
+    source
+  });
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new OperationPlannerTimeoutError()), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+class OperationPlannerTimeoutError extends Error {
+  constructor() {
+    super("Operation planner timed out.");
+  }
+}
+
+function positiveIntegerFromEnv(name: string, fallback: number): number {
+  const parsed = Number(process.env[name]);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
+}
+
+function safeLLMPlannerFailureReason(error: unknown): string {
+  if (error instanceof OperationPlannerTimeoutError) {
+    return "timeout";
+  }
+
+  if (error instanceof SyntaxError) {
+    return "invalid_json";
+  }
+
+  if (error && typeof error === "object" && "name" in error && error.name === "ZodError") {
+    return "schema_validation";
+  }
+
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  if (message.includes("OPENAI_API_KEY")) {
+    return "missing_api_key";
+  }
+
+  if (message.toLowerCase().includes("json")) {
+    return "invalid_json";
+  }
+
+  return "provider_error";
+}
+
 function operationPlan(input: {
   intent: string;
   language: "en" | "es" | "ca" | "unknown";
   confidence: number;
   operations: ConversationPlannedOperation[];
+  source?: "deterministic" | "llm";
 }): ConversationOperationPlan {
   return ConversationOperationPlanSchema.parse({
     intent: input.intent,
@@ -162,7 +468,7 @@ function operationPlan(input: {
     confidence: input.confidence,
     language: input.language,
     needsConfirmation: input.operations.some((operation) => operation.requiresConfirmation),
-    source: "deterministic"
+    source: input.source ?? "deterministic"
   });
 }
 
@@ -295,6 +601,40 @@ function looksLikeRecentMutationQuestion(normalized: string): boolean {
     /\b(did|done|changed|change|archive|archived|snooze|snoozed|complete|completed|happened|previous|last)\b/.test(normalized) &&
     /\b(you|u|it|all|them|those|that|command|stuff|do|did|changed)\b/.test(normalized)
   ) || /\b(que has cambiado|que hiciste|què has canviat|que has canviat|ho has fet|did you do it)\b/.test(normalized);
+}
+
+function looksLikeExplicitMemoryRequest(normalized: string): boolean {
+  return /\b(remember|dont forget|do not forget|recuerda|acuerdate|guardalo|guarda|recorda|no oblidis)\b/.test(normalized);
+}
+
+function memorySummaryFromMessage(message: string): string | undefined {
+  const match = message.match(
+    /\b(?:remember(?:\s+that)?|don't\s+forget(?:\s+that)?|do\s+not\s+forget(?:\s+that)?|note\s+that|acu[eé]rdate(?:\s+de)?(?:\s+que)?|recuerda(?:\s+que)?|guarda(?:\s+que)?|recorda(?:\s+que)?|no\s+oblidis(?:\s+que)?)\s+(.+)/i
+  );
+  const raw = match?.[1]?.trim().replace(/[.!?]+$/g, "");
+
+  if (!raw) {
+    return undefined;
+  }
+
+  const first = raw.charAt(0).toUpperCase() + raw.slice(1);
+  return first.endsWith(".") ? first : `${first}.`;
+}
+
+function looksLikeTodayRequest(normalized: string): boolean {
+  return (
+    /\b(what should i do today|show today|today brief|start my day)\b/.test(normalized) ||
+    /\b(que hago hoy|que deberia hacer hoy|mostrame hoy|muestrame hoy)\b/.test(normalized) ||
+    /\b(que faig avui|que hauria de fer avui)\b/.test(normalized)
+  );
+}
+
+function looksLikeOperatorAttentionRequest(normalized: string): boolean {
+  return (
+    /\b(what should i do now|what needs attention|anything important|what is important|next move|what next)\b/.test(normalized) ||
+    /\b(que hago ahora|que toca ahora|algo importante|que es importante)\b/.test(normalized) ||
+    /\b(que faig ara|alguna cosa important|que toca ara)\b/.test(normalized)
+  );
 }
 
 function looksLikeActionHygieneRequest(normalized: string): boolean {
