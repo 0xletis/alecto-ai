@@ -2074,17 +2074,22 @@ bot.on("message:text", async (ctx) => {
   }
 
   const inbound = buildNormalizedTelegramMessage(ctx);
-  await routeToAgentRuntimeV3(inbound.userId, inbound.text, {
-    callAgentRuntime: (input) =>
-      apiPost<AgentMessageResponse>("/agent/message", {
-        userId: input.userId,
-        message: input.message,
-        channel: "telegram"
-      }),
-    reply: async (text) => {
-      await ctx.reply(text);
-    }
-  });
+  await routeToAgentRuntimeV3(
+    inbound.userId,
+    inbound.text,
+    {
+      callAgentRuntime: (input) =>
+        apiPost<AgentMessageResponse>("/agent/message", {
+          userId: input.userId,
+          message: input.message,
+          channel: "telegram"
+        }),
+      reply: async (text) => {
+        await ctx.reply(text);
+      }
+    },
+    ctx.update.update_id
+  );
 });
 
 bot.catch((error) => {

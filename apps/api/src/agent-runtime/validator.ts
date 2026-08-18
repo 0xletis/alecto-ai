@@ -1,4 +1,5 @@
 import type { UserOperatingProfile } from "@operator-agent/core";
+import type { EmailSignalRule } from "@operator-agent/db";
 import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
@@ -103,6 +104,23 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     }
   }
 
+  // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
+  // nothing to confirm — asking "shall I create it?" would be misleading when it either
+  // already exists or would just create a confusing duplicate. Skip the confirmation gate
+  // entirely; the executor decides the honest "already active" / "paused" response.
+  if (tool.name === "gmail.rule.create") {
+    const existing = findExistingCustomGmailRule(context.gmailRules, String(args.label ?? ""));
+    if (existing) {
+      return {
+        tool: tool.name,
+        args,
+        status: "valid",
+        requiresConfirmation: false,
+        rationale: operation.rationale
+      };
+    }
+  }
+
   return {
     tool: tool.name,
     args,
@@ -110,6 +128,20 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     requiresConfirmation: tool.requiresConfirmation,
     rationale: operation.rationale
   };
+}
+
+/** Same matching rule the gmail.rule.create executor uses to detect a duplicate. */
+export function findExistingCustomGmailRule(rules: EmailSignalRule[], label: string): EmailSignalRule | undefined {
+  const normalized = label.trim().toLowerCase();
+  if (!normalized) {
+    return undefined;
+  }
+  return rules.find(
+    (rule) =>
+      (rule.status === "active" || rule.status === "paused") &&
+      rule.adapterId === "custom_email_review" &&
+      rule.name.trim().toLowerCase() === normalized
+  );
 }
 
 const ZERO_WIDTH_CHARS_RE = /[​-‍﻿]/g;

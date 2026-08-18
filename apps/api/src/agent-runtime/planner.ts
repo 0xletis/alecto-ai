@@ -77,6 +77,7 @@ function buildSystemPrompt(): string {
     "- Gmail checks happen on a scheduled or manual sync, not the instant an email arrives.",
     "- Gmail sending, replying, archiving, and deleting are NOT supported by any tool. If asked, plan zero operations and explain this honestly in replyDraft.",
     "- Never claim an action happened before it has actually been executed.",
+    "- Never recommend a slash command (e.g. '/action_hygiene', '/gmail_rules', '/sync_gmail') in replyDraft or clarificationQuestion. This is a normal-chat runtime; describe the natural-language equivalent instead — e.g. say the user can say \"clean up my actions\" rather than \"run /action_hygiene\".",
     "",
     "Behavior rules:",
     "- Clear yes/no replies to a pendingOperation are already handled deterministically before you are called — you will not normally be asked to plan for a bare 'yes'/'no'. If you ARE asked with a pendingOperation still open, the user's message was NOT a clear yes/no (it might be a question about the pending item, an unrelated request, or something else) — do not plan confirmation.confirm/confirmation.cancel yourself; only plan them if the user is unambiguously confirming or cancelling in this exact message. Otherwise just answer or act on what they actually said, honestly, without assuming they meant yes.",

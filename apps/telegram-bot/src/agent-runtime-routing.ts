@@ -51,27 +51,37 @@ export function logLegacyTelegramRouting(userId: string, log: (message: string) 
  * Deliberately takes only ONE backend callback — there is no second/fallback
  * path this function could call, so a failure can only ever produce the
  * dev-safe error reply below, never a silent fallback to the legacy
- * /messages/process pipeline.
+ * /messages/process pipeline. There are exactly two exit points (the try
+ * body and the catch body) and each calls deps.reply exactly once — this is
+ * what guarantees one incoming message can never produce two Telegram
+ * replies from this function. See the "exactly once" test in
+ * tests/telegram-agent-runtime-routing.test.ts.
  */
-export async function routeToAgentRuntimeV3(userId: string, message: string, deps: RouteToAgentRuntimeDeps): Promise<void> {
+export async function routeToAgentRuntimeV3(
+  userId: string,
+  message: string,
+  deps: RouteToAgentRuntimeDeps,
+  updateId?: number
+): Promise<void> {
   const log = deps.log ?? console.log;
   const logError = deps.logError ?? console.error;
   const startedAt = Date.now();
+  const updateTag = updateId !== undefined ? ` update=${updateId}` : "";
 
-  log(`[telegram] runtime=agent_v3 user=${userId} start text=${JSON.stringify(message)}`);
+  log(`[telegram] runtime=agent_v3${updateTag} user=${userId} start text=${JSON.stringify(message)}`);
 
   try {
     const response = await deps.callAgentRuntime({ userId, message });
     const elapsedMs = Date.now() - startedAt;
     const debug = response.debug;
     log(
-      `[telegram] runtime=agent_v3 user=${userId} done elapsedMs=${elapsedMs} reply=${JSON.stringify(truncate(response.reply, 80))} ` +
+      `[telegram] runtime=agent_v3${updateTag} user=${userId} done elapsedMs=${elapsedMs} reply=${JSON.stringify(truncate(response.reply, 80))} ` +
         `topic=${debug?.conversationTopic ?? "?"} pending=${debug?.pendingOperation ?? "?"} mutation=${debug?.mutationExecuted ?? "?"}`
     );
     await deps.reply(response.reply);
   } catch (error) {
     const elapsedMs = Date.now() - startedAt;
-    logError(`[telegram] runtime=agent_v3 user=${userId} error elapsedMs=${elapsedMs}`, error);
+    logError(`[telegram] runtime=agent_v3${updateTag} user=${userId} error elapsedMs=${elapsedMs}`, error);
     await deps.reply(AGENT_RUNTIME_V3_ERROR_REPLY);
   }
 }

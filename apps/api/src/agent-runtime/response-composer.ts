@@ -12,10 +12,8 @@ export interface ComposeReplyInput {
 /**
  * Deterministic, template-based composition — no second LLM call. The
  * planner's replyDraft carries natural-language framing, but it was written
- * BEFORE execution, so it is only trusted when nothing actually went wrong.
- * The instant any operation fails or is rejected by the validator, the draft
- * is dropped entirely and the reply is rebuilt from ground truth only — it
- * must never read like a success when mutationExecuted is false.
+ * BEFORE execution, so it is only trusted when nothing actually went wrong
+ * AND the executed tool isn't itself the direct answer to the question.
  */
 export function composeReply(input: ComposeReplyInput): string {
   if (input.clarificationQuestion) {
@@ -42,26 +40,29 @@ export function composeReply(input: ComposeReplyInput): string {
     return lines.length > 0 ? joinSentences(lines) : "I couldn't do that. Nothing was changed.";
   }
 
-  // operator.recent_changes IS the answer to "what changed" — its own deterministic bullet
-  // list is always more trustworthy than the LLM's prose paraphrase of the same data, and
-  // showing both produced garbled, duplicated output in practice. Replace, never blend.
-  const recentChanges = input.executedOps.find((op) => op.tool === "operator.recent_changes" && op.status === "executed");
-  if (recentChanges) {
-    return recentChanges.summary;
+  // Some tools ARE the direct answer to the question (or the direct, honest outcome of a
+  // mutation attempt) and their own deterministic summary always wins over the LLM's
+  // pre-execution replyDraft — showing both produced duplicated/contradicting output in
+  // practice (e.g. replyDraft says "I'll create it" while the tool's ground truth says it
+  // already exists). Checked first, ahead of the general informational-tool rule below,
+  // because gmail.rule.create is a mutating tool that still needs this treatment.
+  const groundTruthOnly = executedSummaries(input.executedOps, (tool) => GROUND_TRUTH_ONLY_TOOLS.has(tool?.name ?? ""));
+  if (groundTruthOnly.length > 0) {
+    return groundTruthOnly.join("\n\n");
+  }
+
+  // Informational (read-only) tools are the answer itself — their ground-truth summary is
+  // always the reply, never blended with the LLM's framing, which risks either duplicating
+  // it verbatim or omitting the substance behind a vague sentence like "I'll list them now."
+  const informationalSummaries = executedSummaries(input.executedOps, (tool) => tool?.mutates === false);
+  if (informationalSummaries.length > 0) {
+    return informationalSummaries.join("\n\n");
   }
 
   const leadLines: string[] = [];
 
   if (input.replyDraft) {
     leadLines.push(input.replyDraft);
-  }
-
-  // Informational tools (list/status/explain/search/...) are the answer itself — their
-  // ground-truth summary must always reach the user, even when replyDraft is a generic
-  // framing sentence ("I'll list your rules now.") that never actually states the result.
-  const informationalSummaries = executedSummaries(input.executedOps, (tool) => tool?.mutates === false);
-  if (informationalSummaries.length > 0) {
-    leadLines.push(informationalSummaries.join(" "));
   }
 
   // Mutating tools are trusted to be described by replyDraft; only fall back to the raw
@@ -75,6 +76,8 @@ export function composeReply(input: ComposeReplyInput): string {
 
   return leadLines.length > 0 ? joinSentences(leadLines) : "I didn't find anything to act on.";
 }
+
+const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create"]);
 
 /** "I couldn't <do the thing> because <reason>. Nothing was changed." — always names the failure, never implies success. */
 function correctionLine(tool: string, detail: string): string {
@@ -120,7 +123,7 @@ function joinSentences(lines: string[]): string {
 function describePendingConfirmation(op: ValidatedOperation): string {
   if (op.tool === "gmail.rule.create") {
     const label = String(op.args.label ?? "this");
-    return `I'll set up review-first Gmail tracking for "${label}" — matches go to email review, never auto-logged, never instant. Shall I go ahead?`;
+    return `I can create a review-first Gmail rule for "${label}". Matches go to email reviews first. This is not instant email arrival tracking. Confirm?`;
   }
 
   return `I'm ready to run ${op.tool}. Shall I go ahead?`;

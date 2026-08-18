@@ -96,7 +96,7 @@ Route debug contract:
 
 `apps/api/src/server.ts` remains oversized.
 
-Current line count after this audit pass: 17,900 lines.
+Current line count after this audit pass: 17,440 lines (down from 17,903 — see the `server-types.ts` extraction below).
 
 Known extracted modules:
 
@@ -109,6 +109,7 @@ Known extracted modules:
 - `apps/api/src/conversation/response-composer.ts`: execution-result response composition.
 - `apps/api/src/conversation/gmail-autonomy.ts`: Gmail setup/autonomy state formatting.
 - `apps/api/src/conversation/email-rule-selection.ts`: Gmail rule target selection helpers.
+- `apps/api/src/server-types.ts` (new): 39 pure type/interface declarations extracted from server.ts's private helper zone — daily-brief/operator-attention, weekly review, action hygiene, next-week planning, daily coach, and Gmail/GitHub sync shapes. Zero behavior change (types are erased at compile time); `sanitizeActionItem`, `buildConversationControlDebugForUser`, and `PlanWindowKind` were exported from server.ts (previously private) purely so this file can reference them in `typeof`/`ReturnType` positions. −463 net lines in server.ts.
 
 High-density areas that still live in `server.ts`:
 

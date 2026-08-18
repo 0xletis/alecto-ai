@@ -20,6 +20,7 @@ import {
 } from "@operator-agent/db";
 import { parseActionDueDate } from "@operator-agent/core";
 import type { AgentEntity, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
+import { findExistingCustomGmailRule } from "./validator.js";
 
 export async function executeOperation(
   userId: string,
@@ -167,8 +168,8 @@ export async function executeOperation(
           status: "executed",
           summary:
             limited.length === 0
-              ? "No matching memories."
-              : `I remembered: ${limited.map((memory) => memory.summary).join("; ")}.`,
+              ? "I don't have anything remembered that matches that."
+              : `I remember: ${limited.map((memory) => memory.summary).join("; ")}.`,
           result: limited
         };
       }
@@ -187,13 +188,14 @@ export async function executeOperation(
 
       case "gmail.rule.list": {
         const rules = (await getEmailSignalRules(userId)).filter((rule) => rule.status === "active");
+        const summary =
+          rules.length === 0
+            ? "No active Gmail rules."
+            : `Active Gmail rules:\n${rules.map((rule, index) => `${index + 1}. ${rule.name} — review-first tracking`).join("\n")}`;
         return {
           tool: operation.tool,
           status: "executed",
-          summary:
-            rules.length === 0
-              ? "No active Gmail rules."
-              : `${rules.length} active Gmail rule(s): ${rules.map((rule) => `"${rule.name}"`).join(", ")}.`,
+          summary,
           result: rules,
           entities: rules.map(gmailRuleToEntity)
         };
@@ -208,14 +210,21 @@ export async function executeOperation(
         const matchHint = args.matchHint as string | undefined;
         const query = matchHint ? `${label} ${matchHint}`.trim() : label;
 
-        const existing = (await getEmailSignalRules(userId)).find(
-          (rule) => rule.status === "active" && rule.adapterId === "custom_email_review" && normalize(rule.name) === normalize(label)
-        );
-        if (existing) {
+        const existing = findExistingCustomGmailRule(await getEmailSignalRules(userId), label);
+        if (existing?.status === "active") {
           return {
             tool: operation.tool,
-            status: "executed",
-            summary: `${existing.name} tracking is already on. Matches go to email review before anything is logged.`,
+            // Nothing was actually created/changed — this must not read as a mutation.
+            status: "skipped",
+            summary: `${existing.name} tracking is already active. Matches go to email reviews first. It is not instant email arrival tracking.`,
+            result: existing
+          };
+        }
+        if (existing?.status === "paused") {
+          return {
+            tool: operation.tool,
+            status: "skipped",
+            summary: `${existing.name} tracking already exists but is currently paused. Resuming a paused rule isn't supported yet — let me know if you'd like a new rule instead.`,
             result: existing
           };
         }
@@ -302,11 +311,17 @@ export async function executeOperation(
 
       case "operator.today": {
         const dueToday = context.openActions.filter((action) => action.dueAt && isToday(action.dueAt));
-        const summary = [
+        const parts = [
           `${context.openActions.length} open task(s), ${dueToday.length} due today.`,
           `${context.activeGoals.length} active goal(s).`,
           `${context.gmailReviews.length} pending Gmail review(s).`
-        ].join(" ");
+        ];
+        // Natural next step instead of a slash-command recommendation — v3 normal chat
+        // should never tell the user to run a command, only to say what they want in words.
+        if (context.openActions.length > 0) {
+          parts.push('Tell me "clean up my actions" and I\'ll help you decide what to complete, snooze, or archive.');
+        }
+        const summary = parts.join(" ");
         return { tool: operation.tool, status: "executed", summary, result: { dueToday, openActions: context.openActions } };
       }
 

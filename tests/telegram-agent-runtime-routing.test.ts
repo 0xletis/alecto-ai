@@ -137,3 +137,49 @@ test("case E: v3 failure replies with the exact dev-safe message and never calls
   // There is no legacy/process-message callback it could invoke even if it wanted to — the
   // "no silent fallback" guarantee holds by construction, not just by this assertion.
 });
+
+test("objective 3: routeToAgentRuntimeV3 calls reply exactly once per successful backend response", async () => {
+  const replies: string[] = [];
+
+  await routeToAgentRuntimeV3("telegram:520894688", "what email rules are active?", {
+    callAgentRuntime: async () => ({ reply: "Active Gmail rules:\n1. Naturgy invoices — review-first tracking" }),
+    reply: async (text) => {
+      replies.push(text);
+    }
+  });
+
+  assert.equal(replies.length, 1, "exactly one reply must be sent for one successful backend response");
+});
+
+test("objective 3: routeToAgentRuntimeV3 calls reply exactly once even when the backend throws", async () => {
+  const replies: string[] = [];
+
+  await routeToAgentRuntimeV3("telegram:520894688", "track Naturgy invoices from Gmail", {
+    callAgentRuntime: async () => {
+      throw new Error("boom");
+    },
+    reply: async (text) => {
+      replies.push(text);
+    }
+  });
+
+  assert.equal(replies.length, 1, "exactly one reply must be sent even on failure — never zero, never two");
+});
+
+test("objective 3: the Telegram update id, when provided, is included in the v3 log lines for duplicate-delivery debugging", async () => {
+  const logs: string[] = [];
+
+  await routeToAgentRuntimeV3(
+    "telegram:520894688",
+    "what email rules are active?",
+    {
+      callAgentRuntime: async () => ({ reply: "Active Gmail rules:\n1. Naturgy invoices — review-first tracking" }),
+      reply: async () => {},
+      log: (message) => logs.push(message)
+    },
+    123456789
+  );
+
+  assert.ok(logs.some((line) => line.includes("update=123456789") && line.includes("start")));
+  assert.ok(logs.some((line) => line.includes("update=123456789") && line.includes("done")));
+});

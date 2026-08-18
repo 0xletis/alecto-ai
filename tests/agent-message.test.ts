@@ -581,6 +581,226 @@ test("agent/message: operationsExecuted omits raw DB rows by default, includes t
   }
 });
 
+// ---------------------------------------------------------------------------
+// Objective 1/2/6 — v3 UX cleanup, existing-Gmail-rule handling, no command wording
+// ---------------------------------------------------------------------------
+
+test("agent/message: memory recall is not duplicated even if replyDraft says the same thing", async () => {
+  const server = buildServer();
+  const userId = `agent-memory-dup-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "Prefers blunt feedback" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    await send(server, userId, "remember I prefer blunt feedback");
+
+    // The LLM's draft deliberately restates the same fact the ground-truth memory.search
+    // summary will also state — this is exactly the shape of the real duplication bug.
+    mockPlan({
+      topic: "memory",
+      intent: "recall_memory",
+      operations: [op("memory.search", { query: "blunt" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "I remember that you prefer blunt feedback."
+    });
+    const reply = await send(server, userId, "what did you remember?");
+
+    const occurrences = (reply.reply.match(/blunt feedback/gi) ?? []).length;
+    assert.equal(occurrences, 1, `expected "blunt feedback" to appear exactly once, got: ${JSON.stringify(reply.reply)}`);
+    assert.doesNotMatch(reply.reply, /I remember.*I remember/is);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: gmail.rule.list has no duplicated raw summary appended after the list", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-list-dup-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    const connection = await prisma.integrationConnection.findFirstOrThrow({ where: { userId, integrationId: "gmail" } });
+    await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Naturgy invoices", status: "active", createdBy: "user" }
+    });
+    await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Endesa bills", status: "active", createdBy: "user" }
+    });
+
+    mockPlan({
+      topic: "gmail_rules",
+      intent: "list_active_rules",
+      operations: [op("gmail.rule.list")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "Here are your active Gmail rules:"
+    });
+    const reply = await send(server, userId, "what email rules are active?");
+
+    assert.doesNotMatch(reply.reply, /Here are your active Gmail rules:/i, "the LLM's decoy prefix must not survive alongside the ground-truth list");
+    const listOccurrences = (reply.reply.match(/Naturgy invoices/gi) ?? []).length;
+    assert.equal(listOccurrences, 1, "each rule must appear exactly once, not once in a list and again in a trailing raw summary");
+    assert.doesNotMatch(reply.reply, /\d+ active Gmail rule\(s\):/i, "no trailing raw 'N active Gmail rule(s): ...' dump");
+    // Order between the two rules isn't guaranteed (both are created in rapid succession, so
+    // their createdAt values can tie) — only the numbering/format and no-duplication matter here.
+    assert.match(reply.reply, /\d\. Naturgy invoices — review-first tracking/);
+    assert.match(reply.reply, /\d\. Endesa bills — review-first tracking/);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: tracking a Gmail rule that already exists reports already-active, asks nothing, mutates nothing", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-existing-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    const connection = await prisma.integrationConnection.findFirstOrThrow({ where: { userId, integrationId: "gmail" } });
+    await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Naturgy invoices", status: "active", createdBy: "user" }
+    });
+
+    mockPlan({
+      topic: "gmail_tracking",
+      intent: "create_review_first_gmail_rule",
+      operations: [op("gmail.rule.create", { label: "Naturgy invoices" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "I can set up a tracking rule for Naturgy invoices in Gmail, but I need your confirmation to proceed."
+    });
+    const reply = await send(server, userId, "track Naturgy invoices from Gmail");
+
+    assert.equal(reply.needsConfirmation, false, "no pending confirmation when the rule already exists");
+    assert.equal(reply.debug.pendingOperation, false);
+    assert.equal(reply.debug.mutationExecuted, false, "nothing was actually created");
+    assert.match(reply.reply, /already active/i);
+    assert.match(reply.reply, /review/i);
+    assert.doesNotMatch(reply.reply, /need your confirmation|would you like to proceed|shall I/i, "must not still ask to create it");
+
+    const rules = await prisma.emailSignalRule.count({ where: { userId, name: "Naturgy invoices" } });
+    assert.equal(rules, 1, "no duplicate rule was created");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: tracking a paused Gmail rule explains it exists and is paused, does not invent resume", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-paused-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    const connection = await prisma.integrationConnection.findFirstOrThrow({ where: { userId, integrationId: "gmail" } });
+    await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Naturgy invoices", status: "paused", createdBy: "user" }
+    });
+
+    mockPlan({
+      topic: "gmail_tracking",
+      intent: "create_review_first_gmail_rule",
+      operations: [op("gmail.rule.create", { label: "Naturgy invoices" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const reply = await send(server, userId, "track Naturgy invoices from Gmail");
+
+    assert.equal(reply.needsConfirmation, false);
+    assert.equal(reply.debug.mutationExecuted, false);
+    assert.match(reply.reply, /paused/i);
+    assert.doesNotMatch(reply.reply, /resumed|resuming it now|I've resumed/i, "must not claim to have resumed it — v3 has no resume capability");
+
+    const rules = await prisma.emailSignalRule.count({ where: { userId, name: "Naturgy invoices" } });
+    assert.equal(rules, 1, "no duplicate rule was created alongside the paused one");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: tracking a genuinely new Gmail rule still asks for confirmation", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-new-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+
+    mockPlan({
+      topic: "gmail_tracking",
+      intent: "create_review_first_gmail_rule",
+      operations: [op("gmail.rule.create", { label: "Naturgy invoices" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const reply = await send(server, userId, "track Naturgy invoices from Gmail");
+
+    assert.equal(reply.needsConfirmation, true);
+    assert.equal(reply.debug.pendingOperation, true);
+    assert.equal(reply.debug.mutationExecuted, false);
+    assert.match(reply.reply, /review/i);
+    assert.match(reply.reply, /not instant/i);
+
+    const rules = await prisma.emailSignalRule.count({ where: { userId, name: "Naturgy invoices" } });
+    assert.equal(rules, 0, "nothing is created before confirmation");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: operator.today never recommends a slash command, suggests natural phrasing instead", async () => {
+  const server = buildServer();
+  const userId = `agent-today-no-commands-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await prisma.actionItem.createMany({
+      data: [
+        { userId, source: "manual", title: "Apply to jobs", status: "open", priority: "medium", evidence: "manual" },
+        { userId, source: "manual", title: "Review CV", status: "open", priority: "medium", evidence: "manual" }
+      ]
+    });
+
+    mockPlan({
+      topic: "operator_summary",
+      intent: "show_today",
+      operations: [op("operator.today")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      // Decoy replyDraft mimicking the real observed bug (command-oriented wording) —
+      // ground truth must win and this text must never reach the user.
+      replyDraft: "Today - 2026-08-18. Action hygiene: 2 actions need cleanup decisions. Run /action_hygiene."
+    });
+    const reply = await send(server, userId, "so what today");
+
+    assert.doesNotMatch(reply.reply, /\/action_hygiene|\/gmail_rules|\/sync_gmail|run \//i, "no slash-command recommendation in v3 normal chat");
+    assert.match(reply.reply, /clean up my actions/i, "natural next step instead of a command");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
 async function seedGmailUser(userId: string): Promise<void> {
   await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
   await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });

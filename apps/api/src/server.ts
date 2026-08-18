@@ -219,6 +219,44 @@ import {
 import { shouldUseLLMOperationPlanner } from "./conversation/operation-planner.js";
 import { registerMessageRoutes } from "./routes/messages.js";
 import { registerAgentRoutes, defaultAgentRouteHandlers } from "./routes/agent.js";
+import type {
+  ActionHygieneAction,
+  ActionHygieneOption,
+  ActionHygieneReport,
+  ActionReminderDispatch,
+  ConversationControlResponse,
+  DailyCoachGenerationResult,
+  DailyCoachSource,
+  DailyOperatorBrief,
+  DailyOperatorBriefAction,
+  DailyOperatorBriefGoalStatus,
+  EmailReviewCandidateDebug,
+  EmailRuleDiagnostics,
+  EmailRuleSyncSummary,
+  GithubCommit,
+  GmailErrorStage,
+  GmailMessage,
+  GmailMessagePart,
+  GmailStoredToken,
+  GmailTokenResponse,
+  NextWeekPlanContext,
+  NextWeekPlanSuggestion,
+  OperatorActionAttentionSummary,
+  OperatorAttentionItem,
+  OperatorAttentionPriority,
+  OperatorAttentionState,
+  OperatorEmailAttentionSummary,
+  OperatorGoalAttentionSummary,
+  OperatorPlanningAttentionSummary,
+  OperatorReflectionCandidate,
+  OperatorReflectionContext,
+  OperatorReflectionType,
+  OperatorRiskAttentionSummary,
+  WeeklyEmailAttentionSummary,
+  WeeklyReviewContext,
+  WeeklyReviewDraft,
+  WeeklyReviewMemory
+} from "./server-types.js";
 
 type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
 
@@ -4066,7 +4104,7 @@ function formatWeeklyReviewContextDebug(context: WeeklyReviewContext): string {
   ].join("\n");
 }
 
-type PlanWindowKind = "next_week" | "current_week";
+export type PlanWindowKind = "next_week" | "current_week";
 
 async function buildNextWeekPlanContext(
   userId: string,
@@ -9420,7 +9458,7 @@ function formatMinutesOfDay(minutes: number): string {
   return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
 }
 
-async function buildConversationControlDebugForUser(userId: string, text: string) {
+export async function buildConversationControlDebugForUser(userId: string, text: string) {
   const [actions, goals] = await Promise.all([getActionItems(userId, { status: "all", limit: 100 }), getActiveGoals(userId)]);
 
   return buildConversationControlDebug({
@@ -12197,7 +12235,7 @@ function sanitizeEmailReviewItem(item: EmailReviewItem) {
   };
 }
 
-function sanitizeActionItem(item: ActionItem) {
+export function sanitizeActionItem(item: ActionItem) {
   return {
     ...item,
     evidence: item.evidence ? truncatePlainText(item.evidence, 500) : undefined,
@@ -17338,507 +17376,6 @@ function tomorrow(): Date {
 
 function pendingDecisionExpiry(): Date {
   return new Date(Date.now() + 60 * 60 * 1000);
-}
-
-interface GithubCommit {
-  sha: string;
-  html_url?: string;
-  author?: {
-    login?: string;
-  } | null;
-  committer?: {
-    login?: string;
-  } | null;
-  commit: {
-    message: string;
-    author?: {
-      name?: string;
-      email?: string;
-      date?: string;
-    } | null;
-    committer?: {
-      name?: string;
-      email?: string;
-      date?: string;
-    } | null;
-  };
-}
-
-interface GmailTokenResponse {
-  access_token: string;
-  refresh_token?: string;
-  expires_in?: number;
-  token_type?: string;
-  scope?: string;
-}
-
-interface GmailStoredToken {
-  accessToken: string;
-  refreshToken: string;
-  expiresAt: number;
-  tokenType: string;
-  scope: string;
-}
-
-interface GmailMessage {
-  id: string;
-  threadId?: string;
-  snippet?: string;
-  payload?: GmailMessagePart;
-}
-
-interface EmailRuleSyncSummary {
-  ruleId: string;
-  adapterId: string;
-  query?: string;
-  fetchStrategy: string;
-  classifierMode: string;
-  lookbackDays: number;
-  maxMessagesPerSync: number;
-  maxEventsPerSync: number;
-  messagesFound: number;
-  processed: number;
-  ignoredUnknown: number;
-  filteredMarketing: number;
-  needsReview: number;
-  llmClassified: number;
-  llmUnavailable: number;
-  llmErrors: number;
-  llmNeedsReview: number;
-  llmIgnored: number;
-  reviewItemsCreated: number;
-  reviewItemsAlreadyPending: number;
-  reviewItemsRejectedDeduped: number;
-  reviewItemsSemanticDeduped: number;
-  lowConfidenceIgnored: number;
-  deduped: number;
-  semanticDeduped: number;
-  archivedCleanupReprocessed: number;
-  skippedDueMaxEventsPerSync: number;
-  eventsCreated: number;
-  lastError?: string;
-  lastErrorStage?: GmailErrorStage;
-  reviewCandidateDebug: EmailReviewCandidateDebug[];
-}
-
-interface EmailReviewCandidateDebug {
-  subject?: string;
-  from?: string;
-  proposedEventType?: string;
-  company?: string;
-  role?: string;
-  project?: string;
-  deadline?: string;
-  actionRequired?: boolean;
-  decision:
-    | "created"
-    | "existing_pending"
-    | "existing_rejected"
-    | "existing_approved"
-    | "active_event_exists"
-    | "archived_ignored"
-    | "invalid_ignored";
-  matchedReviewId?: string;
-  matchedReviewStatus?: string;
-  matchedEventId?: string;
-  semanticKey: string;
-}
-
-interface EmailRuleDiagnostics {
-  totalEmailRules: number;
-  rulesForConnection: number;
-  activeRulesForConnection: number;
-  staleOrArchivedRules: number;
-  rejectedRuleReasons: string[];
-}
-
-type GmailErrorStage =
-  | "rule_loading"
-  | "token_refresh"
-  | "gmail_search"
-  | "gmail_message_fetch"
-  | "classification"
-  | "event_creation";
-
-interface DailyOperatorBrief {
-  date: string;
-  summary: string;
-  coach: DailyCoachResponse;
-  coachDebug: DailyCoachDebug;
-  topPriorities: string[];
-  openActions: DailyOperatorBriefAction[];
-  overdueActions: DailyOperatorBriefAction[];
-  goalStatus: DailyOperatorBriefGoalStatus[];
-  recentWins: string[];
-  risks: string[];
-  emailAttention?: OperatorEmailAttentionSummary;
-  actionHygiene?: {
-    summary: string;
-    needsDecision: number;
-  };
-  operatorReflection?: string;
-  weeklyReviewDue?: boolean;
-  suggestedNextStep: string;
-  priorityDebug?: DailyOperatorBriefPriorityDebug[];
-}
-
-type OperatorAttentionPriority = "critical" | "high" | "medium" | "low";
-
-interface OperatorAttentionItem {
-  kind: "risk" | "action" | "email_review" | "goal" | "planning" | "hygiene";
-  title: string;
-  summary: string;
-  priority: OperatorAttentionPriority;
-  suggestedReply?: string;
-  sourceId?: string;
-}
-
-interface OperatorEmailAttentionSummary {
-  pendingCount: number;
-  workActionCount: number;
-  jobSearchCount: number;
-  customCount: number;
-  otherCount: number;
-  handledTodayCount: number;
-  approvedTodayCount: number;
-  rejectedTodayCount: number;
-  gmailDerivedActionItemsToday: number;
-  gmailDerivedEventsToday: number;
-  topReviewSubjects: string[];
-  priority: OperatorAttentionPriority;
-  summary: string;
-  userFacingLine?: string;
-  syncMode: string;
-  notificationPreference: "on" | "off";
-}
-
-interface OperatorActionAttentionSummary {
-  openCount: number;
-  overdueCount: number;
-  dueSoonCount: number;
-  hygieneNeedsDecision: number;
-  topActions: Array<{ id: string; title: string; dueAt?: string; priority: ActionItem["priority"] }>;
-  summary: string;
-}
-
-interface OperatorGoalAttentionSummary {
-  activeCount: number;
-  noProgressCount: number;
-  criticalNoProgressCount: number;
-  summary: string;
-}
-
-interface OperatorRiskAttentionSummary {
-  activeWatchouts: string[];
-  guardrailTriggeredToday: boolean;
-  summary: string;
-}
-
-interface OperatorPlanningAttentionSummary {
-  weeklyReviewDue: boolean;
-  latestWeeklyReviewDate?: string;
-  summary: string;
-}
-
-interface OperatorAttentionState {
-  userId: string;
-  date: string;
-  timezone: string;
-  topAttentionItems: OperatorAttentionItem[];
-  recommendedNextMove: string;
-  emailAttentionSummary: OperatorEmailAttentionSummary;
-  actionAttentionSummary: OperatorActionAttentionSummary;
-  goalAttentionSummary: OperatorGoalAttentionSummary;
-  riskAttentionSummary: OperatorRiskAttentionSummary;
-  planningAttentionSummary: OperatorPlanningAttentionSummary;
-  suggestedUserReplies: string[];
-  missingClarification?: string;
-  confidence: number;
-  reasoning: string[];
-}
-
-interface WeeklyReviewContext {
-  userId: string;
-  timezone: string;
-  weekStartLocalDate: string;
-  weekEndLocalDate: string;
-  reviewedEndLocalDate: string;
-  rangeStart: Date;
-  rangeEnd: Date;
-  activeGoals: Goal[];
-  events: StoredEvent[];
-  eventsByType: Record<string, number>;
-  completedActions: ActionItem[];
-  openActions: ActionItem[];
-  overdueActions: ActionItem[];
-  snoozedOrRescheduledActions: ActionItem[];
-  archivedActions: ActionItem[];
-  guardrailEvents: StoredEvent[];
-  emailAttention: WeeklyEmailAttentionSummary;
-  goalProgress: WeeklyGoalProgress[];
-  goalsWithProgress: WeeklyGoalProgress[];
-  goalsWithoutProgress: WeeklyGoalProgress[];
-  actionHygiene: ActionHygieneReport;
-  activeReflections: MemoryEntry[];
-  dailyLoopCounts: {
-    morningBriefs: number;
-    eveningReviews: number;
-  };
-}
-
-interface WeeklyEmailAttentionSummary {
-  reviewsCreated: number;
-  reviewsApproved: number;
-  reviewsRejected: number;
-  pendingReviews: number;
-  gmailDerivedActionItems: number;
-  gmailDerivedEvents: number;
-  byKind: {
-    jobSearch: number;
-    workAction: number;
-    custom: number;
-    other: number;
-  };
-}
-
-interface WeeklyGoalProgress {
-  goalId: string;
-  title: string;
-  priority?: Goal["priority"];
-  isRiskControl: boolean;
-  progressCount: number;
-  note: string;
-}
-
-interface WeeklyReviewDraft {
-  summary: string;
-  wins: string[];
-  stalls: string[];
-  goalProgress: WeeklyGoalProgress[];
-  guardrailSummary: Record<string, unknown>;
-  patterns: string[];
-  recommendedNextWeekActions: string[];
-  reflectionIds: string[];
-  source: "deterministic" | "llm" | "mixed";
-}
-
-interface WeeklyReviewMemory {
-  id: string;
-  userId: string;
-  weekStartLocalDate: string;
-  weekEndLocalDate: string;
-  reviewedEndLocalDate: string;
-  timezone: string;
-  status: "generated" | "archived";
-  summary: string;
-  wins: string[];
-  stalls: string[];
-  goalProgress: unknown[];
-  guardrailSummary: Record<string, unknown>;
-  emailAttention?: WeeklyEmailAttentionSummary;
-  patterns: string[];
-  recommendedNextWeekActions: string[];
-  reflectionIds: string[];
-  source: "deterministic" | "llm" | "mixed";
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-type OperatorReflectionType = "pattern" | "preference" | "friction" | "guardrail_pattern" | "goal_strategy" | "stale_goal";
-type OperatorReflectionSource = "daily_reflection" | "weekly_reflection" | "manual_debug";
-
-interface OperatorReflectionCandidate {
-  type: OperatorReflectionType;
-  title: string;
-  summary: string;
-  evidence: Record<string, unknown>;
-  confidence: number;
-  source: OperatorReflectionSource;
-}
-
-interface OperatorReflectionContext {
-  userId: string;
-  timezone: string;
-  dateRange: {
-    start: string;
-    end: string;
-    since: Date;
-    until: Date;
-  };
-  activeGoals: Awaited<ReturnType<typeof getActiveGoals>>;
-  completedActions: ActionItem[];
-  overdueActions: ActionItem[];
-  snoozedOrRescheduledActions: ActionItem[];
-  archivedActions: ActionItem[];
-  events: StoredEvent[];
-  guardrailEvents: StoredEvent[];
-  existingReflections: MemoryEntry[];
-  goalsWithoutProgress: Awaited<ReturnType<typeof getActiveGoals>>;
-  counts: {
-    completedActions: number;
-    overdueActions: number;
-    snoozedOrRescheduledActions: number;
-    archivedActions: number;
-    events: number;
-    guardrailTriggers: number;
-    activeGoals: number;
-    existingReflections: number;
-  };
-}
-
-type ActionHygieneOption = "complete" | "snooze" | "archive" | "keep";
-
-interface ActionHygieneAction {
-  actionId: string;
-  title: string;
-  dueAt?: string;
-  linkedGoalTitle?: string;
-  priority: ActionItem["priority"];
-  daysOverdue?: number;
-  snoozeCount?: number;
-  lastTouchedAt?: string;
-  reason: string;
-  recommendedOptions: ActionHygieneOption[];
-}
-
-interface ActionHygieneReport {
-  staleActions: ActionHygieneAction[];
-  overdueActions: ActionHygieneAction[];
-  repeatedlySnoozedActions: ActionHygieneAction[];
-  lowPriorityStaleActions: ActionHygieneAction[];
-  suggestedCleanupCandidates: ActionHygieneAction[];
-  summary: string;
-}
-
-interface NextWeekPlanContext {
-  userId: string;
-  timezone: string;
-  now: Date;
-  planWindowKind: PlanWindowKind;
-  planStartLocalDate: string;
-  planEndLocalDate: string;
-  nextWeekStartLocalDate: string;
-  nextWeekEndLocalDate: string;
-  nextWeekRangeStart: Date;
-  nextWeekRangeEnd: Date;
-  latestWeeklyReview?: WeeklyReviewMemory;
-  activeGoals: Goal[];
-  goalsWithNoProgress: WeeklyGoalProgress[];
-  openActions: ActionItem[];
-  staleActions: ActionHygieneAction[];
-  activeReflections: MemoryEntry[];
-  recentEventsSummary: Record<string, number>;
-  guardrailGoals: Goal[];
-  guardrailEvents: StoredEvent[];
-  emailAttention: WeeklyEmailAttentionSummary;
-  futureActionsNextWeek: ActionItem[];
-  reviewedWeek: {
-    weekStartLocalDate: string;
-    weekEndLocalDate: string;
-    reviewedEndLocalDate: string;
-  };
-}
-
-interface NextWeekPlanSuggestion {
-  index: number;
-  title: string;
-  reason: string;
-  goalId?: string;
-  goalTitle?: string;
-  priority: "low" | "medium" | "high" | "critical";
-  actionPriority?: "low" | "medium" | "high";
-  suggestedDueAt: Date;
-  actionType: "generic";
-  source: "weekly_plan";
-  duplicateRisk: boolean;
-  existingActionId?: string;
-  existingActionTitle?: string;
-  planKind?: "action" | "cleanup";
-  creatable?: boolean;
-  notCreatableReason?: string;
-  dedupeKey?: string;
-}
-
-type DailyCoachSource = "llm" | "fallback_disabled" | "fallback_invalid" | "fallback_error" | "fallback_timeout";
-
-interface DailyCoachDebug {
-  source: DailyCoachSource;
-  llmAttempted: boolean;
-  validationStatus: "passed" | "failed" | "skipped";
-  validationFailureCodes: string[];
-  validationFailureSummary?: string;
-  schemaValidationPassed: boolean;
-  fallbackReason?: string;
-  selectedActionTitle?: string;
-  rawResponseType?: "json_object" | "text" | "empty" | "unknown";
-  parsedFieldsPresent?: string[];
-  responseLength?: number;
-  diagnosisLength?: number;
-  nextMoveLength?: number;
-  warningLength?: number;
-  encouragementLength?: number;
-}
-
-interface DailyCoachGenerationResult {
-  coach: DailyCoachResponse;
-  debug: DailyCoachDebug;
-}
-
-interface ConversationControlResponse {
-  handled: boolean;
-  reply?: string;
-  debug: Awaited<ReturnType<typeof buildConversationControlDebugForUser>>;
-  action?: unknown;
-  goal?: unknown;
-  brief?: DailyOperatorBrief;
-  actions?: unknown[];
-}
-
-interface DailyOperatorBriefAction {
-  id: string;
-  title: string;
-  status: ActionItem["status"];
-  priority: ActionItem["priority"];
-  dueAt?: string;
-  snoozedUntil?: string;
-  goalId?: string;
-  goalTitle?: string;
-}
-
-interface DailyOperatorBriefGoalStatus {
-  goalId: string;
-  title: string;
-  status: string;
-  note: string;
-  openActionTitle?: string;
-  completedActionTitle?: string;
-}
-
-interface DailyOperatorBriefPriorityDebug {
-  rank: number;
-  actionId: string;
-  title: string;
-  score: number;
-  rankReason: string;
-  factors: string[];
-}
-
-interface ActionReminderDispatch {
-  actionItem: ReturnType<typeof sanitizeActionItem>;
-  reminderType: ActionItemReminderType;
-  message: string;
-}
-
-interface GmailMessagePart {
-  mimeType?: string;
-  headers?: Array<{
-    name: string;
-    value: string;
-  }>;
-  body?: {
-    data?: string;
-  };
-  parts?: GmailMessagePart[];
 }
 
 class GithubFetchError extends Error {
