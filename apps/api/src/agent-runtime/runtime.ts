@@ -1,3 +1,4 @@
+import { rejectPendingAction, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
@@ -95,10 +96,32 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
   // "nothing pending" reply instead of falling through to the LLM planner, which has been
   // observed to invent an unrelated action (e.g. listing Gmail rules) for a lone "yes".
   if (CONFIRM_WHITELIST.has(normalized)) {
-    return pending ? finalizeDeterministicConfirmation(context) : finalizeNoPendingReply(context, "confirmation.confirm");
+    if (pending) {
+      return finalizeDeterministicConfirmation(context);
+    }
+    return context.legacyPendingAction
+      ? finalizeLegacyPendingActionConfirm(context)
+      : finalizeNoPendingReply(context, "confirmation.confirm");
   }
   if (CANCEL_WHITELIST.has(normalized)) {
-    return pending ? finalizeDeterministicCancellation(context) : finalizeNoPendingReply(context, "confirmation.cancel");
+    if (pending) {
+      return finalizeDeterministicCancellation(context);
+    }
+    return context.legacyPendingAction
+      ? finalizeLegacyPendingActionCancel(context, context.legacyPendingAction)
+      : finalizeNoPendingReply(context, "confirmation.cancel");
+  }
+
+  // A legacy PendingAction (from a slash-command flow like /action_hygiene or a Gmail rule
+  // proposal) still lives entirely in server.ts's legacy resolver — v3 has no tool that can
+  // safely execute it (applyPendingAction is entangled with Gmail-rule/action-hygiene helpers
+  // that aren't safely importable here). v3's own pendingOperation always takes precedence
+  // (handled above); only once that's empty do we check for a legacy one. Anything other than
+  // an exact confirm/cancel gets deflected here, before the planner ever runs, so a random
+  // natural message can never accidentally execute or silently drop a pending slash-command
+  // action — see docs/09-architecture-inventory.md's "PendingAction / Agent Runtime v3 interop".
+  if (!pending && context.legacyPendingAction) {
+    return finalizeLegacyPendingActionAmbiguous(context, context.legacyPendingAction);
   }
 
   if (UNSUPPORTED_GMAIL_ACTION_RE.test(message.trim())) {
@@ -269,6 +292,64 @@ async function finalizeDeterministicCancellation(context: ContextBundle): Promis
   });
 }
 
+const LEGACY_PENDING_ACTION_CONFIRM_REPLY =
+  "I can't safely apply that kind of pending action from here yet. Reply with /confirm to complete it, or /cancel to drop it.";
+
+async function finalizeLegacyPendingActionConfirm(context: ContextBundle): Promise<AgentMessageResponse> {
+  // Deliberately does NOT call the legacy confirmPendingAction/applyPendingAction here: the
+  // actual mutation logic (applyPendingAction) lives in server.ts, entangled with Gmail-rule and
+  // action-hygiene helpers that aren't safely importable into agent-runtime without a circular
+  // import back into server.ts. Marking it "confirmed" without running that logic would silently
+  // skip the mutation the user is expecting — worse than doing nothing. The row is left untouched.
+  return finalize(context, {
+    reply: LEGACY_PENDING_ACTION_CONFIRM_REPLY,
+    operationsPlanned: [],
+    executedOps: [{ tool: "confirmation.confirm", status: "skipped", summary: LEGACY_PENDING_ACTION_CONFIRM_REPLY }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: context.session.topic
+  });
+}
+
+async function finalizeLegacyPendingActionCancel(
+  context: ContextBundle,
+  legacyPendingAction: PendingAction
+): Promise<AgentMessageResponse> {
+  // Safe to execute directly: rejecting a pending action only ever marks the row
+  // status="rejected" — it never runs applyPendingAction's type-specific mutation logic, so
+  // there's no entangled Gmail/action-hygiene behavior to reproduce here.
+  await rejectPendingAction(context.session.userId, legacyPendingAction.id);
+  const reply = "Cancelled. I did not change anything.";
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [],
+    executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: reply }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: context.session.topic
+  });
+}
+
+async function finalizeLegacyPendingActionAmbiguous(
+  context: ContextBundle,
+  legacyPendingAction: PendingAction
+): Promise<AgentMessageResponse> {
+  const reply = `You have a pending action from the previous flow: ${legacyPendingAction.summary}. Confirm, cancel, or continue with a new request.`;
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [],
+    executedOps: [],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: context.session.topic
+  });
+}
+
 interface FinalizeInput {
   reply: string;
   operationsPlanned: PlannedOperation[];
@@ -300,7 +381,8 @@ async function finalize(context: ContextBundle, input: FinalizeInput): Promise<A
       toolValidationPassed: input.toolValidationPassed,
       mutationExecuted: input.executedOps.some((op) => op.status === "executed" && getToolDefinition(op.tool)?.mutates),
       conversationTopic: input.topic,
-      pendingOperation: needsConfirmation
+      pendingOperation: needsConfirmation,
+      legacyPendingActionDetected: Boolean(context.legacyPendingAction)
     }
   };
 }

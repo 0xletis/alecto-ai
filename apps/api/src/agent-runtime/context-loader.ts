@@ -5,6 +5,7 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getIntegrationConnections,
+  getLatestPendingAction,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
   getRelevantMemories
@@ -23,7 +24,8 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
     gmailRules,
     gmailReviews,
     operatingProfile,
-    session
+    session,
+    legacyPendingAction
   ] = await Promise.all([
     ensureUser(userId),
     getActiveGoals(userId),
@@ -34,7 +36,8 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
     getEmailSignalRules(userId),
     getEmailReviewItems(userId, { status: "pending", limit: 10 }),
     getOrCreateUserOperatingProfile(userId),
-    loadSession(userId, channel)
+    loadSession(userId, channel),
+    getLatestPendingAction(userId)
   ]);
 
   const gmailConnection = integrationConnections.find((connection) => connection.integrationId === "gmail");
@@ -49,6 +52,7 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
     gmailRules,
     gmailReviews,
     operatingProfile,
-    session
+    session,
+    legacyPendingAction: legacyPendingAction ?? null
   };
 }

@@ -3,6 +3,7 @@ import type {
   EmailReviewItem,
   EmailSignalRule,
   IntegrationConnection,
+  PendingAction,
   ensureUser
 } from "@operator-agent/db";
 import type { Goal, MemoryEntry, StoredEvent, UserOperatingProfile } from "@operator-agent/core";
@@ -45,6 +46,14 @@ export interface AgentDebugInfo {
   mutationExecuted: boolean;
   conversationTopic: string | null;
   pendingOperation: boolean;
+  /**
+   * True whenever a legacy PendingAction (from a slash-command flow like
+   * /action_hygiene, a Gmail rule proposal, etc.) blocked or redirected this
+   * turn. See ContextBundle.legacyPendingAction and runtime.ts's handling of
+   * it — v3 never executes a legacy PendingAction itself, only detects it,
+   * defers to /confirm, or safely cancels it via /cancel's own DB function.
+   */
+  legacyPendingActionDetected: boolean;
 }
 
 /** One operation as proposed by the planner, before validation. */
@@ -137,4 +146,16 @@ export interface ContextBundle {
   gmailReviews: EmailReviewItem[];
   operatingProfile: UserOperatingProfile;
   session: AgentSessionState;
+  /**
+   * The user's active legacy PendingAction row, if any — created by a
+   * slash-command flow (e.g. /action_hygiene, a custom Gmail rule proposal)
+   * that still lives entirely in server.ts's legacy resolver. Deliberately
+   * separate from session.pendingOperation, which is v3's own, unrelated
+   * confirmation mechanism — the two must never be conflated. v3 only reads
+   * this to detect/inform/safely-cancel; it never runs legacy's
+   * applyPendingAction itself (that function is entangled with Gmail-rule
+   * and action-hygiene helpers that are not safely importable here without
+   * a circular import back into server.ts).
+   */
+  legacyPendingAction: PendingAction | null;
 }
