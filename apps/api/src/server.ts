@@ -2,7 +2,6 @@ import Fastify from "fastify";
 import {
   buildDailyReview,
   buildDailyInsight,
-  buildDailyCheckinPrompt,
   buildCustomGoalConfig,
   buildConversationControlDebug,
   composeAgentResponse,
@@ -39,7 +38,6 @@ import {
   inferGoalLinkForAction,
   looksLikeMultiIntentText,
   goalTemplates,
-  IngestTextBodySchema,
   CreateEmailSignalRuleInputSchema,
   UpdateEmailSignalRuleInputSchema,
   GithubPublicConnectionInputSchema,
@@ -55,7 +53,6 @@ import {
   parseConversationControlTime,
   resolveActionReference,
   resolveGoalReference,
-  routeIngestion,
   decryptSecretJson,
   encryptSecretJson,
   getSecretEncryptionKeyFromEnv,
@@ -66,7 +63,6 @@ import {
   writeGmailBackgroundSyncAttempt,
   UpdateIntegrationConnectionInputSchema,
   UpdateUserOperatingProfileInputSchema,
-  type IngestTextBody,
   type GithubPublicConnectionInput,
   type MessageIntent,
   type InsightReport,
@@ -219,6 +215,8 @@ import { registerMessageRoutes } from "./routes/messages.js";
 import { registerAgentRoutes, defaultAgentRouteHandlers } from "./routes/agent.js";
 import { registerMemoryRoutes } from "./routes/memory.js";
 import { registerNotificationSettingsRoutes } from "./routes/notification-settings.js";
+import { registerCheckinsIngestRoutes } from "./routes/checkins-ingest.js";
+import { isRecord } from "./utils/records.js";
 import type {
   ActionHygieneAction,
   ActionHygieneOption,
@@ -306,6 +304,7 @@ export function buildServer() {
   registerAgentRoutes(server, defaultAgentRouteHandlers());
   registerMemoryRoutes(server);
   registerNotificationSettingsRoutes(server);
+  registerCheckinsIngestRoutes(server);
 
   registerMessageRoutes(server, {
     processV2: async (input) => {
@@ -1334,43 +1333,6 @@ export function buildServer() {
       };
     }
   );
-
-  server.get<{ Params: { userId: string } }>("/users/:userId/checkins/daily/prompt", async (request) => ({
-    prompt: buildDailyCheckinPrompt({
-      activeGoals: await getActiveGoals(request.params.userId),
-      userOperatingProfile: await getOrCreateUserOperatingProfile(request.params.userId),
-      recentEvents: await getRecentEvents(request.params.userId, 20)
-    })
-  }));
-
-  server.post<{ Params: { userId: string } }>("/users/:userId/ingest/text", async (request, reply) => {
-    const parsed = IngestTextBodySchema.safeParse(request.body);
-
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid request body",
-        issues: parsed.error.issues
-      });
-    }
-
-    return ingestText(request.params.userId, parsed.data);
-  });
-
-  server.post<{ Params: { userId: string } }>("/users/:userId/ingest/job-search-text", async (request, reply) => {
-    const parsed = IngestTextBodySchema.safeParse({
-      ...(isRecord(request.body) ? request.body : {}),
-      domainHint: "career"
-    });
-
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid request body",
-        issues: parsed.error.issues
-      });
-    }
-
-    return ingestText(request.params.userId, parsed.data);
-  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/integrations", async (request) => ({
     connections: (await getIntegrationConnections(request.params.userId)).map(sanitizeIntegrationConnection)
@@ -11061,43 +11023,6 @@ function looksLikeBulkPronounResetRequest(text: string): boolean {
   );
 }
 
-async function ingestText(userId: string, input: IngestTextBody) {
-  const result = routeIngestion({
-    userId,
-    text: input.text,
-    source: input.source,
-    metadata: {
-      domainHint: input.domainHint
-    }
-  });
-  const validCandidates = result.eventCandidates.filter((candidate) => EventTypeSchema.safeParse(candidate.type).success);
-  const events =
-    validCandidates.length > 0
-      ? await createEvents(
-          userId,
-          validCandidates.map((candidate) => ({
-            type: EventTypeSchema.parse(candidate.type),
-            source: "manual",
-            data: {
-              ...candidate.data,
-              adapterId: result.adapterId,
-              classification: result.classification,
-              extracted: result.extracted ?? {},
-              originalText: input.text.slice(0, 1000)
-            },
-            confidence: candidate.confidence,
-            evidence: candidate.evidence
-          }))
-        )
-      : [];
-
-  return {
-    result,
-    events,
-    reply: composeIngestionReply(result.classification, events.length)
-  };
-}
-
 async function syncGithubPublicConnection(connection: IntegrationConnection) {
   const startedAt = new Date();
 
@@ -14054,14 +13979,6 @@ function shortErrorMessage(error: unknown): string {
 function truncatePlainText(text: string, maxLength: number): string {
   const clean = text.replace(/\s+/g, " ").trim();
   return clean.length > maxLength ? `${clean.slice(0, maxLength - 3)}...` : clean;
-}
-
-function composeIngestionReply(classification: string, eventCount: number): string {
-  if (eventCount === 0 || classification === "unknown") {
-    return "I could not classify this clearly. Paste more context or log it manually.";
-  }
-
-  return `Logged career event: ${classification.replace(/_/g, " ")}.`;
 }
 
 async function maybeAnalyzeWithOpenAI(
@@ -17341,10 +17258,6 @@ class GmailSyncError extends Error {
   ) {
     super(message);
   }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 function composeSavedEventsReply(events: StoredEvent[]): string {
