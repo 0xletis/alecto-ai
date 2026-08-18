@@ -218,6 +218,7 @@ import {
 } from "./conversation/orchestrator-v2.js";
 import { shouldUseLLMOperationPlanner } from "./conversation/operation-planner.js";
 import { registerMessageRoutes } from "./routes/messages.js";
+import { registerAgentRoutes, defaultAgentRouteHandlers } from "./routes/agent.js";
 
 type ProcessRouteDebug = NonNullable<ProcessMessageResult["routeDebug"]>;
 
@@ -263,6 +264,8 @@ export function buildServer() {
 
     return { goalTemplate: template };
   });
+
+  registerAgentRoutes(server, defaultAgentRouteHandlers());
 
   registerMessageRoutes(server, {
     processV2: async (input) => {

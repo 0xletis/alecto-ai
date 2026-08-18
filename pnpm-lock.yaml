@@ -35,6 +35,9 @@ importers:
       fastify:
         specifier: ^5.2.1
         version: 5.9.0
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
     devDependencies:
       tsx:
         specifier: ^4.19.2

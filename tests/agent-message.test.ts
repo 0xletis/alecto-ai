@@ -1,0 +1,586 @@
+import { randomUUID } from "node:crypto";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { prisma, updateUserOperatingProfile } from "../packages/db/src/index.ts";
+import { buildServer } from "../apps/api/src/server.ts";
+
+interface MockPlan {
+  topic: string;
+  intent: string;
+  operations: Array<{ tool: string; args: unknown; rationale?: string }>;
+  needsClarification: boolean;
+  clarificationQuestion: string | null;
+  replyDraft: string;
+}
+
+function op(tool: string, args: unknown = {}, rationale?: string) {
+  return { tool, args, rationale };
+}
+
+function mockPlan(plan: MockPlan): void {
+  process.env.AGENT_RUNTIME_PLANNER_MOCK_RESPONSE = JSON.stringify(plan);
+}
+
+function clearMocks(): void {
+  delete process.env.AGENT_RUNTIME_PLANNER_MOCK_RESPONSE;
+  delete process.env.AGENT_RUNTIME_PLANNER_MOCK_THROW;
+}
+
+async function send(server: ReturnType<typeof buildServer>, userId: string, message: string, debugRaw = false) {
+  const response = await server.inject({
+    method: "POST",
+    url: "/agent/message",
+    payload: { userId, message, channel: "telegram", debugRaw }
+  });
+  assert.equal(response.statusCode, 200, message);
+  return response.json();
+}
+
+test("agent/message: gmail rule creation golden transcript — 'yes' executes deterministically", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-rule-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await prisma.integrationConnection.create({
+      data: { userId, integrationId: "gmail", status: "active", config: {} }
+    });
+
+    mockPlan({
+      topic: "gmail_tracking_endesa",
+      intent: "create_review_first_gmail_rule",
+      operations: [op("gmail.rule.create", { label: "Endesa bills" }, "user wants Endesa bill tracking")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft:
+        "I can watch for Endesa bill emails. Matches will go to email review first, not instant tracking. Want me to set that up?"
+    });
+    const turn1 = await send(server, userId, "track Endesa bills from Gmail");
+    assert.match(turn1.reply, /review/i);
+    assert.match(turn1.reply, /not instant/i);
+    assert.equal(turn1.needsConfirmation, true);
+    assert.equal(turn1.debug.pendingOperation, true);
+    assert.equal(turn1.operationsExecuted.length, 0);
+    // Topic is derived from the tool that was actually planned (ground truth), not the LLM's freeform label.
+    assert.equal(turn1.debug.conversationTopic, "gmail_rule_creation");
+
+    mockPlan({
+      topic: "gmail_tracking_endesa",
+      intent: "explain_notification_behavior",
+      operations: [],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft:
+        "I can notify you after a scheduled or manual Gmail check creates a review, not the instant an email arrives."
+    });
+    const turn2 = await send(server, userId, "let me know when I receive one");
+    assert.match(turn2.reply, /scheduled|manual/i);
+    assert.match(turn2.reply, /not the instant/i);
+    assert.equal(turn2.needsConfirmation, true, "pending rule confirmation must still be open");
+    assert.equal(turn2.debug.conversationTopic, "gmail_rule_creation", "no operations this turn — topic must not go stale/drift");
+
+    // No mockPlan here on purpose: a bare "yes" against a pending operation must be resolved
+    // deterministically, without depending on the live LLM planner emitting confirmation.confirm.
+    const turn3 = await send(server, userId, "yes");
+    assert.equal(turn3.needsConfirmation, false);
+    assert.equal(turn3.debug.pendingOperation, false);
+    assert.equal(turn3.debug.mutationExecuted, true);
+    assert.equal(turn3.operationsExecuted.length, 1);
+    assert.equal(turn3.operationsExecuted[0].tool, "gmail.rule.create");
+    assert.equal(turn3.operationsExecuted[0].status, "executed");
+    assert.match(turn3.reply, /Endesa/i);
+    assert.match(turn3.reply, /review/i);
+
+    const rules = await prisma.emailSignalRule.findMany({ where: { userId } });
+    assert.equal(rules.length, 1);
+    assert.equal(rules[0].adapterId, "custom_email_review");
+    assert.equal(rules[0].reviewBeforeLogging, true);
+    assert.match(rules[0].name, /Endesa/i);
+
+    // Read-only follow-up in the same conversation must not resurrect a pending confirmation.
+    mockPlan({
+      topic: "gmail_rules",
+      intent: "list_active_rules",
+      operations: [op("gmail.rule.list")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn4 = await send(server, userId, "what email rules are active?");
+    assert.equal(turn4.needsConfirmation, false);
+    assert.equal(turn4.debug.pendingOperation, false);
+    assert.equal(turn4.debug.mutationExecuted, false);
+    assert.equal(turn4.debug.conversationTopic, "gmail_rules");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: unrelated unsupported-Gmail request does not hijack a pending Endesa confirmation", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-hijack-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await prisma.integrationConnection.create({
+      data: { userId, integrationId: "gmail", status: "active", config: {} }
+    });
+
+    mockPlan({
+      topic: "gmail_tracking_endesa",
+      intent: "create_review_first_gmail_rule",
+      operations: [op("gmail.rule.create", { label: "Endesa bills" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "I can watch for Endesa bill emails, review-first. Want me to set that up?"
+    });
+    await send(server, userId, "track Endesa bills from Gmail");
+
+    // No mockPlan: this must be caught deterministically before ever reaching the planner.
+    const hijackTurn = await send(server, userId, "reply to the Endesa email");
+    assert.match(hijackTurn.reply, /can't reply|isn't supported|not supported/i);
+    assert.doesNotMatch(hijackTurn.reply, /I'll set up|review-first Gmail tracking/i);
+    assert.equal(hijackTurn.operationsExecuted.length, 0);
+    assert.equal(hijackTurn.debug.mutationExecuted, false);
+    assert.equal(hijackTurn.debug.pendingOperation, true, "the unrelated Endesa pending operation must survive untouched");
+    assert.equal(hijackTurn.debug.conversationTopic, "gmail_unsupported_action");
+
+    // The original Endesa confirmation must still be exactly what gets executed.
+    const confirmTurn = await send(server, userId, "yes");
+    assert.equal(confirmTurn.operationsExecuted.length, 1);
+    assert.equal(confirmTurn.operationsExecuted[0].tool, "gmail.rule.create");
+    assert.equal(confirmTurn.operationsExecuted[0].status, "executed");
+
+    const rules = await prisma.emailSignalRule.findMany({ where: { userId } });
+    assert.equal(rules.length, 1);
+    assert.match(rules[0].name, /Endesa/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: memory.create with malformed/missing args never claims success", async () => {
+  const server = buildServer();
+  const userId = `agent-memory-malformed-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { type: "preference" })], // missing required `summary`
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "Got it, I'll remember that."
+    });
+    const missingFieldTurn = await send(server, userId, "remember I prefer blunt feedback");
+    assert.doesNotMatch(missingFieldTurn.reply, /got it|i'll remember|i've noted|remembered/i);
+    assert.match(missingFieldTurn.reply, /couldn't save that memory/i);
+    assert.match(missingFieldTurn.reply, /nothing was changed/i);
+    assert.equal(missingFieldTurn.operationsExecuted.length, 0);
+    assert.equal(missingFieldTurn.debug.toolValidationPassed, false);
+    assert.equal(missingFieldTurn.debug.mutationExecuted, false);
+
+    // Structured args (not a JSON string) mean the planner literally cannot hand the
+    // validator a non-object/array for `args` — normalizePlan coerces anything that
+    // isn't a plain object to `{}` before validation ever runs. That still safely
+    // fails schema validation (as above) rather than silently executing with junk
+    // data; the validator's dedicated "malformed" branch is retained as defense in
+    // depth for callers that bypass normalizePlan, but is unreachable through the
+    // real planner path — a direct, positive consequence of switching off argsJson.
+
+    const memoryCount = await prisma.memoryEntry.count({ where: { userId } });
+    assert.equal(memoryCount, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: memory golden transcript — valid save then recall", async () => {
+  const server = buildServer();
+  const userId = `agent-memory-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "Prefers blunt feedback", type: "preference" }, "explicit remember request")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "Got it, I'll remember that you prefer blunt feedback."
+    });
+    const turn1 = await send(server, userId, "remember I prefer blunt feedback");
+    assert.match(turn1.reply, /blunt feedback/i);
+    assert.equal(turn1.operationsExecuted[0].status, "executed");
+    assert.equal(turn1.debug.mutationExecuted, true);
+    assert.equal(turn1.debug.conversationTopic, "memory");
+
+    const memoryCount = await prisma.memoryEntry.count({ where: { userId, status: "active" } });
+    assert.equal(memoryCount, 1);
+
+    mockPlan({
+      topic: "memory",
+      intent: "recall_memory",
+      operations: [op("memory.search", { query: "blunt" }, "user asking to recall")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn2 = await send(server, userId, "what did you remember?");
+    assert.match(turn2.reply, /blunt feedback/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: zero-width characters and stray whitespace in planner args are sanitized", async () => {
+  const server = buildServer();
+  const userId = `agent-sanitize-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "  Prefers blunt feedback​ ", type: "preference" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn1 = await send(server, userId, "remember I prefer blunt feedback");
+    assert.equal(turn1.operationsExecuted[0].status, "executed");
+
+    const memory = await prisma.memoryEntry.findFirst({ where: { userId } });
+    assert.equal(memory?.summary, "Prefers blunt feedback");
+    assert.doesNotMatch(memory?.summary ?? "", /​/);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: action cleanup golden transcript resolves 'it'", async () => {
+  const server = buildServer();
+  const userId = `agent-cleanup-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    const action = await prisma.actionItem.create({
+      data: { userId, source: "manual", title: "Write YouTube script", status: "open", priority: "medium", evidence: "manual" }
+    });
+
+    mockPlan({
+      topic: "action_cleanup",
+      intent: "list_actions_for_cleanup",
+      operations: [op("action.list", { status: "open" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn1 = await send(server, userId, "clean up my tasks");
+    assert.match(turn1.reply, /Write YouTube script/i);
+
+    mockPlan({
+      topic: "action_cleanup",
+      intent: "snooze_referenced_action",
+      operations: [op("action.snooze", { untilText: "tomorrow" }, "resolve 'it' to the single visible action")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn2 = await send(server, userId, "snooze it to tomorrow");
+    assert.equal(turn2.operationsExecuted.length, 1);
+    assert.equal(turn2.operationsExecuted[0].status, "executed");
+    assert.match(turn2.reply, /Snoozed/i);
+
+    const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(updated?.status, "snoozed");
+    assert.ok(updated?.snoozedUntil);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: gmail read golden transcript is read-only and never sets pendingOperation", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-read-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    const connection = await prisma.integrationConnection.create({
+      data: { userId, integrationId: "gmail", status: "active", config: {} }
+    });
+    await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        status: "active",
+        createdBy: "user"
+      }
+    });
+
+    mockPlan({
+      topic: "gmail_rules",
+      intent: "list_active_rules",
+      operations: [op("gmail.rule.list")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn1 = await send(server, userId, "what email rules are active?");
+    assert.match(turn1.reply, /Job search emails/i);
+    assert.equal(turn1.needsConfirmation, false);
+    assert.equal(turn1.debug.pendingOperation, false);
+    assert.equal(turn1.debug.mutationExecuted, false);
+
+    mockPlan({
+      topic: "gmail_rules",
+      intent: "explain_endesa_rule",
+      operations: [op("gmail.rule.explain", { label: "Endesa" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn2 = await send(server, userId, "does Endesa auto-log?");
+    assert.match(turn2.reply, /does not auto-log/i);
+    assert.match(turn2.reply, /email review/i);
+    assert.equal(turn2.needsConfirmation, false);
+    assert.equal(turn2.debug.pendingOperation, false);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: unknown context asks a narrow clarifying question, no gmail dump", async () => {
+  const server = buildServer();
+  const userId = `agent-unknown-context-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "general",
+      intent: "ambiguous_tracking_request",
+      operations: [op("clarification.ask", { question: "Which emails do you want me to track?" })],
+      needsClarification: true,
+      clarificationQuestion: "Which emails do you want me to track?",
+      replyDraft: ""
+    });
+    const turn1 = await send(server, userId, "track those emails");
+    assert.equal(turn1.reply, "Which emails do you want me to track?");
+    assert.doesNotMatch(turn1.reply, /webhook|classifierMode|reviewBeforeLogging|adapterId/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: hallucinated unsupported tool is blocked by the validator, not just the prompt", async () => {
+  const server = buildServer();
+  const userId = `agent-unsupported-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "gmail_autolabel",
+      intent: "unsupported_gmail_autolabel",
+      operations: [op("gmail.autolabel", { label: "Bills" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "I'll set that up to auto-label instantly."
+    });
+    const turn1 = await send(server, userId, "auto-label my bill emails the instant they arrive");
+    assert.doesNotMatch(turn1.reply, /I'll set that up/i);
+    assert.match(turn1.reply, /isn't something I can do yet|nothing was changed/i);
+    assert.equal(turn1.operationsExecuted.length, 0);
+    assert.equal(turn1.debug.mutationExecuted, false);
+    assert.equal(turn1.debug.toolValidationPassed, false);
+
+    const rulesCount = await prisma.emailSignalRule.count({ where: { userId } });
+    assert.equal(rulesCount, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: generic user policy guardrail blocks before planning, no hardcoded domain", async () => {
+  const server = buildServer();
+  const userId = `agent-guardrail-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await updateUserOperatingProfile(userId, { knownTriggers: ["chasing losses"] });
+
+    // No mocked plan: the guardrail must short-circuit before the planner is ever invoked.
+    const turn1 = await send(server, userId, "I think I'm chasing losses again tonight");
+    assert.match(turn1.reply, /slow down|careful/i);
+    assert.equal(turn1.operationsExecuted.length, 0);
+    assert.equal(turn1.debug.plannerUsed, "none");
+    assert.equal(turn1.debug.llmPlannerAttempted, false);
+    assert.equal(turn1.debug.mutationExecuted, false);
+
+    const eventCount = await prisma.event.count({ where: { userId } });
+    assert.equal(eventCount, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: falls back to the heuristic planner when the LLM planner is unavailable", async () => {
+  const server = buildServer();
+  const userId = `agent-fallback-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    process.env.AGENT_RUNTIME_PLANNER_MOCK_THROW = "true";
+
+    const turn1 = await send(server, userId, "something totally unscripted");
+    assert.equal(turn1.debug.plannerUsed, "fallback");
+    assert.equal(turn1.debug.llmPlannerAttempted, true);
+    assert.equal(turn1.debug.llmPlannerUsed, false);
+    assert.ok(turn1.reply.length > 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: progress logging golden transcript, and topic updates progress -> memory -> gmail", async () => {
+  const server = buildServer();
+  const userId = `agent-progress-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "progress_log",
+      intent: "log_progress",
+      operations: [
+        op("event.log_job_applications", { count: 2 }, "2 CVs sent"),
+        op("event.log_workout", { minutes: 45 }, "45 minutes training")
+      ],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "I logged: 2 CVs sent, 45 minutes of training."
+    });
+    const turn1 = await send(server, userId, "I sent two CVs and trained 45 minutes");
+    assert.match(turn1.reply, /2 CVs/i);
+    assert.match(turn1.reply, /45 minutes/i);
+    assert.equal(turn1.operationsExecuted.length, 2);
+    assert.ok(turn1.operationsExecuted.every((executed: { status: string }) => executed.status === "executed"));
+    assert.equal(turn1.debug.mutationExecuted, true);
+    assert.equal(turn1.debug.conversationTopic, "progress_logging");
+
+    const applicationCount = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+    const workoutCount = await prisma.event.count({ where: { userId, type: "health.workout_completed" } });
+    assert.equal(applicationCount, 2);
+    assert.equal(workoutCount, 1);
+
+    mockPlan({
+      topic: "progress_log",
+      intent: "answer_recent_changes",
+      operations: [op("operator.recent_changes")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn2 = await send(server, userId, "qué has cambiado?");
+    assert.match(turn2.reply, /2 job application/i);
+    assert.match(turn2.reply, /45 minutes/i);
+    // operator.recent_changes ran this turn, so ground-truth inference reclassifies the
+    // topic to reflect that (an operator/summary interaction), rather than blindly
+    // repeating "progress_logging" from the prior turn.
+    assert.equal(turn2.debug.conversationTopic, "operator_summary");
+
+    mockPlan({
+      topic: "irrelevant_label_the_llm_might_repeat",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "Prefers blunt feedback" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "Got it — I'll remember that."
+    });
+    const turn3 = await send(server, userId, "remember I prefer blunt feedback");
+    assert.equal(turn3.debug.conversationTopic, "memory");
+
+    mockPlan({
+      topic: "irrelevant_label_the_llm_might_repeat",
+      intent: "list_rules",
+      operations: [op("gmail.rule.list")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const turn4 = await send(server, userId, "what email rules are active?");
+    assert.equal(turn4.debug.conversationTopic, "gmail_rules");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("agent/message: operationsExecuted omits raw DB rows by default, includes them only with debugRaw", async () => {
+  const server = buildServer();
+  const userId = `agent-debugraw-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "Prefers blunt feedback" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const defaultTurn = await send(server, userId, "remember I prefer blunt feedback", false);
+    assert.equal(defaultTurn.operationsExecuted[0].status, "executed");
+    assert.equal(defaultTurn.operationsExecuted[0].result, undefined, "default response must not leak raw DB rows");
+    assert.ok(defaultTurn.operationsExecuted[0].summary.length > 0);
+
+    mockPlan({
+      topic: "memory",
+      intent: "recall_memory",
+      operations: [op("memory.search", { query: "blunt" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const rawTurn = await send(server, userId, "what did you remember?", true);
+    assert.equal(rawTurn.operationsExecuted[0].status, "executed");
+    assert.ok(Array.isArray(rawTurn.operationsExecuted[0].result), "debugRaw:true must include the raw DB result");
+    assert.equal(rawTurn.operationsExecuted[0].result[0].summary, "Prefers blunt feedback");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
