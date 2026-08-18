@@ -343,7 +343,7 @@ Reachability confirmed via precise import-path grep (`conversation/<name>.js`, n
 
 **Files NOT deleted (still used elsewhere), and why:**
 - `apps/api/src/conversation/gmail-autonomy.ts`, `apps/api/src/conversation/email-rule-selection.ts` — unrelated to v2, still imported by legacy Gmail conversation handling in `server.ts`.
-- `packages/llm/src/operation-planner.ts` — a distinct file (same basename, different package) that only `orchestrator-v2.ts` imported from. Now unreachable too, but left in place: out of this pass's explicit scope (`apps/api/src/conversation/`, not `packages/llm/`), and cross-package deletions carry more risk than this pass's mandate covers. Flagged as the next cleanup target below.
+- `packages/llm/src/operation-planner.ts` — a distinct file (same basename, different package) that only `orchestrator-v2.ts` imported from. Was unreachable, out of this pass's explicit scope — deleted in a dedicated follow-up pass; see "LLM Operation-Planner Package Cleanup" below.
 - `packages/core/src/message-processing.ts`'s `ProcessMessageResult.routeDebug` schema — the v2-specific optional fields (`v2Enabled`, `llmOperationPlannerEnabled`, `v2SkippedReason`, `operationPlanValidated`) were left defined rather than removed from the schema, since they're optional and harmless, and touching a shared response schema is a larger blast radius than this pass needed.
 - Also newly-orphaned and deleted from `server.ts` itself (not files, but functions that existed only to wire into v2's callback interface, confirmed via grep to have zero other callers): `buildOperationPlannerStateSummary`, `logProgressFromConversationMessage`, `createMemoryFromConversationMessage`, `formatMemorySummaryForUser`, `formatConversationProgressEventDone`, `formatConversationProgressEventStatus`, `rememberRecentMutationStatus`. Their own internal dependencies (`formatMultiIntentEventDone`, `getPendingEmailReviewCount`, etc.) were checked individually and confirmed to have independent live callers elsewhere in `server.ts`, so those stayed.
 
@@ -353,7 +353,31 @@ Reachability confirmed via precise import-path grep (`conversation/<name>.js`, n
 
 **What's unchanged:** `/agent/message`, Telegram normal chat v3, Telegram slash commands, `/messages/process` (still legacy, still exists, now permanently running only the deterministic/semantic pipeline that was already its fallback), Gmail OAuth/sync, pending-actions routes, memory/checkin/insights routes.
 
-**Next cleanup target:** `packages/llm/src/operation-planner.ts` (the LLM-calling half of v2's operation planner, now unreachable — flagged above, deliberately left for a dedicated pass since it's outside `apps/api/src/conversation/`). After that, the Gmail-rules and action-hygiene "migrate-first" work already queued in the Server.ts Map section is next in line, same as before this pass.
+**Next cleanup target:** ~~`packages/llm/src/operation-planner.ts`~~ — **deleted**, see "LLM Operation-Planner Package Cleanup" below. After that, the Gmail-rules and action-hygiene "migrate-first" work already queued in the Server.ts Map section is next in line, same as before this pass.
+
+## LLM Operation-Planner Package Cleanup
+
+Executes the deletion flagged at the end of "Conversation Orchestrator v2 — Full Retirement" above: `packages/llm/src/operation-planner.ts` was left in place during that pass since it's a different package (`packages/llm`, not `apps/api/src/conversation/`) and out of that pass's explicit scope. This pass verified and deleted it.
+
+**References found:**
+- `planConversationOperationsWithLLM` and its two interfaces (`PlanConversationOperationsWithLLMInput`, `PlanConversationOperationsWithLLMOptions`): defined only in this file, called/used nowhere else in `apps/`, `packages/`, or `tests/` — confirmed via `rg` across the whole repo.
+- `packages/llm/src/index.ts` re-exported the file (`export * from "./operation-planner.js"`), but nothing consumed that export — no `apps/*` package, `packages/*` package, or test imported these symbols through `@operator-agent/llm`.
+- `LLM_OPERATION_PLANNER_MOCK_DELAY_MS`, `LLM_OPERATION_PLANNER_MOCK_THROW`, `LLM_OPERATION_PLANNER_MOCK_RESPONSE`, `LLM_OPERATION_PLANNER_MODEL`, and the `CONVERSATION_ORCHESTRATOR_V2_MOCK_RESPONSE`/`CONVERSATION_ORCHESTRATOR_V2_MODEL` fallbacks: all read only inside this now-deleted file. Confirmed distinct from Agent Runtime v3's own planner env vars (`AGENT_RUNTIME_PLANNER_MOCK_*`, `AGENT_RUNTIME_PLANNER_MODEL` in `apps/api/src/agent-runtime/planner.ts`) — completely separate namespace, zero risk of confusing the two.
+- Agent Runtime v3's planner (`apps/api/src/agent-runtime/planner.ts`) imports only `createOpenAIClient` from `@operator-agent/llm` — a different, unrelated file (`openai-client.ts`) that this deletion does not touch.
+- No test file imported this file directly or via the package export.
+- Docs mentioning it: this file (multiple sections, corrected in this pass).
+
+**Files deleted:** `packages/llm/src/operation-planner.ts`.
+
+**Package exports changed:** `export * from "./operation-planner.js";` removed from `packages/llm/src/index.ts`. No consumer broke — confirmed via a full `pnpm typecheck` across all 6 workspace packages after the change.
+
+**Tests removed/updated:** none — no test ever covered this file.
+
+**New unreachable code discovered, not deleted (out of this pass's scope):** while tracing this file's imports, `ConversationOperationNameSchema`, `ConversationVisibleEntityTypeSchema`, `ConversationOperationPlan`, `normalizeConversationOperationPlan`, and the rest of `packages/core/src/conversation-orchestrator.ts` (171 lines, re-exported from `packages/core/src/index.ts`) turned out to have **zero remaining consumers anywhere** now that both `apps/api/src/conversation/orchestrator-v2.ts` and `packages/llm/src/operation-planner.ts` are gone — the only file that ever imported these symbols was the operation-planner file just deleted. This is a third package (`@operator-agent/core`, the most widely-depended-on package in the monorepo) and was never named in this task's scope, so it was left untouched rather than deleted opportunistically. Flagged as the next cleanup target.
+
+**What's unchanged:** `/agent/message`, Telegram normal chat v3, slash commands, `/messages/process` legacy behavior, Gmail OAuth/sync, pending-actions routes.
+
+**Next cleanup target:** `packages/core/src/conversation-orchestrator.ts` — now fully unreachable, confirmed via `rg` (zero importers outside itself and the deleted operation-planner file), but deserves its own dedicated, scoped pass rather than being folded into this one, both because it's a different package boundary and because `@operator-agent/core` is imported by every app in the monorepo, so any mistake there has the widest blast radius of any deletion in this whole cleanup series. After that, the Gmail-rules and action-hygiene "migrate-first" work already queued in the Server.ts Map section remains next in line.
 
 ## Migration Rule
 
