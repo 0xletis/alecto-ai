@@ -1,13 +1,5 @@
 import { loadContext } from "./context-loader.js";
-import {
-  appendMessage,
-  createPendingOperationRecord,
-  getSession,
-  recordMutation,
-  setPendingOperation,
-  setTopic,
-  setVisibleEntities
-} from "./conversation-session.js";
+import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
 import { planMessage } from "./planner.js";
 import { composeReply, summarizePendingOperations } from "./response-composer.js";
@@ -20,6 +12,7 @@ import type {
   AgentMessageRequest,
   AgentMessageResponse,
   AgentPendingOperation,
+  AgentSessionState,
   ContextBundle,
   ExecutedOperation,
   PlannedOperation
@@ -76,13 +69,13 @@ export async function handleAgentMessage(request: AgentMessageRequest): Promise<
 }
 
 async function processAgentMessage(request: AgentMessageRequest): Promise<AgentMessageResponse> {
-  const { userId, message } = request;
-  const context = await loadContext(userId);
-  appendMessage(userId, "user", message);
+  const { userId, message, channel } = request;
+  const context = await loadContext(userId, channel);
+  appendMessage(context.session, "user", message);
 
   const guardrail = checkPolicyGuardrail(message, context.operatingProfile);
   if (guardrail.triggered) {
-    return finalize(userId, {
+    return finalize(context, {
       reply:
         "This touches something you've asked me to be careful about. I'm not going to act on it automatically — let's slow down and talk it through first.",
       operationsPlanned: [],
@@ -102,16 +95,16 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
   // "nothing pending" reply instead of falling through to the LLM planner, which has been
   // observed to invent an unrelated action (e.g. listing Gmail rules) for a lone "yes".
   if (CONFIRM_WHITELIST.has(normalized)) {
-    return pending ? finalizeDeterministicConfirmation(userId, context) : finalizeNoPendingReply(userId, context, "confirmation.confirm");
+    return pending ? finalizeDeterministicConfirmation(context) : finalizeNoPendingReply(context, "confirmation.confirm");
   }
   if (CANCEL_WHITELIST.has(normalized)) {
-    return pending ? finalizeDeterministicCancellation(userId, context) : finalizeNoPendingReply(userId, context, "confirmation.cancel");
+    return pending ? finalizeDeterministicCancellation(context) : finalizeNoPendingReply(context, "confirmation.cancel");
   }
 
   if (UNSUPPORTED_GMAIL_ACTION_RE.test(message.trim())) {
     // Deliberately does not touch pendingOperation: an unrelated, unsupported
     // request must not silently cancel or continue an unrelated pending flow.
-    return finalize(userId, {
+    return finalize(context, {
       reply: UNSUPPORTED_GMAIL_ACTION_REPLY,
       operationsPlanned: [],
       executedOps: [],
@@ -126,7 +119,7 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
     const pendingGmailRule = pending.operations.find((op) => op.tool === "gmail.rule.create");
     if (pendingGmailRule && GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE.test(message.trim())) {
       const label = String(pendingGmailRule.args.label ?? "this");
-      return finalize(userId, {
+      return finalize(context, {
         reply: `I can notify you when a manual or scheduled Gmail check creates a review for ${label}. This is not instant email arrival tracking. Matches go to email reviews first. Confirm creating this rule?`,
         operationsPlanned: [],
         executedOps: [],
@@ -148,7 +141,7 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
   // checked on the raw validated ops (any status), so it also blocks a plan that tries to
   // re-propose gmail.rule.create instead of emitting a genuine confirmation.
   if (pending && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
-    return finalize(userId, {
+    return finalize(context, {
       reply: `You still have a pending confirmation for ${pending.summary}. Confirm, cancel, or tell me a new request.`,
       operationsPlanned: plan.operations,
       executedOps: [],
@@ -180,13 +173,13 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
     clarificationQuestion = String(askMeta.args.question ?? "Could you clarify what you mean?");
   } else {
     executedOps = await Promise.all(executableOps.map((op) => executeOperation(userId, op, context, message)));
-    applyExecutionSideEffects(userId, executedOps);
+    applyExecutionSideEffects(context.session, executedOps);
 
     // pendingConfirmationOps can only be non-empty here when `pending` was null (the firewall
     // above already returned for any mutation attempt while a pending operation exists).
     if (pendingConfirmationOps.length > 0) {
       const summary = summarizePendingOperations(pendingConfirmationOps);
-      setPendingOperation(userId, createPendingOperationRecord(topic, summary, pendingConfirmationOps));
+      setPendingOperation(context.session, createPendingOperationRecord(topic, summary, pendingConfirmationOps));
     }
 
     if (referenceClarifications.length > 0) {
@@ -202,7 +195,7 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
     problemOps
   });
 
-  return finalize(userId, {
+  return finalize(context, {
     reply,
     operationsPlanned: plan.operations,
     executedOps,
@@ -217,8 +210,8 @@ function normalizeExactMessage(message: string): string {
   return message.trim().toLowerCase().replace(/[.!]+$/, "");
 }
 
-function finalizeNoPendingReply(userId: string, context: ContextBundle, tool: string): AgentMessageResponse {
-  return finalize(userId, {
+async function finalizeNoPendingReply(context: ContextBundle, tool: string): Promise<AgentMessageResponse> {
+  return finalize(context, {
     reply: NO_PENDING_REPLY,
     operationsPlanned: [],
     executedOps: [{ tool, status: "skipped", summary: NO_PENDING_REPLY }],
@@ -229,7 +222,8 @@ function finalizeNoPendingReply(userId: string, context: ContextBundle, tool: st
   });
 }
 
-async function finalizeDeterministicConfirmation(userId: string, context: ContextBundle): Promise<AgentMessageResponse> {
+async function finalizeDeterministicConfirmation(context: ContextBundle): Promise<AgentMessageResponse> {
+  const { userId } = context.session;
   const pending = context.session.pendingOperation as AgentPendingOperation;
 
   const revalidated = pending.operations.map((op) => revalidateForExecution(op));
@@ -237,8 +231,8 @@ async function finalizeDeterministicConfirmation(userId: string, context: Contex
   const brokenOps = revalidated.filter((op) => op.status !== "valid");
 
   const executedOps = await Promise.all(readyOps.map((op) => executeOperation(userId, op, context, `[confirmed] ${pending.summary}`)));
-  applyExecutionSideEffects(userId, executedOps);
-  setPendingOperation(userId, null);
+  applyExecutionSideEffects(context.session, executedOps);
+  setPendingOperation(context.session, null);
 
   const reply = composeReply({
     replyDraft: "",
@@ -247,7 +241,7 @@ async function finalizeDeterministicConfirmation(userId: string, context: Contex
     problemOps: brokenOps
   });
 
-  return finalize(userId, {
+  return finalize(context, {
     reply,
     operationsPlanned: pending.operations.map((op) => ({ tool: op.tool, args: op.args })),
     executedOps,
@@ -258,13 +252,13 @@ async function finalizeDeterministicConfirmation(userId: string, context: Contex
   });
 }
 
-function finalizeDeterministicCancellation(userId: string, context: ContextBundle): AgentMessageResponse {
+async function finalizeDeterministicCancellation(context: ContextBundle): Promise<AgentMessageResponse> {
   const pending = context.session.pendingOperation as AgentPendingOperation;
-  setPendingOperation(userId, null);
+  setPendingOperation(context.session, null);
 
   const reply = "Cancelled — I won't do that.";
 
-  return finalize(userId, {
+  return finalize(context, {
     reply,
     operationsPlanned: [],
     executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: reply }],
@@ -285,10 +279,13 @@ interface FinalizeInput {
   topic: string | null;
 }
 
-function finalize(userId: string, input: FinalizeInput): AgentMessageResponse {
-  setTopic(userId, input.topic);
-  appendMessage(userId, "assistant", input.reply);
-  const needsConfirmation = Boolean(getSession(userId).pendingOperation);
+async function finalize(context: ContextBundle, input: FinalizeInput): Promise<AgentMessageResponse> {
+  const { session } = context;
+  setTopic(session, input.topic);
+  appendMessage(session, "assistant", input.reply);
+  const needsConfirmation = Boolean(session.pendingOperation);
+
+  await saveSession(session);
 
   return {
     reply: input.reply,
@@ -340,7 +337,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
   return null;
 }
 
-function applyExecutionSideEffects(userId: string, executedOps: ExecutedOperation[]): void {
+function applyExecutionSideEffects(session: AgentSessionState, executedOps: ExecutedOperation[]): void {
   const entities: AgentEntity[] = [];
 
   for (const op of executedOps) {
@@ -348,7 +345,7 @@ function applyExecutionSideEffects(userId: string, executedOps: ExecutedOperatio
     // executions here (e.g. operator.recent_changes itself) makes a "what changed?"
     // answer recurse into and duplicate its own prior answer on the next call.
     if (op.status === "executed" && getToolDefinition(op.tool)?.mutates === true) {
-      recordMutation(userId, op.summary);
+      recordMutation(session, op.summary);
     }
     if (op.entities) {
       entities.push(...op.entities);
@@ -356,7 +353,7 @@ function applyExecutionSideEffects(userId: string, executedOps: ExecutedOperatio
   }
 
   if (entities.length > 0) {
-    setVisibleEntities(userId, dedupeEntities(entities));
+    setVisibleEntities(session, dedupeEntities(entities));
   }
 }
 

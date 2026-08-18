@@ -118,6 +118,7 @@ export interface AgentSessionMessage {
 
 export interface AgentSessionState {
   userId: string;
+  channel: string;
   messages: AgentSessionMessage[];
   topic: string | null;
   pendingOperation: AgentPendingOperation | null;

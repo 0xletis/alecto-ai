@@ -134,7 +134,8 @@ TELEGRAM_AGENT_RUNTIME_V3_ENABLED=true
 
 - Slash commands (`/start`, `/help`, `/setup`, `/sync_gmail`, `/gmail_status`, `/gmail_rules`, etc.) and all Gmail OAuth/setup/sync flows keep using the existing behavior unchanged, flag on or off.
 - If v3 errors, the bot replies with a short dev-safe message and logs the error — it does not fall back to `/messages/process`, so bugs stay visible instead of being silently masked.
-- Agent Runtime v3's conversation/session state is still in-memory and per-process (see `apps/api/src/agent-runtime/conversation-session.ts`); it does not survive an API restart. This flag is for dev/local testing only, not a production default.
+- Agent Runtime v3's conversation/session state is now **persisted** in the `AgentConversationSession` table (one row per `userId` + `channel`) instead of an in-memory `Map` — topic, pending confirmation, visible entities, recent mutations, and a bounded message history (last 20) all survive an API restart. A pending confirmation created before a restart can still be confirmed (`yes`) or cancelled (`no`/`cancel`) afterward. Each session has a sliding 24h TTL, refreshed on every turn; an expired session is treated as missing, so a stale pending confirmation can never execute — replying `yes` to one just gets "I don't have anything pending to confirm." See `apps/api/src/agent-runtime/session-store.ts` (DB mapping) and `conversation-session.ts` (per-turn load/mutate/save).
+- The per-user in-memory lock (`apps/api/src/agent-runtime/user-lock.ts`) still serializes same-user turns end-to-end (including the DB read/write) — different users still process fully concurrently. DB persistence does not replace it.
 - Leave the flag unset or `false` for normal use — Telegram behavior is unchanged.
 
 ## Product Surfaces
