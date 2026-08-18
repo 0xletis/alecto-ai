@@ -96,7 +96,7 @@ Route debug contract:
 
 `apps/api/src/server.ts` remains oversized.
 
-Current line count after this audit pass: 17,440 lines (down from 17,903 — see the `server-types.ts` extraction below).
+Current line count after this audit pass: 17,380 lines (down from 17,903 at the start of the type-extraction pass; 17,440 after that pass, 17,380 after this route-extraction pass — see below).
 
 Known extracted modules:
 
@@ -109,23 +109,29 @@ Known extracted modules:
 - `apps/api/src/conversation/response-composer.ts`: execution-result response composition.
 - `apps/api/src/conversation/gmail-autonomy.ts`: Gmail setup/autonomy state formatting.
 - `apps/api/src/conversation/email-rule-selection.ts`: Gmail rule target selection helpers.
-- `apps/api/src/server-types.ts` (new): 39 pure type/interface declarations extracted from server.ts's private helper zone — daily-brief/operator-attention, weekly review, action hygiene, next-week planning, daily coach, and Gmail/GitHub sync shapes. Zero behavior change (types are erased at compile time); `sanitizeActionItem`, `buildConversationControlDebugForUser`, and `PlanWindowKind` were exported from server.ts (previously private) purely so this file can reference them in `typeof`/`ReturnType` positions. −463 net lines in server.ts.
+- `apps/api/src/server-types.ts`: 39 pure type/interface declarations extracted from server.ts's private helper zone — daily-brief/operator-attention, weekly review, action hygiene, next-week planning, daily coach, and Gmail/GitHub sync shapes. Zero behavior change (types are erased at compile time); `sanitizeActionItem`, `buildConversationControlDebugForUser`, and `PlanWindowKind` were exported from server.ts (previously private) purely so this file can reference them in `typeof`/`ReturnType` positions. −463 net lines in server.ts.
+- `apps/api/src/routes/memory.ts` (new, server cleanup phase 1): the three `/users/:userId/memory*` routes (list/create/archive), moved verbatim. Zero server.ts-private helper dependencies, so zero circular-import risk. Registered via `registerMemoryRoutes(server)`.
+- `apps/api/src/routes/notification-settings.ts` (new, server cleanup phase 1): the two `/users/:userId/notification-settings` routes (get-or-create/update), moved verbatim. Same zero-dependency, zero-circular-import profile. Registered via `registerNotificationSettingsRoutes(server)`.
+- −60 net lines in server.ts from this pass (43 + 19 lines of route code removed, 2 lines of unused schema imports removed, 4 lines of import/register calls added).
 
 High-density areas that still live in `server.ts`:
 
-- Route registration for domain APIs.
+- Route registration for domain APIs (actions, goals, events, Gmail OAuth/sync/rules/reviews, daily loop, weekly review, planning, insights, conversation-control — everything except memory and notification-settings now).
 - Telegram-facing text formatting.
 - Gmail OAuth/sync/rule/review orchestration.
 - Daily loop, action hygiene, planning, and weekly review composition.
 - Legacy semantic routing and deterministic phrase routing.
 - Callback glue for Conversation Orchestrator v2.
+- The inline `/messages/process`/`/messages/process_v2` handler bodies passed into `registerMessageRoutes(...)` (route registration itself is in `routes/messages.ts`, but the callbacks still live in server.ts and depend on 10+ private helpers plus the legacy semantic/deterministic-surface routers directly — confirmed high risk to extract without a circular import back into server.ts; left in place).
 
-Recommended next extraction target:
+Recommended next extraction target (in safety order, re-verified during the phase-1 pass):
 
-1. Move conversation-facing Gmail rule and Gmail status handlers into `apps/api/src/conversation/gmail-rules.ts`.
-2. Move action hygiene session creation/formatting into `apps/api/src/actions/hygiene.ts`.
-3. Move planning session handlers into `apps/api/src/planning/`.
-4. Move route registration for actions/goals/events/integrations into `apps/api/src/routes/` one surface at a time.
+1. `checkins-prompt/ingest` routes (`GET /checkins/daily/prompt`, `POST /ingest/text`, `POST /ingest/job-search-text`) — only 2 local helper deps (`ingestText`, `isRecord`); verify `isRecord` isn't used broadly enough elsewhere to force a circular import before extracting.
+2. `insights` and `pending-actions` route groups — low dependency count (5 and 2), no Gmail/legacy-routing entanglement confirmed.
+3. Move conversation-facing Gmail rule and Gmail status handlers into `apps/api/src/conversation/gmail-rules.ts` — confirmed Gmail-tangled (OAuth token exchange, Gmail API calls), higher risk, do only with dedicated time.
+4. Move action hygiene session creation/formatting into `apps/api/src/actions/hygiene.ts` — 14+ local helper deps including Telegram-facing reply formatters; do only with dedicated time and by moving the formatters too (not leaving them behind, which would force a circular import).
+5. Move planning session handlers into `apps/api/src/planning/`.
+6. The `/messages/process` inline handler bodies are the least safe candidate in the file (10+ deps, direct calls into the legacy semantic/deterministic-surface routers) — do not attempt without a dedicated, carefully-scoped pass.
 
 ## Legacy And Split-Brain Risks
 

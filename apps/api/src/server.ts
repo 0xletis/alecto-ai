@@ -46,7 +46,6 @@ import {
   emailAdapterRegistry,
   getEmailAdapterDefinition,
   integrationRegistry,
-  CreateMemoryInputSchema,
   PendingMemoryCreatePayloadSchema,
   processMessage,
   processMessageFromAnalysis,
@@ -66,7 +65,6 @@ import {
   writeGmailAutonomyPreferences,
   writeGmailBackgroundSyncAttempt,
   UpdateIntegrationConnectionInputSchema,
-  UpdateNotificationSettingsInputSchema,
   UpdateUserOperatingProfileInputSchema,
   type IngestTextBody,
   type GithubPublicConnectionInput,
@@ -219,6 +217,8 @@ import {
 import { shouldUseLLMOperationPlanner } from "./conversation/operation-planner.js";
 import { registerMessageRoutes } from "./routes/messages.js";
 import { registerAgentRoutes, defaultAgentRouteHandlers } from "./routes/agent.js";
+import { registerMemoryRoutes } from "./routes/memory.js";
+import { registerNotificationSettingsRoutes } from "./routes/notification-settings.js";
 import type {
   ActionHygieneAction,
   ActionHygieneOption,
@@ -304,6 +304,8 @@ export function buildServer() {
   });
 
   registerAgentRoutes(server, defaultAgentRouteHandlers());
+  registerMemoryRoutes(server);
+  registerNotificationSettingsRoutes(server);
 
   registerMessageRoutes(server, {
     processV2: async (input) => {
@@ -834,49 +836,6 @@ export function buildServer() {
     }
   );
 
-  server.get<{ Params: { userId: string }; Querystring: { includeArchived?: string } }>(
-    "/users/:userId/memory",
-    async (request) => ({
-      memories:
-        request.query.includeArchived === "true"
-          ? await getMemories(request.params.userId)
-          : await getActiveMemories(request.params.userId)
-    })
-  );
-
-  server.post<{ Params: { userId: string } }>("/users/:userId/memory", async (request, reply) => {
-    const parsed = CreateMemoryInputSchema.safeParse(request.body);
-
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid request body",
-        issues: parsed.error.issues
-      });
-    }
-
-    return {
-      memory: await createMemory(request.params.userId, {
-        ...parsed.data,
-        source: "manual"
-      })
-    };
-  });
-
-  server.patch<{ Params: { userId: string; memoryId: string } }>(
-    "/users/:userId/memory/:memoryId/archive",
-    async (request, reply) => {
-      const memory = await archiveMemory(request.params.userId, request.params.memoryId);
-
-      if (!memory) {
-        return reply.status(404).send({
-          error: "Memory not found"
-        });
-      }
-
-      return { memory };
-    }
-  );
-
   server.post<{ Params: { userId: string }; Querystring: { now?: string } }>("/users/:userId/reflections/generate", async (request) => {
     const timezone = await getUserTimezone(request.params.userId);
     const now = parseOptionalNow(request.query.now) ?? new Date();
@@ -1032,25 +991,6 @@ export function buildServer() {
       };
     }
   );
-
-  server.get<{ Params: { userId: string } }>("/users/:userId/notification-settings", async (request) => ({
-    notificationSettings: await getOrCreateNotificationSettings(request.params.userId)
-  }));
-
-  server.patch<{ Params: { userId: string } }>("/users/:userId/notification-settings", async (request, reply) => {
-    const parsed = UpdateNotificationSettingsInputSchema.safeParse(request.body);
-
-    if (!parsed.success) {
-      return reply.status(400).send({
-        error: "Invalid request body",
-        issues: parsed.error.issues
-      });
-    }
-
-    return {
-      notificationSettings: await updateNotificationSettings(request.params.userId, parsed.data)
-    };
-  });
 
   server.get<{ Params: { userId: string } }>("/users/:userId/pending-actions", async (request) => ({
     pendingActions: await getPendingActions(request.params.userId)
