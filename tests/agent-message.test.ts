@@ -64,18 +64,14 @@ test("agent/message: gmail rule creation golden transcript — 'yes' executes de
     // Topic is derived from the tool that was actually planned (ground truth), not the LLM's freeform label.
     assert.equal(turn1.debug.conversationTopic, "gmail_rule_creation");
 
-    mockPlan({
-      topic: "gmail_tracking_endesa",
-      intent: "explain_notification_behavior",
-      operations: [],
-      needsClarification: false,
-      clarificationQuestion: null,
-      replyDraft:
-        "I can notify you after a scheduled or manual Gmail check creates a review, not the instant an email arrives."
-    });
+    // No mockPlan here on purpose: the pending-Gmail-followup phrasing is now handled
+    // deterministically, before the planner is ever invoked.
     const turn2 = await send(server, userId, "let me know when I receive one");
     assert.match(turn2.reply, /scheduled|manual/i);
-    assert.match(turn2.reply, /not the instant/i);
+    assert.match(turn2.reply, /not instant/i);
+    assert.match(turn2.reply, /Endesa bills/i);
+    assert.equal(turn2.debug.plannerUsed, "none");
+    assert.equal(turn2.operationsExecuted.length, 0);
     assert.equal(turn2.needsConfirmation, true, "pending rule confirmation must still be open");
     assert.equal(turn2.debug.conversationTopic, "gmail_rule_creation", "no operations this turn — topic must not go stale/drift");
 
@@ -578,6 +574,338 @@ test("agent/message: operationsExecuted omits raw DB rows by default, includes t
     assert.equal(rawTurn.operationsExecuted[0].status, "executed");
     assert.ok(Array.isArray(rawTurn.operationsExecuted[0].result), "debugRaw:true must include the raw DB result");
     assert.equal(rawTurn.operationsExecuted[0].result[0].summary, "Prefers blunt feedback");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+async function seedGmailUser(userId: string): Promise<void> {
+  await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+  await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+}
+
+function mockAiguesGmailRulePlan(): void {
+  mockPlan({
+    topic: "gmail_tracking_aigues",
+    intent: "create_review_first_gmail_rule",
+    operations: [op("gmail.rule.create", { label: "Aigues de Barcelona invoices" })],
+    needsClarification: false,
+    clarificationQuestion: null,
+    replyDraft: "I can create a review-first Gmail tracking rule for Aigues de Barcelona invoices. Would you like to proceed?"
+  });
+}
+
+// Test A (real HTTP layer): two same-user /agent/message calls fired without waiting for the
+// first to finish must still process in order, and the second must see the first's session
+// changes (the pending confirmation it created) rather than racing past it. See also
+// tests/agent-runtime-user-lock.test.ts for a fast, dependency-free unit proof of the
+// underlying primitive.
+test("agent/message: per-user serialization — concurrent calls process in order for the same user", async () => {
+  const server = buildServer();
+  const userId = `agent-serialize-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    process.env.AGENT_RUNTIME_PLANNER_MOCK_DELAY_MS = "150";
+    mockAiguesGmailRulePlan();
+
+    const call1 = send(server, userId, "track Aigues de Barcelona invoices from Gmail");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    delete process.env.AGENT_RUNTIME_PLANNER_MOCK_DELAY_MS; // "yes" is deterministic and never touches the planner anyway
+    const call2 = send(server, userId, "yes");
+
+    const [result1, result2] = await Promise.all([call1, call2]);
+
+    assert.equal(result1.debug.pendingOperation, true, "first message must finish creating the pending confirmation");
+    assert.equal(
+      result2.debug.mutationExecuted,
+      true,
+      "second message ('yes') must see the pending operation the first message created, not race past it"
+    );
+    assert.equal(result2.operationsExecuted[0]?.tool, "gmail.rule.create");
+    assert.equal(result2.operationsExecuted[0]?.status, "executed");
+
+    const rules = await prisma.emailSignalRule.findMany({ where: { userId } });
+    assert.equal(rules.length, 1, "exactly one rule should exist — no duplicate/racing execution");
+  } finally {
+    delete process.env.AGENT_RUNTIME_PLANNER_MOCK_DELAY_MS;
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test B: pending Gmail rule + notification-followup phrasing must not execute, not call
+// action.list, not ask a generic clarification, not dump Gmail setup — deterministic reply only.
+test("agent/message: pending Gmail rule + notification followup stays pending with a deterministic reply", async () => {
+  const server = buildServer();
+  const userId = `agent-gmail-followup-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    mockAiguesGmailRulePlan();
+    await send(server, userId, "track Aigues de Barcelona invoices from Gmail");
+
+    // No mockPlan: this phrasing must be handled deterministically, before the planner runs.
+    const followUp = await send(server, userId, "let me know when I receive one");
+
+    assert.equal(followUp.debug.plannerUsed, "none");
+    assert.equal(followUp.debug.mutationExecuted, false);
+    assert.equal(followUp.debug.pendingOperation, true);
+    assert.equal(followUp.operationsExecuted.length, 0);
+    assert.equal(followUp.operationsPlanned.length, 0, "no action.list or any other tool should have been planned");
+    assert.match(followUp.reply, /manual or scheduled/i);
+    assert.match(followUp.reply, /not instant/i);
+    assert.match(followUp.reply, /Aigues de Barcelona invoices/i);
+    assert.doesNotMatch(followUp.reply, /action item|found \d+ action/i, "must not bleed in an action.list result");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test C: a non-exact confirmation ("just let me know i wanna know") must never execute the
+// pending mutation, regardless of which deterministic guard catches it.
+test("agent/message: non-exact confirmation phrasing never executes the pending mutation", async () => {
+  const server = buildServer();
+  const userId = `agent-non-exact-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    mockAiguesGmailRulePlan();
+    await send(server, userId, "track Aigues de Barcelona invoices from Gmail");
+
+    const reply = await send(server, userId, "just let me know i wanna know");
+
+    assert.equal(reply.debug.mutationExecuted, false);
+    assert.equal(reply.debug.pendingOperation, true);
+    assert.equal(reply.operationsExecuted.length, 0);
+    assert.doesNotMatch(reply.reply, /tracking is on|has been created/i, "must never claim the rule was created");
+
+    const rules = await prisma.emailSignalRule.count({ where: { userId } });
+    assert.equal(rules, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test D: an exact "yes" against a real pending Gmail rule executes it and clears pending.
+test("agent/message: exact 'yes' executes the pending Gmail rule and clears pendingOperation", async () => {
+  const server = buildServer();
+  const userId = `agent-exact-yes-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    mockAiguesGmailRulePlan();
+    await send(server, userId, "track Aigues de Barcelona invoices from Gmail");
+
+    const confirmed = await send(server, userId, "yes");
+
+    assert.equal(confirmed.debug.mutationExecuted, true);
+    assert.equal(confirmed.debug.pendingOperation, false);
+    assert.equal(confirmed.needsConfirmation, false);
+
+    const rules = await prisma.emailSignalRule.findMany({ where: { userId } });
+    assert.equal(rules.length, 1);
+    assert.match(rules[0].name, /Aigues de Barcelona/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test E: exact "yes" with nothing pending must be a fixed deterministic reply, never reach
+// the LLM planner, never mutate.
+test("agent/message: exact 'yes' with no pending operation gives a fixed reply and never calls the planner", async () => {
+  const server = buildServer();
+  const userId = `agent-yes-no-pending-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    // No mockPlan on purpose — if this reached the planner it would throw (no OPENAI_API_KEY
+    // in test env) and fall back to the heuristic planner instead of failing loudly, which
+    // would silently hide a real routing bug. Asserting plannerUsed:"none" is the real proof.
+    const reply = await send(server, userId, "yes");
+
+    assert.equal(reply.reply, "I don't have anything pending to confirm.");
+    assert.equal(reply.debug.plannerUsed, "none");
+    assert.equal(reply.debug.llmPlannerAttempted, false);
+    assert.equal(reply.debug.mutationExecuted, false);
+    assert.ok(
+      reply.operationsExecuted.every((executed: { status: string }) => executed.status === "skipped"),
+      "no real tool executed — only a transparency entry noting there was nothing to confirm"
+    );
+
+    const eventCount = await prisma.event.count({ where: { userId } });
+    assert.equal(eventCount, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test F: a genuine read-only question while pending is answered normally, without touching
+// the pending confirmation.
+test("agent/message: read-only question during a pending confirmation answers without clearing pending", async () => {
+  const server = buildServer();
+  const userId = `agent-read-during-pending-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    mockAiguesGmailRulePlan();
+    await send(server, userId, "track Aigues de Barcelona invoices from Gmail");
+
+    mockPlan({
+      topic: "gmail_rules",
+      intent: "list_active_rules",
+      operations: [op("gmail.rule.list")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const reply = await send(server, userId, "what email rules are active?");
+
+    assert.equal(reply.debug.mutationExecuted, false);
+    assert.equal(reply.debug.pendingOperation, true, "the Aigues de Barcelona confirmation must still be pending");
+    assert.match(reply.reply, /active Gmail rule/i);
+
+    const rules = await prisma.emailSignalRule.count({ where: { userId } });
+    assert.equal(rules, 0, "the pending rule must not have been created as a side effect of a read question");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test G: an unsupported Gmail send/reply request during a pending confirmation refuses
+// safely and does not execute the pending mutation.
+test("agent/message: unsupported Gmail reply request during pending confirmation refuses without executing pending", async () => {
+  const server = buildServer();
+  const userId = `agent-unsupported-during-pending-${randomUUID()}`;
+
+  try {
+    await seedGmailUser(userId);
+    mockAiguesGmailRulePlan();
+    await send(server, userId, "track Aigues de Barcelona invoices from Gmail");
+
+    const reply = await send(server, userId, "reply to the Endesa email");
+
+    assert.match(reply.reply, /can't reply|isn't supported|not supported/i);
+    assert.equal(reply.debug.mutationExecuted, false);
+    assert.equal(reply.debug.pendingOperation, true);
+
+    const rules = await prisma.emailSignalRule.count({ where: { userId } });
+    assert.equal(rules, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Test H: "what changed" is a clean bulleted list from ground truth, never a raw
+// semicolon-joined dump, and never blended with an unrelated LLM paraphrase.
+test("agent/message: recent-changes composer produces a clean bulleted summary, no raw dump", async () => {
+  const server = buildServer();
+  const userId = `agent-recent-changes-clean-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "Prefers blunt feedback" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "Got it — I'll remember that."
+    });
+    await send(server, userId, "remember I prefer blunt feedback");
+
+    mockPlan({
+      topic: "progress_log",
+      intent: "log_progress",
+      operations: [
+        op("event.log_job_applications", { count: 2 }, "2 CVs sent"),
+        op("event.log_workout", { minutes: 45 }, "45 minutes training")
+      ],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: "Logged both."
+    });
+    await send(server, userId, "I sent two CVs and trained 45 minutes");
+
+    mockPlan({
+      topic: "progress_log",
+      intent: "answer_recent_changes",
+      operations: [op("operator.recent_changes")],
+      needsClarification: false,
+      clarificationQuestion: null,
+      // Deliberately a decoy that doesn't match ground truth, to prove the composer
+      // ignores replyDraft entirely for this tool rather than blending the two.
+      replyDraft: "He cambiado la configuración para recordar que prefieres comentarios directos."
+    });
+    const reply = await send(server, userId, "qué has cambiado?");
+
+    assert.doesNotMatch(reply.reply, /cambiado la configuración/i, "must not blend the LLM's decoy paraphrase into the answer");
+    assert.doesNotMatch(reply.reply, /;/, "must not be a raw semicolon-joined dump");
+    assert.match(reply.reply, /- .*(CV|application)/i);
+    assert.match(reply.reply, /- .*45 minutes/i);
+    assert.match(reply.reply, /- .*blunt feedback/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// Regression: operator.recent_changes is itself read-only and must never be recorded into
+// recentMutations — otherwise a second "what changed?" nests and duplicates the first answer.
+test("agent/message: asking 'what changed' twice in a row does not nest/duplicate the answer", async () => {
+  const server = buildServer();
+  const userId = `agent-recent-changes-idempotent-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+
+    mockPlan({
+      topic: "memory",
+      intent: "create_memory",
+      operations: [op("memory.create", { summary: "Prefers blunt feedback" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    await send(server, userId, "remember I prefer blunt feedback");
+
+    const recentChangesPlan = () =>
+      mockPlan({
+        topic: "operator_summary",
+        intent: "answer_recent_changes",
+        operations: [op("operator.recent_changes")],
+        needsClarification: false,
+        clarificationQuestion: null,
+        replyDraft: ""
+      });
+
+    recentChangesPlan();
+    const first = await send(server, userId, "what changed?");
+    assert.match(first.reply, /- .*blunt feedback/i);
+
+    recentChangesPlan();
+    const second = await send(server, userId, "what changed?");
+
+    assert.doesNotMatch(second.reply, /Here's what I've recorded:[\s\S]*Here's what I've recorded:/i, "must not nest a prior answer inside a new one");
+    assert.doesNotMatch(second.reply, /(blunt feedback[\s\S]*){2,}/i, "must not duplicate the same recorded item");
   } finally {
     clearMocks();
     await server.close();

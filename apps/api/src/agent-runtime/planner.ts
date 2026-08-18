@@ -24,6 +24,13 @@ async function planWithLLM(message: string, context: ContextBundle): Promise<Raw
     throw new Error("Mock agent-runtime planner failure.");
   }
 
+  // Test-only: simulates real LLM latency so tests can prove per-user request
+  // serialization without depending on network timing.
+  const mockDelayMs = Number(process.env.AGENT_RUNTIME_PLANNER_MOCK_DELAY_MS ?? 0);
+  if (Number.isFinite(mockDelayMs) && mockDelayMs > 0) {
+    await new Promise((resolve) => setTimeout(resolve, mockDelayMs));
+  }
+
   const mockResponse = process.env.AGENT_RUNTIME_PLANNER_MOCK_RESPONSE;
   if (mockResponse) {
     return normalizePlan(JSON.parse(mockResponse));
@@ -76,6 +83,7 @@ function buildSystemPrompt(): string {
     "- If the user refers to 'it'/'that'/'this' and exactly one matching entity is visible in context, omit the id field so the validator can resolve it; if it's ambiguous, use clarification.ask instead.",
     "- If the request is genuinely ambiguous or missing required information (e.g. 'track those emails' with no email topic in context), set needsClarification true and do not plan mutating operations.",
     "- gmail.rule.create always requires confirmation (the validator enforces this); explain what will happen and ask before it's created.",
+    "- For 'what changed?', 'what did you do?', 'qué has cambiado?', or similar, ALWAYS plan operator.recent_changes instead of answering from your own memory of the conversation — its result is verified ground truth and is shown to the user directly.",
     "- Keep replyDraft concise and specific about what you understood/did, in the user's own language.",
     "- Return only JSON matching the schema."
   ].join("\n");

@@ -124,6 +124,19 @@ Both the Telegram bot and worker need `TELEGRAM_BOT_TOKEN`. For local dev, remin
 
 Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each Telegram account has separate goals, events, and profile.
 
+### Agent Runtime v3 (dev flag)
+
+`TELEGRAM_AGENT_RUNTIME_V3_ENABLED=true` routes normal (non-command) Telegram text to the isolated Agent Runtime v3 (`POST /agent/message`) instead of the legacy `/messages/process` pipeline:
+
+```bash
+TELEGRAM_AGENT_RUNTIME_V3_ENABLED=true
+```
+
+- Slash commands (`/start`, `/help`, `/setup`, `/sync_gmail`, `/gmail_status`, `/gmail_rules`, etc.) and all Gmail OAuth/setup/sync flows keep using the existing behavior unchanged, flag on or off.
+- If v3 errors, the bot replies with a short dev-safe message and logs the error — it does not fall back to `/messages/process`, so bugs stay visible instead of being silently masked.
+- Agent Runtime v3's conversation/session state is still in-memory and per-process (see `apps/api/src/agent-runtime/conversation-session.ts`); it does not survive an API restart. This flag is for dev/local testing only, not a production default.
+- Leave the flag unset or `false` for normal use — Telegram behavior is unchanged.
+
 ## Product Surfaces
 
 Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `anything important?`, `what needs my attention?`, `what should I handle first?`, `what emails need action?`, `hay correos importantes de Gmail?`, `anything for my job search?`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, `what can Gmail track`, `what email rules are on`, `what email rules do we have`, `email reviews`, `correos pendientes`, `Gmail status`, `enable job search rule for Gmail`, `enable work action rule for Gmail`, `create a rule for Endesa bills`, `track Endesa bills from Gmail`, `only look for Endesa`, `looks for only Aigues de Barcelona instead of Endesa`, `que reglas de email tenemos activas`, `crea una regla de Gmail para facturas de Aigues de Barcelona`, `quan m'avisareu dels correus d'Endesa?`, `where will Endesa emails go?`, `when will you let me know about new emails?`, `remove Endesa rule`, `delete all email rules`, `sync Gmail`, or `sync integrations`. Slash commands remain shortcuts/backdoors for precision and debugging.

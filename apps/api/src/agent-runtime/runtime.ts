@@ -10,14 +10,16 @@ import {
 } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
 import { planMessage } from "./planner.js";
-import { composeReply } from "./response-composer.js";
+import { composeReply, summarizePendingOperations } from "./response-composer.js";
 import { getToolDefinition } from "./tool-catalog.js";
+import { runExclusive } from "./user-lock.js";
 import { checkPolicyGuardrail, revalidateForExecution, validateOperations } from "./validator.js";
 import type {
   AgentDebugInfo,
   AgentEntity,
   AgentMessageRequest,
   AgentMessageResponse,
+  AgentPendingOperation,
   ContextBundle,
   ExecutedOperation,
   PlannedOperation
@@ -25,23 +27,55 @@ import type {
 
 const META_TOOLS = new Set(["confirmation.confirm", "confirmation.cancel", "clarification.ask"]);
 
-// Anchored to the whole message so a compound reply like "yes but change the
-// label" — which is NOT a clean confirmation — falls through to the planner
-// instead of being blindly executed.
-const AFFIRMATION_RE = /^(yes|yep|yeah|yup|confirm|do it|go ahead|sí|si|vale|ok|okay)[.!]?$/i;
-const NEGATION_RE = /^(no|nope|nevermind|never mind|cancel|stop|don'?t)[.!]?$/i;
+// Exact, whitelisted, whole-message-only confirm/cancel vocabulary. Anything that doesn't
+// match exactly (after trimming/lowercasing/dropping a single trailing "."/"!") is NOT treated
+// as a confirmation or cancellation — it falls through to the pending-operation firewall below
+// or to the planner. This is deliberately much stricter than free-form affirmation detection:
+// a false "yes" that executes an unapproved mutation is a far worse failure than asking the
+// user to reply with an exact word.
+const CONFIRM_WHITELIST = new Set([
+  "yes",
+  "y",
+  "yep",
+  "confirm",
+  "do it",
+  "ok",
+  "okay",
+  "sure",
+  "vale",
+  "va",
+  "sí",
+  "si",
+  "perfecto",
+  "perfect"
+]);
+const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget it", "cancelar", "cancela"]);
+
+const NO_PENDING_REPLY = "I don't have anything pending to confirm.";
 
 // Deliberately narrow, hardcoded-safe pattern: Gmail send/reply/forward/delete
 // has no tool in the catalog at all, so this is enforced deterministically
 // rather than left to the planner's judgment — it must never depend on
-// whether the LLM correctly refuses in a given turn.
+// whether the LLM correctly refuses in a given turn. Runs unconditionally,
+// including while a pending operation is open, and never touches pendingOperation.
 const UNSUPPORTED_GMAIL_ACTION_RE =
   /\b(reply|respond|answer)\b[\s\S]{0,40}\b(email|mail|message|gmail)\b|\bsend\b[\s\S]{0,20}\b(email|mail|reply)\b|\bforward\b[\s\S]{0,20}\b(email|mail)\b|\b(delete|remove)\b[\s\S]{0,20}\b(email|mail)\b[\s\S]{0,20}\b(gmail|inbox)\b/i;
 
 const UNSUPPORTED_GMAIL_ACTION_REPLY =
   "I can't reply to Gmail messages or send emails yet. I can only read matching emails through active rules and create review items.";
 
+// Covers "let me know when I receive one/it arrives", "notify me when I get one", "just let
+// me know", "I wanna know", "about those emails", "when they arrive", and close paraphrases.
+// Only ever checked while the pending operation is specifically a gmail.rule.create — a narrow
+// enough gate that a broader phrase match here is safe.
+const GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE =
+  /\b(let me know|notify me|keep me posted|tell me)\b|\bi wanna know\b|\bi want to know\b|\bwhen (i receive|i get|it arrives|they arrive)\b|\babout (those|these|that) emails?\b/i;
+
 export async function handleAgentMessage(request: AgentMessageRequest): Promise<AgentMessageResponse> {
+  return runExclusive(request.userId, () => processAgentMessage(request));
+}
+
+async function processAgentMessage(request: AgentMessageRequest): Promise<AgentMessageResponse> {
   const { userId, message } = request;
   const context = await loadContext(userId);
   appendMessage(userId, "user", message);
@@ -60,18 +94,21 @@ export async function handleAgentMessage(request: AgentMessageRequest): Promise<
     });
   }
 
-  const trimmedMessage = message.trim();
+  const pending = context.session.pendingOperation;
+  const normalized = normalizeExactMessage(message);
 
-  if (context.session.pendingOperation) {
-    if (AFFIRMATION_RE.test(trimmedMessage)) {
-      return finalizeDeterministicConfirmation(userId, context);
-    }
-    if (NEGATION_RE.test(trimmedMessage)) {
-      return finalizeDeterministicCancellation(userId, context);
-    }
+  // Exact confirm/cancel is checked FIRST and ALWAYS — regardless of whether a pending
+  // operation exists — so a bare "yes"/"no" with nothing pending gets the deterministic
+  // "nothing pending" reply instead of falling through to the LLM planner, which has been
+  // observed to invent an unrelated action (e.g. listing Gmail rules) for a lone "yes".
+  if (CONFIRM_WHITELIST.has(normalized)) {
+    return pending ? finalizeDeterministicConfirmation(userId, context) : finalizeNoPendingReply(userId, context, "confirmation.confirm");
+  }
+  if (CANCEL_WHITELIST.has(normalized)) {
+    return pending ? finalizeDeterministicCancellation(userId, context) : finalizeNoPendingReply(userId, context, "confirmation.cancel");
   }
 
-  if (UNSUPPORTED_GMAIL_ACTION_RE.test(trimmedMessage)) {
+  if (UNSUPPORTED_GMAIL_ACTION_RE.test(message.trim())) {
     // Deliberately does not touch pendingOperation: an unrelated, unsupported
     // request must not silently cancel or continue an unrelated pending flow.
     return finalize(userId, {
@@ -85,10 +122,42 @@ export async function handleAgentMessage(request: AgentMessageRequest): Promise<
     });
   }
 
+  if (pending) {
+    const pendingGmailRule = pending.operations.find((op) => op.tool === "gmail.rule.create");
+    if (pendingGmailRule && GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE.test(message.trim())) {
+      const label = String(pendingGmailRule.args.label ?? "this");
+      return finalize(userId, {
+        reply: `I can notify you when a manual or scheduled Gmail check creates a review for ${label}. This is not instant email arrival tracking. Matches go to email reviews first. Confirm creating this rule?`,
+        operationsPlanned: [],
+        executedOps: [],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: pending.topic
+      });
+    }
+  }
+
   const { plan, plannerUsed } = await planMessage(message, context);
 
   const validatedOps = validateOperations(plan.operations, context);
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
+
+  // Pending-operation firewall: while a mutation is awaiting confirmation, no OTHER mutation
+  // may run — not even a fresh, unrelated one, and not even a re-ask of the same one. This is
+  // checked on the raw validated ops (any status), so it also blocks a plan that tries to
+  // re-propose gmail.rule.create instead of emitting a genuine confirmation.
+  if (pending && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
+    return finalize(userId, {
+      reply: `You still have a pending confirmation for ${pending.summary}. Confirm, cancel, or tell me a new request.`,
+      operationsPlanned: plan.operations,
+      executedOps: [],
+      plannerUsed,
+      llmPlannerAttempted: true,
+      toolValidationPassed,
+      topic: pending.topic
+    });
+  }
 
   const metaOps = validatedOps.filter((op) => META_TOOLS.has(op.tool) && op.status === "valid");
   const referenceClarifications = validatedOps.filter((op) => op.status === "needs_clarification");
@@ -104,12 +173,8 @@ export async function handleAgentMessage(request: AgentMessageRequest): Promise<
   const askMeta = metaOps.find((op) => op.tool === "clarification.ask");
 
   // Deliberately does NOT trust an LLM-emitted confirmation.confirm/cancel here — live
-  // testing showed the model can over-eagerly treat an unrelated follow-up ("let me know
-  // when I receive one") as a confirmation, which would wrongly execute a pending mutation
-  // the user never actually approved. The regex pre-check above is the ONLY path that can
-  // confirm/cancel; if it didn't match, this turn is treated as a normal message and the
-  // pending operation is left exactly as-is. confirmation.confirm/cancel remain valid,
-  // harmless no-ops if the planner emits them here anyway (excluded from executableOps).
+  // testing showed the model can over-eagerly treat an unrelated follow-up as a confirmation.
+  // The exact whitelist check above is the ONLY path that can confirm/cancel.
 
   if (askMeta) {
     clarificationQuestion = String(askMeta.args.question ?? "Could you clarify what you mean?");
@@ -117,8 +182,10 @@ export async function handleAgentMessage(request: AgentMessageRequest): Promise<
     executedOps = await Promise.all(executableOps.map((op) => executeOperation(userId, op, context, message)));
     applyExecutionSideEffects(userId, executedOps);
 
+    // pendingConfirmationOps can only be non-empty here when `pending` was null (the firewall
+    // above already returned for any mutation attempt while a pending operation exists).
     if (pendingConfirmationOps.length > 0) {
-      const summary = pendingConfirmationOps.map((op) => `${op.tool}(${JSON.stringify(op.args)})`).join("; ");
+      const summary = summarizePendingOperations(pendingConfirmationOps);
       setPendingOperation(userId, createPendingOperationRecord(topic, summary, pendingConfirmationOps));
     }
 
@@ -146,25 +213,24 @@ export async function handleAgentMessage(request: AgentMessageRequest): Promise<
   });
 }
 
-async function finalizeDeterministicConfirmation(
-  userId: string,
-  context: ContextBundle,
-  plannerUsed: "llm" | "fallback" | "none" = "none"
-): Promise<AgentMessageResponse> {
-  const pending = context.session.pendingOperation;
+function normalizeExactMessage(message: string): string {
+  return message.trim().toLowerCase().replace(/[.!]+$/, "");
+}
 
-  if (!pending) {
-    const reply = "There's nothing pending for me to confirm.";
-    return finalize(userId, {
-      reply,
-      operationsPlanned: [],
-      executedOps: [{ tool: "confirmation.confirm", status: "skipped", summary: reply }],
-      plannerUsed,
-      llmPlannerAttempted: plannerUsed !== "none",
-      toolValidationPassed: true,
-      topic: context.session.topic
-    });
-  }
+function finalizeNoPendingReply(userId: string, context: ContextBundle, tool: string): AgentMessageResponse {
+  return finalize(userId, {
+    reply: NO_PENDING_REPLY,
+    operationsPlanned: [],
+    executedOps: [{ tool, status: "skipped", summary: NO_PENDING_REPLY }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: context.session.topic
+  });
+}
+
+async function finalizeDeterministicConfirmation(userId: string, context: ContextBundle): Promise<AgentMessageResponse> {
+  const pending = context.session.pendingOperation as AgentPendingOperation;
 
   const revalidated = pending.operations.map((op) => revalidateForExecution(op));
   const readyOps = revalidated.filter((op) => op.status === "valid");
@@ -185,31 +251,27 @@ async function finalizeDeterministicConfirmation(
     reply,
     operationsPlanned: pending.operations.map((op) => ({ tool: op.tool, args: op.args })),
     executedOps,
-    plannerUsed,
-    llmPlannerAttempted: plannerUsed !== "none",
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
     toolValidationPassed: brokenOps.length === 0,
     topic: pending.topic
   });
 }
 
-function finalizeDeterministicCancellation(
-  userId: string,
-  context: ContextBundle,
-  plannerUsed: "llm" | "fallback" | "none" = "none"
-): AgentMessageResponse {
-  const pending = context.session.pendingOperation;
+function finalizeDeterministicCancellation(userId: string, context: ContextBundle): AgentMessageResponse {
+  const pending = context.session.pendingOperation as AgentPendingOperation;
   setPendingOperation(userId, null);
 
-  const reply = pending ? "Cancelled — I won't do that." : "There's nothing pending for me to cancel.";
+  const reply = "Cancelled — I won't do that.";
 
   return finalize(userId, {
     reply,
     operationsPlanned: [],
-    executedOps: [{ tool: "confirmation.cancel", status: pending ? "executed" : "skipped", summary: reply }],
-    plannerUsed,
-    llmPlannerAttempted: plannerUsed !== "none",
+    executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: reply }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
     toolValidationPassed: true,
-    topic: pending ? pending.topic : context.session.topic
+    topic: pending.topic
   });
 }
 
@@ -282,7 +344,10 @@ function applyExecutionSideEffects(userId: string, executedOps: ExecutedOperatio
   const entities: AgentEntity[] = [];
 
   for (const op of executedOps) {
-    if (op.status === "executed") {
+    // Only tools that actually mutate belong in recentMutations. Recording read-only
+    // executions here (e.g. operator.recent_changes itself) makes a "what changed?"
+    // answer recurse into and duplicate its own prior answer on the next call.
+    if (op.status === "executed" && getToolDefinition(op.tool)?.mutates === true) {
       recordMutation(userId, op.summary);
     }
     if (op.entities) {

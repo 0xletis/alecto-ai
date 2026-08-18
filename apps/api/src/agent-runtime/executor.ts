@@ -312,10 +312,14 @@ export async function executeOperation(
 
       case "operator.recent_changes": {
         const mutations = context.session.recentMutations;
+        const summary =
+          mutations.length === 0
+            ? "Nothing has changed yet in this conversation."
+            : `Here's what I've recorded:\n${mutations.map((m) => `- ${m.summary.replace(/\.$/, "")}`).join("\n")}`;
         return {
           tool: operation.tool,
           status: "executed",
-          summary: mutations.length === 0 ? "Nothing has changed yet in this conversation." : mutations.map((m) => m.summary).join("; "),
+          summary,
           result: mutations
         };
       }

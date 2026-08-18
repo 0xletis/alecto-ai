@@ -42,6 +42,14 @@ export function composeReply(input: ComposeReplyInput): string {
     return lines.length > 0 ? joinSentences(lines) : "I couldn't do that. Nothing was changed.";
   }
 
+  // operator.recent_changes IS the answer to "what changed" — its own deterministic bullet
+  // list is always more trustworthy than the LLM's prose paraphrase of the same data, and
+  // showing both produced garbled, duplicated output in practice. Replace, never blend.
+  const recentChanges = input.executedOps.find((op) => op.tool === "operator.recent_changes" && op.status === "executed");
+  if (recentChanges) {
+    return recentChanges.summary;
+  }
+
   const leadLines: string[] = [];
 
   if (input.replyDraft) {
@@ -116,4 +124,19 @@ function describePendingConfirmation(op: ValidatedOperation): string {
   }
 
   return `I'm ready to run ${op.tool}. Shall I go ahead?`;
+}
+
+/** Short, human-readable noun phrase for a pending operation — used to store
+ * AgentPendingOperation.summary and to reference it later (e.g. "you still
+ * have a pending confirmation for <this>"). Never the raw tool/args dump. */
+export function summarizePendingOperations(ops: ValidatedOperation[]): string {
+  return ops.map(describePendingOperationLabel).join(", ");
+}
+
+function describePendingOperationLabel(op: ValidatedOperation): string {
+  if (op.tool === "gmail.rule.create") {
+    return `a Gmail tracking rule for "${String(op.args.label ?? "this")}"`;
+  }
+
+  return `"${op.tool}"`;
 }

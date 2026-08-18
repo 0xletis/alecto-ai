@@ -11,6 +11,7 @@ import {
   type InboundRouteDebug,
   type NormalizedInboundMessage
 } from "@operator-agent/core";
+import { isAgentRuntimeV3EnabledForTelegram, routeToAgentRuntimeV3 } from "./agent-runtime-routing.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -1986,6 +1987,22 @@ bot.command("cancel", async (ctx) => {
 
 bot.on("message:text", async (ctx) => {
   if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  if (isAgentRuntimeV3EnabledForTelegram()) {
+    const inbound = buildNormalizedTelegramMessage(ctx);
+    await routeToAgentRuntimeV3(inbound.userId, inbound.text, {
+      callAgentRuntime: (input) =>
+        apiPost<AgentMessageResponse>("/agent/message", {
+          userId: input.userId,
+          message: input.message,
+          channel: "telegram"
+        }),
+      reply: async (text) => {
+        await ctx.reply(text);
+      }
+    });
     return;
   }
 
@@ -4404,6 +4421,16 @@ function balancedProfile() {
 
 interface ProcessMessageResponse {
   reply: string;
+}
+
+interface AgentMessageResponse {
+  reply: string;
+  debug?: {
+    conversationTopic?: unknown;
+    pendingOperation?: unknown;
+    mutationExecuted?: unknown;
+    [key: string]: unknown;
+  };
 }
 
 interface DailyReviewResponse {
