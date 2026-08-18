@@ -19,11 +19,12 @@ Current channel status:
 ```
 Telegram update
   -> Telegram adapter
+  -> normal chat: Agent Runtime v3 (POST /agent/message, apps/api/src/agent-runtime/) — the default
+     OR (TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false opt-out): legacy /messages/process pipeline below
   -> NormalizedInboundMessage
   -> inbound message segmentation
   -> message route registration in apps/api/src/routes/messages.ts
-  -> Conversation Orchestrator v2 for migrated scopes when enabled
-  -> legacy IntentRouter / command router fallback for unmigrated scopes
+  -> legacy IntentRouter / command router / deterministic-surface / semantic router
   -> API service layer
   -> core domain services
   -> Prisma/Postgres
@@ -77,15 +78,15 @@ Normal inbound text is segmented before intent routing.
 11. Natural operator-attention and email-attention questions route to shared attention/readout services, for example `anything important?`, `what needs my attention?`, `what should I handle first?`, `what emails need action?`, and Spanish/Catalan Gmail-attention variants.
 12. Optional LLM semantic router can classify normal free text that missed deterministic phrase rules across operator surfaces and Gmail rule conversations. It targets English, Spanish, and Catalan phrasing and returns structured intent only: intent, operation, confidence, language, side-effect risk, confirmation requirement, target, extracted filters, goal hint, and safe issue text. API executors still validate and apply or reject any mutation.
 13. Gmail rule conversations may store short-lived focused-rule context in the pending-action layer so follow-up references such as `that rule`, `it`, or `pause it` can resolve channel-neutrally. This context is not authorization to scan Gmail or mutate anything; it only helps deterministic executors resolve the target.
-14. Conversation Orchestrator v2 Phase 1 can handle migrated context-bound operation planning through `ConversationContext`, `AvailableOperations`, deterministic validation, deterministic executors, and a response composer. It is available at `/messages/process_v2` and can be opt-in for `/messages/process` with `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`. The runtime planner is deterministic by default. With `LLM_OPERATION_PLANNER_ENABLED=true` plus `OPENAI_API_KEY` or a test mock response, v2 can call the real LLM operation planner for selected migrated scopes; invalid, low-confidence, failed, or timed-out plans fall back safely. `/messages/process_v2` is v2-only and reports `not_migrated` instead of silently using legacy routing.
+14. ~~Conversation Orchestrator v2~~ — **retired.** It briefly handled migrated context-bound operation planning behind `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true` and a debug-only `/messages/process_v2` endpoint. Product confirmed no live deployment relied on it; the branch, its `apps/api/src/conversation/{orchestrator-v2,context,operation-catalog,operation-planner,operation-validator,operation-executor,response-composer}.ts` modules, and its test file were all deleted. See `docs/09-architecture-inventory.md`'s "Conversation Orchestrator v2 — Full Retirement". Agent Runtime v3 (`POST /agent/message`) is the actual default normal-chat runtime today — see step 1 above and the README's "Agent Runtime v3" section; it is architecturally independent of both v2 and the legacy pipeline described in this numbered list.
 15. Remaining messages route to message processing / response composition.
 
-`/messages/process` may include a non-user-facing `routeDebug` object for API smoke tests and local diagnostics. Telegram ignores it and sends only the reply text. The debug payload includes semantic language/confidence/side-effect-risk fields when available plus v2 audit fields such as `handledBy`, `v2SkippedReason`, `plannerUsed`, `llmPlannerAttempted`, `llmPlannerUsed`, `operationPlanValidated`, `policyPrecheckResult`, `mutationExecuted`, and legacy semantic attempted/used flags.
+`/messages/process` may include a non-user-facing `routeDebug` object for API smoke tests and local diagnostics. Telegram ignores it and sends only the reply text. The debug payload includes semantic language/confidence/side-effect-risk fields when available, plus `handledBy`, `plannerUsed`, `llmPlannerAttempted`, `llmPlannerUsed`, `policyPrecheckResult`, `mutationExecuted`, and legacy semantic attempted/used flags — all populated by the remaining legacy routers now that Conversation Orchestrator v2 is retired.
 
 Implementation note:
-- [~] `apps/api/src/server.ts` still contains too much orchestration logic and should be split further. Message route registration now lives in `apps/api/src/routes/messages.ts`. Extracted conversation modules live in `apps/api/src/conversation/`, including Gmail rule selection helpers plus Conversation Orchestrator v2 Phase 1 context, operation catalog, planner, validator, executor, and response composer modules.
+- [~] `apps/api/src/server.ts` still contains too much orchestration logic and should be split further. Message route registration now lives in `apps/api/src/routes/messages.ts`. `apps/api/src/conversation/` now holds only `gmail-autonomy.ts` and `email-rule-selection.ts` — the Conversation Orchestrator v2 context/operation-catalog/planner/validator/executor/response-composer modules that used to live there have been deleted.
 - [x] `GET /users/:userId/operator-attention?now=...` builds a channel-neutral operator attention state from actions, goals, events, risk signals, action hygiene, Gmail email reviews, and latest weekly-review status. `/today`, `/start_day`, `/end_day`, `/weekly`, planning, and natural attention/email-attention replies reuse this data instead of duplicating ad hoc logic.
-- [~] Conversation Orchestrator v2 Phase 1 uses the existing `PendingAction` layer as the short-lived backing store for `ConversationContext`, so no DB schema migration was required. It currently migrates action hygiene list creation and visible-list replies, all-except cleanup batches, recent mutation questions, natural confirmation variants, cross-domain visible-context safety, reference-text safety, selected read surfaces (`today`, operator attention, Gmail status, email reviews), conservative progress logging, and betting/trading risk precedence. The optional LLM operation planner can propose operations for these migrated scopes only; deterministic validation/execution still owns all mutations. A fuller migration of action control, Gmail rules, planning, and generic chat is still deferred.
+- [x] ~~Conversation Orchestrator v2 Phase 1's `ConversationContext`/migrated-scope description~~ — retired along with v2 itself; see above.
 
 ## Integrations
 

@@ -2,93 +2,66 @@
 
 Last updated: 2026-08-19
 
-This file is the current architecture handoff for humans and orchestrator agents. It is descriptive, not aspirational. If a capability is not marked as owned by Conversation Orchestrator v2 below, assume legacy routing still owns it until tests prove otherwise.
+This file is the current architecture handoff for humans and orchestrator agents. It is descriptive, not aspirational. Conversation Orchestrator v2 has been fully retired (see "Conversation Orchestrator v2 — Full Retirement" below) — assume legacy `/messages/process` routing owns anything not explicitly owned by Agent Runtime v3, until tests prove otherwise.
 
 ## Entry Points
 
 - `apps/telegram-bot`: Telegram adapter. It converts Telegram updates into API calls and should stay thin. Core business logic must not depend on Telegram `ctx`, inline buttons, command menus, or hardcoded chat IDs.
 - `POST /agent/message`: **the default runtime for normal Telegram chat** (`apps/api/src/agent-runtime/`), isolated from the `/messages/process` routing order below. `apps/telegram-bot` routes all normal (non-command) text here unless `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` explicitly opts back into legacy (`routeToLegacyMessageProcessor` in `apps/telegram-bot/src/index.ts`); slash commands and Gmail OAuth/setup/sync flows are unaffected either way. Session state (topic, pending confirmation, visible entities, recent mutations, bounded message history) is persisted per `userId`+`channel` in the `AgentConversationSession` table with a sliding 24h TTL — it survives an API restart; an expired session is treated as missing. **New conversation/product work goes here, not into the legacy pipeline below.** See `apps/api/src/agent-runtime/session-store.ts`, `apps/telegram-bot/src/agent-runtime-routing.ts`, the README's "Agent Runtime v3" section, and "Legacy conversation stack to remove or isolate" below.
-- `POST /messages/process`: **legacy** natural-message entry point for normal conversation. Still the production path for the explicit `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` opt-out and for direct API callers. It is v2-first when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`; legacy routing remains the fallback for unmigrated scopes. Not removed yet — see the legacy inventory below for what's still needed and what isn't.
-- `POST /messages/process_v2`: **retired.** This debug/audit-only endpoint (unconditional Conversation Orchestrator v2 invocation, bypassing the `CONVERSATION_ORCHESTRATOR_V2_ENABLED` flag) was deleted after confirming zero production callers in `apps/telegram-bot` or `apps/worker` — see "`/messages/process_v2` Retirement" below for the deletion record. Conversation Orchestrator v2's own logic was **not** deleted — it's still live, reachable through `/messages/process` when the flag is enabled (see below).
+- `POST /messages/process`: **legacy** natural-message entry point for normal conversation. Still the production path for the explicit `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` opt-out and for direct API callers. Purely legacy deterministic/semantic routing now — the Conversation Orchestrator v2 branch that used to run first has been retired (see "Conversation Orchestrator v2 — Full Retirement" below). Not removed yet — see the legacy inventory below for what's still needed and what isn't.
+- `POST /messages/process_v2`: **retired.** This debug/audit-only endpoint (unconditional Conversation Orchestrator v2 invocation) was deleted after confirming zero production callers — see "`/messages/process_v2` Retirement" below. Conversation Orchestrator v2's own logic has since been retired too, in a later pass — see "Conversation Orchestrator v2 — Full Retirement" below.
 - Domain API routes under `/users/:userId/...`: canonical mutation/read surfaces for goals, events, actions, email rules, reviews, integrations, daily loop, weekly review, planning, and debug views.
 - `apps/worker`: proactive jobs for daily loop, reminders, integration sync, and Gmail background sync. It should call API/core services, not duplicate domain rules.
 
 ## Conversation Routing Order
 
-Current production `/messages/process` order:
+Current production `/messages/process` order (Conversation Orchestrator v2 was the first step here until its retirement — see "Conversation Orchestrator v2 — Full Retirement" below; the order below is what's left, unchanged otherwise):
 
 1. Parse request body and ensure user.
 2. Expire stale pending decisions.
-3. If v2 is enabled, ask Conversation Orchestrator v2 to handle migrated scopes.
-4. Handle standalone `now` safely.
-5. Run deterministic policy/guardrail precheck.
-6. Resolve pending decisions before ordinary routing when the reply fits the pending scope.
-7. Handle focused pending Gmail rule creation/editing.
-8. Reject unresolved hygiene follow-ups without a visible context.
-9. Route planning requests.
-10. Route explicit memory requests.
-11. Re-run guardrail check before surface routing.
-12. Route deterministic conversation surfaces.
-13. Route optional legacy LLM semantic router.
-14. Try manual action creation.
-15. Block unhandled mutation/control verbs from generic chat.
-16. Route custom goal progress and structural proposals.
-17. Optionally analyze with OpenAI and create extracted events.
-18. Compose final response.
-
-Conversation Orchestrator v2's own internal order (still accurate — this is what runs inside `/messages/process`'s v2-first branch when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`; formerly also reachable unconditionally via the now-retired `/messages/process_v2`):
-
-1. Parse request body and ensure user.
-2. Expire stale pending decisions.
-3. Segment reference/log/example text and stop without side effects.
+3. Handle standalone `now` safely.
 4. Run deterministic policy/guardrail precheck.
-5. Build `ConversationContext`.
-6. Build `AvailableOperations`.
-7. Plan operations deterministically or with the optional LLM operation planner.
-8. Validate operation plan deterministically.
-9. Execute through deterministic API callbacks/services.
-10. Compose response from actual execution results.
-11. Return route debug.
+5. Resolve pending decisions before ordinary routing when the reply fits the pending scope.
+6. Handle focused pending Gmail rule creation/editing.
+7. Reject unresolved hygiene follow-ups without a visible context.
+8. Route planning requests.
+9. Route explicit memory requests.
+10. Re-run guardrail check before surface routing.
+11. Route deterministic conversation surfaces.
+12. Route optional legacy LLM semantic router.
+13. Try manual action creation.
+14. Block unhandled mutation/control verbs from generic chat.
+15. Route custom goal progress and structural proposals.
+16. Optionally analyze with OpenAI and create extracted events.
+17. Compose final response.
 
 ## Route Ownership Map
 
-Owned by Conversation Orchestrator v2 when enabled:
+Conversation Orchestrator v2 has been retired (see "Conversation Orchestrator v2 — Full Retirement" below) — there is no more split ownership between v2 and legacy. Everything below is owned by legacy `/messages/process` routing:
 
-- Action hygiene list creation and visible-list replies.
-- Single visible-item pronouns such as `it`.
-- Multi-operation hygiene replies such as `archive all except the read one`.
-- Recent mutation status questions.
-- Explicit memory creation through operation plans.
-- Selected read surfaces: today, operator attention, Gmail status, and email reviews.
-- Conservative progress logging for CV/application and workout reports in English, Spanish, and Catalan.
-- Reference-text safety and cross-domain visible-context safety.
-- Policy/guardrail precedence for migrated scopes.
-
-Still owned by legacy `/messages/process` routing:
-
-- Most slash command behavior and command batching.
-- Most Gmail rule creation/editing/removal conversations outside the migrated read/status surfaces.
+- All slash command behavior and command batching.
+- All Gmail rule creation/editing/removal conversations (only `gmail.rule.create`/`.list`/`.explain` and `gmail.review.*` have a v3 equivalent — see "Legacy Conversation Stack To Remove Or Isolate" below for what v3 does and doesn't cover).
 - Planning sessions, weekly planning edits, and plan creation replies.
 - Daily loop settings mutations.
-- Most conversational action control outside hygiene-context replies.
+- Action hygiene list creation and bulk/multi-item hygiene replies (v3's `action.*` tools are single-item only).
+- Recent mutation status questions.
+- Explicit memory creation, conservative progress logging, and selected read surfaces — v3 independently reimplements these for its own default Telegram path, but the legacy versions inside `/messages/process` are unchanged and still what direct API callers and the legacy opt-out hit.
 - Generic chat/coaching fallback.
-- Legacy LLM semantic routing for unmigrated natural-language surfaces.
+- Legacy LLM semantic routing for natural-language surfaces v3's tool catalog doesn't cover.
 - Event extraction and final response composition after legacy OpenAI analysis.
 
-Route debug contract:
+Route debug contract (fields still populated by the remaining legacy routers):
 
-- `v2Enabled`
-- `llmOperationPlannerEnabled`
 - `plannerUsed`
 - `llmPlannerAttempted`
 - `llmPlannerUsed`
 - `legacySemanticAttempted`
 - `legacySemanticUsed`
-- `v2SkippedReason`
 - `handledBy`
 - `mutationExecuted`
-- `operationPlanValidated`
 - `policyPrecheckResult`
+
+`v2Enabled`, `llmOperationPlannerEnabled`, `v2SkippedReason`, and `operationPlanValidated` were Conversation Orchestrator v2 debug fields. They remain defined (as optional fields) in the shared `ProcessMessageResult.routeDebug` zod schema in `packages/core/src/message-processing.ts` for backward compatibility with any external consumer of the API response shape, but no code populates them anymore — treat them as dead schema, not live contract.
 
 `policyPrecheckResult` is safe and compact. Expected values include `passed`, `reference_text_blocked`, and `blocked_by_guardrail`.
 
@@ -96,17 +69,13 @@ Route debug contract:
 
 `apps/api/src/server.ts` remains oversized.
 
-Current line count after this audit pass: 17,172 lines. History: 17,903 (start) → 17,440 (type-extraction pass) → 17,380 (phase 1: memory + notification-settings routes) → 17,293 (phase 2: checkins-prompt/ingest routes + isRecord de-duplication) → 17,172 (phase 3: insights routes + shouldUseOpenAIAnalysis de-duplication — see below).
+Current line count after this audit pass: 16,938 lines. History: 17,903 (start) → 17,440 (type-extraction pass) → 17,380 (phase 1: memory + notification-settings routes) → 17,293 (phase 2: checkins-prompt/ingest routes + isRecord de-duplication) → 17,172 (phase 3: insights routes + shouldUseOpenAIAnalysis de-duplication) → 17,122 (`/messages/process_v2` retirement) → 16,938 (Conversation Orchestrator v2 full retirement — see "Conversation Orchestrator v2 — Full Retirement" below).
+
+`apps/api/src/conversation/context.ts`, `operation-catalog.ts`, `operation-planner.ts`, `operation-validator.ts`, `operation-executor.ts`, and `response-composer.ts` — the six Conversation Orchestrator v2 modules previously listed here as "known extracted modules" — have been **deleted**, not extracted; see "Conversation Orchestrator v2 — Full Retirement" below.
 
 Known extracted modules:
 
 - `apps/api/src/routes/messages.ts`: Fastify registration and validation for `/messages/process`. (`/messages/process_v2` was registered here too until it was retired — see "`/messages/process_v2` Retirement" below.)
-- `apps/api/src/conversation/context.ts`: short-lived context projection from pending decisions and visible lists.
-- `apps/api/src/conversation/operation-catalog.ts`: allowed operation catalog for v2.
-- `apps/api/src/conversation/operation-planner.ts`: deterministic planner and LLM planner bridge.
-- `apps/api/src/conversation/operation-validator.ts`: deterministic validation before execution.
-- `apps/api/src/conversation/operation-executor.ts`: deterministic operation executors using existing services/callbacks.
-- `apps/api/src/conversation/response-composer.ts`: execution-result response composition.
 - `apps/api/src/conversation/gmail-autonomy.ts`: Gmail setup/autonomy state formatting.
 - `apps/api/src/conversation/email-rule-selection.ts`: Gmail rule target selection helpers.
 - `apps/api/src/server-types.ts`: 39 pure type/interface declarations extracted from server.ts's private helper zone — daily-brief/operator-attention, weekly review, action hygiene, next-week planning, daily coach, and Gmail/GitHub sync shapes. Zero behavior change (types are erased at compile time); `sanitizeActionItem`, `buildConversationControlDebugForUser`, and `PlanWindowKind` were exported from server.ts (previously private) purely so this file can reference them in `typeof`/`ReturnType` positions. −463 net lines in server.ts.
@@ -130,8 +99,7 @@ High-density areas that still live in `server.ts`:
 - Gmail OAuth/sync/rule/review orchestration.
 - Daily loop, action hygiene, planning, and weekly review composition.
 - Legacy semantic routing and deterministic phrase routing.
-- Callback glue for Conversation Orchestrator v2.
-- The inline `/messages/process` handler body passed into `registerMessageRoutes(...)` (route registration itself is in `routes/messages.ts`, but the callback still lives in server.ts and depends on 10+ private helpers plus the legacy semantic/deterministic-surface routers directly — confirmed high risk to extract without a circular import back into server.ts; left in place). The sibling `/messages/process_v2` handler body was retired, not extracted — see "`/messages/process_v2` Retirement" below.
+- The inline `/messages/process` handler body passed into `registerMessageRoutes(...)` (route registration itself is in `routes/messages.ts`, but the callback still lives in server.ts and depends on 10+ private helpers plus the legacy semantic/deterministic-surface routers directly — confirmed high risk to extract without a circular import back into server.ts; left in place). The sibling `/messages/process_v2` handler body was retired, not extracted — see "`/messages/process_v2` Retirement" below. (The Conversation Orchestrator v2 branch that used to run inside this same handler body has since been deleted entirely — see "Conversation Orchestrator v2 — Full Retirement" below.)
 
 Recommended next extraction target (in safety order, re-verified during the phase-3 pass):
 
@@ -143,65 +111,24 @@ Recommended next extraction target (in safety order, re-verified during the phas
 
 ## Legacy And Split-Brain Risks
 
-- V2 and legacy both understand some action/hygiene language. Tests currently protect visible-list hygiene ownership, but broader action control remains split.
-- Gmail rule conversation state exists in legacy pending-action handlers while v2 can answer Gmail status/read surfaces. This can confuse follow-up pronouns unless the target surface is migrated deliberately.
-- Legacy LLM semantic routing and v2 LLM operation planning are separate layers. The semantic router classifies intent; v2 planner proposes operation plans. Do not let both mutate the same message.
+The v2-vs-legacy split-brain risk this section used to describe no longer applies — Conversation Orchestrator v2 is retired, so there is exactly one router (legacy `/messages/process`) for anything Agent Runtime v3 doesn't own. The risk that remains is v3-vs-legacy, already covered in "Legacy Conversation Stack To Remove Or Isolate" below.
+
+- Route debug remains the guardrail against accidental silent fallback for any future migration work (now v3-targeted, not v2-targeted) — new migrated scopes must prove `legacySemanticUsed=false` in tests.
 - Some worker and API surfaces share summaries but not always a single composer. Keep proactive messages concise and tested.
-- Route debug is the guardrail against accidental silent fallback. New migrated scopes must prove `legacySemanticUsed=false` in tests.
 
 ## Potentially Obsolete Logic To Audit Later
 
 Do not delete these without targeted tests:
 
-- Legacy multi-intent orchestration for messages that v2 could eventually own.
+- Legacy multi-intent orchestration.
 - Legacy conversational action control for complete/reschedule/archive flows.
 - Legacy Gmail semantic-router patches for custom rule follow-ups.
-- Duplicate natural setup/help surfaces that overlap with v2 read operations.
-- Old phrase-specific fixes for Spanish/Catalan Gmail rule edits once the v2 planner owns those operations.
+- Duplicate natural setup/help surfaces.
+- Old phrase-specific fixes for Spanish/Catalan Gmail rule edits.
 
-## ConversationContext Audit
+## ConversationContext / LLM OperationPlanner Audits — Retired
 
-Current behavior:
-
-- Uses existing `PendingAction` rows as short-lived context storage.
-- Stores visible entities for action hygiene, email reviews, Gmail rule selection, recent mutation status, and other pending flows.
-- V2 tests now enforce the invariant: if v2 renders a numbered visible list, the stored context must contain the same visible entities.
-- Context is advisory only. It does not authorize Gmail scanning, event creation, action creation, or destructive changes without deterministic validation.
-
-Known gaps:
-
-- Context types are multiplexed through `PendingAction.payload`; there is no dedicated `ConversationContext` table.
-- One pending context per user keeps v1 simple but can replace unrelated focus.
-- Some legacy surfaces still create context with legacy labels. Route debug should expose `contextCreatedBy` only when context is actually loaded.
-
-## LLM OperationPlanner Audit
-
-Current behavior:
-
-- Disabled by default.
-- Enabled with `LLM_OPERATION_PLANNER_ENABLED=true`.
-- Uses safe summarized context and an allowed operation catalog.
-- LLM output is a proposal, not authority.
-- Deterministic validation rejects unsupported operations, unsafe targets, low confidence, stale context, missing confirmation, and invalid fields.
-- Deterministic executors perform all mutations.
-- Failures, invalid JSON, timeouts, provider errors, and low confidence fall back to deterministic planning.
-
-Current migrated operation families:
-
-- `show_action_hygiene`
-- hygiene replies and visible-list operations
-- recent mutation status
-- explicit memory
-- selected read surfaces
-- conservative progress logging
-
-Not yet migrated:
-
-- Full Gmail rule management.
-- Planning-session edits/creation.
-- Full action reschedule/complete/archive outside visible hygiene context.
-- Daily loop settings.
-- Generic chat/coaching.
+These two sections used to document Conversation Orchestrator v2's internal `ConversationContext` projection and its LLM operation planner (`LLM_OPERATION_PLANNER_ENABLED`, deterministic validation, migrated operation families, etc.). Both mechanisms were deleted along with the rest of v2 — see "Conversation Orchestrator v2 — Full Retirement" below for exactly what was removed. Kept as a pointer here rather than reproducing now-inapplicable internals: if you're looking for how context or LLM-assisted operation planning works today, that's Agent Runtime v3's `agent-runtime/context-loader.ts` and `agent-runtime/planner.ts` — an independent, unrelated implementation, not a descendant of v2's.
 
 ## Risk And Guardrail Generalization Plan
 
@@ -253,11 +180,10 @@ Now that Agent Runtime v3 is the default Telegram normal-chat runtime, this is t
 - Safe deletion conditions: v3's tool catalog gains rule editing/removal/toggle/autonomy-preference tools with test parity against the current natural-language Gmail conversation tests.
 - Replacement in v3: partial — creation and read-only status/review flows only.
 
-**Old Conversation Orchestrator v2 paths**
-- Still needed: **unresolved — audited twice more since, still cannot be proven safe to delete from repo inspection alone.** See "Conversation Orchestrator v2 Branch Retirement Audit" below for the full pass.
-- Reason: v2 (`apps/api/src/conversation/*`) still owns several scopes on paper (hygiene lists, single-item pronouns, recent mutation status, explicit memory, selected read surfaces, conservative progress logging) — but v3 now independently re-implements memory, progress logging, and read surfaces for Telegram's default path. Since v2 is only reached via `/messages/process` (when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`), which itself is now only hit by the legacy opt-out or direct API callers, v2's real-world traffic share for the primary product experience is unclear without a dedicated usage audit.
-- Safe deletion conditions: confirm (via logs/telemetry, not just "no test fails") that production traffic no longer reaches v2 through the v2-first branch of `/messages/process`, then remove once every migrated scope has v3 (or legacy) coverage with equal or better tests. (`/messages/process_v2`, the debug-only endpoint that made this easy to test in isolation, has already been retired — see "`/messages/process_v2` Retirement" below; its ~40 regression tests were rewritten to exercise the same v2 logic through `/messages/process` instead, so this deletion condition is unaffected.)
-- Replacement in v3: overlapping already, for the scopes v3 independently reimplemented (memory, progress logging, read surfaces).
+**Conversation Orchestrator v2** — **RETIRED.**
+- A product decision confirmed no live deployment relies on `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`; the branch, `apps/api/src/conversation/{orchestrator-v2,context,operation-catalog,operation-planner,operation-validator,operation-executor,response-composer}.ts`, and `tests/conversation-orchestrator-v2.test.ts` were all deleted. See "Conversation Orchestrator v2 — Full Retirement" below for the deletion record.
+- Scopes it used to own (hygiene lists, single-item pronouns, recent mutation status, explicit memory, selected read surfaces, conservative progress logging) now fall through entirely to legacy `/messages/process` routing, exactly as they did whenever the flag was off — no behavior change for any scope, since the flag was confirmed off everywhere it mattered.
+- Replacement in v3: v3 already independently reimplements memory, progress logging, and read surfaces for its own default path — unaffected by this deletion, since v3 never depended on v2's code.
 
 **Pending-actions confirmation flow** (`GET/POST /users/:userId/pending-actions*`, `applyPendingAction`, `findPendingAction`)
 - Still needed: yes — this is the least "legacy" item in this list.
@@ -267,10 +193,8 @@ Now that Agent Runtime v3 is the default Telegram normal-chat runtime, this is t
 - **Cross-system risk: RESOLVED** (see "PendingAction / Agent Runtime v3 Interop" below). v3's context loader now reads the legacy `PendingAction` table every turn and detects/defers/safely-cancels it before the planner runs. It still never executes `applyPendingAction`'s type-specific mutation logic itself — that stays legacy-only, reachable through `/confirm`.
 
 **Old tests that only protect deprecated behavior**
-- Still needed: unknown, depends per-file.
-- Reason: e.g. `tests/conversation-orchestrator-v2.test.ts` protects v2 behavior that may become effectively unreachable once v3 is the Telegram default — but keeping it is cheap insurance if v2 is still reachable (legacy flag / API), and expensive maintenance if v2 is truly dead.
-- Safe deletion conditions: only once the underlying production code path is itself confirmed unreachable and removed. A passing test suite with no failures is not evidence a path is dead — it only means nothing currently exercises the risk.
-- Replacement in v3: `tests/agent-message.test.ts`, `tests/agent-runtime-*.test.ts`, and `tests/telegram-agent-runtime-routing.test.ts` already cover the v3-equivalent behavior for scopes v3 owns.
+- `tests/conversation-orchestrator-v2.test.ts` — **deleted**, along with the v2 code it protected. See "Conversation Orchestrator v2 — Full Retirement" below.
+- Replacement in v3: `tests/messages-process-legacy.test.ts` (new), `tests/agent-message.test.ts`, `tests/agent-runtime-*.test.ts`, and `tests/telegram-agent-runtime-routing.test.ts` cover the remaining legacy path and v3-equivalent behavior.
 
 ### Legacy Usage Audit — Deletion-Readiness Pass (2026-08-18)
 
@@ -283,13 +207,13 @@ Grep/reference-verified pass answering: with v3 as the Telegram default, which o
 | 1 | `/messages/process` | `apps/api/src/routes/messages.ts` (registration); handler body `server.ts:308-608` | `apps/telegram-bot/src/index.ts:55` (pending-reply+command-batch middleware, unconditional), `:136` (`/help`), `:2054` (`routeToLegacyMessageProcessor`, opt-out only), `:3818` (`createManualActionFromCommand`, guardrail/risk-flagged manual-action commands) | No, not directly (`message:text` goes to v3 by default) | Yes — `/help` always; `/todo`, `/add_action`, `/action` etc. when the deterministic router flags the text as guardrail/risk; combined pending-reply+command text | No — live production callers exist | No | `POST /agent/message` | **KEEP** | v3 has tool/flow parity for every scope in "Not yet migrated," the legacy Telegram opt-out is itself deprecated, and no direct API callers remain |
 | 2 | Deterministic surface router | `handleConversationSurfaceIntent` (`server.ts:5577-5756`), `detectConversationSurfaceIntent` (`:8564-8755`) | Both have exactly 1 call site, inside `/messages/process`'s `process` handler only (not `process_v2`) | Same as #1, transitively | Same as #1, transitively | No | Yes, effectively | `agent-runtime/{validator,executor}.ts` (not 1:1) | **KEEP** | Only becomes reachable to delete once #1 is safe to delete |
 | 3 | Legacy semantic router | `handleSemanticRouterIntent` (`server.ts:6935`) + ~20-function cluster (`:6427-8560`, Gmail rule proposal/edit/create, autonomy-preference conversation) | 2 call sites, both inside `/messages/process`'s `process` handler (`:403` pending-Gmail focus, `:471` main dispatch) — confirmed via `rg "handleSemanticRouterIntent\("` repo-wide | Same as #1, transitively | Same as #1, transitively | No | Yes, effectively | `agent-runtime/planner.ts` (narrower tool catalog) | **KEEP / MIGRATE-FIRST** | v3's planner+catalog covers generic chat/coaching and every surface this router classifies, with tests proving `legacySemanticUsed=false` |
-| 4a | Conversation Orchestrator v2 (logic) | `apps/api/src/conversation/orchestrator-v2.ts` + `operation-{catalog,planner,validator,executor}.ts`, `response-composer.ts` | Called from `/messages/process`'s `process` handler only when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true` (default **off**) — `server.ts:308`-ish (line shifted after 4b's deletion) | No | No (indirect only, behind an off-by-default flag) | Partially — `tests/conversation-orchestrator-v2.test.ts` is its main coverage, now routed through `/messages/process` | No — `process_v2` no longer exists | Overlaps v3 for memory/progress-logging/read-surfaces it independently reimplemented | **UNKNOWN / MIGRATE-FIRST** | Confirm via logs/telemetry (not test results) that no production traffic sets the flag; then evaluate scope-by-scope |
+| 4a | Conversation Orchestrator v2 (logic) | **DELETED.** Was `apps/api/src/conversation/orchestrator-v2.ts` + `operation-{catalog,planner,validator,executor}.ts`, `response-composer.ts` | N/A — deleted | No | No | N/A — `tests/conversation-orchestrator-v2.test.ts` deleted | N/A | Overlaps v3 for memory/progress-logging/read-surfaces it independently reimplemented | **DELETED** | Done — product confirmed no live deployment set the flag; see "Conversation Orchestrator v2 — Full Retirement" below |
 | 4b | `/messages/process_v2` route | **DELETED.** Was `routes/messages.ts:9-13,29-39`; unconditional call was `server.ts:308-314` | Zero matches in `apps/telegram-bot/` or `apps/worker/` — confirmed via `rg "process_v2"` across both dirs, both before and after deletion | No | No | Was **yes** — only `tests/conversation-orchestrator-v2.test.ts` called this route (43 call sites through a shared `processV2()` test helper, not 2 — the original count only found the literal route-string matches, not the helper's callers) | N/A (it was the alternative to `/messages/process`) | N/A — it was explicitly a debug/audit endpoint per its own `messageRouteOwnership` doc comment | **DELETED** | Done — see "`/messages/process_v2` Retirement" below for what was removed and how the test coverage was preserved |
 | 5 | `/conversation/control`, `/conversation/multi-intent` | `server.ts:1206` (control), `:1232` (multi-intent) | `index.ts:2043`/`:2011` (`routeToLegacyMessageProcessor`, opt-out only); `index.ts:172` (`/debug_conversation_intent`, dry-run), `index.ts:196` (`/debug_intent_plan`, dry-run) — both debug-gated (`guardDebugAllowedUser`) | No (ordinary chat never hits these directly) | Yes — two debug-only, non-mutating slash commands | No | No | Pending-op confirm/cancel firewall in `runtime.ts` (conceptual, not 1:1) | **KEEP** | Legacy Telegram pipeline removed, no other callers, debug commands repointed or removed |
 | 6 | Old action-hygiene NL parser | `parseActionHygieneReply` (`:16315`), `resolveActionHygieneReply` (`:15462`), `normalizeHygieneBatchText`, `applyActionHygieneBatchOperations`, ~25 functions total (`:2631-16800`ish) | `resolveActionHygieneReply` is called only from `resolvePendingDecisionReply`, itself only inside `/messages/process`'s `process` handler | Same as #1, transitively — a plain-text hygiene reply with v3 as default now reaches v3 first, not here (**see "PendingAction / Agent Runtime v3 Interop" below** — v3 no longer silently ignores it; it detects the row and defers to `/confirm`/`/cancel` instead of guessing) | Same as #1, transitively (pending-reply+command-batch text) | No | Yes, effectively | `action.list` + single-entity "it" resolution only (no bulk/multi-item, no numbered-list resolution) | **KEEP** | v3 gains bulk/multi-item action operations with equivalent safety guarantees, proven by tests matching current hygiene coverage |
 | 7 | Old Gmail NL handlers | Same cluster as #3: `buildCustomGmailRuleProposal`, `editPendingCustomGmailRule`, `editActiveCustomGmailRuleForConversation`, `manageCustomGmailRuleForConversation`, `answerGmailRuleQuestionForConversation` (dispatch at `:7223-7257`) | Reached only via `handleSemanticRouterIntent` (see #3) | Same as #3 | Same as #3 | No | Yes, effectively | `gmail.rule.{create,list,explain}`, `gmail.review.{list,reject,to_action}` (creation + read-only only) | **KEEP / MIGRATE-FIRST** | v3 tool catalog gains rule editing/removal/toggle/autonomy-preference tools with test parity |
 | 8 | Pending-actions confirmation flow | `server.ts:994-1041` (routes), `applyPendingAction` (~345 lines), `findPendingAction` | `index.ts:1929` (`/pending`), `:1942` (`/confirm`), `:1965` (`/cancel`) — **all three unconditional**, independent of the v3/legacy flag; also called internally from `/messages/process` | **Yes, now detected** — v3's context loader reads the legacy `PendingAction` table every turn (see "PendingAction / Agent Runtime v3 Interop" below); it still never executes `applyPendingAction` itself | **Yes, directly** — `/pending`, `/confirm`, `/cancel` always live | No | No | v3 detects/defers/safely-cancels; `/confirm`'s actual execution stays legacy-only | **KEEP** | Not a deletion candidate; `applyPendingAction` execution moves to v3 only once the Gmail-rules/action-hygiene migrate-first work (rows 3/6/7) is done |
-| 9 | Old tests protecting opt-in-off behavior | `tests/conversation-orchestrator-v2.test.ts` (~1,350 lines, 32 tests, down from 34) | Exercises the `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true` branch of `/messages/process` (rewritten off `/messages/process_v2` when it was retired — see below) | N/A (test file) | N/A | No longer test-only-for-a-dead-route — it now protects a still-live production path (v2 logic, reachable when the flag is on) via the real endpoint | N/A | `tests/agent-message.test.ts`, `tests/agent-runtime-*.test.ts`, `tests/telegram-agent-runtime-routing.test.ts` | **KEEP** | Right-sizing further is only warranted if row 4a's v2 logic itself is ever confirmed dead via telemetry, not before |
+| 9 | `tests/conversation-orchestrator-v2.test.ts` | **DELETED.** All 32 tests removed along with the v2 code they protected | N/A | N/A | N/A | N/A | N/A | `tests/messages-process-legacy.test.ts` (new, 3 tests: legacy path still works, the retired flag is inert, v3 unaffected), plus `tests/agent-message.test.ts`, `tests/agent-runtime-*.test.ts`, `tests/telegram-agent-runtime-routing.test.ts` | **DELETED** | Done — see "Conversation Orchestrator v2 — Full Retirement" below |
 | 10 | `tests/email-review-dedupe.test.ts` (11,492 lines, 128 tests) | Direct HTTP tests against `/messages/process`, `/conversation/control`, Gmail semantic-router flows, action-hygiene flows | Hits the API layer directly, bypassing the Telegram v3/legacy flag entirely | N/A (test file) | N/A | Mostly no — most of what it covers is still reachable per rows 1, 3, 6, 7, 8 above (via `/help`, guardrail-flagged commands, debug commands, `/confirm`) | Partially | Same as above per-scope | **KEEP AS-IS** | Do not touch; despite testing "legacy" code, it protects genuinely live production paths |
 
 **Delete-now candidates**
@@ -298,7 +222,6 @@ Grep/reference-verified pass answering: with v3 as the Telegram default, which o
 **Migrate-first candidates** (build v3 parity before touching the legacy code)
 - Legacy semantic router / old Gmail NL handlers (#3, #7): v3 needs rule editing/removal/toggle/autonomy-preference tools.
 - Old action-hygiene NL parser (#6): v3 needs bulk/multi-item action operations with visible-list numbering and all-except selection.
-- Conversation Orchestrator v2 (#4a): needs a telemetry-based (not test-based) confirmation that the opt-in flag carries zero production traffic before any deletion decision.
 
 **Keep-for-slash-command candidates** (still directly wired to live, non-debug slash commands — do not touch without also updating the bot)
 - `/messages/process` (#1) — `/help`, guardrail-flagged action-creation commands, pending-reply+command-batch text.
@@ -306,13 +229,14 @@ Grep/reference-verified pass answering: with v3 as the Telegram default, which o
 - `/conversation/control` + `/conversation/multi-intent` (#5) — kept alive by debug-only commands (`/debug_conversation_intent`, `/debug_intent_plan`), lower priority than the two above since they're read-only debug tooling, not core product flow.
 
 **Tests that should be rewritten or removed later**
-- ~~`tests/conversation-orchestrator-v2.test.ts`~~ — **done.** Rewritten to route through `/messages/process` instead of the deleted debug route; see "`/messages/process_v2` Retirement" below.
+- ~~`tests/conversation-orchestrator-v2.test.ts`~~ — **deleted.** See "Conversation Orchestrator v2 — Full Retirement" below.
 - No other test file in `tests/*.test.ts` was found to protect exclusively-dead behavior; `tests/email-review-dedupe.test.ts` in particular should NOT be touched (row 10).
 
 **Exact next safe cleanup PR/pass**
 1. ~~Confirm whether `/messages/process_v2` debug tooling is still wanted; if not, delete it.~~ **Done** — see "`/messages/process_v2` Retirement" below.
 2. ~~Close the cross-system gap under "Pending-actions confirmation flow."~~ **Done** — see "PendingAction / Agent Runtime v3 Interop" below.
-3. Next: the Gmail-rules and action-hygiene "migrate-first" work already queued in the Server.ts Map section above, which is also the prerequisite for ever safely extracting `applyPendingAction`/`pending-actions` out of `server.ts` (and for eventually letting v3 execute legacy `PendingAction`s directly instead of just detecting them).
+3. ~~Confirm whether `CONVERSATION_ORCHESTRATOR_V2_ENABLED` and Conversation Orchestrator v2 itself can be deleted.~~ **Done** — see "Conversation Orchestrator v2 — Full Retirement" below.
+4. Next: the Gmail-rules and action-hygiene "migrate-first" work already queued in the Server.ts Map section above, which is also the prerequisite for ever safely extracting `applyPendingAction`/`pending-actions` out of `server.ts` (and for eventually letting v3 execute legacy `PendingAction`s directly instead of just detecting them).
 
 ## PendingAction / Agent Runtime v3 Interop
 
@@ -337,6 +261,8 @@ Grep/reference-verified pass answering: with v3 as the Telegram default, which o
 **Safe deletion/further-migration conditions:** v3 could take over *executing* legacy `PendingAction`s (not just detecting them) once `applyPendingAction`'s Gmail-rule and action-hygiene dependencies are themselves extracted into safely-importable modules — i.e. after the "migrate-first" work already queued for rows 3/6/7 in the audit table above. Until then, this detect-defer-or-safely-cancel design is the stopping point, and should not be treated as "done, no further work needed" — it closes the silent-ignore bug, not the broader migration.
 
 ## `/messages/process_v2` Retirement
+
+*Historical record — accurate as of this pass. Everything below about Conversation Orchestrator v2's own logic "still being imported by a live production path" was true then; it no longer is — see "Conversation Orchestrator v2 — Full Retirement" further below for the later pass that deleted it entirely.*
 
 **References found before deletion** (verified with `rg`, not just text search — see below for the import-level check):
 - `rg "messages/process_v2"` across `apps/`: exactly 2 files — the route definition/registration in `apps/api/src/routes/messages.ts` (lines 10, 29 pre-deletion), and `tests/conversation-orchestrator-v2.test.ts` (the route string, plus a `processV2()` test helper function calling it).
@@ -367,7 +293,9 @@ Grep/reference-verified pass answering: with v3 as the Telegram default, which o
 
 **Question:** now that `/messages/process_v2` is gone, is `CONVERSATION_ORCHESTRATOR_V2_ENABLED` — and the v2-first branch it gates inside `/messages/process` — still needed anywhere, or can it (and the v2 internals it calls) be deleted?
 
-**Decision: KEEP. Not deleted.** This is a repeat of the same open question from the "Legacy Usage Audit" pass and the `/messages/process_v2` retirement pass above — both already flagged the identical blocker. This pass re-verified it from scratch rather than assuming the prior answer still held, and reached the same conclusion for the same reason: **the blocker is not a code question, it's a runtime-environment question this repository cannot answer from the outside.**
+**Decision at the time: KEEP. Not deleted.** This is a repeat of the same open question from the "Legacy Usage Audit" pass and the `/messages/process_v2` retirement pass above — both already flagged the identical blocker. This pass re-verified it from scratch rather than assuming the prior answer still held, and reached the same conclusion for the same reason: **the blocker is not a code question, it's a runtime-environment question this repository cannot answer from the outside.**
+
+**Update — superseded by a product decision:** the exact external fact this audit said would unblock deletion (confirmed via the deployed environment, not this repo) came back negative — no live deployment relies on `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`. Conversation Orchestrator v2 has since been deleted. See "Conversation Orchestrator v2 — Full Retirement" below for the execution record. The rest of this section is kept as the historical evidence trail that justified waiting for that confirmation before deleting anything.
 
 **References found:**
 - `CONVERSATION_ORCHESTRATOR_V2_ENABLED`: read in exactly one place in non-test code — `apps/api/src/conversation/orchestrator-v2.ts:37`, inside `isConversationOrchestratorV2Enabled()`. That function is called from exactly one production gate: `server.ts:314`, the `if (isConversationOrchestratorV2Enabled())` branch inside `/messages/process`'s `process` handler (7 lines: check flag, call v2, return early if it handled the message). Two more read-only references at `server.ts:7166` and `:7169` just populate a `v2Enabled`/`v2SkippedReason` debug field inside the *legacy* semantic-router's own routeDebug output — cosmetic, not a second gate.
@@ -391,13 +319,49 @@ Grep/reference-verified pass answering: with v3 as the Telegram default, which o
 
 **What replaces v2 if/when it's deleted:** Agent Runtime v3 already independently reimplements the memory, progress-logging, and read-surface scopes v2 owns. It does **not** yet cover v2's bulk/multi-item action-hygiene batch operations or full Gmail rule editing — those would fall back to the legacy deterministic/semantic pipeline inside `/messages/process` (not disappear), consistent with everything else already documented in "Legacy Conversation Stack To Remove Or Isolate" above.
 
+## Conversation Orchestrator v2 — Full Retirement
+
+Executes the deletion the "Conversation Orchestrator v2 Branch Retirement Audit" above said would become safe once the one external fact it identified was confirmed. Product confirmed it: no live deployment relies on `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`.
+
+**References removed:**
+- `CONVERSATION_ORCHESTRATOR_V2_ENABLED`: the one production gate (`server.ts:314`, `if (isConversationOrchestratorV2Enabled())`) and its `isConversationOrchestratorV2Enabled` import are deleted. No code anywhere reads this env var anymore — confirmed via `rg "CONVERSATION_ORCHESTRATOR_V2_ENABLED"` returning zero matches under `apps/` and `packages/` after the change.
+- `runConversationOrchestratorV2`/`runConversationOrchestratorV2ForMessage`: both deleted (the latter was `server.ts`-local, the former was `orchestrator-v2.ts`'s export, deleted with the file).
+- The `v2Enabled`, `llmOperationPlannerEnabled`, and `v2SkippedReason` fields inside the legacy semantic router's own `routeDebug` object (`server.ts`, inside `handleSemanticRouterIntent`) — these referenced the now-deleted flag-check functions and are removed from the object literal. The corresponding fields stay defined (as optional) in the shared `ProcessMessageResult.routeDebug` zod schema in `packages/core/src/message-processing.ts` for response-shape backward compatibility, but nothing populates them anymore.
+- `shouldUseLLMOperationPlanner` import into `server.ts` — removed; it was only used to populate the now-removed `llmOperationPlannerEnabled` debug field.
+
+**Files deleted:**
+- `apps/api/src/conversation/orchestrator-v2.ts`
+- `apps/api/src/conversation/context.ts`
+- `apps/api/src/conversation/operation-catalog.ts`
+- `apps/api/src/conversation/operation-executor.ts`
+- `apps/api/src/conversation/operation-planner.ts`
+- `apps/api/src/conversation/operation-validator.ts`
+- `apps/api/src/conversation/response-composer.ts`
+- `tests/conversation-orchestrator-v2.test.ts` (32 tests)
+
+Reachability confirmed via precise import-path grep (`conversation/<name>.js`, not a loose basename match — an earlier loose check falsely flagged `apps/api/src/conversation/operation-planner.ts` as imported by `packages/llm/src/index.ts`, which turned out to be a same-named but entirely unrelated file in a different package) before deleting each file: all seven had zero importers outside this same cluster once `orchestrator-v2.ts` itself was confirmed to have exactly one importer (`server.ts`, the deleted branch).
+
+**Files NOT deleted (still used elsewhere), and why:**
+- `apps/api/src/conversation/gmail-autonomy.ts`, `apps/api/src/conversation/email-rule-selection.ts` — unrelated to v2, still imported by legacy Gmail conversation handling in `server.ts`.
+- `packages/llm/src/operation-planner.ts` — a distinct file (same basename, different package) that only `orchestrator-v2.ts` imported from. Now unreachable too, but left in place: out of this pass's explicit scope (`apps/api/src/conversation/`, not `packages/llm/`), and cross-package deletions carry more risk than this pass's mandate covers. Flagged as the next cleanup target below.
+- `packages/core/src/message-processing.ts`'s `ProcessMessageResult.routeDebug` schema — the v2-specific optional fields (`v2Enabled`, `llmOperationPlannerEnabled`, `v2SkippedReason`, `operationPlanValidated`) were left defined rather than removed from the schema, since they're optional and harmless, and touching a shared response schema is a larger blast radius than this pass needed.
+- Also newly-orphaned and deleted from `server.ts` itself (not files, but functions that existed only to wire into v2's callback interface, confirmed via grep to have zero other callers): `buildOperationPlannerStateSummary`, `logProgressFromConversationMessage`, `createMemoryFromConversationMessage`, `formatMemorySummaryForUser`, `formatConversationProgressEventDone`, `formatConversationProgressEventStatus`, `rememberRecentMutationStatus`. Their own internal dependencies (`formatMultiIntentEventDone`, `getPendingEmailReviewCount`, etc.) were checked individually and confirmed to have independent live callers elsewhere in `server.ts`, so those stayed.
+
+**`server.ts` line count:** 17,122 → **16,938** (−184).
+
+**Tests: 32 deleted, 3 added.** `tests/conversation-orchestrator-v2.test.ts` is gone entirely — every one of its 32 tests exercised v2-specific behavior (its own deterministic operation planner, validator, and response composer) that no longer exists; there was no legacy-equivalent behavior to preserve by rewriting them, unlike the `/messages/process_v2` retirement pass where the underlying v2 logic survived and only the route changed. New: `tests/messages-process-legacy.test.ts` (3 tests) — `/messages/process` still responds through the remaining legacy deterministic-surface path; setting `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true` is now provably inert (identical response with or without it); `/agent/message` (Agent Runtime v3) is unaffected by any of this.
+
+**What's unchanged:** `/agent/message`, Telegram normal chat v3, Telegram slash commands, `/messages/process` (still legacy, still exists, now permanently running only the deterministic/semantic pipeline that was already its fallback), Gmail OAuth/sync, pending-actions routes, memory/checkin/insights routes.
+
+**Next cleanup target:** `packages/llm/src/operation-planner.ts` (the LLM-calling half of v2's operation planner, now unreachable — flagged above, deliberately left for a dedicated pass since it's outside `apps/api/src/conversation/`). After that, the Gmail-rules and action-hygiene "migrate-first" work already queued in the Server.ts Map section is next in line, same as before this pass.
+
 ## Migration Rule
 
-When moving a legacy surface into v2:
+When moving a legacy surface into v3 (Conversation Orchestrator v2 is retired — this rule now targets Agent Runtime v3's tool catalog, not v2's operation catalog):
 
-1. Add operation catalog entries.
-2. Add deterministic validation.
-3. Add deterministic executor callbacks.
-4. Add routeDebug assertions proving `plannerUsed`, `mutationExecuted`, `operationPlanValidated`, and `legacySemanticUsed`.
-5. Keep legacy fallback until tests prove parity.
+1. Add a tool definition to `apps/api/src/agent-runtime/tool-catalog.ts`.
+2. Add deterministic validation in `apps/api/src/agent-runtime/validator.ts`.
+3. Add a deterministic executor case in `apps/api/src/agent-runtime/executor.ts`.
+4. Add debug assertions proving `plannerUsed`, `mutationExecuted`, and `legacySemanticUsed` (still exposed by the legacy `/messages/process` routeDebug contract) so a migrated scope's parity with legacy is provable in tests, not assumed.
+5. Keep the legacy fallback in `/messages/process` until tests prove v3 parity for that scope.
 6. Update `README.md`, `docs/01-system-architecture.md`, `docs/05-agent-behavior.md`, `docs/07-implementation-status.md`, and `docs/08-product-capability-audit.md`.
