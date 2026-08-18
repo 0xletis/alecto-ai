@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { PrismaClient, type Prisma } from "@prisma/client";
+import { Prisma, PrismaClient } from "@prisma/client";
 import {
   defaultGoalPriority,
   findDuplicateActiveGoal,
@@ -2641,6 +2641,89 @@ export async function expireOldPendingActions(userId: string): Promise<void> {
       status: "expired"
     }
   });
+}
+
+export interface AgentConversationSessionRow {
+  id: string;
+  userId: string;
+  channel: string;
+  topic: string | null;
+  focusedEntities: Prisma.JsonValue;
+  pendingOperation: Prisma.JsonValue;
+  visibleEntities: Prisma.JsonValue;
+  recentMutations: Prisma.JsonValue;
+  messages: Prisma.JsonValue;
+  expiresAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export interface UpsertAgentConversationSessionInput {
+  topic: string | null;
+  focusedEntities: unknown;
+  pendingOperation: unknown;
+  visibleEntities: unknown;
+  recentMutations: unknown;
+  messages: unknown;
+  expiresAt: Date | null;
+}
+
+export async function getAgentConversationSession(
+  userId: string,
+  channel: string
+): Promise<AgentConversationSessionRow | undefined> {
+  const row = await prisma.agentConversationSession.findUnique({
+    where: { userId_channel: { userId, channel } }
+  });
+
+  return row ? toAgentConversationSessionRow(row) : undefined;
+}
+
+export async function upsertAgentConversationSession(
+  userId: string,
+  channel: string,
+  input: UpsertAgentConversationSessionInput
+): Promise<AgentConversationSessionRow> {
+  await ensureUser(userId);
+
+  const data = {
+    topic: input.topic,
+    focusedEntities: toJsonInput(input.focusedEntities),
+    pendingOperation: toJsonInput(input.pendingOperation),
+    visibleEntities: toJsonInput(input.visibleEntities),
+    recentMutations: toJsonInput(input.recentMutations),
+    messages: toJsonInput(input.messages),
+    expiresAt: input.expiresAt
+  };
+
+  const row = await prisma.agentConversationSession.upsert({
+    where: { userId_channel: { userId, channel } },
+    create: { userId, channel, ...data },
+    update: data
+  });
+
+  return toAgentConversationSessionRow(row);
+}
+
+function toAgentConversationSessionRow(row: Prisma.AgentConversationSessionGetPayload<object>): AgentConversationSessionRow {
+  return {
+    id: row.id,
+    userId: row.userId,
+    channel: row.channel,
+    topic: row.topic,
+    focusedEntities: row.focusedEntities,
+    pendingOperation: row.pendingOperation,
+    visibleEntities: row.visibleEntities,
+    recentMutations: row.recentMutations,
+    messages: row.messages,
+    expiresAt: row.expiresAt,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+  };
+}
+
+function toJsonInput(value: unknown): Prisma.NullableJsonNullValueInput | Prisma.InputJsonValue {
+  return value === null || value === undefined ? Prisma.JsonNull : (value as Prisma.InputJsonValue);
 }
 
 function toGoal(goal: Prisma.GoalGetPayload<object>): Goal {

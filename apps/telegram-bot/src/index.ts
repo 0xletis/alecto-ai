@@ -11,6 +11,7 @@ import {
   type InboundRouteDebug,
   type NormalizedInboundMessage
 } from "@operator-agent/core";
+import { isLegacyTelegramChatEnabled, logLegacyTelegramRouting, routeToAgentRuntimeV3 } from "./agent-runtime-routing.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -1984,11 +1985,16 @@ bot.command("cancel", async (ctx) => {
   }
 });
 
-bot.on("message:text", async (ctx) => {
-  if (!(await guardAllowedUser(ctx))) {
-    return;
-  }
-
+/**
+ * Legacy normal-message pipeline: multi-intent → daily-checkin → ingest-text
+ * → conversation/control → /messages/process. This is no longer the default —
+ * Agent Runtime v3 (routeToAgentRuntimeV3) is — and only runs when a user has
+ * explicitly opted out via TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false. Slated
+ * for removal in a later cleanup pass once v3 has full parity; see
+ * docs/09-architecture-inventory.md's "Legacy conversation stack" section.
+ * Unchanged from the original handler body — do not add new behavior here.
+ */
+async function routeToLegacyMessageProcessor(ctx: Context): Promise<void> {
   try {
     const inbound = buildNormalizedTelegramMessage(ctx);
     const recentDailyCheckInReminder = shouldCheckRecentDailyCheckInReminder(inbound)
@@ -2054,6 +2060,36 @@ bot.on("message:text", async (ctx) => {
   } catch (error) {
     await replyWithApiFailure(ctx, error, "I could not process that message right now.");
   }
+}
+
+bot.on("message:text", async (ctx) => {
+  if (!(await guardAllowedUser(ctx))) {
+    return;
+  }
+
+  if (isLegacyTelegramChatEnabled()) {
+    logLegacyTelegramRouting(getTelegramUserId(ctx));
+    await routeToLegacyMessageProcessor(ctx);
+    return;
+  }
+
+  const inbound = buildNormalizedTelegramMessage(ctx);
+  await routeToAgentRuntimeV3(
+    inbound.userId,
+    inbound.text,
+    {
+      callAgentRuntime: (input) =>
+        apiPost<AgentMessageResponse>("/agent/message", {
+          userId: input.userId,
+          message: input.message,
+          channel: "telegram"
+        }),
+      reply: async (text) => {
+        await ctx.reply(text);
+      }
+    },
+    ctx.update.update_id
+  );
 });
 
 bot.catch((error) => {
@@ -4404,6 +4440,16 @@ function balancedProfile() {
 
 interface ProcessMessageResponse {
   reply: string;
+}
+
+interface AgentMessageResponse {
+  reply: string;
+  debug?: {
+    conversationTopic?: unknown;
+    pendingOperation?: unknown;
+    mutationExecuted?: unknown;
+    [key: string]: unknown;
+  };
 }
 
 interface DailyReviewResponse {

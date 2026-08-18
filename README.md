@@ -124,6 +124,22 @@ Both the Telegram bot and worker need `TELEGRAM_BOT_TOKEN`. For local dev, remin
 
 Telegram users are mapped to API users as `telegram:<telegramUserId>`, so each Telegram account has separate goals, events, and profile.
 
+### Agent Runtime v3 (default Telegram normal-chat runtime)
+
+Agent Runtime v3 (`POST /agent/message`, `apps/api/src/agent-runtime/`) is the **default** runtime for normal (non-command) Telegram text — no flag needed. `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` is the explicit opt-out that falls back to the legacy `/messages/process` pipeline:
+
+```bash
+# default (unset) and TELEGRAM_AGENT_RUNTIME_V3_ENABLED=true both mean: use Agent Runtime v3
+# only the literal string "false" opts back into the legacy pipeline
+TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false
+```
+
+- Slash commands (`/start`, `/help`, `/setup`, `/sync_gmail`, `/gmail_status`, `/gmail_rules`, etc.) and all Gmail OAuth/setup/sync flows keep using the existing (legacy) handlers unchanged, regardless of this flag.
+- If v3 errors, the bot replies with a short dev-safe message ("Agent v3 hit an error while handling that. Nothing was changed.") and logs the error — it does not fall back to `/messages/process`, so bugs stay visible instead of being silently masked.
+- Agent Runtime v3's conversation/session state is **persisted** in the `AgentConversationSession` table (one row per `userId` + `channel`) — topic, pending confirmation, visible entities, recent mutations, and a bounded message history (last 20) all survive an API restart. A pending confirmation created before a restart can still be confirmed (`yes`) or cancelled (`no`/`cancel`) afterward. Each session has a sliding 24h TTL, refreshed on every turn; an expired session is treated as missing, so a stale pending confirmation can never execute — replying `yes` to one just gets "I don't have anything pending to confirm." See `apps/api/src/agent-runtime/session-store.ts` (DB mapping) and `conversation-session.ts` (per-turn load/mutate/save).
+- The per-user in-memory lock (`apps/api/src/agent-runtime/user-lock.ts`) still serializes same-user turns end-to-end (including the DB read/write) — different users still process fully concurrently. DB persistence does not replace it.
+- `/messages/process` and its supporting routers (deterministic surface router, legacy semantic router, `/conversation/control`, action hygiene parser) remain available but are now legacy for normal conversation — reachable only via the explicit `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` opt-out or direct API calls. **New conversation/product work should go into Agent Runtime v3**, not the legacy pipeline. See docs/09-architecture-inventory.md's "Legacy conversation stack to remove or isolate" for what's still needed there and what isn't. Legacy code isn't deleted yet — that happens in a later cleanup pass, once v3 has proven parity.
+
 ## Product Surfaces
 
 Natural chat now covers the main operator surfaces. Users can ask things like `what can you do`, `help me set up`, `how do I start`, `what should I configure`, `what is missing`, `set up goals`, `how do reminders work`, `set up actions`, `set up daily loop`, `what should I do today`, `anything important?`, `what needs my attention?`, `what should I handle first?`, `what emails need action?`, `hay correos importantes de Gmail?`, `anything for my job search?`, `review my day`, `review my week`, `plan this week`, `plan my week`, `plan next week`, `clean up my tasks`, `show my goals`, `show my tasks`, `show my memories`, `connect Gmail`, `what can Gmail track`, `what email rules are on`, `what email rules do we have`, `email reviews`, `correos pendientes`, `Gmail status`, `enable job search rule for Gmail`, `enable work action rule for Gmail`, `create a rule for Endesa bills`, `track Endesa bills from Gmail`, `only look for Endesa`, `looks for only Aigues de Barcelona instead of Endesa`, `que reglas de email tenemos activas`, `crea una regla de Gmail para facturas de Aigues de Barcelona`, `quan m'avisareu dels correus d'Endesa?`, `where will Endesa emails go?`, `when will you let me know about new emails?`, `remove Endesa rule`, `delete all email rules`, `sync Gmail`, or `sync integrations`. Slash commands remain shortcuts/backdoors for precision and debugging.

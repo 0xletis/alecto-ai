@@ -26,6 +26,7 @@ model User {
   emailReviewItems       EmailReviewItem[]
   actionItems            ActionItem[]
   actionItemReminderLogs ActionItemReminderLog[]
+  agentConversationSessions AgentConversationSession[]
 }
 
 model Goal {
@@ -141,6 +142,31 @@ model PendingAction {
 
   @@index([userId])
   @@index([userId, status, createdAt])
+}
+
+// Agent Runtime v3's persisted conversation/session state (topic, pending
+// confirmation, visible entities, recent mutations, bounded message history).
+// One row per (userId, channel). expiresAt is a sliding 24h TTL, refreshed on
+// every turn — an expired row is treated as missing and a fresh session is
+// created. Isolated from PendingAction/legacy conversation-control state.
+model AgentConversationSession {
+  id               String    @id @default(uuid())
+  userId           String
+  channel          String
+  topic            String?
+  focusedEntities  Json?
+  pendingOperation Json?
+  visibleEntities  Json?
+  recentMutations  Json?
+  messages         Json?
+  expiresAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channel])
+  @@index([userId])
 }
 
 model NotificationSettings {
