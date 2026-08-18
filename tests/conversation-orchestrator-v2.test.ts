@@ -6,40 +6,6 @@ import { buildServer } from "../apps/api/src/server.ts";
 
 const now = "2026-08-13T10:00:00+02:00";
 
-test("messages/process_v2 exposes explicit v2 ownership when a scope is unmigrated", async () => {
-  const server = buildServer();
-  const userId = `orchestrator-v2-unhandled-debug-${randomUUID()}`;
-
-  try {
-    await createUserWithTimezone(userId);
-
-    const response = await withEnvOverrides(
-      {
-        CONVERSATION_ORCHESTRATOR_V2_ENABLED: "true",
-        LLM_OPERATION_PLANNER_ENABLED: "false"
-      },
-      () => processV2(server, userId, "hello, just checking")
-    );
-
-    assert.equal(response.statusCode, 200);
-    assert.equal(response.json().reply, "Conversation Orchestrator v2 did not handle this message yet.");
-    assert.equal(response.json().routeDebug.routerSource, "conversation_orchestrator_v2");
-    assert.equal(response.json().routeDebug.handledBy, "none");
-    assert.equal(response.json().routeDebug.v2SkippedReason, "No v2 operation matched this message.");
-    assert.equal(response.json().routeDebug.plannerUsed, "none");
-    assert.equal(response.json().routeDebug.llmPlannerAttempted, false);
-    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
-    assert.equal(response.json().routeDebug.legacySemanticAttempted, false);
-    assert.equal(response.json().routeDebug.legacySemanticUsed, false);
-    assert.equal(response.json().routeDebug.mutationExecuted, false);
-    assert.equal(response.json().routeDebug.operationPlanValidated, false);
-    assert.equal(response.json().routeDebug.policyPrecheckResult, "passed");
-  } finally {
-    await server.close();
-    await prisma.user.deleteMany({ where: { id: userId } });
-  }
-});
-
 test("conversation orchestrator v2 stores the exact one-item hygiene list it renders", async () => {
   const server = buildServer();
   const userId = `orchestrator-v2-visible-invariant-${randomUUID()}`;
@@ -672,29 +638,6 @@ test("conversation orchestrator v2 falls back when LLM planner returns invalid J
   }
 });
 
-test("conversation orchestrator v2 debug preserves LLM failure when no fallback plan exists", async () => {
-  const server = buildServer();
-  const userId = `orchestrator-v2-llm-no-plan-${randomUUID()}`;
-
-  try {
-    await createUserWithTimezone(userId);
-
-    const response = await withLLMPlannerMock("{not json", () => processV2(server, userId, "mensaje extraño sin ruta"));
-
-    assert.equal(response.statusCode, 200);
-    assert.equal(response.json().reply, "Conversation Orchestrator v2 did not handle this message yet.");
-    assert.equal(response.json().routeDebug.plannerUsed, "fallback");
-    assert.equal(response.json().routeDebug.llmPlannerAttempted, true);
-    assert.equal(response.json().routeDebug.llmPlannerUsed, false);
-    assert.equal(response.json().routeDebug.llmPlannerFailedReason, "invalid_json");
-    assert.equal(response.json().routeDebug.operationPlanValidated, false);
-    assert.equal(response.json().routeDebug.mutationExecuted, false);
-  } finally {
-    await server.close();
-    await prisma.user.deleteMany({ where: { id: userId } });
-  }
-});
-
 test("conversation orchestrator v2 stays deterministic when LLM planner flag is disabled", async () => {
   const server = buildServer();
   const userId = `orchestrator-v2-llm-disabled-${randomUUID()}`;
@@ -1301,12 +1244,21 @@ async function loadHygieneCandidates(server: ReturnType<typeof buildServer>, use
   return candidates;
 }
 
+/**
+ * /messages/process_v2 (the debug-only endpoint that unconditionally invoked
+ * Conversation Orchestrator v2, bypassing CONVERSATION_ORCHESTRATOR_V2_ENABLED)
+ * has been retired — it had zero production callers. Every call site in this
+ * file that uses processV2() is testing v2's own successful-handling behavior
+ * (result.handled === true), which is byte-for-byte identical whether reached
+ * through the old debug route or through /messages/process with the flag on —
+ * the two only ever diverged in the unhandled/"not migrated" fallback case,
+ * which had no production equivalent and whose two tests were removed along
+ * with the route. So this now routes through the real production endpoint
+ * instead, keeping the old name so the ~40 existing call sites below don't
+ * need to change.
+ */
 async function processV2(server: ReturnType<typeof buildServer>, userId: string, message: string) {
-  return server.inject({
-    method: "POST",
-    url: "/messages/process_v2",
-    payload: { userId, message }
-  });
+  return withV2Enabled(() => processMessage(server, userId, message));
 }
 
 async function processMessage(server: ReturnType<typeof buildServer>, userId: string, message: string) {

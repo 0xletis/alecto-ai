@@ -306,46 +306,6 @@ export function buildServer() {
   registerInsightRoutes(server);
 
   registerMessageRoutes(server, {
-    processV2: async (input) => {
-      const parsed = { data: input };
-      await ensureUser(parsed.data.userId);
-      await expireOldPendingActions(parsed.data.userId);
-
-    const v2Result = await runConversationOrchestratorV2ForMessage(parsed.data.userId, parsed.data.message, {
-      returnUnhandled: true
-    });
-
-    if (v2Result) {
-      return v2Result;
-    }
-
-    return replyOnly(parsed.data.userId, parsed.data.message, "Conversation Orchestrator v2 did not handle this message yet.", {
-      routerSource: "conversation_orchestrator_v2",
-      orchestrator: "v2",
-      v2Enabled: isConversationOrchestratorV2Enabled(),
-      llmOperationPlannerEnabled: shouldUseLLMOperationPlanner(),
-      intent: "not_migrated",
-      handlerName: "runConversationOrchestratorV2",
-      handledBy: "none",
-      skippedReason: "No v2 operation matched this message.",
-      v2SkippedReason: "No v2 operation matched this message.",
-      plannerUsed: "deterministic",
-      llmPlannerAttempted: false,
-      llmPlannerUsed: false,
-      contextLoaded: false,
-      visibleContextType: "unknown",
-      visibleEntityCount: 0,
-      pendingConfirmation: false,
-      mutationExecuted: false,
-      semanticRouterAttempted: false,
-      semanticRouterUsed: false,
-      legacySemanticAttempted: false,
-      legacySemanticUsed: false,
-      mutation: false,
-      policyPrecheckResult: "passed",
-      reason: "This scope still uses legacy /messages/process."
-    });
-    },
     process: async (input) => {
       const parsed = { data: input };
       await ensureUser(parsed.data.userId);
@@ -16948,8 +16908,7 @@ async function buildOperationPlannerStateSummary(userId: string): Promise<Record
 
 async function runConversationOrchestratorV2ForMessage(
   userId: string,
-  message: string,
-  options: { returnUnhandled?: boolean } = {}
+  message: string
 ): Promise<ProcessMessageResult | undefined> {
   const result = await runConversationOrchestratorV2({
     userId,
@@ -16982,15 +16941,6 @@ async function runConversationOrchestratorV2ForMessage(
   });
 
   if (!result.handled) {
-    if (options.returnUnhandled && result.routeDebug) {
-      return replyOnly(
-        userId,
-        message,
-        "Conversation Orchestrator v2 did not handle this message yet.",
-        result.routeDebug
-      );
-    }
-
     return undefined;
   }
 
