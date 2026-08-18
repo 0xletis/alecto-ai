@@ -1,5 +1,6 @@
 /**
- * Dev-flag routing helpers for POST /agent/message (Agent Runtime v3).
+ * Telegram routing helpers for normal (non-command) chat: Agent Runtime v3
+ * (the default) and the explicit legacy opt-out.
  *
  * Kept in its own module, separate from index.ts, specifically so it can be
  * imported by tests without side effects: index.ts constructs a real grammy
@@ -31,8 +32,18 @@ export interface RouteToAgentRuntimeDeps {
 
 export const AGENT_RUNTIME_V3_ERROR_REPLY = "Agent v3 hit an error while handling that. Nothing was changed.";
 
-export function isAgentRuntimeV3EnabledForTelegram(): boolean {
-  return process.env.TELEGRAM_AGENT_RUNTIME_V3_ENABLED === "true";
+/**
+ * Agent Runtime v3 is the DEFAULT for normal Telegram text: unset, "true", or
+ * any value other than the literal string "false" all route to v3. Only an
+ * explicit TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false opts back into the legacy
+ * /messages/process pipeline (routeToLegacyMessageProcessor in index.ts).
+ */
+export function isLegacyTelegramChatEnabled(): boolean {
+  return process.env.TELEGRAM_AGENT_RUNTIME_V3_ENABLED === "false";
+}
+
+export function logLegacyTelegramRouting(userId: string, log: (message: string) => void = console.log): void {
+  log(`[telegram] runtime=legacy_messages reason=flag_disabled user=${userId}`);
 }
 
 /**
@@ -47,20 +58,20 @@ export async function routeToAgentRuntimeV3(userId: string, message: string, dep
   const logError = deps.logError ?? console.error;
   const startedAt = Date.now();
 
-  log(`[telegram] agent_v3 start user=${userId} text=${JSON.stringify(message)}`);
+  log(`[telegram] runtime=agent_v3 user=${userId} start text=${JSON.stringify(message)}`);
 
   try {
     const response = await deps.callAgentRuntime({ userId, message });
     const elapsedMs = Date.now() - startedAt;
     const debug = response.debug;
     log(
-      `[telegram] agent_v3 done user=${userId} elapsedMs=${elapsedMs} reply=${JSON.stringify(truncate(response.reply, 80))} ` +
+      `[telegram] runtime=agent_v3 user=${userId} done elapsedMs=${elapsedMs} reply=${JSON.stringify(truncate(response.reply, 80))} ` +
         `topic=${debug?.conversationTopic ?? "?"} pending=${debug?.pendingOperation ?? "?"} mutation=${debug?.mutationExecuted ?? "?"}`
     );
     await deps.reply(response.reply);
   } catch (error) {
     const elapsedMs = Date.now() - startedAt;
-    logError(`[telegram] agent_v3 error user=${userId} elapsedMs=${elapsedMs}`, error);
+    logError(`[telegram] runtime=agent_v3 user=${userId} error elapsedMs=${elapsedMs}`, error);
     await deps.reply(AGENT_RUNTIME_V3_ERROR_REPLY);
   }
 }

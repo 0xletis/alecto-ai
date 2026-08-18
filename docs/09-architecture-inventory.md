@@ -7,8 +7,8 @@ This file is the current architecture handoff for humans and orchestrator agents
 ## Entry Points
 
 - `apps/telegram-bot`: Telegram adapter. It converts Telegram updates into API calls and should stay thin. Core business logic must not depend on Telegram `ctx`, inline buttons, command menus, or hardcoded chat IDs.
-- `POST /messages/process`: production natural-message entry point. It is v2-first when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`; legacy routing remains the fallback for unmigrated scopes.
-- `POST /agent/message`: isolated Agent Runtime v3 spike (`apps/api/src/agent-runtime/`). Not part of the `/messages/process` routing order below. With `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=true`, `apps/telegram-bot` routes normal (non-command) text here instead of `/messages/process`; slash commands and Gmail OAuth/setup/sync flows are unaffected. Session state (topic, pending confirmation, visible entities, recent mutations, bounded message history) is persisted per `userId`+`channel` in the `AgentConversationSession` table with a sliding 24h TTL — it survives an API restart; an expired session is treated as missing. Still dev/test only, not a production default. See `apps/api/src/agent-runtime/session-store.ts`, `apps/telegram-bot/src/agent-runtime-routing.ts`, and the README's "Agent Runtime v3 (dev flag)" section.
+- `POST /agent/message`: **the default runtime for normal Telegram chat** (`apps/api/src/agent-runtime/`), isolated from the `/messages/process` routing order below. `apps/telegram-bot` routes all normal (non-command) text here unless `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` explicitly opts back into legacy (`routeToLegacyMessageProcessor` in `apps/telegram-bot/src/index.ts`); slash commands and Gmail OAuth/setup/sync flows are unaffected either way. Session state (topic, pending confirmation, visible entities, recent mutations, bounded message history) is persisted per `userId`+`channel` in the `AgentConversationSession` table with a sliding 24h TTL — it survives an API restart; an expired session is treated as missing. **New conversation/product work goes here, not into the legacy pipeline below.** See `apps/api/src/agent-runtime/session-store.ts`, `apps/telegram-bot/src/agent-runtime-routing.ts`, the README's "Agent Runtime v3" section, and "Legacy conversation stack to remove or isolate" below.
+- `POST /messages/process`: **legacy** natural-message entry point for normal conversation. Still the production path for the explicit `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` opt-out and for direct API callers. It is v2-first when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`; legacy routing remains the fallback for unmigrated scopes. Not removed yet — see the legacy inventory below for what's still needed and what isn't.
 - `POST /messages/process_v2`: debug/audit entry point for Conversation Orchestrator v2 only. It does not fall through to legacy. If v2 cannot handle a message, it returns an explicit `not_migrated` reply and route debug.
 - Domain API routes under `/users/:userId/...`: canonical mutation/read surfaces for goals, events, actions, email rules, reviews, integrations, daily loop, weekly review, planning, and debug views.
 - `apps/worker`: proactive jobs for daily loop, reminders, integration sync, and Gmail background sync. It should call API/core services, not duplicate domain rules.
@@ -197,6 +197,58 @@ Current implementation is betting/trading-heavy because that was the first real 
 - Future domains can include health, spending, sleep, social media, or custom user-defined no-go rules.
 - Do not create actions, plans, or Gmail rules that help bypass a hard guardrail.
 - Do not let LLM advice optimize restricted behavior. It may support safe refusal or cooldown language only.
+
+## Legacy Conversation Stack To Remove Or Isolate
+
+Now that Agent Runtime v3 is the default Telegram normal-chat runtime, this is the working inventory of what the old stack still owns. Do not delete any of these without targeted tests proving the replacement has parity — "no test currently fails" is not proof a path is dead, only that nothing exercises it yet.
+
+**`/messages/process` (legacy normal-message path)**
+- Still needed: yes.
+- Reason: it's the live target of the explicit `TELEGRAM_AGENT_RUNTIME_V3_ENABLED=false` opt-out, and the only path for direct API callers who haven't moved to `/agent/message`. It also still owns scopes v3 doesn't have tools for yet (planning sessions, daily loop settings, full Gmail rule management — see "Not yet migrated" above).
+- Safe deletion conditions: v3 has a tool/flow for every scope in "Still owned by legacy `/messages/process` routing" above, with tests proving parity; the Telegram legacy opt-out is itself deprecated; no direct API callers remain.
+- Replacement in v3: `POST /agent/message` (already the default).
+
+**Deterministic surface router** (`handleConversationSurfaceIntent`/`detectConversationSurfaceIntent`, inline in `server.ts`)
+- Still needed: yes.
+- Reason: still runs as step 12 of `/messages/process`'s routing order for every legacy-path message; not migrated to v3's tool catalog.
+- Safe deletion conditions: only reachable once `/messages/process` itself is safe to delete (see above), or once every surface it currently routes is independently ported into v3's tool catalog with test parity.
+- Replacement in v3: conceptually, the validator+executor pattern (`apps/api/src/agent-runtime/{validator,executor}.ts`) — but coverage isn't 1:1 yet.
+
+**Legacy semantic router** (LLM-based intent classification, inline in `server.ts`)
+- Still needed: yes.
+- Reason: still owns "Legacy LLM semantic routing for unmigrated natural-language surfaces" (generic chat/coaching fallback and anything outside v3's ~22-tool catalog).
+- Safe deletion conditions: v3's planner + tool catalog covers generic chat/coaching and every surface this router currently classifies, with tests proving `legacySemanticUsed=false` for those scopes.
+- Replacement in v3: `apps/api/src/agent-runtime/planner.ts` (the LLM operation planner) is the architectural replacement, but its tool catalog is narrower today.
+
+**`/conversation/control`**
+- Still needed: yes.
+- Reason: called directly by the legacy Telegram pipeline (`routeToLegacyMessageProcessor` in `apps/telegram-bot/src/index.ts`), not just internally by `/messages/process`.
+- Safe deletion conditions: once the legacy Telegram pipeline is itself removed and no other direct callers remain.
+- Replacement in v3: the pending-operation confirm/cancel firewall (`runtime.ts`) plus the tool catalog cover the same "resolve a pending decision" concept generically.
+
+**Old action hygiene parser**
+- Still needed: yes.
+- Reason: owns bulk/multi-item hygiene language ("archive all except the read one", numbered visible-list batches) that v3 has no equivalent for — v3's `action.*` tools are single-item only (list/create/snooze/complete/archive, with "it" resolved only when exactly one action is visible).
+- Safe deletion conditions: v3 gains bulk/multi-item action operations with the same safety guarantees (visible-list numbering, all-except selection), proven by tests equivalent to the current hygiene test coverage.
+- Replacement in v3: partial only — `action.list` + single-entity "it" resolution in `validator.ts`, not a full replacement.
+
+**Old Gmail natural conversation handlers**
+- Still needed: yes.
+- Reason: legacy still owns rule editing, rule removal, built-in rule (job-search/work-action) toggling, and Gmail autonomy-preference conversations. v3 only has `gmail.rule.create` (custom, review-first), `gmail.rule.list`, `gmail.rule.explain`, and `gmail.review.{list,reject,to_action}`.
+- Safe deletion conditions: v3's tool catalog gains rule editing/removal/toggle/autonomy-preference tools with test parity against the current natural-language Gmail conversation tests.
+- Replacement in v3: partial — creation and read-only status/review flows only.
+
+**Old Conversation Orchestrator v2 paths**
+- Still needed: unknown.
+- Reason: v2 (`apps/api/src/conversation/*`) still owns several scopes on paper (hygiene lists, single-item pronouns, recent mutation status, explicit memory, selected read surfaces, conservative progress logging) — but v3 now independently re-implements memory, progress logging, and read surfaces for Telegram's default path. Since v2 is only reached via `/messages/process` (when `CONVERSATION_ORCHESTRATOR_V2_ENABLED=true`), which itself is now only hit by the legacy opt-out or direct API callers, v2's real-world traffic share for the primary product experience is unclear without a dedicated usage audit.
+- Safe deletion conditions: confirm (via logs/telemetry, not just "no test fails") that production traffic no longer reaches v2; or explicitly deprecate `/messages/process_v2` and the v2-first branch of `/messages/process` first, then remove once every migrated scope has v3 (or legacy) coverage with equal or better tests.
+- Replacement in v3: overlapping already, for the scopes v3 independently reimplemented (memory, progress logging, read surfaces).
+
+**Old tests that only protect deprecated behavior**
+- Still needed: unknown, depends per-file.
+- Reason: e.g. `tests/conversation-orchestrator-v2.test.ts` protects v2 behavior that may become effectively unreachable once v3 is the Telegram default — but keeping it is cheap insurance if v2 is still reachable (legacy flag / API), and expensive maintenance if v2 is truly dead.
+- Safe deletion conditions: only once the underlying production code path is itself confirmed unreachable and removed. A passing test suite with no failures is not evidence a path is dead — it only means nothing currently exercises the risk.
+- Replacement in v3: `tests/agent-message.test.ts`, `tests/agent-runtime-*.test.ts`, and `tests/telegram-agent-runtime-routing.test.ts` already cover the v3-equivalent behavior for scopes v3 owns.
 
 ## Migration Rule
 
