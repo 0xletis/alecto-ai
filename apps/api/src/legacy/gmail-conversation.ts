@@ -1,6 +1,7 @@
 import { getEmailAdapterDefinition, isRiskControlGoal, type Goal, type SemanticRouterResult } from "@operator-agent/core";
 import {
   archiveEmailSignalRule,
+  confirmPendingAction,
   createEmailSignalRule,
   getActiveGoals,
   getEmailSignalRules,
@@ -8,6 +9,7 @@ import {
   getIntegrationConnections,
   getLatestPendingAction,
   getPendingEmailReviewCount,
+  rejectPendingAction,
   replacePendingAction,
   updateEmailSignalRule,
   updateEmailSignalRuleDefinition,
@@ -24,7 +26,9 @@ import {
 import {
   cleanEmailRuleTarget,
   findEmailRulesByTarget as findSelectableEmailRulesByTarget,
+  readEmailRuleSelectionCandidates,
   resolveMultipleEmailRuleTargets,
+  selectEmailRuleCandidate,
   sortEmailRuleCandidates,
   splitEmailRuleTargets,
   toEmailRuleSelectionCandidate
@@ -2038,4 +2042,80 @@ export function looksLikeEmailRuleOrGmailConversationText(text: string): boolean
       text
     )
   );
+}
+
+/**
+ * Resolves a "which Gmail rule do you mean" pending-decision reply (created
+ * when a pause/resume/archive request matched more than one custom Gmail
+ * rule). Extracted from apps/api/src/server.ts's resolvePendingDecisionReply
+ * during the fresh `/messages/process` extraction readiness audit — this
+ * was already fully self-contained (every dependency was either an
+ * already-extracted module or a plain @operator-agent/db call), unlike
+ * resolvePendingDecisionReply itself, which still depends on the
+ * un-extracted email-review domain and stays in server.ts.
+ */
+export async function resolvePendingCustomEmailRuleReply(
+  userId: string,
+  pendingAction: PendingAction,
+  message: string
+): Promise<string | undefined> {
+  if (pendingAction.type !== "custom_email_rule" || !isRecord(pendingAction.payload)) {
+    return undefined;
+  }
+
+  const operation = typeof pendingAction.payload.operation === "string" ? pendingAction.payload.operation : "";
+
+  if (operation !== "clarify_rule_management") {
+    return undefined;
+  }
+
+  const intendedOperation = typeof pendingAction.payload.intendedOperation === "string"
+    ? pendingAction.payload.intendedOperation
+    : "";
+  const candidates = readEmailRuleSelectionCandidates(pendingAction.payload.candidateRules);
+  const selected = selectEmailRuleCandidate(message, candidates);
+
+  if (!selected) {
+    return candidates.length > 0
+      ? `Reply with 1-${candidates.length}, the rule name, or cancel.`
+      : "That pending Gmail rule decision no longer has any options. Please ask again.";
+  }
+
+  const rule = (await getEmailSignalRules(userId)).find((item) => item.id === selected.id && item.status !== "archived");
+
+  if (!rule) {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "I could not find that Gmail rule anymore. Use /my_email_rules to check the current rules.";
+  }
+
+  if (intendedOperation === "pause" || intendedOperation === "resume") {
+    const status = intendedOperation === "pause" ? "paused" : "active";
+    const updated = await updateEmailSignalRule(userId, rule.id, { status });
+
+    await confirmPendingAction(userId, pendingAction.id);
+
+    if (updated) {
+      await maybeRememberGmailRuleConversationContext(userId, [updated], updated);
+    }
+
+    return updated ? `Gmail rule ${status}: ${updated.name}` : "I could not update that Gmail rule.";
+  }
+
+  if (intendedOperation === "archive") {
+    await replacePendingAction(userId, {
+      type: "custom_email_rule",
+      summary: `Archive Gmail rule: ${rule.name}`,
+      payload: {
+        operation: "archive_rule",
+        ruleId: rule.id,
+        ruleName: rule.name
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return `Confirm remove Gmail rule: ${rule.name}? Reply yes to confirm or no to cancel.`;
+  }
+
+  await rejectPendingAction(userId, pendingAction.id);
+  return "I could not complete that Gmail rule decision. Please ask again.";
 }
