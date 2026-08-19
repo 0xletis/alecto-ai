@@ -35,6 +35,24 @@ export function mockPlan(plan: MockPlan): void {
   process.env.AGENT_RUNTIME_PLANNER_MOCK_RESPONSE = JSON.stringify(plan);
 }
 
+export interface MockGuardrailClassification {
+  conflict: "none" | "soft_warn" | "hard_block" | "ask_clarification";
+  goalId: string | null;
+  pattern: "active_violation" | "avoidance" | "lapse_admission" | null;
+  clarifyingQuestion: string | null;
+  reason: string;
+}
+
+/**
+ * Sets the mocked goal-guardrail LLM classification for the NEXT call to checkGoalGuardrail's
+ * Tier 2 (AGENT_RUNTIME_GUARDRAIL_MOCK_RESPONSE is read once per call to classifyGoalConflict).
+ * Only reached when the turn's message doesn't match a literal knownTriggers/knownFailureModes
+ * phrase AND the user has at least one active goal — see goal-guardrails.ts.
+ */
+export function mockGuardrail(classification: MockGuardrailClassification): void {
+  process.env.AGENT_RUNTIME_GUARDRAIL_MOCK_RESPONSE = JSON.stringify(classification);
+}
+
 /**
  * Clears every Agent Runtime v3 test-only env hook. Safe to call before a turn that should
  * hit the real planner (LLM if OPENAI_API_KEY is set, deterministic heuristic fallback
@@ -45,6 +63,7 @@ export function clearAgentRuntimeMocks(): void {
   delete process.env.AGENT_RUNTIME_PLANNER_MOCK_THROW;
   delete process.env.AGENT_RUNTIME_FORCE_ERROR;
   delete process.env.AGENT_RUNTIME_PLANNING_TRACE;
+  delete process.env.AGENT_RUNTIME_GUARDRAIL_MOCK_RESPONSE;
 }
 
 export async function seedUser(userId: string): Promise<void> {

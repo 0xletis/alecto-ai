@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { completeActionItem, createActionItem, createEvent, createGoal, prisma } from "../packages/db/src/index.ts";
-import { clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
+import { clearAgentRuntimeMocks, mockGuardrail, mockPlan, op, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertNoFalseSuccessClaim,
   assertNoGenericError,
@@ -906,58 +906,126 @@ test("scripted smoke 12: what pending gmail reviews do I have? -> turn that emai
   }
 });
 
-// --- Scenario 13: guardrail smoke --------------------------------------------------------------
+// --- Scenario 13: goal-aligned guardrail smoke — cessation goal --------------------------------
 //
-// Part of the V3 global readiness audit. checkPolicyGuardrail (validator.ts) is entirely
-// data-driven off the user's OWN UserOperatingProfile.knownTriggers/knownFailureModes — it has
-// no hardcoded gambling/financial-risk detection. Legacy has a genuinely separate, LLM-classified
-// betting_intent/trading_intent + riskState mechanism (packages/core/src/message-processing.ts,
-// gated by the profile's distinct gamblingGuardrails field) that V3 does not have at all. This
-// scenario proves both halves: with no configured trigger, a risky-sounding message just flows
-// to normal planning (no special refusal — the gap); once the user's own profile has a matching
-// trigger configured, the SAME message is hard-blocked before the planner ever runs.
+// Part of the V3 global readiness audit's follow-up: V3 does NOT port legacy's hardcoded
+// gambling/trading classifier. Instead, checkGoalGuardrail (apps/api/src/agent-runtime/
+// goal-guardrails.ts) classifies a message against the user's OWN active goals — "Stop
+// gambling" here is just a plain Goal row, no different from "Quit smoking" or "Train 3x/week";
+// nothing in the guardrail module's code branches on what the goal is *about*. The LLM
+// classification tier is mocked (AGENT_RUNTIME_GUARDRAIL_MOCK_RESPONSE) so this stays CI-safe
+// without OPENAI_API_KEY, exactly like the existing planner mock. Proves both halves: an actual
+// violation is hard-blocked (and logged as a risk_pattern memory, reusing existing memory
+// infrastructure — no new schema), while a supportive, recovery-oriented message about the SAME
+// goal is correctly let through, not blocked as if it were itself the violation.
 
-test("scripted smoke 13: a risky message flows to normal planning with no configured trigger, but is hard-blocked once one is configured", async () => {
+test("scripted smoke 13: a message that violates the user's own 'stop gambling' goal is hard-blocked and logged; asking for help with it is not", async () => {
   const server = buildServer();
-  const userId = `smoke-guardrail-${randomUUID()}`;
+  const userId = `smoke-goal-guardrail-gambling-${randomUUID()}`;
 
   try {
     await seedUser(userId);
+    const goalResult = await createGoal(userId, { title: "Stop gambling", category: "wellbeing", priority: "high" });
+    assert.equal(goalResult.duplicate, false);
+    const goal = goalResult.goal;
 
-    const scenario: ScriptedScenario = {
-      name: "guardrail-smoke",
-      turns: [
-        {
-          message: "I want to bet 1000 on this because it feels safe, right?",
-          // No hardcoded gambling detection exists in V3 today, so this is treated as ordinary
-          // chat and reaches the (here, mocked) planner like any other message.
-          plan: { topic: "general", intent: "unclassified", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "I can't tell you that's safe. Want me to log it as a note instead?" },
-          assert: (turn) => {
-            assertNoGenericError(turn);
-            assertNoMutationYet(turn);
-            assert.doesNotMatch(turn.reply, /hard stop|slow down and talk it through/i, "must not accidentally already be hitting a guardrail with no trigger configured");
-          }
-        }
-      ]
-    };
-
-    await runScriptedScenario(server, userId, scenario);
-
-    // The user (elsewhere, e.g. via /profile) has configured this as a known trigger.
-    await prisma.userOperatingProfile.upsert({
-      where: { userId },
-      update: { knownTriggers: ["bet", "gambling"] },
-      create: { userId, knownTriggers: ["bet", "gambling"] }
+    mockGuardrail({
+      conflict: "hard_block",
+      goalId: goal.id,
+      pattern: "active_violation",
+      clarifyingQuestion: null,
+      reason: "explicit intent to gamble directly violates the stop-gambling goal"
     });
+    const blockedReply = await sendAgentMessage(server, userId, "I want to bet 1000 because it's safe");
+    assertNoGenericErrorRaw(blockedReply.reply);
+    assert.match(blockedReply.reply, /conflicts with your goal to stop gambling/i);
+    assert.deepEqual(blockedReply.operationsPlanned, [], "the tool planner must never be reached once the guardrail hard-blocks");
+    assert.equal(blockedReply.debug.mutationExecuted, true, "the conflict itself is logged as a risk_pattern memory, not silently dropped");
 
-    // No plan: the guardrail short-circuits before the planner ever runs, same mechanism as the
-    // exact confirm/cancel whitelist.
-    const guardedReply = await sendAgentMessage(server, userId, "I want to bet 1000 on this because it feels safe, right?");
-    assert.equal(guardedReply.reply, "This touches something you've asked me to be careful about. I'm not going to act on it automatically — let's slow down and talk it through first.");
-    assert.equal(guardedReply.debug.mutationExecuted, false);
-    assert.equal(guardedReply.debug.llmPlannerAttempted, false, "the planner must never run once the guardrail is triggered");
-    assert.deepEqual(guardedReply.operationsPlanned, []);
-    assert.deepEqual(guardedReply.operationsExecuted, []);
+    const loggedRisk = await prisma.memoryEntry.findMany({ where: { userId, type: "risk_pattern" } });
+    assert.equal(loggedRisk.length, 1);
+    assert.match(loggedRisk[0].summary, /stop gambling/i);
+
+    mockGuardrail({
+      conflict: "none",
+      goalId: null,
+      pattern: null,
+      clarifyingQuestion: null,
+      reason: "user is seeking support to control the urge, not describing intent to gamble"
+    });
+    mockPlan({ topic: "general", intent: "support", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "Good — what's making the urge strong right now?" });
+    const supportiveReply = await sendAgentMessage(server, userId, "I want to control my gambling impulses");
+    assertNoGenericErrorRaw(supportiveReply.reply);
+    assert.doesNotMatch(supportiveReply.reply, /conflicts with your goal|don'?t do it/i, "recovery/support language about the goal must not itself be treated as the violation");
+
+    const riskAfterSupportiveTurn = await prisma.memoryEntry.count({ where: { userId, type: "risk_pattern" } });
+    assert.equal(riskAfterSupportiveTurn, 1, "the supportive turn must not add a second risk_pattern entry");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 14: goal-aligned guardrail smoke — pursuit goal / avoidance ----------------------
+//
+// Same guardrail module, a completely different kind of goal (a pursuit goal, not a cessation
+// one) — proving the design generalizes rather than being gambling-shaped underneath.
+
+test("scripted smoke 14: avoiding a job-search goal for something else gets an accountability nudge tied to that goal", async () => {
+  const server = buildServer();
+  const userId = `smoke-goal-guardrail-job-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const goalResult = await createGoal(userId, { title: "Find a new developer job", category: "career", priority: "high" });
+    assert.equal(goalResult.duplicate, false);
+    const goal = goalResult.goal;
+
+    mockGuardrail({
+      conflict: "soft_warn",
+      goalId: goal.id,
+      pattern: "avoidance",
+      clarifyingQuestion: null,
+      reason: "choosing an unrelated, lower-priority activity over the stated job-search goal"
+    });
+    const reply = await sendAgentMessage(server, userId, "I'm going to browse cars instead of applying");
+    assertNoGenericErrorRaw(reply.reply);
+    assert.match(reply.reply, /avoidance|pulling you away/i);
+    assert.match(reply.reply, /find a new developer job/i);
+    assert.deepEqual(reply.operationsPlanned, [], "the tool planner must never be reached once the guardrail intervenes");
+    assert.equal(reply.debug.mutationExecuted, true, "the avoidance pattern is logged as a risk_pattern memory");
+
+    const loggedRisk = await prisma.memoryEntry.findMany({ where: { userId, type: "risk_pattern" } });
+    assert.equal(loggedRisk.length, 1);
+    assert.match(loggedRisk[0].summary, /developer job/i);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 15: known-trigger guardrail still works with no goal at all ----------------------
+//
+// Keeps the pre-existing, user-configured knownTriggers/knownFailureModes mechanism working
+// exactly as before this pass, for a user who hasn't (or hasn't yet) turned that trigger into a
+// formal goal — the deterministic Tier 1 path, no LLM call involved at all.
+
+test("scripted smoke 15: a configured knownTrigger still intervenes even with no matching goal", async () => {
+  const server = buildServer();
+  const userId = `smoke-guardrail-trigger-only-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["sports betting"] } });
+
+    // No mockGuardrail needed: a configured trigger is matched deterministically, before any
+    // LLM tier would even be considered.
+    const reply = await sendAgentMessage(server, userId, "I'm opening the betting app, sports betting always relaxes me");
+    assertNoGenericErrorRaw(reply.reply);
+    assert.equal(reply.debug.llmPlannerAttempted, false, "a literal trigger match never needs the LLM tier");
+    assert.deepEqual(reply.operationsPlanned, []);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

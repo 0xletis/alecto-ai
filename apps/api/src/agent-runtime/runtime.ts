@@ -1,12 +1,13 @@
-import { rejectPendingAction, type PendingAction } from "@operator-agent/db";
+import { createMemory, rejectPendingAction, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
+import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
-import { checkPolicyGuardrail, revalidateForExecution, validateOperations } from "./validator.js";
+import { revalidateForExecution, validateOperations } from "./validator.js";
 import type {
   AgentDebugInfo,
   AgentEntity,
@@ -212,17 +213,22 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const pendingOperationBefore = context.session.pendingOperation;
   const visibleEntitiesBefore = context.session.visibleEntities;
 
-  const guardrail = checkPolicyGuardrail(message, context.operatingProfile);
-  if (guardrail.triggered) {
+  const guardrail = await checkGoalGuardrail(message, context);
+  if (guardrail.decision !== "allow") {
+    // hard_block/soft_warn are real, detected conflicts worth a durable trace (feeds existing
+    // insight/daily-review pipelines that already read risk_pattern memories); ask_clarification
+    // is not — nothing was actually confirmed yet, so nothing is logged.
+    const executedOps: ExecutedOperation[] =
+      guardrail.decision === "hard_block" || guardrail.decision === "soft_warn" ? [await logGuardrailIncident(userId, message, guardrail)] : [];
+    applyExecutionSideEffects(context.session, executedOps);
     return finalize(context, {
-      reply:
-        "This touches something you've asked me to be careful about. I'm not going to act on it automatically — let's slow down and talk it through first.",
+      reply: guardrail.reply ?? "Let's pause here for a moment.",
       operationsPlanned: [],
-      executedOps: [],
+      executedOps,
       plannerUsed: "none",
-      llmPlannerAttempted: false,
+      llmPlannerAttempted: guardrail.llmAttempted,
       toolValidationPassed: true,
-      topic: context.session.topic
+      topic: "guardrail"
     });
   }
 
@@ -616,6 +622,24 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
     if (op.tool.startsWith("operator.")) return "operator_summary";
   }
   return null;
+}
+
+/**
+ * Deterministic, not LLM-driven: the guardrail module only ever returns a classification, never
+ * touches the DB itself (see goal-guardrails.ts's doc comment) — this is the one place that
+ * turns a detected conflict into a durable record, reusing the existing memory.create/
+ * risk_pattern mechanism already read by insights/daily-review, rather than inventing new schema.
+ */
+async function logGuardrailIncident(userId: string, message: string, guardrail: GuardrailResult): Promise<ExecutedOperation> {
+  const target = guardrail.matchedGoalTitle ? `goal "${guardrail.matchedGoalTitle}"` : guardrail.matchedTrigger ? `configured trigger "${guardrail.matchedTrigger}"` : "a guardrail";
+  const created = await createMemory(userId, {
+    type: "risk_pattern",
+    summary: `Guardrail (${guardrail.decision}): "${message}" conflicted with ${target}.`,
+    source: "system_inferred",
+    confidence: 1,
+    evidence: { message, decision: guardrail.decision, pattern: guardrail.pattern, matchedGoalId: guardrail.matchedGoalId, matchedTrigger: guardrail.matchedTrigger }
+  });
+  return { tool: "memory.create", status: "executed", summary: `Remembered: ${created.summary}`, result: created };
 }
 
 function applyExecutionSideEffects(session: AgentSessionState, executedOps: ExecutedOperation[]): void {

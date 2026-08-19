@@ -1,4 +1,4 @@
-import { parseActionDueDate, type UserOperatingProfile } from "@operator-agent/core";
+import { parseActionDueDate } from "@operator-agent/core";
 import type { EmailSignalRule } from "@operator-agent/db";
 import { computeLighterPlanRemoval, readPendingNextWeekPlanSuggestions, resolvePlanSuggestionRef } from "../planning/next-week.js";
 import type { NextWeekPlanSuggestion } from "../server-types.js";
@@ -6,35 +6,6 @@ import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
 const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
-
-export interface PolicyGuardrailResult {
-  triggered: boolean;
-  reason?: string;
-  matchedTrigger?: string;
-}
-
-/**
- * Generic, data-driven guardrail: it reacts to whatever the user's own
- * UserOperatingProfile.knownTriggers / knownFailureModes contain, never to a
- * hardcoded domain (e.g. gambling). A user with no configured triggers never
- * hits this check, regardless of what they say.
- */
-export function checkPolicyGuardrail(message: string, profile: UserOperatingProfile): PolicyGuardrailResult {
-  const text = message.toLowerCase();
-  const candidates = [...(profile.knownTriggers ?? []), ...(profile.knownFailureModes ?? [])];
-
-  const matched = candidates.find((trigger) => trigger.trim().length > 0 && text.includes(trigger.trim().toLowerCase()));
-
-  if (!matched) {
-    return { triggered: false };
-  }
-
-  return {
-    triggered: true,
-    reason: "message_matches_configured_trigger",
-    matchedTrigger: matched
-  };
-}
 
 export function validateOperations(operations: PlannedOperation[], context: ContextBundle): ValidatedOperation[] {
   return operations.map((operation) => validateOperation(operation, context));
