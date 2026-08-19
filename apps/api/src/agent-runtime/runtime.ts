@@ -81,7 +81,9 @@ const BROAD_OPERATOR_QUESTION_RE =
 
 const GOAL_ANCHOR_NUDGE_MARKER = "one real goal or guardrail";
 
-const GOAL_ANCHOR_NUDGE_REPLY = [
+// Exported so apps/operator/proactive.ts's morning-brief decision can reuse the exact same
+// empty-user text (task explicitly asks for "goal-anchor nudge style") instead of duplicating it.
+export const GOAL_ANCHOR_NUDGE_REPLY = [
   `I can help, but I work best with ${GOAL_ANCHOR_NUDGE_MARKER} to anchor to — right now you don't have one set.`,
   "",
   "A few examples:",

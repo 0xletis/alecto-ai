@@ -1162,3 +1162,146 @@ test("scripted smoke 16: so what today (empty user) -> what can you help me with
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+// --- Scenario 17: proactive evening check-in -> reply is handled by existing event logging ------
+//
+// The proactive decision itself (apps/api/src/operator/proactive.ts) is exercised through its
+// preview route, not through /agent/message — a proactive nudge isn't a reply to something the
+// user said. What this scenario actually proves is the second half of the proactive story:
+// once the nudge exists, the user's natural reply to it is handled entirely by EXISTING V3
+// event-logging capability, with no proactive-specific reply parsing needed anywhere.
+
+test("scripted smoke 17: proactive evening check-in nudge -> user replies with both signals -> both events logged", async () => {
+  const server = buildServer();
+  const userId = `smoke-proactive-evening-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningTimeMinutes: 540, eveningTimeMinutes: 1140, timezone: "Europe/Madrid" } });
+    await createGoal(userId, {
+      title: "Apply to developer jobs",
+      category: "career",
+      priority: "high",
+      targetMetrics: [{ key: "applications", label: "Applications sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+    });
+    await createGoal(userId, {
+      title: "Train 3 times per week",
+      category: "health",
+      priority: "medium",
+      targetMetrics: [{ key: "workouts", label: "Workouts", eventType: "health.workout_completed", aggregation: "count", window: "daily" }]
+    });
+
+    const previewReply = await server.inject({
+      method: "GET",
+      url: `/users/${userId}/operator/proactive/preview?now=${encodeURIComponent("2026-08-20T17:00:00.000Z")}` // 19:00 Europe/Madrid
+    });
+    assert.equal(previewReply.statusCode, 200);
+    const decision = previewReply.json().decision;
+    assert.equal(decision.decision, "proposed_message");
+    assert.equal(decision.type, "evening_checkin");
+    assert.match(decision.message, /apply to developer jobs/i);
+    assert.match(decision.message, /train 3 times per week/i);
+
+    // The user replies naturally to that nudge — handled entirely by existing V3 event-logging
+    // tools, exactly as if they'd said this unprompted in normal chat.
+    mockPlan({
+      topic: "progress_logging",
+      intent: "log_workout_and_applications",
+      operations: [op("event.log_workout", { minutes: 45 }), op("event.log_job_applications", { count: 2 })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const reply = await sendAgentMessage(server, userId, "gym 45m and sent 2 CVs");
+    assertNoGenericErrorRaw(reply.reply);
+    assert.match(reply.reply, /45 minutes/i);
+    assert.match(reply.reply, /2 job application/i);
+    assert.equal(reply.debug.mutationExecuted, true);
+
+    const workoutEvents = await prisma.event.count({ where: { userId, type: "health.workout_completed" } });
+    const applicationEvents = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+    assert.equal(workoutEvents, 1);
+    assert.equal(applicationEvents, 2);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 18: proactive Gmail nudge -> reply is handled by existing review-to-action path ---
+//
+// Same shape as scenario 17: the proactive decision is previewed (not sent — see
+// docs/10-v3-readiness-audit.md §13), then the user's natural reply is routed entirely through
+// the EXISTING Gmail review triage capability (validator.ts's resolveGmailReviewRef). Actual
+// delivery isn't wired this pass, so a real send would need to also record the referenced
+// review as a visible session entity for a bare "turn it into a task" reply (with no "the
+// recruiter one" qualifier) to resolve without repeating itself — that's simulated directly
+// here via the session row, standing in for what a future delivery step would do.
+
+test("scripted smoke 18: proactive Gmail nudge -> user replies 'turn it into a task' -> existing triage creates the action", async () => {
+  const server = buildServer();
+  const userId = `smoke-proactive-gmail-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningTimeMinutes: 540, eveningTimeMinutes: 1140, timezone: "Europe/Madrid" } });
+    const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+    const rule = await prisma.emailSignalRule.create({ data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" } });
+    const review = await prisma.emailReviewItem.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        ruleId: rule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "m1",
+        externalId: `gmail-review:${rule.id}:m1`,
+        subject: "Recruiter reply from Example Labs",
+        from: "recruiter@example.com",
+        snippet: "Can we talk tomorrow?",
+        confidence: 0.9,
+        reason: "custom_rule_match",
+        extracted: {},
+        status: "pending"
+      }
+    });
+
+    const previewReply = await server.inject({
+      method: "GET",
+      url: `/users/${userId}/operator/proactive/preview?now=${encodeURIComponent("2026-08-20T11:00:00.000Z")}` // 13:00 Europe/Madrid
+    });
+    assert.equal(previewReply.statusCode, 200);
+    const decision = previewReply.json().decision;
+    assert.equal(decision.decision, "proposed_message");
+    assert.equal(decision.type, "gmail_nudge");
+    assert.match(decision.message, /recruiter reply from example labs/i);
+
+    // Stands in for a future delivery step recording the nudged review as a visible entity —
+    // this pass only builds the decision layer (see file-level comment above), not delivery.
+    await prisma.agentConversationSession.create({
+      data: { userId, channel: "telegram", visibleEntities: [{ type: "gmail_review", id: review.id, label: "Recruiter reply from Example Labs", index: 1 }] }
+    });
+
+    mockPlan({
+      topic: "gmail_reviews",
+      intent: "convert_review_to_action",
+      operations: [op("gmail.review.to_action", { ref: "recruiter" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const reply = await sendAgentMessage(server, userId, "turn it into a task");
+    assertNoGenericErrorRaw(reply.reply);
+    assert.match(reply.reply, /turned the email review into task/i);
+    assert.equal(reply.debug.mutationExecuted, true);
+
+    const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(reviewAfter?.status, "approved");
+    assert.ok(reviewAfter?.actionItemId);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
