@@ -210,6 +210,14 @@ import { registerCheckinsIngestRoutes } from "./routes/checkins-ingest.js";
 import { registerInsightRoutes } from "./routes/insights.js";
 import { isRecord } from "./utils/records.js";
 import { shouldUseOpenAIAnalysis } from "./utils/env.js";
+import { normalizeForComparison } from "./utils/text.js";
+import {
+  formatGmailEmailRuleSelectionLines,
+  getVisibleGmailEmailRules,
+  groupEmailRulesForHumanDisplay,
+  isBuiltInEmailAdapter,
+  type EmailRuleHumanDisplayGroup
+} from "./gmail/gmail-rule-service.js";
 import type {
   ActionHygieneAction,
   ActionHygieneOption,
@@ -3332,14 +3340,6 @@ function sharesMeaningfulToken(left: string, right: string): boolean {
   return left.split(" ").some((token) => token.length >= 4 && rightTokens.has(token));
 }
 
-function normalizeForComparison(value: string): string {
-  return value
-    .toLowerCase()
-    .trim()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ");
-}
-
 async function buildWeeklyReviewContext(
   userId: string,
   weekStartLocalDate: string | undefined,
@@ -5939,42 +5939,6 @@ function formatEmailRuleConversationLine(rule: EmailSignalRule, goalById: Map<st
   return parts.filter(Boolean).join(" - ");
 }
 
-interface EmailRuleHumanDisplayGroup {
-  primary: EmailSignalRule;
-  rules: EmailSignalRule[];
-}
-
-function groupEmailRulesForHumanDisplay(rules: EmailSignalRule[]): EmailRuleHumanDisplayGroup[] {
-  const groups = new Map<string, EmailRuleHumanDisplayGroup>();
-
-  for (const rule of sortEmailRuleCandidates(rules)) {
-    const key = emailRuleHumanDisplayKey(rule);
-    const existing = groups.get(key);
-
-    if (existing) {
-      existing.rules.push(rule);
-    } else {
-      groups.set(key, { primary: rule, rules: [rule] });
-    }
-  }
-
-  return [...groups.values()];
-}
-
-function emailRuleHumanDisplayKey(rule: EmailSignalRule): string {
-  if (isBuiltInEmailAdapter(rule.adapterId)) {
-    return [
-      "builtin",
-      rule.connectionId,
-      rule.adapterId,
-      rule.status,
-      normalizeForComparison(rule.query ?? "")
-    ].join("|");
-  }
-
-  return `rule:${rule.id}`;
-}
-
 function formatEmailRuleConversationGroupLine(
   group: EmailRuleHumanDisplayGroup,
   goalById: Map<string, string>
@@ -5986,22 +5950,6 @@ function formatEmailRuleConversationGroupLine(
   }
 
   return `${line} - ${group.rules.length} duplicate rules; shown once`;
-}
-
-function formatGmailEmailRuleSelectionLines(rules: EmailSignalRule[], options: { showStatus?: boolean } = {}): string[] {
-  return groupEmailRulesForHumanDisplay(rules).map((group) => {
-    const parts = [
-      group.primary.name,
-      options.showStatus && group.primary.status !== "active" ? group.primary.status : undefined,
-      group.rules.length > 1 ? `${group.rules.length} duplicate rules` : undefined
-    ];
-
-    return `- ${parts.filter(Boolean).join(" - ")}`;
-  });
-}
-
-function isBuiltInEmailAdapter(adapterId: string): boolean {
-  return adapterId === "job_search_email" || adapterId === "work_action_email";
 }
 
 function emailRuleConversationBehavior(rule: EmailSignalRule): string {
@@ -8236,17 +8184,6 @@ async function manageCustomGmailRuleForConversation(
   });
 
   return `Confirm remove Gmail rule: ${rule.name}? Reply yes to confirm or no to cancel.`;
-}
-
-async function getVisibleGmailEmailRules(userId: string): Promise<EmailSignalRule[]> {
-  const [rules, connections] = await Promise.all([getEmailSignalRules(userId), getIntegrationConnections(userId)]);
-  const gmailConnectionIds = new Set(
-    connections
-      .filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived")
-      .map((connection) => connection.id)
-  );
-
-  return rules.filter((rule) => rule.status !== "archived" && gmailConnectionIds.has(rule.connectionId));
 }
 
 function maybeHandleGmailRuleIgnoreWithoutVisibleReviewContext(
