@@ -1,6 +1,7 @@
 import {
   approveEmailReviewItem,
   archiveActionItem,
+  archiveEmailSignalRule,
   completeActionItem,
   createActionItem,
   createActionItemIfNotExists,
@@ -14,6 +15,7 @@ import {
   getEmailSignalRules,
   rejectEmailReviewItem,
   snoozeActionItem,
+  updateEmailSignalRule,
   type ActionItem,
   type EmailReviewItem,
   type EmailSignalRule
@@ -22,6 +24,15 @@ import { parseActionDueDate } from "@operator-agent/core";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
+import { findEmailRulesByTarget, sortEmailRuleCandidates } from "../conversation/email-rule-selection.js";
+import {
+  formatGmailRuleUpdateProposal,
+  gmailRuleOperationVerb,
+  gmailRuleTargetStateLabel,
+  isGmailRuleAlreadyInTargetState,
+  type GmailRuleOperation
+} from "../gmail/gmail-rule-management.js";
+import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   actionInputFromPlanSuggestion,
   buildNextWeekPlanContext,
@@ -494,7 +505,7 @@ export async function executeOperation(
           status: "executed",
           summary,
           result: rules,
-          entities: rules.map(gmailRuleToEntity)
+          entities: rules.map((rule, index) => gmailRuleToEntity(rule, index + 1))
         };
       }
 
@@ -561,6 +572,86 @@ export async function executeOperation(
             ? `"${rule.name}" is active. It's review-first: matches go to email review, they are not auto-logged.`
             : `No active rule matches "${args.label}". Custom Gmail tracking would go to email review first and does not auto-log.`,
           result: rule
+        };
+      }
+
+      case "gmail.rule.propose_update": {
+        // Always a fresh DB lookup, never session.visibleEntities — a rule is a stable,
+        // directly-nameable record (unlike an ephemeral generated plan draft), so "turn off
+        // Endesa" must resolve correctly even if the user never ran gmail.rule.list first.
+        const ref = args.ref as string;
+        const gmailOperation = args.operation as GmailRuleOperation;
+        const rules = await getVisibleGmailEmailRules(userId);
+        const matches = sortEmailRuleCandidates(findEmailRulesByTarget(rules, ref));
+
+        if (matches.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `I couldn't find an active Gmail rule matching "${ref}". Nothing was changed.`
+          };
+        }
+
+        if (matches.length > 1) {
+          const shown = matches.slice(0, 5);
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: ["I found more than one matching rule. Which one do you mean?", ...shown.map((rule, index) => `${index + 1}. ${rule.name}`)].join("\n"),
+            entities: shown.map((rule, index) => gmailRuleToEntity(rule, index + 1))
+          };
+        }
+
+        const rule = matches[0];
+
+        if (isGmailRuleAlreadyInTargetState(rule, gmailOperation)) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `${rule.name} is already ${gmailRuleTargetStateLabel(gmailOperation)}. Nothing to change.`,
+            entities: [gmailRuleToEntity(rule)]
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatGmailRuleUpdateProposal(rule, gmailOperation),
+          entities: [gmailRuleToEntity(rule)],
+          pendingOperationUpdate: {
+            topic: "gmail_rule_management",
+            summary: `${gmailRuleOperationVerb(gmailOperation)} ${rule.name}`,
+            operations: [
+              {
+                tool: "gmail.rule.apply_update",
+                args: { ruleId: rule.id, ruleName: rule.name, operation: gmailOperation },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "gmail.rule.apply_update": {
+        const ruleId = args.ruleId as string;
+        const ruleName = args.ruleName as string;
+        const gmailOperation = args.operation as GmailRuleOperation;
+
+        const updated =
+          gmailOperation === "archive"
+            ? await archiveEmailSignalRule(userId, ruleId)
+            : await updateEmailSignalRule(userId, ruleId, { status: gmailOperation === "pause" ? "paused" : "active" });
+
+        if (!updated) {
+          return failed(operation.tool, `${ruleName} no longer exists.`);
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Done — ${updated.name} is now ${gmailRuleTargetStateLabel(gmailOperation)}.`,
+          result: updated
         };
       }
 
@@ -661,8 +752,8 @@ function actionToEntity(action: ActionItem): AgentEntity {
   return { type: "action", id: action.id, label: action.title };
 }
 
-function gmailRuleToEntity(rule: EmailSignalRule): AgentEntity {
-  return { type: "gmail_rule", id: rule.id, label: rule.name };
+function gmailRuleToEntity(rule: EmailSignalRule, index?: number): AgentEntity {
+  return { type: "gmail_rule", id: rule.id, label: rule.name, index };
 }
 
 function reviewToEntity(review: EmailReviewItem): AgentEntity {

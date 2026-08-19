@@ -484,3 +484,86 @@ test("scripted smoke 6: review my week -> what should I improve next week? -> sa
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+// --- Scenario 7: Gmail rule management smoke ------------------------------------------------
+
+test("scripted smoke 7: what email rules are active? -> turn off Endesa -> yes -> what email rules are active?", async () => {
+  const server = buildServer();
+  const userId = `smoke-gmail-rules-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+    const endesa = await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Endesa bills", status: "active", createdBy: "user" }
+    });
+    await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Naturgy invoices", status: "active", createdBy: "user" }
+    });
+
+    const scenario: ScriptedScenario = {
+      name: "gmail-rule-management-smoke",
+      turns: [
+        {
+          message: "what email rules are active?",
+          plan: { topic: "gmail_rules", intent: "list_active_rules", operations: [op("gmail.rule.list")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /endesa bills/i);
+            assert.match(turn.reply, /naturgy invoices/i);
+            assert.doesNotMatch(turn.reply, /\/gmail|\/setup|\/connect/i, "must not show a legacy slash-command setup wall");
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "turn off Endesa",
+          plan: {
+            topic: "gmail_rule_management",
+            intent: "propose_gmail_rule_update",
+            operations: [op("gmail.rule.propose_update", { ref: "Endesa", operation: "pause" })],
+            needsClarification: false,
+            clarificationQuestion: null,
+            replyDraft: ""
+          },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoFalseSuccessClaim(turn);
+            assert.match(turn.reply, /about to pause endesa bills/i);
+            assertNoMutationYet(turn);
+            assert.ok(turn.pendingOperationAfter, "proposing a change opens a pending confirmation");
+          }
+        },
+        {
+          message: "yes",
+          // No plan: "yes" is handled by the exact confirm whitelist before the planner runs.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true, "Endesa's state must only change after 'yes'");
+            assert.match(turn.reply, /done — endesa bills is now paused/i);
+            assert.equal(turn.pendingOperationAfter, null);
+          }
+        },
+        {
+          message: "what email rules are active?",
+          plan: { topic: "gmail_rules", intent: "list_active_rules", operations: [op("gmail.rule.list")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            // gmail.rule.list only shows ACTIVE rules — Endesa, now paused, must be grounded
+            // (i.e. actually absent), not just left stale from the first listing.
+            assert.doesNotMatch(turn.reply, /endesa bills/i, "the now-paused rule must not still be listed as active");
+            assert.match(turn.reply, /naturgy invoices/i, "the untouched rule must still be listed");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const endesaAfter = await prisma.emailSignalRule.findUnique({ where: { id: endesa.id } });
+    assert.equal(endesaAfter?.status, "paused");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});

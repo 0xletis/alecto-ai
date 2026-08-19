@@ -604,6 +604,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
   for (const op of operations) {
     if (op.tool === "gmail.rule.create") return "gmail_rule_creation";
     if (op.tool === "gmail.rule.list" || op.tool === "gmail.rule.explain") return "gmail_rules";
+    if (op.tool.startsWith("gmail.rule.")) return "gmail_rule_management";
     if (op.tool.startsWith("gmail.review")) return "gmail_reviews";
     if (op.tool === "gmail.status") return "gmail_status";
     if (op.tool.startsWith("memory.")) return "memory";

@@ -292,6 +292,29 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({ label: z.string().min(1) })
   },
   {
+    name: "gmail.rule.propose_update",
+    description:
+      "Propose pausing, resuming, or removing an existing Gmail tracking rule (built-in or custom) — resolves the target by name against the user's real rules (a fresh lookup; the user does not need to have listed rules first) and opens a pending confirmation. Use for 'turn off X', 'pause the X rule', 'resume X', 'delete/remove the X rule'. Does NOT support changing an existing rule's review/auto-log behavior — that's fixed when a rule is created and can't be changed afterward; if asked, explain that honestly instead of planning this.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      ref: z.string().min(1).describe("The rule's name or a distinctive part of it, exactly as the user referred to it (e.g. 'Endesa', 'Naturgy', 'job search'). Never invent an id."),
+      operation: z.enum(["pause", "resume", "archive"]).describe("archive means fully remove/delete the rule.")
+    })
+  },
+  {
+    name: "gmail.rule.apply_update",
+    description:
+      "Internal: applies the confirmed Gmail rule change. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      ruleId: z.string().min(1),
+      ruleName: z.string().min(1),
+      operation: z.enum(["pause", "resume", "archive"])
+    })
+  },
+  {
     name: "gmail.review.list",
     description: "List pending Gmail email reviews awaiting a decision.",
     mutates: false,

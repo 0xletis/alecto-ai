@@ -198,6 +198,22 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     };
   }
 
+  // Same reasoning again: gmail.rule.apply_update is never planned by the LLM directly, only
+  // ever reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation. Its args (ruleId/ruleName) are set by gmail.rule.propose_update's
+  // pendingOperationUpdate after resolving the real rule — a direct plan would have no real
+  // rule id to put there anyway.
+  if (tool.name === "gmail.rule.apply_update") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending Gmail rule change",
+      rationale: operation.rationale
+    };
+  }
+
   // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
   // nothing to confirm — asking "shall I create it?" would be misleading when it either
   // already exists or would just create a confusing duplicate. Skip the confirmation gate

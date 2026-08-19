@@ -82,7 +82,7 @@ export function composeReply(input: ComposeReplyInput): string {
   return leadLines.length > 0 ? joinSentences(leadLines) : "I didn't find anything to act on.";
 }
 
-const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create", "action.hygiene_apply", "planning.next_week_apply", "weekly_review.save"]);
+const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create", "action.hygiene_apply", "planning.next_week_apply", "weekly_review.save", "gmail.rule.apply_update"]);
 
 /** Exposed only for runtime.ts's dev/test-only planning trace, to classify which composeReply branch produced a reply without duplicating its branch logic. */
 export function isGroundTruthOnlyTool(tool: string): boolean {
@@ -108,7 +108,8 @@ const HUMAN_ACTION: Record<string, string> = {
   "gmail.review.to_action": "turn that email into a task",
   "action.hygiene_apply": "apply those action cleanup decisions",
   "planning.next_week_apply": "create that plan",
-  "weekly_review.save": "save that weekly review"
+  "weekly_review.save": "save that weekly review",
+  "gmail.rule.apply_update": "update that Gmail rule"
 };
 
 function humanAction(tool: string): string {
