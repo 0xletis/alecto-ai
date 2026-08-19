@@ -77,7 +77,7 @@ export function composeReply(input: ComposeReplyInput): string {
   return leadLines.length > 0 ? joinSentences(leadLines) : "I didn't find anything to act on.";
 }
 
-const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create", "action.hygiene_apply"]);
+const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create", "action.hygiene_apply", "planning.next_week_apply"]);
 
 /** "I couldn't <do the thing> because <reason>. Nothing was changed." — always names the failure, never implies success. */
 function correctionLine(tool: string, detail: string): string {
@@ -96,7 +96,8 @@ const HUMAN_ACTION: Record<string, string> = {
   "gmail.rule.create": "set up that Gmail rule",
   "gmail.review.reject": "reject that email review",
   "gmail.review.to_action": "turn that email into a task",
-  "action.hygiene_apply": "apply those action cleanup decisions"
+  "action.hygiene_apply": "apply those action cleanup decisions",
+  "planning.next_week_apply": "create that plan"
 };
 
 function humanAction(tool: string): string {

@@ -13,6 +13,19 @@ const actionIdField = z.string().min(1).optional().describe(
   "The id of the action item. Omit if the user is referring to one already visible in context (e.g. 'it', 'that task')."
 );
 
+/** One item of a next-week plan draft, as stored in planning.next_week_apply's pending args. Internal shape, never populated by the LLM directly. */
+const planSelectionSchema = z.object({
+  index: z.number().int().nonnegative(),
+  title: z.string().min(1),
+  reason: z.string(),
+  goalId: z.string().optional(),
+  goalTitle: z.string().optional(),
+  priority: z.enum(["low", "medium", "high", "critical"]),
+  actionPriority: z.enum(["low", "medium", "high"]).optional(),
+  suggestedDueAt: z.string().min(1).describe("ISO 8601 date-time."),
+  dedupeKey: z.string().optional()
+});
+
 export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.list",
@@ -98,6 +111,50 @@ export const toolCatalog: ToolDefinition[] = [
         )
         .min(1)
         .max(10)
+    })
+  },
+  {
+    name: "planning.next_week_start",
+    description:
+      "Build and show a draft next-week (or this-week) action plan based on the user's goals, stale actions, and recent activity. Use for 'plan next week', 'help me plan next week', 'make a plan for next week based on my goals', 'plan this week'.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      windowKind: z.enum(["next_week", "current_week"]).optional().describe("Which week to plan. Defaults to next week if omitted or ambiguous.")
+    })
+  },
+  {
+    name: "planning.next_week_edit",
+    description:
+      "Edit the currently open next-week plan draft (from planning.next_week_start) before it's confirmed: remove suggestions and/or change a suggestion's day/time. Use for 'remove 2', 'change 1 to Tuesday', 'make it lighter' (drop some suggestions to reduce load), and similar. Only works while a plan draft is open.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      removeIndexes: z
+        .array(z.number().int().positive())
+        .optional()
+        .describe("1-based positions to remove from the current draft."),
+      changes: z
+        .array(
+          z.object({
+            index: z.number().int().positive().describe("1-based position in the current draft to change."),
+            dueText: z.string().min(1).describe("New natural-language day/time for this suggestion, e.g. 'Tuesday', 'Friday morning'.")
+          })
+        )
+        .optional()
+        .describe("Day/time changes to apply.")
+    })
+  },
+  {
+    name: "planning.next_week_apply",
+    description:
+      "Internal: creates the action items from the current next-week plan draft. This is invoked automatically when the user confirms an open plan draft (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      planStartLocalDate: z.string().min(1),
+      planWindowKind: z.enum(["next_week", "current_week"]),
+      selections: z.array(planSelectionSchema).max(10)
     })
   },
   {

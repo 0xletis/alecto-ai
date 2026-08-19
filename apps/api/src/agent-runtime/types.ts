@@ -97,10 +97,20 @@ export interface ExecutedOperation {
   error?: string;
   /** Entities this operation surfaced, to become the session's new visible-entities set (e.g. after action.list). */
   entities?: AgentEntity[];
+  /**
+   * Lets a "valid"-status (not requiresConfirmation) executed operation directly install,
+   * replace, or clear the session's pendingOperation as a side effect of running — used by
+   * multi-turn propose/edit/confirm flows (e.g. next-week planning) where the tool that
+   * computes and shows the proposal must actually execute to display real data, unlike
+   * gmail.rule.create's static pre-execution confirmation prompt. Absent/undefined is a
+   * complete no-op (the normal pendingConfirmationOps-driven path in runtime.ts is
+   * untouched); explicit null clears any existing pendingOperation.
+   */
+  pendingOperationUpdate?: { topic: string; summary: string; operations: ValidatedOperation[] } | null;
 }
 
 export interface AgentEntity {
-  type: "action" | "goal" | "gmail_rule" | "gmail_review" | "memory" | "event";
+  type: "action" | "goal" | "gmail_rule" | "gmail_review" | "memory" | "event" | "plan_suggestion";
   id: string;
   label: string;
   /**

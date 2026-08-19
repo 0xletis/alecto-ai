@@ -41,7 +41,8 @@ const CONFIRM_WHITELIST = new Set([
   "sí",
   "si",
   "perfecto",
-  "perfect"
+  "perfect",
+  "looks good"
 ]);
 const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget it", "cancelar", "cancela"]);
 
@@ -421,6 +422,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
     if (op.tool.startsWith("memory.")) return "memory";
     if (op.tool.startsWith("event.")) return "progress_logging";
     if (op.tool.startsWith("action.")) return "action_cleanup";
+    if (op.tool.startsWith("planning.")) return "next_week_planning";
     if (op.tool.startsWith("operator.")) return "operator_summary";
   }
   return null;
@@ -438,6 +440,17 @@ function applyExecutionSideEffects(session: AgentSessionState, executedOps: Exec
     }
     if (op.entities) {
       entities.push(...op.entities);
+    }
+    // See ExecutedOperation.pendingOperationUpdate — a multi-turn propose/edit/confirm tool
+    // (e.g. planning.next_week_start/_edit) installs or replaces the session's pending
+    // operation this way, decoupled from the requiresConfirmation-driven path below it.
+    if (op.pendingOperationUpdate !== undefined) {
+      setPendingOperation(
+        session,
+        op.pendingOperationUpdate === null
+          ? null
+          : createPendingOperationRecord(op.pendingOperationUpdate.topic, op.pendingOperationUpdate.summary, op.pendingOperationUpdate.operations)
+      );
     }
   }
 

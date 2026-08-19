@@ -19,11 +19,21 @@ import {
   type EmailSignalRule
 } from "@operator-agent/db";
 import { parseActionDueDate } from "@operator-agent/core";
-import type { ActionHygieneAction } from "../server-types.js";
+import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
+import {
+  actionInputFromPlanSuggestion,
+  buildNextWeekPlanContext,
+  findEquivalentOpenPlanAction,
+  formatPlanTitle,
+  generateNextWeekPlanSuggestions,
+  isCreatableNewPlanSuggestion,
+  readPendingNextWeekPlanSuggestions,
+  toPendingNextWeekPlanSuggestion
+} from "../planning/next-week.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
-import type { AgentEntity, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
+import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
 
 export async function executeOperation(
@@ -170,6 +180,166 @@ export async function executeOperation(
           status: "executed",
           summary: [applied.reply, ...notes].filter(Boolean).join("\n"),
           result: applied
+        };
+      }
+
+      case "planning.next_week_start": {
+        const timezone = await getUserTimezone(userId);
+        const windowKind = (args.windowKind as PlanWindowKind | undefined) ?? "next_week";
+        const planContext = await buildNextWeekPlanContext(userId, new Date(), timezone, windowKind);
+        const suggestions = await generateNextWeekPlanSuggestions(planContext);
+        const creatable = suggestions
+          .filter(isCreatableNewPlanSuggestion)
+          .map((suggestion, i) => ({ ...suggestion, index: i + 1 }));
+
+        if (creatable.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary:
+              "Nothing new to suggest right now — your open actions and goals already look covered. Say \"clean up my actions\" if you want to review what's open.",
+            result: suggestions
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatPlanDraftSummary(formatPlanTitle(planContext), creatable, timezone),
+          result: creatable,
+          entities: creatable.map((suggestion) => planSuggestionToEntity(suggestion)),
+          pendingOperationUpdate: {
+            topic: "next_week_planning",
+            summary: `${formatPlanTitle(planContext)} draft (${creatable.length} item${creatable.length === 1 ? "" : "s"})`,
+            operations: [nextWeekApplyOperation(planContext.planStartLocalDate, windowKind, creatable)]
+          }
+        };
+      }
+
+      case "planning.next_week_edit": {
+        const pending = context.session.pendingOperation as AgentPendingOperation;
+        const pendingArgs = pending.operations[0].args;
+        const timezone = await getUserTimezone(userId);
+        const current = readPendingNextWeekPlanSuggestions(pendingArgs.selections);
+        const removeIndexes = new Set((args.removeIndexes as number[] | undefined) ?? []);
+        const changes = (args.changes as Array<{ index: number; dueText: string }> | undefined) ?? [];
+
+        const notes: string[] = [];
+        const matchedRemoveIndexes = new Set(current.filter((s) => removeIndexes.has(s.index)).map((s) => s.index));
+        for (const index of removeIndexes) {
+          if (!matchedRemoveIndexes.has(index)) {
+            notes.push(`Item ${index}: not in the current plan.`);
+          }
+        }
+
+        let anyChangeApplied = false;
+        const changed = current
+          .filter((suggestion) => !removeIndexes.has(suggestion.index))
+          .map((suggestion) => {
+            const change = changes.find((c) => c.index === suggestion.index);
+            if (!change) {
+              return suggestion;
+            }
+            const parsed = parseActionDueDate(change.dueText);
+            if (!parsed.dueAt) {
+              notes.push(`Item ${suggestion.index}: couldn't understand "${change.dueText}".`);
+              return suggestion;
+            }
+            anyChangeApplied = true;
+            return { ...suggestion, suggestedDueAt: parsed.dueAt };
+          });
+
+        for (const change of changes) {
+          if (!current.some((s) => s.index === change.index)) {
+            notes.push(`Item ${change.index}: not in the current plan.`);
+          }
+        }
+
+        if (matchedRemoveIndexes.size === 0 && !anyChangeApplied) {
+          return failed(operation.tool, notes.join(" ") || "I couldn't match any of those to the current plan.");
+        }
+
+        const renumbered = changed.map((suggestion, i) => ({ ...suggestion, index: i + 1 }));
+        const windowKind = (pendingArgs.planWindowKind as PlanWindowKind | undefined) ?? "next_week";
+        const planTitle = windowKind === "current_week" ? "This week plan" : "Next week plan";
+
+        if (renumbered.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: [...notes, "The plan is now empty. Say cancel, or plan next week again to start over."].filter(Boolean).join(" "),
+            entities: [],
+            pendingOperationUpdate: {
+              topic: "next_week_planning",
+              summary: `${planTitle} draft (0 items)`,
+              operations: [nextWeekApplyOperation(pendingArgs.planStartLocalDate as string, windowKind, renumbered)]
+            }
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: [formatPlanDraftSummary(planTitle, renumbered, timezone), ...notes].filter(Boolean).join("\n"),
+          entities: renumbered.map((suggestion) => planSuggestionToEntity(suggestion)),
+          pendingOperationUpdate: {
+            topic: "next_week_planning",
+            summary: `${planTitle} draft (${renumbered.length} item${renumbered.length === 1 ? "" : "s"})`,
+            operations: [nextWeekApplyOperation(pendingArgs.planStartLocalDate as string, windowKind, renumbered)]
+          }
+        };
+      }
+
+      case "planning.next_week_apply": {
+        const timezone = await getUserTimezone(userId);
+        const planWindowKind = (args.planWindowKind as PlanWindowKind | undefined) ?? "next_week";
+        const selections = readPendingNextWeekPlanSuggestions(args.selections);
+
+        if (selections.length === 0) {
+          return { tool: operation.tool, status: "executed", summary: "Nothing to create — the plan was empty.", result: [] };
+        }
+
+        const payload = { planStartLocalDate: args.planStartLocalDate as string, planWindowKind };
+        const planContext = await buildNextWeekPlanContext(userId, new Date(), timezone, planWindowKind);
+        const created: string[] = [];
+        const createdWithDay: string[] = [];
+        const covered: string[] = [];
+
+        for (const suggestion of selections) {
+          const duplicate = findEquivalentOpenPlanAction(planContext, suggestion.title, suggestion.suggestedDueAt, suggestion.dedupeKey);
+
+          if (duplicate || suggestion.duplicateRisk) {
+            covered.push(`${suggestion.title}${duplicate?.title ? ` (${duplicate.title})` : ""}`);
+            continue;
+          }
+
+          const actionInput = actionInputFromPlanSuggestion(suggestion, payload);
+          const result = await createActionItemIfNotExists(userId, actionInput);
+
+          if (result.created) {
+            created.push(result.actionItem.title);
+            createdWithDay.push(`${formatPlanWeekday(suggestion.suggestedDueAt, timezone)}: ${result.actionItem.title}`);
+          } else {
+            covered.push(result.actionItem.title);
+          }
+        }
+
+        const lines: string[] = [];
+        if (createdWithDay.length > 0) {
+          lines.push("Done. I created:", ...createdWithDay.map((line) => `- ${line}`));
+        }
+        if (covered.length > 0) {
+          lines.push("Already covered:", ...covered.map((title) => `- ${title}`));
+        }
+        if (created.length === 0 && covered.length === 0) {
+          lines.push("Nothing to create — the plan was empty.");
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: lines.join("\n"),
+          result: { created, covered }
         };
       }
 
@@ -454,4 +624,34 @@ function hygieneActionLabel(action: ActionHygieneAction): string {
 
 function hygieneActionToEntity(action: ActionHygieneAction, index: number): AgentEntity {
   return { type: "action", id: action.actionId, label: action.title, index };
+}
+
+function planSuggestionToEntity(suggestion: NextWeekPlanSuggestion): AgentEntity {
+  return { type: "plan_suggestion", id: suggestion.dedupeKey ?? `plan-suggestion-${suggestion.index}`, label: suggestion.title, index: suggestion.index };
+}
+
+function formatPlanWeekday(date: Date, timezone: string): string {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: timezone, weekday: "long" }).format(date);
+}
+
+function formatPlanDraftSummary(planTitle: string, selections: NextWeekPlanSuggestion[], timezone: string): string {
+  return [
+    `Here's a draft plan for ${planTitle.toLowerCase()}:`,
+    ...selections.map((suggestion) => `${suggestion.index}. ${formatPlanWeekday(suggestion.suggestedDueAt, timezone)} — ${suggestion.title}`),
+    "",
+    "Reply: yes, remove <n>, change <n> to <day>, or cancel."
+  ].join("\n");
+}
+
+function nextWeekApplyOperation(planStartLocalDate: string, windowKind: PlanWindowKind, selections: NextWeekPlanSuggestion[]): ValidatedOperation {
+  return {
+    tool: "planning.next_week_apply",
+    args: {
+      planStartLocalDate,
+      planWindowKind: windowKind,
+      selections: selections.map(toPendingNextWeekPlanSuggestion)
+    },
+    status: "valid",
+    requiresConfirmation: false
+  };
 }

@@ -121,6 +121,51 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     args.selections = resolution.selections;
   }
 
+  if (tool.name === "planning.next_week_edit") {
+    const openDraft = context.session.pendingOperation?.operations[0]?.tool === "planning.next_week_apply";
+
+    if (!openDraft) {
+      return {
+        tool: tool.name,
+        args,
+        status: "needs_clarification",
+        requiresConfirmation: false,
+        clarificationQuestion: 'I don\'t have a draft plan open right now. Say "plan next week" to see one.',
+        rationale: operation.rationale
+      };
+    }
+
+    const removeIndexes = (args.removeIndexes as number[] | undefined) ?? [];
+    const changes = (args.changes as Array<{ index: number; dueText: string }> | undefined) ?? [];
+
+    if (removeIndexes.length === 0 && changes.length === 0) {
+      return {
+        tool: tool.name,
+        args,
+        status: "needs_clarification",
+        requiresConfirmation: false,
+        clarificationQuestion: "What would you like to change about the plan — remove an item, or change its day?",
+        rationale: operation.rationale
+      };
+    }
+  }
+
+  // planning.next_week_apply is never planned by the LLM directly — it only ever runs via the
+  // deterministic confirm whitelist re-executing an already-stored pendingOperation
+  // (finalizeDeterministicConfirmation calls revalidateForExecution, not validateOperation, so
+  // this check never blocks the real confirm path). This guards against a fresh LLM plan that
+  // tries to invoke it directly with fabricated args and have it execute immediately.
+  if (tool.name === "planning.next_week_apply") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming an open plan draft",
+      rationale: operation.rationale
+    };
+  }
+
   // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
   // nothing to confirm — asking "shall I create it?" would be misleading when it either
   // already exists or would just create a confusing duplicate. Skip the confirmation gate
