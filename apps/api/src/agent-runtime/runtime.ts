@@ -107,9 +107,15 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
     if (pending) {
       return finalizeDeterministicCancellation(context);
     }
-    return context.legacyPendingAction
-      ? finalizeLegacyPendingActionCancel(context, context.legacyPendingAction)
-      : finalizeNoPendingReply(context, "confirmation.cancel");
+    if (context.legacyPendingAction) {
+      return finalizeLegacyPendingActionCancel(context, context.legacyPendingAction);
+    }
+    // No v3 pendingOperation and no legacy PendingAction to cancel — but a "cancel" here still
+    // safely resets any visible-entity context (e.g. a numbered action-hygiene list), so a
+    // stray later "complete 1" can't resolve against stale state. action.hygiene_apply never
+    // requires confirmation, so there is nothing to reject, only this defensive reset.
+    setVisibleEntities(context.session, []);
+    return finalizeNoPendingReply(context, "confirmation.cancel");
   }
 
   // A legacy PendingAction (from a slash-command flow like /action_hygiene or a Gmail rule
@@ -278,6 +284,7 @@ async function finalizeDeterministicConfirmation(context: ContextBundle): Promis
 async function finalizeDeterministicCancellation(context: ContextBundle): Promise<AgentMessageResponse> {
   const pending = context.session.pendingOperation as AgentPendingOperation;
   setPendingOperation(context.session, null);
+  setVisibleEntities(context.session, []);
 
   const reply = "Cancelled — I won't do that.";
 

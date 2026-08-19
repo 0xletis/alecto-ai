@@ -177,12 +177,12 @@ import {
   type PendingActionCandidate
 } from "./actions/pending-candidate.js";
 import {
-  analyzeActionHygiene,
   formatActionHygieneDebug,
   formatActionHygieneReport,
   resolveActionHygieneReply,
   storeActionHygieneSession
 } from "./legacy/action-hygiene-conversation.js";
+import { analyzeActionHygiene } from "./actions/hygiene-session.js";
 import {
   buildNextWeekPlanContext,
   formatNextWeekPlanContextDebug,

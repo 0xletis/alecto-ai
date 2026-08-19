@@ -104,6 +104,23 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     }
   }
 
+  if (tool.name === "action.hygiene_apply") {
+    const resolution = resolveHygieneApplySelections(args.selections as HygieneApplySelectionArgs[], context);
+
+    if (resolution.status === "needs_clarification") {
+      return {
+        tool: tool.name,
+        args,
+        status: "needs_clarification",
+        requiresConfirmation: false,
+        clarificationQuestion: resolution.question,
+        rationale: operation.rationale
+      };
+    }
+
+    args.selections = resolution.selections;
+  }
+
   // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
   // nothing to confirm — asking "shall I create it?" would be misleading when it either
   // already exists or would just create a confusing duplicate. Skip the confirmation gate
@@ -155,14 +172,30 @@ const ZERO_WIDTH_CHARS_RE = /[​-‍﻿]/g;
  * - Strips zero-width characters and surrounding whitespace from string
  *   values — real LLM output has been observed to include these, which are
  *   invisible but corrupt exact-match comparisons and stored data.
+ * Recurses into nested arrays/objects (e.g. action.hygiene_apply's
+ * `selections` array of objects) so the same null-to-omitted normalization
+ * applies at every level, not just the top-level args object.
  */
 function stripNulls(obj: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj)) {
     if (value === null) continue;
-    result[key] = typeof value === "string" ? value.replace(ZERO_WIDTH_CHARS_RE, "").trim() : value;
+    result[key] = sanitizeValue(value);
   }
   return result;
+}
+
+function sanitizeValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(ZERO_WIDTH_CHARS_RE, "").trim();
+  }
+  if (Array.isArray(value)) {
+    return value.map(sanitizeValue);
+  }
+  if (value && typeof value === "object") {
+    return stripNulls(value as Record<string, unknown>);
+  }
+  return value;
 }
 
 /**
@@ -206,4 +239,59 @@ function resolveSingleVisibleEntity(entities: AgentEntity[], type: AgentEntity["
   }
 
   return { status: "resolved", entity: matches[0] };
+}
+
+export interface HygieneApplySelectionArgs {
+  index?: number;
+  actionId?: string;
+  decision: string;
+  snoozeUntilText?: string;
+}
+
+type HygieneApplyResolution =
+  | { status: "resolved"; selections: HygieneApplySelectionArgs[] }
+  | { status: "needs_clarification"; question: string };
+
+/**
+ * Resolves each action.hygiene_apply selection's actionId deterministically
+ * against the session's ground-truth visible entities — never trusts a raw
+ * index the LLM invented from its own memory of the conversation. A direct
+ * actionId supplied by the planner is trusted as-is, matching the existing
+ * precedent for action.snooze/complete/archive (which never cross-check a
+ * provided actionId either).
+ *
+ * If every selection fails to resolve — most commonly because there is no
+ * action-hygiene list currently visible in the session — the whole operation
+ * asks for clarification and nothing executes. If at least one selection
+ * resolves, the rest are passed through unresolved (actionId left unset) so
+ * the executor can report them individually as skipped, the same way
+ * applyActionHygieneBatchOperations already reports an operation whose
+ * action "no longer exists".
+ */
+function resolveHygieneApplySelections(selections: HygieneApplySelectionArgs[], context: ContextBundle): HygieneApplyResolution {
+  const resolved = selections.map((selection) => {
+    if (selection.actionId) {
+      return selection;
+    }
+
+    if (typeof selection.index === "number") {
+      const entity = context.session.visibleEntities.find((item) => item.type === "action" && item.index === selection.index);
+      if (entity) {
+        return { ...selection, actionId: entity.id };
+      }
+    }
+
+    return selection;
+  });
+
+  const anyResolved = resolved.some((selection) => Boolean(selection.actionId));
+
+  if (!anyResolved) {
+    return {
+      status: "needs_clarification",
+      question: 'I don\'t have an action-cleanup list in view right now. Say "clean up my actions" to see one, then tell me what to do with each.'
+    };
+  }
+
+  return { status: "resolved", selections: resolved };
 }

@@ -10,7 +10,7 @@ import {
   getRelevantMemories,
   updateNotificationSettings
 } from "@operator-agent/db";
-import { analyzeActionHygiene, cleanupDecisionGrammar } from "./action-hygiene-conversation.js";
+import { analyzeActionHygiene, cleanupDecisionGrammar } from "../actions/hygiene-session.js";
 import { sortGoalsForDisplay } from "../utils/goal-priority.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 

@@ -1,15 +1,12 @@
-import { getLocalTodayRange, isRiskControlGoal, parseActionDueDate, type Goal } from "@operator-agent/core";
+import { isRiskControlGoal, parseActionDueDate } from "@operator-agent/core";
 import {
   completeActionItem,
   confirmPendingAction,
   getActionItem,
-  getActionItems,
-  getActiveGoals,
   getOrCreateNotificationSettings,
   rejectPendingAction,
   replacePendingAction,
   snoozeActionItem,
-  type ActionItem,
   type PendingAction
 } from "@operator-agent/db";
 import type { ActionHygieneAction, ActionHygieneOption, ActionHygieneReport } from "../server-types.js";
@@ -18,6 +15,7 @@ import {
   type ActionHygieneBatchOperation,
   type HygieneOperation
 } from "../actions/hygiene.js";
+import { analyzeActionHygiene, actionHygieneVisibleActions } from "../actions/hygiene-session.js";
 import { createGoalProgressFromCompletedAction } from "../actions/goal-progress.js";
 import {
   readPendingActionCandidates,
@@ -25,12 +23,7 @@ import {
   toPendingActionCandidate,
   type PendingActionCandidate
 } from "../actions/pending-candidate.js";
-import { isSnoozedDue } from "../utils/action-item.js";
-import { goalPriorityRank } from "../utils/goal-priority.js";
 import {
-  daysBetween,
-  daysBetweenLocalDates,
-  formatDateInTimezone,
   formatLocalDateTime,
   pendingDecisionExpiry
 } from "../utils/datetime.js";
@@ -54,44 +47,6 @@ import { getUserTimezone } from "../utils/user-timezone.js";
  * action_target_clarification cluster, and the cross-type "recent action
  * mutation status" tracker), and why.
  */
-
-export async function analyzeActionHygiene(userId: string, now: Date, timezone: string): Promise<ActionHygieneReport> {
-  const [actions, goals] = await Promise.all([
-    getActionItems(userId, { status: "all", limit: 200 }),
-    getActiveGoals(userId)
-  ]);
-  const today = getLocalTodayRange(now, timezone);
-  const goalsById = new Map(goals.map((goal) => [goal.id, goal]));
-  const openActions = actions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
-  const analyzed = openActions
-    .map((action) => analyzeActionHygieneItem(action, goalsById.get(action.goalId ?? ""), today, now, timezone))
-    .filter(Boolean) as ActionHygieneAction[];
-  const overdueActions = analyzed.filter((action) => action.daysOverdue !== undefined && action.daysOverdue >= 1);
-  const staleActions = analyzed.filter((action) => action.daysOverdue !== undefined && action.daysOverdue >= 3);
-  const lowPriorityStaleActions = analyzed.filter(
-    (action) => action.priority === "low" && action.lastTouchedAt && daysBetween(new Date(action.lastTouchedAt), now) >= 7
-  );
-  const repeatedlySnoozedActions: ActionHygieneAction[] = [];
-  const suggestedCleanupCandidates = uniqueHygieneActions([
-    ...staleActions,
-    ...overdueActions.filter((action) => !action.linkedGoalTitle || (action.daysOverdue ?? 0) >= 2),
-    ...lowPriorityStaleActions
-  ]).slice(0, 10);
-
-  return {
-    staleActions,
-    overdueActions,
-    repeatedlySnoozedActions,
-    lowPriorityStaleActions,
-    suggestedCleanupCandidates,
-    summary:
-      suggestedCleanupCandidates.length > 0
-        ? cleanupDecisionGrammar(suggestedCleanupCandidates.length)
-        : overdueActions.length > 0
-          ? cleanupDecisionGrammar(overdueActions.length)
-        : "Action list is clean enough."
-  };
-}
 
 export async function createActionHygieneSession(
   userId: string,
@@ -142,55 +97,6 @@ export async function storeActionHygieneSession(
   });
 }
 
-export function analyzeActionHygieneItem(
-  action: ActionItem,
-  goal: Goal | undefined,
-  today: ReturnType<typeof getLocalTodayRange>,
-  now: Date,
-  timezone: string
-): ActionHygieneAction | undefined {
-  if (goal && isRiskControlGoal(goal)) {
-    return undefined;
-  }
-
-  const dueAt = action.dueAt;
-  const daysOverdue = dueAt && dueAt < now ? daysBetweenLocalDates(formatDateInTimezone(dueAt, timezone), today.date) : undefined;
-  const untouchedDays = daysBetween(action.updatedAt, now);
-  const reasons: string[] = [];
-
-  if (daysOverdue !== undefined && daysOverdue >= 1) {
-    reasons.push(daysOverdue >= 3 ? `overdue ${daysOverdue} days` : `overdue ${daysOverdue} day${daysOverdue === 1 ? "" : "s"}`);
-  }
-
-  if (action.priority === "low" && untouchedDays >= 7) {
-    reasons.push(`low priority and untouched ${untouchedDays} days`);
-  }
-
-  if (reasons.length === 0) {
-    return undefined;
-  }
-
-  const goalPriority = goalPriorityRank(goal);
-  const recommendedOptions = goalPriority >= 45
-    ? ["complete", "snooze", "keep"] as ActionHygieneOption[]
-    : action.goalId
-      ? ["complete", "snooze", "archive", "keep"] as ActionHygieneOption[]
-      : ["complete", "snooze", "archive", "keep"] as ActionHygieneOption[];
-
-  return {
-    actionId: action.id,
-    title: action.title,
-    dueAt: action.dueAt?.toISOString(),
-    linkedGoalTitle: action.goalTitleSnapshot,
-    priority: action.priority,
-    daysOverdue,
-    snoozeCount: undefined,
-    lastTouchedAt: action.updatedAt.toISOString(),
-    reason: reasons.join("; "),
-    recommendedOptions
-  };
-}
-
 export function formatActionHygieneReport(report: ActionHygieneReport): string {
   const visibleActions = actionHygieneVisibleActions(report);
 
@@ -213,13 +119,6 @@ export function formatActionHygieneReport(report: ActionHygieneReport): string {
   ]
     .filter((line) => line !== undefined)
     .join("\n");
-}
-
-export function actionHygieneVisibleActions(report: ActionHygieneReport): ActionHygieneAction[] {
-  return uniqueHygieneActions([
-    ...report.overdueActions,
-    ...report.suggestedCleanupCandidates
-  ]).slice(0, 10);
 }
 
 export function formatActionHygieneReplyExamples(actions: ActionHygieneAction[]): string[] {
@@ -271,21 +170,6 @@ export function formatHygieneActionLine(action: ActionHygieneAction): string {
   ]
     .filter(Boolean)
     .join(" - ");
-}
-
-export function cleanupDecisionGrammar(count: number): string {
-  return count === 1 ? "1 action needs a cleanup decision." : `${count} actions need cleanup decisions.`;
-}
-
-export function uniqueHygieneActions(actions: ActionHygieneAction[]): ActionHygieneAction[] {
-  const seen = new Set<string>();
-  return actions.filter((action) => {
-    if (seen.has(action.actionId)) {
-      return false;
-    }
-    seen.add(action.actionId);
-    return true;
-  });
 }
 
 export async function resolveActionHygieneReply(

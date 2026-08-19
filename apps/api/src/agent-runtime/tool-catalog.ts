@@ -61,6 +61,46 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({ actionId: actionIdField })
   },
   {
+    name: "action.hygiene_start",
+    description:
+      "Show the user's action-cleanup candidates (stale/overdue action items worth completing, snoozing, or archiving). Use this for 'clean up my actions', 'help me clean up my tasks', 'what actions should I complete, snooze, or archive?', and similar requests.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "action.hygiene_apply",
+    description:
+      "Apply complete/snooze/archive/keep decisions to one or more actions from the most recently shown action-hygiene cleanup list (from action.hygiene_start). One selection per action the user decided on in this message, e.g. 'complete 1, snooze 2 to Friday, archive 3' becomes three selections.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      selections: z
+        .array(
+          z.object({
+            index: z
+              .number()
+              .int()
+              .positive()
+              .optional()
+              .describe("1-based position in the most recently shown action-hygiene list, e.g. 1 for the first item. Preferred way to reference an item."),
+            actionId: z
+              .string()
+              .min(1)
+              .optional()
+              .describe("Direct action id, only if already known from visible context. Prefer index when a numbered hygiene list is visible."),
+            decision: z.enum(["complete", "snooze", "archive", "keep"]).describe("keep means no change — explicitly decided to leave it as is."),
+            snoozeUntilText: z
+              .string()
+              .optional()
+              .describe("Natural language snooze target, required when decision is 'snooze', e.g. 'tomorrow', 'friday'.")
+          })
+        )
+        .min(1)
+        .max(10)
+    })
+  },
+  {
     name: "event.log_job_applications",
     description: "Log that the user sent N job applications/CVs.",
     mutates: true,
@@ -230,7 +270,18 @@ export function toolArgsPlannerJsonSchema(tool: ToolDefinition): Record<string, 
     return { type: "object", additionalProperties: false, properties: {}, required: [] };
   }
 
-  const shape = tool.argsSchema.shape as Record<string, z.ZodTypeAny>;
+  return zodObjectToPlannerJsonSchema(tool.argsSchema);
+}
+
+/**
+ * Recursively builds a JSON Schema for a ZodObject's fields, shaped for
+ * OpenAI Structured Outputs' strict mode (every property listed in
+ * `required`, optionality modeled via a nullable type). Used both for a
+ * tool's top-level args and for nested object shapes inside an array field
+ * (e.g. action.hygiene_apply's `selections`).
+ */
+function zodObjectToPlannerJsonSchema(schema: z.ZodObject<Record<string, z.ZodTypeAny>>): Record<string, unknown> {
+  const shape = schema.shape as Record<string, z.ZodTypeAny>;
   const keys = Object.keys(shape);
   const properties: Record<string, unknown> = {};
 
@@ -245,6 +296,14 @@ function zodFieldToPlannerJsonSchema(field: z.ZodTypeAny): Record<string, unknow
   const optional = field.isOptional();
   const inner = unwrapOptional(field);
 
+  if (inner instanceof z.ZodArray) {
+    const element = inner.element as z.ZodTypeAny;
+    const items = element instanceof z.ZodObject ? zodObjectToPlannerJsonSchema(element) : zodFieldToPlannerJsonSchema(element);
+    return { type: "array", items };
+  }
+  if (inner instanceof z.ZodObject) {
+    return zodObjectToPlannerJsonSchema(inner);
+  }
   if (inner instanceof z.ZodEnum) {
     const values = inner.options as string[];
     return optional ? { type: ["string", "null"], enum: [...values, null] } : { type: "string", enum: values };
@@ -291,6 +350,12 @@ function describeZodType(schema: z.ZodTypeAny): string {
   }
   if (inner instanceof z.ZodBoolean) {
     return "boolean";
+  }
+  if (inner instanceof z.ZodArray) {
+    return `${describeZodType(inner.element as z.ZodTypeAny)}[]`;
+  }
+  if (inner instanceof z.ZodObject) {
+    return describeArgsShape(inner);
   }
   return "string";
 }

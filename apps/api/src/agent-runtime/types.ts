@@ -103,6 +103,14 @@ export interface AgentEntity {
   type: "action" | "goal" | "gmail_rule" | "gmail_review" | "memory" | "event";
   id: string;
   label: string;
+  /**
+   * 1-based position in the most recently shown numbered list (e.g. an
+   * action-hygiene cleanup list), when this entity was surfaced as part of
+   * one. Lets a reply like "complete 1" resolve deterministically against
+   * ground-truth session state instead of hidden LLM memory. Absent for
+   * entities not shown as part of a numbered list.
+   */
+  index?: number;
 }
 
 export interface AgentMutationRecord {

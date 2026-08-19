@@ -18,7 +18,7 @@ import type {
   WeeklyReviewDraft,
   WeeklyReviewMemory
 } from "../server-types.js";
-import { analyzeActionHygiene } from "./action-hygiene-conversation.js";
+import { analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { isSnoozedDue } from "../utils/action-item.js";
 import {
   addDaysToLocalDateString,

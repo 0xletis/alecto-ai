@@ -19,8 +19,12 @@ import {
   type EmailSignalRule
 } from "@operator-agent/db";
 import { parseActionDueDate } from "@operator-agent/core";
+import type { ActionHygieneAction } from "../server-types.js";
+import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
+import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
+import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
-import { findExistingCustomGmailRule } from "./validator.js";
+import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
 
 export async function executeOperation(
   userId: string,
@@ -95,6 +99,78 @@ export async function executeOperation(
         const updated = await archiveActionItem(userId, args.actionId as string);
         if (!updated) return failed(operation.tool, "That task no longer exists.");
         return { tool: operation.tool, status: "executed", summary: `Archived "${updated.title}".`, result: updated };
+      }
+
+      case "action.hygiene_start": {
+        const timezone = await getUserTimezone(userId);
+        const report = await analyzeActionHygiene(userId, new Date(), timezone);
+        const visible = actionHygieneVisibleActions(report);
+
+        if (visible.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "Your actions look clean right now. No stale or overdue actions need cleanup.",
+            result: report
+          };
+        }
+
+        const summary = [
+          "Here are the actions worth cleaning up:",
+          ...visible.map((action, index) => `${index + 1}. ${hygieneActionLabel(action)}`),
+          "",
+          "Reply like: complete 1, snooze 2 to Friday, archive 3."
+        ].join("\n");
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary,
+          result: visible,
+          entities: visible.map((action, index) => hygieneActionToEntity(action, index + 1))
+        };
+      }
+
+      case "action.hygiene_apply": {
+        const selections = (args.selections as HygieneApplySelectionArgs[]) ?? [];
+        const timezone = await getUserTimezone(userId);
+        const batchOps: ActionHygieneBatchOperation[] = [];
+        const notes: string[] = [];
+
+        for (const selection of selections) {
+          if (!selection.actionId) {
+            notes.push(
+              `Item ${selection.index ?? "?"}: I couldn't find that in the current list. Say "clean up my actions" to see it again.`
+            );
+            continue;
+          }
+
+          const title = context.session.visibleEntities.find((entity) => entity.type === "action" && entity.id === selection.actionId)?.label ?? "";
+
+          if (selection.decision === "snooze") {
+            const parsedDate = parseActionDueDate(selection.snoozeUntilText ?? "");
+            if (!parsedDate.dueAt) {
+              notes.push(`${title || "That task"}: couldn't understand the snooze time "${selection.snoozeUntilText ?? ""}".`);
+              continue;
+            }
+            batchOps.push({ operation: "snooze", actionId: selection.actionId, title, dueAt: parsedDate.dueAt.toISOString() });
+            continue;
+          }
+
+          batchOps.push({ operation: selection.decision as HygieneOperation, actionId: selection.actionId, title });
+        }
+
+        if (batchOps.length === 0) {
+          return failed(operation.tool, notes.join(" ") || "I couldn't match any of those to a visible action.");
+        }
+
+        const applied = await applyActionHygieneBatchOperations(userId, batchOps, timezone);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: [applied.reply, ...notes].filter(Boolean).join("\n"),
+          result: applied
+        };
       }
 
       case "event.log_job_applications": {
@@ -370,4 +446,12 @@ function gmailRuleToEntity(rule: EmailSignalRule): AgentEntity {
 
 function reviewToEntity(review: EmailReviewItem): AgentEntity {
   return { type: "gmail_review", id: review.id, label: review.subject ?? review.from ?? review.id };
+}
+
+function hygieneActionLabel(action: ActionHygieneAction): string {
+  return action.daysOverdue !== undefined && action.daysOverdue >= 1 ? `${action.title} — overdue` : action.title;
+}
+
+function hygieneActionToEntity(action: ActionHygieneAction, index: number): AgentEntity {
+  return { type: "action", id: action.actionId, label: action.title, index };
 }

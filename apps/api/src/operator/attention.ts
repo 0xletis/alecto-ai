@@ -45,7 +45,7 @@ import type {
 } from "../server-types.js";
 import { buildGmailAutonomyState, gmailSyncModeShortLabel } from "../conversation/gmail-autonomy.js";
 import { getLatestWeeklyReview, shouldPromptWeeklyReview } from "../legacy/weekly-review-conversation.js";
-import { analyzeActionHygiene, cleanupDecisionGrammar } from "../legacy/action-hygiene-conversation.js";
+import { analyzeActionHygiene, cleanupDecisionGrammar } from "../actions/hygiene-session.js";
 import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime } from "../utils/datetime.js";
 import { emailReviewKind, type EmailReviewKind } from "../utils/email-review.js";
 import { isSnoozedDue } from "../utils/action-item.js";
