@@ -19,7 +19,7 @@ import {
   type EmailSignalRule
 } from "@operator-agent/db";
 import { parseActionDueDate } from "@operator-agent/core";
-import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind } from "../server-types.js";
+import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
 import {
@@ -32,6 +32,13 @@ import {
   readPendingNextWeekPlanSuggestions,
   toPendingNextWeekPlanSuggestion
 } from "../planning/next-week.js";
+import { buildWeeklyReviewContext } from "../weekly-review/context.js";
+import {
+  buildWeeklyGuardrailNote,
+  formatWeeklyEmailSignalsForReview,
+  generateAndSaveWeeklyReview,
+  generateDeterministicWeeklyReview
+} from "../weekly-review/review.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
@@ -344,6 +351,49 @@ export async function executeOperation(
         };
       }
 
+      case "weekly_review.start": {
+        const timezone = await getUserTimezone(userId);
+        const reviewContext = await buildWeeklyReviewContext(userId, undefined, timezone, new Date());
+        const draft = generateDeterministicWeeklyReview(reviewContext);
+        // Deliberately not just "wins is the placeholder sentence" — a thin week is also
+        // thin on stalls/overdue actions, so this checks the underlying signal directly
+        // rather than parsing generateDeterministicWeeklyReview's prose output.
+        const isThin = reviewContext.events.length === 0 && reviewContext.completedActions.length === 0 && reviewContext.overdueActions.length === 0;
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: isThin ? formatThinWeeklyReviewSummary(reviewContext) : formatWeeklyReviewDraftSummary(reviewContext, draft),
+          result: { context: reviewContext, draft },
+          pendingOperationUpdate: {
+            topic: "weekly_review",
+            summary: `Weekly review draft (${reviewContext.weekStartLocalDate} to ${reviewContext.reviewedEndLocalDate})`,
+            operations: [
+              {
+                tool: "weekly_review.save",
+                args: { weekStartLocalDate: reviewContext.weekStartLocalDate, timezone: reviewContext.timezone },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "weekly_review.save": {
+        const weekStartLocalDate = args.weekStartLocalDate as string;
+        const timezone = args.timezone as string;
+        const reviewContext = await buildWeeklyReviewContext(userId, weekStartLocalDate, timezone, new Date());
+        const saved = await generateAndSaveWeeklyReview(userId, reviewContext);
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Saved your weekly review (${saved.weekStartLocalDate} to ${saved.reviewedEndLocalDate}). You can ask for it again anytime.`,
+          result: saved
+        };
+      }
+
       case "event.log_job_applications": {
         const count = args.count as number;
         const created = await createEvents(
@@ -642,6 +692,49 @@ function formatPlanDraftSummary(windowKind: PlanWindowKind, selections: NextWeek
     "",
     'Tell me naturally what to change — for example: "move the gym one to Friday", "remove the YouTube item", "make it lighter", or "yes" to create it.'
   ].join("\n");
+}
+
+function formatWeeklyReviewDraftSummary(context: WeeklyReviewContext, draft: WeeklyReviewDraft): string {
+  return [
+    "Here's your weekly review:",
+    "",
+    draft.summary,
+    "",
+    "Wins:",
+    ...draft.wins.map((win) => `- ${win}`),
+    "",
+    "Stalls:",
+    ...draft.stalls.map((stall) => `- ${stall}`),
+    "",
+    "Guardrails:",
+    `- ${buildWeeklyGuardrailNote(context)}`,
+    "",
+    "Email signals:",
+    formatWeeklyEmailSignalsForReview(context.emailAttention),
+    "",
+    "Patterns:",
+    draft.patterns.length > 0 ? draft.patterns.map((pattern) => `- ${pattern}`).join("\n") : "- No active operator reflections included.",
+    "",
+    "Next move:",
+    draft.recommendedNextWeekActions.length > 0
+      ? draft.recommendedNextWeekActions.map((action, index) => `${index + 1}. ${action}`).join("\n")
+      : "- No next-week focus suggested from this week's data.",
+    "",
+    'Reply: "save this review" to keep it, or "cancel".'
+  ].join("\n");
+}
+
+function formatThinWeeklyReviewSummary(context: WeeklyReviewContext): string {
+  const openParts = [
+    context.openActions.length > 0 ? `${context.openActions.length} open action${context.openActions.length === 1 ? "" : "s"}` : undefined,
+    context.activeGoals.length > 0 ? `${context.activeGoals.length} active goal${context.activeGoals.length === 1 ? "" : "s"}` : undefined
+  ].filter(Boolean);
+
+  return [
+    "Not much was logged this week. I can still review open goals/actions, but the event history is thin.",
+    openParts.length > 0 ? `Right now: ${openParts.join(", ")}.` : undefined,
+    'Reply: "save this review" to keep it, or "cancel".'
+  ].filter(Boolean).join("\n");
 }
 
 function nextWeekApplyOperation(planStartLocalDate: string, windowKind: PlanWindowKind, selections: NextWeekPlanSuggestion[]): ValidatedOperation {

@@ -187,6 +187,25 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "weekly_review.start",
+    description:
+      "Build and show a grounded weekly review of the user's actual goals/actions/events/email activity this week — wins, stalls, guardrail activity, and up to 3 recommended next-week focuses, all computed from real data, never invented. Use for 'review my week', 'give me my weekly review', 'how did this week go?', 'what changed this week?' (week-scoped — NOT the same as a bare 'what changed?'/'what did you do?', which means operator.recent_changes instead), 'what should I improve next week?'. Safe to use again to re-show the review — it always reflects real current data.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "weekly_review.save",
+    description:
+      "Internal: saves the currently shown weekly review as a durable memory. This is invoked automatically when the user confirms saving (e.g. 'save this review', 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      weekStartLocalDate: z.string().min(1),
+      timezone: z.string().min(1)
+    })
+  },
+  {
     name: "event.log_job_applications",
     description: "Log that the user sent N job applications/CVs.",
     mutates: true,

@@ -44,7 +44,10 @@ const CONFIRM_WHITELIST = new Set([
   "si",
   "perfecto",
   "perfect",
-  "looks good"
+  "looks good",
+  "save this review",
+  "save the review",
+  "save it"
 ]);
 const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget it", "cancelar", "cancela"]);
 
@@ -607,6 +610,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
     if (op.tool.startsWith("event.")) return "progress_logging";
     if (op.tool.startsWith("action.")) return "action_cleanup";
     if (op.tool.startsWith("planning.")) return "next_week_planning";
+    if (op.tool.startsWith("weekly_review.")) return "weekly_review";
     if (op.tool.startsWith("operator.")) return "operator_summary";
   }
   return null;

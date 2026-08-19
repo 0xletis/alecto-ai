@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createActionItem, createGoal, prisma } from "../packages/db/src/index.ts";
+import { completeActionItem, createActionItem, createEvent, createGoal, prisma } from "../packages/db/src/index.ts";
 import { clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertNoFalseSuccessClaim,
@@ -404,6 +404,80 @@ test("scripted smoke 5: remember a preference -> ask Gmail rules -> so what toda
     };
 
     await runScriptedScenario(server, userId, scenario);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 6: weekly review smoke --------------------------------------------------------
+
+test("scripted smoke 6: review my week -> what should I improve next week? -> save this review -> so what today", async () => {
+  const server = buildServer();
+  const userId = `smoke-weekly-review-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium" });
+    const completed = await createActionItem(userId, { source: "manual", title: "Send CV to acme corp", priority: "medium" });
+    await completeActionItem(userId, completed.id);
+    await createEvent(userId, { type: "health.workout_completed", source: "manual", confidence: 1, data: { minutes: 45 } });
+
+    const scenario: ScriptedScenario = {
+      name: "weekly-review-smoke",
+      turns: [
+        {
+          message: "review my week",
+          plan: { topic: "weekly_review", intent: "start_weekly_review", operations: [op("weekly_review.start")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /here's your weekly review:/i);
+            // Grounded in the actually seeded data — not invented.
+            assert.match(turn.reply, /completed 1 action/i);
+            assert.match(turn.reply, /logged 1 workout/i);
+            assertNoMutationYet(turn);
+            assert.ok(turn.pendingOperationAfter, "showing the review opens a pending save state");
+          }
+        },
+        {
+          message: "what should I improve next week?",
+          plan: { topic: "weekly_review", intent: "start_weekly_review", operations: [op("weekly_review.start")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoFalseSuccessClaim(turn);
+            assert.match(turn.reply, /next move:/i);
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "save this review",
+          // No plan: "save this review" is handled by the exact confirm whitelist, same
+          // mechanism as "yes"/"looks good", before the planner runs.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true, "saving the review must actually persist it");
+            assert.match(turn.reply, /saved your weekly review/i);
+            assert.equal(turn.pendingOperationAfter, null, "the pending save state clears once saved");
+          }
+        },
+        {
+          message: "so what today",
+          plan: { topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /open task|goal/i);
+            assert.doesNotMatch(turn.reply, /\/action_hygiene|\/gmail_rules|\/sync_gmail/i, "must never recommend a slash command in normal v3 chat");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const saved = await prisma.memoryEntry.findMany({ where: { userId, status: "active" } });
+    const reviewMemory = saved.find((memory) => (memory.data as Record<string, unknown> | null)?.kind === "weekly_review");
+    assert.ok(reviewMemory, "a weekly_review memory must exist after 'save this review'");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

@@ -182,6 +182,22 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     };
   }
 
+  // Same reasoning as planning.next_week_apply above: weekly_review.save is never planned by
+  // the LLM directly, only ever reached via the deterministic confirm whitelist (an exact
+  // "yes"/"save this review"/etc.) re-executing an already-stored pendingOperation. Its args
+  // (weekStartLocalDate/timezone) are set by weekly_review.start's pendingOperationUpdate, not
+  // guessed by the LLM — a direct plan would have no real values to put there anyway.
+  if (tool.name === "weekly_review.save") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming an open weekly review",
+      rationale: operation.rationale
+    };
+  }
+
   // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
   // nothing to confirm — asking "shall I create it?" would be misleading when it either
   // already exists or would just create a confusing duplicate. Skip the confirmation gate
