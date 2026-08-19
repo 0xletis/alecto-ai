@@ -567,3 +567,97 @@ test("scripted smoke 7: what email rules are active? -> turn off Endesa -> yes -
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+// --- Scenario 8: daily-loop settings smoke --------------------------------------------------
+
+test("scripted smoke 8: what are my daily loop settings? -> turn off daily review -> cancel -> turn off daily review -> yes -> what are my daily loop settings?", async () => {
+  const server = buildServer();
+  const userId = `smoke-daily-loop-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true } });
+
+    const showPlan: MockPlan = { topic: "daily_loop_settings", intent: "show_daily_loop_settings", operations: [op("daily_loop.settings_show")], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+    const proposeOffPlan: MockPlan = {
+      topic: "daily_loop_settings",
+      intent: "propose_daily_loop_settings_update",
+      operations: [op("daily_loop.settings_propose_update", { enabled: false })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    };
+
+    const scenario: ScriptedScenario = {
+      name: "daily-loop-settings-smoke",
+      turns: [
+        {
+          message: "what are my daily loop settings?",
+          plan: showPlan,
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /daily review: on/i);
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "turn off daily review",
+          plan: proposeOffPlan,
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoFalseSuccessClaim(turn);
+            assert.match(turn.reply, /about to turn off daily review reminders/i);
+            assertNoMutationYet(turn);
+            assert.ok(turn.pendingOperationAfter, "proposing a change opens a pending confirmation");
+          }
+        },
+        {
+          message: "cancel",
+          // No plan: "cancel" is handled by the exact cancel whitelist before the planner runs.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.pendingOperationAfter, null, "cancel must clear the pending change");
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "turn off daily review",
+          plan: proposeOffPlan,
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /about to turn off daily review reminders/i);
+            assertNoMutationYet(turn);
+            assert.ok(turn.pendingOperationAfter, "proposing again after cancel must open a fresh pending confirmation");
+          }
+        },
+        {
+          message: "yes",
+          // No plan: "yes" is handled by the exact confirm whitelist before the planner runs.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true, "the setting must only change after 'yes'");
+            assert.match(turn.reply, /done — daily review reminders are now off/i);
+            assert.equal(turn.pendingOperationAfter, null);
+          }
+        },
+        {
+          message: "what are my daily loop settings?",
+          plan: showPlan,
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /daily review: off/i, "must reflect the real, now-updated DB state");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const settingsAfter = await prisma.notificationSettings.findUnique({ where: { userId } });
+    assert.equal(settingsAfter?.dailyLoopEnabled, false);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});

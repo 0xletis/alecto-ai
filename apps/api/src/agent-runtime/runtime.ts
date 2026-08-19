@@ -612,6 +612,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
     if (op.tool.startsWith("action.")) return "action_cleanup";
     if (op.tool.startsWith("planning.")) return "next_week_planning";
     if (op.tool.startsWith("weekly_review.")) return "weekly_review";
+    if (op.tool.startsWith("daily_loop.")) return "daily_loop_settings";
     if (op.tool.startsWith("operator.")) return "operator_summary";
   }
   return null;

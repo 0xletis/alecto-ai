@@ -353,6 +353,38 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({})
   },
   {
+    name: "daily_loop.settings_show",
+    description:
+      "Show the user's current daily-loop settings: whether it's on, and the morning-brief/evening-review times. Use for 'what are my daily loop settings?', 'when is my daily review?'.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "daily_loop.settings_propose_update",
+    description:
+      "Propose turning the daily loop on/off and/or changing the morning-brief or evening-review time — shows what would change and opens a pending confirmation. Use for 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day'. Set only the field(s) the user is actually asking to change. Does NOT support anything beyond on/off + the two times (e.g. delivery channel, default action reminder time, weekly insight day) — those aren't supported; explain that honestly instead of planning this.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      enabled: z.boolean().optional().describe("Set true to turn the daily loop on, false to turn it off."),
+      morningTimeText: z.string().optional().describe("New natural-language time for the morning brief, e.g. '9am', '09:00'."),
+      eveningTimeText: z.string().optional().describe("New natural-language time for the evening review, e.g. '9:30pm', '21:30'.")
+    })
+  },
+  {
+    name: "daily_loop.settings_apply_update",
+    description:
+      "Internal: applies the confirmed daily-loop settings change. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      enabled: z.boolean().optional(),
+      morningTimeMinutes: z.number().int().min(0).max(1439).optional(),
+      eveningTimeMinutes: z.number().int().min(0).max(1439).optional()
+    })
+  },
+  {
     name: "confirmation.confirm",
     description: "The user confirmed the currently pending operation(s).",
     mutates: false,

@@ -214,6 +214,32 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     };
   }
 
+  // Same reasoning again: daily_loop.settings_apply_update is never planned by the LLM
+  // directly, only ever reached via the deterministic confirm whitelist re-executing an
+  // already-stored pendingOperation. Its args are the fully-resolved values (minutes, not
+  // text) set by daily_loop.settings_propose_update's pendingOperationUpdate.
+  if (tool.name === "daily_loop.settings_apply_update") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending daily-loop settings change",
+      rationale: operation.rationale
+    };
+  }
+
+  if (tool.name === "daily_loop.settings_propose_update" && args.enabled === undefined && !args.morningTimeText && !args.eveningTimeText) {
+    return {
+      tool: tool.name,
+      args,
+      status: "needs_clarification",
+      requiresConfirmation: false,
+      clarificationQuestion: "What would you like to change — turn the daily loop on/off, the morning-brief time, or the evening-review time?",
+      rationale: operation.rationale
+    };
+  }
+
   // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
   // nothing to confirm — asking "shall I create it?" would be misleading when it either
   // already exists or would just create a confusing duplicate. Skip the confirmation gate

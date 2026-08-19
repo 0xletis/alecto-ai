@@ -13,14 +13,16 @@ import {
   getActiveMemories,
   getEmailReviewItems,
   getEmailSignalRules,
+  getOrCreateNotificationSettings,
   rejectEmailReviewItem,
   snoozeActionItem,
   updateEmailSignalRule,
+  updateNotificationSettings,
   type ActionItem,
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
-import { parseActionDueDate } from "@operator-agent/core";
+import { parseActionDueDate, type NotificationSettings } from "@operator-agent/core";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
@@ -33,6 +35,7 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
+import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
 import {
   actionInputFromPlanSuggestion,
   buildNextWeekPlanContext,
@@ -727,6 +730,93 @@ export async function executeOperation(
         };
       }
 
+      case "daily_loop.settings_show": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatDailyLoopSettingsSummary(settings),
+          result: settings
+        };
+      }
+
+      case "daily_loop.settings_propose_update": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const morningTimeText = args.morningTimeText as string | undefined;
+        const eveningTimeText = args.eveningTimeText as string | undefined;
+
+        let morningTimeMinutes: number | undefined;
+        if (morningTimeText) {
+          morningTimeMinutes = parseTimeOfDayText(morningTimeText);
+          if (morningTimeMinutes === undefined) {
+            return { tool: operation.tool, status: "executed", summary: `I couldn't understand the morning time "${morningTimeText}". Try something like "9am" or "09:00".` };
+          }
+        }
+
+        let eveningTimeMinutes: number | undefined;
+        if (eveningTimeText) {
+          eveningTimeMinutes = parseTimeOfDayText(eveningTimeText);
+          if (eveningTimeMinutes === undefined) {
+            return { tool: operation.tool, status: "executed", summary: `I couldn't understand the evening time "${eveningTimeText}". Try something like "9:30pm" or "21:30".` };
+          }
+        }
+
+        const enabled = args.enabled as boolean | undefined;
+        const changes = describeDailyLoopChanges(settings, { enabled, morningTimeMinutes, eveningTimeMinutes });
+
+        if (changes.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `That's already how it's set.\n\n${formatDailyLoopSettingsSummary(settings)}`
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `You're about to ${changes.map((change) => change.proposal).join(" and ")}. Reply yes to confirm or cancel.`,
+          pendingOperationUpdate: {
+            topic: "daily_loop_settings",
+            summary: changes.map((change) => change.proposal).join(" and "),
+            operations: [
+              {
+                tool: "daily_loop.settings_apply_update",
+                args: {
+                  enabled,
+                  morningTimeMinutes,
+                  eveningTimeMinutes
+                },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "daily_loop.settings_apply_update": {
+        const enabled = args.enabled as boolean | undefined;
+        const morningTimeMinutes = args.morningTimeMinutes as number | undefined;
+        const eveningTimeMinutes = args.eveningTimeMinutes as number | undefined;
+        const before = await getOrCreateNotificationSettings(userId);
+
+        const updated = await updateNotificationSettings(userId, {
+          dailyLoopEnabled: enabled,
+          morningTimeMinutes,
+          eveningTimeMinutes
+        });
+
+        const changes = describeDailyLoopChanges(before, { enabled, morningTimeMinutes, eveningTimeMinutes });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: changes.length > 0 ? `Done — ${changes.map((change) => change.done).join(" and ")}.` : "Done — nothing needed to change.",
+          result: updated
+        };
+      }
+
       default:
         return failed(operation.tool, `"${operation.tool}" has no executor implementation.`);
     }
@@ -826,6 +916,57 @@ function formatThinWeeklyReviewSummary(context: WeeklyReviewContext): string {
     openParts.length > 0 ? `Right now: ${openParts.join(", ")}.` : undefined,
     'Reply: "save this review" to keep it, or "cancel".'
   ].filter(Boolean).join("\n");
+}
+
+function formatDailyLoopSettingsSummary(settings: NotificationSettings): string {
+  return [
+    "Daily loop settings:",
+    `- Daily review: ${settings.dailyLoopEnabled ? "on" : "off"}`,
+    `- Morning brief: ${formatMinutesOfDay(settings.morningTimeMinutes)} (${settings.timezone})`,
+    `- Evening review: ${formatMinutesOfDay(settings.eveningTimeMinutes)} (${settings.timezone})`
+  ].join("\n");
+}
+
+interface DailyLoopChangeDescription {
+  proposal: string;
+  done: string;
+}
+
+interface DailyLoopChangeRequest {
+  enabled?: boolean;
+  morningTimeMinutes?: number;
+  eveningTimeMinutes?: number;
+}
+
+/**
+ * Compares a requested daily-loop change against the current settings and describes only the
+ * fields that would actually change — in both the pre-execution "You're about to..." phrasing
+ * and the post-execution "Done — ..." phrasing, so neither has to be derived from the other
+ * with fragile string surgery. Returns an empty array when the request wouldn't change
+ * anything (already in that state).
+ */
+function describeDailyLoopChanges(current: NotificationSettings, request: DailyLoopChangeRequest): DailyLoopChangeDescription[] {
+  const changes: DailyLoopChangeDescription[] = [];
+
+  if (request.enabled !== undefined && request.enabled !== current.dailyLoopEnabled) {
+    changes.push(
+      request.enabled
+        ? { proposal: "turn daily loop reminders on", done: "daily loop reminders are now on" }
+        : { proposal: "turn off daily review reminders", done: "daily review reminders are now off" }
+    );
+  }
+
+  if (request.morningTimeMinutes !== undefined && request.morningTimeMinutes !== current.morningTimeMinutes) {
+    const time = formatMinutesOfDay(request.morningTimeMinutes);
+    changes.push({ proposal: `move the morning brief to ${time}`, done: `the morning brief is now at ${time}` });
+  }
+
+  if (request.eveningTimeMinutes !== undefined && request.eveningTimeMinutes !== current.eveningTimeMinutes) {
+    const time = formatMinutesOfDay(request.eveningTimeMinutes);
+    changes.push({ proposal: `move the evening review to ${time}`, done: `the evening review is now at ${time}` });
+  }
+
+  return changes;
 }
 
 function nextWeekApplyOperation(planStartLocalDate: string, windowKind: PlanWindowKind, selections: NextWeekPlanSuggestion[]): ValidatedOperation {

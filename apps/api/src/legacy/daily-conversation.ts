@@ -11,6 +11,7 @@ import {
   updateNotificationSettings
 } from "@operator-agent/db";
 import { analyzeActionHygiene, cleanupDecisionGrammar } from "../actions/hygiene-session.js";
+import { formatMinutesOfDay, parseNaturalTimeToMinutes } from "../operator/daily-loop-settings.js";
 import { sortGoalsForDisplay } from "../utils/goal-priority.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 
@@ -368,34 +369,4 @@ function parseNaturalDailyLoopSettings(message: string): { morningTimeMinutes?: 
   }
 
   return undefined;
-}
-
-function parseNaturalTimeToMinutes(hourText: string, minuteText?: string, meridiem?: string): number | undefined {
-  let hour = Number(hourText);
-  const minute = minuteText ? Number(minuteText) : 0;
-
-  if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
-    return undefined;
-  }
-
-  if (meridiem?.toLowerCase() === "pm" && hour < 12) {
-    hour += 12;
-  }
-
-  if (meridiem?.toLowerCase() === "am" && hour === 12) {
-    hour = 0;
-  }
-
-  if (hour < 0 || hour > 23) {
-    return undefined;
-  }
-
-  return hour * 60 + minute;
-}
-
-function formatMinutesOfDay(minutes: number): string {
-  const safe = Number.isInteger(minutes) && minutes >= 0 && minutes <= 1439 ? minutes : 0;
-  const hours = Math.floor(safe / 60);
-  const mins = safe % 60;
-  return `${String(hours).padStart(2, "0")}:${String(mins).padStart(2, "0")}`;
 }
