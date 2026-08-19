@@ -14,3 +14,14 @@
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
+
+/**
+ * Generic, dependency-free record-field reader extracted from
+ * apps/api/src/server.ts alongside isRecord, for the same reason — the
+ * legacy Gmail conversation cluster (apps/api/src/legacy/gmail-conversation.ts)
+ * needs it and cannot import it back from server.ts.
+ */
+export function stringFromRecord(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" ? value : undefined;
+}

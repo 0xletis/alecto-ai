@@ -20,3 +20,14 @@ export function formatLocalDateTime(date: Date | undefined, timezone = "Europe/M
     hour12: false
   }).format(date);
 }
+
+/**
+ * Generic pending-decision expiry helper extracted from
+ * apps/api/src/server.ts, where it was called ~21 times across pending
+ * actions of every kind (not just Gmail rules) — moved here so the legacy
+ * Gmail conversation cluster (apps/api/src/legacy/gmail-conversation.ts)
+ * can use it without importing back from server.ts.
+ */
+export function pendingDecisionExpiry(): Date {
+  return new Date(Date.now() + 60 * 60 * 1000);
+}

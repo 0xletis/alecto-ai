@@ -1,4 +1,9 @@
-import { getEmailSignalRules, getIntegrationConnections, type EmailSignalRule } from "@operator-agent/db";
+import {
+  archiveEmailSignalRule,
+  getEmailSignalRules,
+  getIntegrationConnections,
+  type EmailSignalRule
+} from "@operator-agent/db";
 import { sortEmailRuleCandidates } from "../conversation/email-rule-selection.js";
 import { normalizeForComparison } from "../utils/text.js";
 
@@ -74,4 +79,28 @@ export async function getVisibleGmailEmailRules(userId: string): Promise<EmailSi
   );
 
   return rules.filter((rule) => rule.status !== "archived" && gmailConnectionIds.has(rule.connectionId));
+}
+
+/**
+ * Archives active job-search rules left over on other Gmail connections for
+ * this user, so only the current connection keeps the built-in job-search
+ * rule active. Used by the Gmail OAuth callback (server.ts) when a new
+ * connection is created, and by the legacy Gmail conversation cluster's
+ * enable/reactivate flow (apps/api/src/legacy/gmail-conversation.ts).
+ */
+export async function archiveStaleJobSearchEmailRules(userId: string, currentConnectionId: string): Promise<void> {
+  const [rules, connections] = await Promise.all([getEmailSignalRules(userId), getIntegrationConnections(userId)]);
+  const connectionById = new Map(connections.map((connection) => [connection.id, connection]));
+
+  for (const rule of rules) {
+    if (rule.status !== "active" || rule.adapterId !== "job_search_email" || rule.connectionId === currentConnectionId) {
+      continue;
+    }
+
+    const connection = connectionById.get(rule.connectionId);
+
+    if (!connection || connection.integrationId !== "gmail" || connection.status === "error" || connection.status === "archived") {
+      await archiveEmailSignalRule(userId, rule.id);
+    }
+  }
 }

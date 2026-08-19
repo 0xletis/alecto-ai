@@ -1390,6 +1390,17 @@ export async function getEmailReviewItem(userId: string, reviewId: string): Prom
   return item ? toEmailReviewItem(item) : undefined;
 }
 
+export async function getPendingEmailReviewCount(userId: string): Promise<number> {
+  await ensureUser(userId);
+
+  return prisma.emailReviewItem.count({
+    where: {
+      userId,
+      status: "pending"
+    }
+  });
+}
+
 export async function createActionItemIfNotExists(
   userId: string,
   input: CreateActionItemInput
