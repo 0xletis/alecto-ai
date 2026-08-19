@@ -31,3 +31,37 @@ export function formatLocalDateTime(date: Date | undefined, timezone = "Europe/M
 export function pendingDecisionExpiry(): Date {
   return new Date(Date.now() + 60 * 60 * 1000);
 }
+
+/**
+ * Generic date-arithmetic and timezone-local-date helpers extracted from
+ * apps/api/src/server.ts, where they were used across daily brief, weekly
+ * review, and action-hygiene analysis — not specific to any one of those,
+ * which is why they live here rather than in
+ * apps/api/src/legacy/action-hygiene-conversation.ts (which also needs them).
+ */
+export function getDateTimePart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
+  return parts.find((part) => part.type === type)?.value ?? "";
+}
+
+export function formatDateInTimezone(date: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+
+  return `${getDateTimePart(parts, "year")}-${getDateTimePart(parts, "month")}-${getDateTimePart(parts, "day")}`;
+}
+
+export function daysBetweenLocalDates(fromDate: string, toDate: string): number {
+  const [fromYear, fromMonth, fromDay] = fromDate.split("-").map(Number);
+  const [toYear, toMonth, toDay] = toDate.split("-").map(Number);
+  const from = Date.UTC(fromYear, fromMonth - 1, fromDay);
+  const to = Date.UTC(toYear, toMonth - 1, toDay);
+  return Math.max(0, Math.floor((to - from) / (24 * 60 * 60 * 1000)));
+}
+
+export function daysBetween(from: Date, to: Date): number {
+  return Math.max(0, Math.floor((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)));
+}

@@ -58,3 +58,52 @@ export function isConfirmationMessage(message: string): boolean {
 export function isRejectionMessage(message: string): boolean {
   return /^(no|cancel|cancelar|nope|stop|don't|dont)$/i.test(message.trim());
 }
+
+/**
+ * Generic ASCII-only text comparison helper extracted from
+ * apps/api/src/server.ts, where it was used across memory dedup, goal
+ * matching, and email review selection — not specific to action hygiene,
+ * which is why it lives here rather than in
+ * apps/api/src/actions/pending-candidate.ts (which also needs it).
+ */
+export function normalizeComparableText(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * Generic "first/second/third..." (English/Spanish) ordinal-word parser
+ * extracted from apps/api/src/server.ts alongside normalizeComparableText,
+ * for the same reason.
+ */
+export function ordinalSelectionIndex(text: string): number | undefined {
+  const normalized = normalizeComparableText(text);
+  const map: Record<string, number> = {
+    first: 0,
+    "first one": 0,
+    primero: 0,
+    primera: 0,
+    second: 1,
+    "second one": 1,
+    segundo: 1,
+    segunda: 1,
+    third: 2,
+    "third one": 2,
+    tercero: 2,
+    tercera: 2,
+    fourth: 3,
+    "fourth one": 3,
+    fourthone: 3,
+    cuarto: 3,
+    cuarta: 3,
+    fifth: 4,
+    "fifth one": 4,
+    quinto: 4,
+    quinta: 4
+  };
+
+  return map[normalized];
+}
