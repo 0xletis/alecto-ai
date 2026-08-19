@@ -218,6 +218,14 @@ import {
   isBuiltInEmailAdapter,
   type EmailRuleHumanDisplayGroup
 } from "./gmail/gmail-rule-service.js";
+import { formatLocalDateTime } from "./utils/datetime.js";
+import { createGoalProgressFromCompletedAction } from "./actions/goal-progress.js";
+import {
+  applyActionHygieneBatchOperations,
+  readActionHygieneBatchOperations,
+  type ActionHygieneBatchOperation,
+  type HygieneOperation
+} from "./actions/hygiene.js";
 import type {
   ActionHygieneAction,
   ActionHygieneOption,
@@ -10519,22 +10527,6 @@ function formatLocalDate(date: Date): string {
   return date.toISOString().slice(0, 10);
 }
 
-function formatLocalDateTime(date: Date | undefined, timezone = "Europe/Madrid"): string {
-  if (!date) {
-    return "not set";
-  }
-
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).format(date);
-}
-
 function formatLocalActionDueKey(date: Date, timezone = "Europe/Madrid"): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: timezone,
@@ -10671,36 +10663,6 @@ function formatActionCreatedReply(input: {
   ]
     .filter(Boolean)
     .join("\n");
-}
-
-async function createGoalProgressFromCompletedAction(userId: string, actionItem: ActionItem) {
-  if (!actionItem.goalId) {
-    return undefined;
-  }
-
-  const goal = (await getGoals(userId)).find((item) => item.id === actionItem.goalId);
-  const goalTitle = actionItem.goalTitleSnapshot ?? goal?.title ?? "Linked goal";
-  const created = await createExternalEventIfNotExists(userId, {
-    type: "custom.goal_progress_logged",
-    source: "manual",
-    provider: "action_completion",
-    externalId: `action-completion:${actionItem.id}`,
-    timestamp: actionItem.completedAt ?? new Date(),
-    data: {
-      goalId: actionItem.goalId,
-      goalTitle,
-      actionItemId: actionItem.id,
-      actionTitle: actionItem.title,
-      source: "action_completion"
-    },
-    confidence: 1,
-    evidence: [`Completed action: ${actionItem.title}`]
-  });
-
-  return {
-    ...created,
-    goalTitle
-  };
 }
 
 async function dispatchActionRemindersForUser(userId: string, now: Date): Promise<ActionReminderDispatch[]> {
@@ -15537,16 +15499,6 @@ function formatNoVisibleHygieneContextReply(pendingAction?: PendingAction): stri
   return "I don't have a visible cleanup item right now. Say 'clean up my tasks' first.";
 }
 
-type HygieneOperation = "archive" | "complete" | "snooze" | "keep";
-
-type ActionHygieneBatchOperation = {
-  operation: HygieneOperation;
-  actionId: string;
-  title: string;
-  timeText?: string;
-  dueAt?: string;
-};
-
 type ActionHygieneBatchPlan = {
   operations: ActionHygieneBatchOperation[];
   missingSnoozeTargets: PendingActionCandidate[];
@@ -15971,76 +15923,6 @@ function formatActionHygieneBatchOperation(operation: ActionHygieneBatchOperatio
 
   const formatted = operation.dueAt ? formatLocalDateTime(new Date(operation.dueAt), timezone) : operation.timeText ?? "the chosen time";
   return `snooze ${operation.title} to ${formatted}`;
-}
-
-async function applyActionHygieneBatchOperations(
-  userId: string,
-  operations: ActionHygieneBatchOperation[],
-  timezone: string
-): Promise<{ reply: string }> {
-  const done: string[] = [];
-  const skipped: string[] = [];
-
-  for (const operation of operations) {
-    const action = await getActionItem(userId, operation.actionId);
-
-    if (!action) {
-      skipped.push(`${operation.title}: no longer found`);
-      continue;
-    }
-
-    if (action.status === "archived" || action.status === "completed") {
-      skipped.push(`${action.title}: already ${action.status}`);
-      continue;
-    }
-
-    if (operation.operation === "archive") {
-      const archived = await archiveActionItem(userId, action.id);
-      if (archived) {
-        done.push(`Archived ${archived.title}`);
-      }
-      continue;
-    }
-
-    if (operation.operation === "complete") {
-      const completed = await completeActionItem(userId, action.id);
-      if (completed) {
-        const progressEvent = await createGoalProgressFromCompletedAction(userId, completed);
-        done.push(
-          progressEvent?.created
-            ? `Completed ${completed.title}; goal progress logged for ${progressEvent.goalTitle}`
-            : `Completed ${completed.title}`
-        );
-      }
-      continue;
-    }
-
-    if (operation.operation === "snooze") {
-      const dueAt = operation.dueAt ? new Date(operation.dueAt) : undefined;
-      if (!dueAt || Number.isNaN(dueAt.getTime())) {
-        skipped.push(`${action.title}: missing snooze time`);
-        continue;
-      }
-
-      const updated = await snoozeActionItem(userId, action.id, dueAt);
-      if (updated) {
-        done.push(`Snoozed ${updated.title} to ${formatLocalDateTime(updated.snoozedUntil, timezone)}`);
-      }
-      continue;
-    }
-
-    done.push(`Kept ${action.title}`);
-  }
-
-  return {
-    reply: [
-      done.length > 0 ? "Done:" : "No action changes were made.",
-      ...done.map((line) => `- ${line}`),
-      skipped.length > 0 ? "" : undefined,
-      skipped.length > 0 ? "Skipped:" : undefined,
-      ...skipped.map((line) => `- ${line}`)
-    ].filter((line) => line !== undefined).join("\n")
-  };
 }
 
 async function closeHygieneSessionIfDone(userId: string, pendingAction: PendingAction, now: Date): Promise<void> {
@@ -16673,36 +16555,6 @@ async function applyPendingAction(userId: string, pendingAction: PendingAction):
   }
 
   throw new Error(`Unsupported pending action type: ${pendingAction.type}`);
-}
-
-function readActionHygieneBatchOperations(value: unknown): ActionHygieneBatchOperation[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-
-  return value
-    .filter(isRecord)
-    .flatMap((item): ActionHygieneBatchOperation[] => {
-      const operation = typeof item.operation === "string" ? item.operation : "";
-      if (operation !== "archive" && operation !== "complete" && operation !== "snooze" && operation !== "keep") {
-        return [];
-      }
-
-      const actionId = typeof item.actionId === "string" ? item.actionId : "";
-      const title = typeof item.title === "string" ? item.title : "";
-
-      if (!actionId || !title) {
-        return [];
-      }
-
-      return [{
-        operation,
-        actionId,
-        title,
-        timeText: typeof item.timeText === "string" ? item.timeText : undefined,
-        dueAt: typeof item.dueAt === "string" ? item.dueAt : undefined
-      }];
-    });
 }
 
 function isRecentActionMutationContext(pendingAction: PendingAction): boolean {
