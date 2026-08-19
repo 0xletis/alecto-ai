@@ -83,3 +83,21 @@ export function addDaysToLocalDateString(date: string, days: number): string {
 export function localDateStartUtc(localDate: string, timezone: string): Date {
   return getLocalTodayRange(new Date(`${localDate}T12:00:00Z`), timezone).start;
 }
+
+/**
+ * Generic local-week/date-range helpers extracted from
+ * apps/api/src/server.ts, where they were used both by next-week planning's
+ * `buildNextWeekPlanContext` (stays in server.ts) and the legacy
+ * weekly-review cluster (apps/api/src/legacy/weekly-review-conversation.ts),
+ * which also needs them.
+ */
+export function startOfLocalWeek(localDate: string): string {
+  const date = new Date(`${localDate}T12:00:00Z`);
+  const day = date.getUTCDay();
+  const mondayOffset = day === 0 ? -6 : 1 - day;
+  return addDaysToLocalDateString(localDate, mondayOffset);
+}
+
+export function isDateInRange(date: Date | undefined, start: Date, end: Date): boolean {
+  return Boolean(date && date >= start && date < end);
+}

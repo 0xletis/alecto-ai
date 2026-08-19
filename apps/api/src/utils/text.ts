@@ -120,3 +120,14 @@ export function sharesMeaningfulToken(left: string, right: string): boolean {
   const rightTokens = new Set(right.split(" ").filter((token) => token.length >= 4));
   return left.split(" ").some((token) => token.length >= 4 && rightTokens.has(token));
 }
+
+/**
+ * Generic unsafe-language filter extracted from apps/api/src/server.ts,
+ * where it was used both by the operator-reflection candidate builder
+ * (stays in server.ts) and the legacy weekly-review cluster's LLM-draft
+ * safety check (apps/api/src/legacy/weekly-review-conversation.ts), which
+ * also needs it.
+ */
+export function containsUnsafeReflectionLanguage(text: string): boolean {
+  return /\b(lazy|addict|addicted|undisciplined|diagnosis|disorder|pathological|hopeless|failure)\b/i.test(text);
+}
