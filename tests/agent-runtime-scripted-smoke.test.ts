@@ -1,0 +1,412 @@
+import { randomUUID } from "node:crypto";
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createActionItem, createGoal, prisma } from "../packages/db/src/index.ts";
+import { clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
+import {
+  assertNoFalseSuccessClaim,
+  assertNoGenericError,
+  assertNoMutationYet,
+  assertPendingStateUnchanged,
+  assertPlanningDraftInSync,
+  buildServer,
+  runScriptedScenario,
+  type ScriptedScenario
+} from "./helpers/agent-runtime-scripted-eval.ts";
+
+/**
+ * Lightweight scripted multi-turn conversation smoke/eval coverage for Agent Runtime v3 —
+ * the small harness this file exercises lives in tests/helpers/agent-runtime-scripted-eval.ts
+ * (+ tests/helpers/agent-runtime-test-helpers.ts for the generic send/mock/session pieces).
+ * Not a general eval framework: fixed scripts, fixed assertions, run through the exact same
+ * POST /agent/message route Telegram calls.
+ *
+ * Exists because the planning state-machine bugs fixed in the two preceding hardening passes
+ * (docs/09-architecture-inventory.md's "Next-Week Planning Hotfix" and its follow-up) were
+ * each individually well-covered by single-tool unit tests, yet real multi-turn Telegram
+ * conversation still found bugs — state carried BETWEEN turns (a stale index, a
+ * regenerated draft, a false success claim) is exactly what a turn-by-turn test can miss.
+ * These scenarios replay the same multi-turn shapes automatically instead of requiring a
+ * human to retest them by hand in Telegram after every change.
+ *
+ * Deterministic / CI-safe: every turn below sets an explicit mocked plan
+ * (AGENT_RUNTIME_PLANNER_MOCK_RESPONSE), so nothing here depends on network access or
+ * OPENAI_API_KEY. To also exercise the real planner locally (OPENAI_API_KEY set), write a
+ * ScriptedTurn with no `plan` field — see agent-runtime-scripted-eval.ts's ScriptedTurn doc.
+ */
+
+function nextWeekStartPlan(): MockPlan {
+  return { topic: "next_week_planning", intent: "start_next_week_plan", operations: [op("planning.next_week_start")], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+}
+
+function nextWeekEditPlan(args: Record<string, unknown>): MockPlan {
+  return { topic: "next_week_planning", intent: "edit_next_week_plan", operations: [op("planning.next_week_edit", args)], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+}
+
+function nextWeekShowCurrentPlan(): MockPlan {
+  return { topic: "next_week_planning", intent: "show_current_next_week_plan", operations: [op("planning.next_week_show_current")], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+}
+
+function hygieneStartPlan(): MockPlan {
+  return { topic: "action_cleanup", intent: "show_hygiene_candidates", operations: [op("action.hygiene_start")], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+}
+
+function hygieneApplyPlan(selections: Array<Record<string, unknown>>): MockPlan {
+  return { topic: "action_cleanup", intent: "apply_hygiene_decisions", operations: [op("action.hygiene_apply", { selections })], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+}
+
+/**
+ * Job + reading + car goals, same shape used by tests/agent-runtime-next-week-planning.test.ts
+ * — three same-priority real suggestions avoids the "fewer than 3 -> pad with 3 fixed items"
+ * fallback, so the draft is fully deterministic. The scripts below add one "remove reading"
+ * turn ahead of the reported transcript's literal wording for the same reason: a real
+ * Telegram draft's exact starting item count depends on the user's live goal data, which a
+ * deterministic CI scenario has to pin down by seeding instead.
+ */
+async function seedJobReadingCarGoals(userId: string): Promise<void> {
+  const goals = [
+    { title: "Apply to developer jobs", category: "career" },
+    { title: "Read more books this year", category: "learning" },
+    { title: "Buy a cheap car", category: "lifestyle" }
+  ];
+  for (const goal of goals) {
+    await createGoal(userId, { title: goal.title, category: goal.category, priority: "medium" });
+  }
+}
+
+function daysAgo(days: number): Date {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+}
+
+// --- Scenario 1: planning happy path (the real Telegram transcript that found the state-
+// machine bugs, replayed end to end) --------------------------------------------------------
+
+test("scripted smoke 1: plan next week -> remove car listings -> move jobs to Friday -> show plan -> yes -> so what today", async () => {
+  const server = buildServer();
+  const userId = `smoke-planning-happy-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "planning-happy-path",
+      turns: [
+        {
+          message: "plan next week",
+          plan: nextWeekStartPlan(),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /draft plan for next week:/i);
+            assert.ok(turn.pendingOperationAfter, "a draft must open a pending confirmation");
+            assertPlanningDraftInSync(turn);
+          }
+        },
+        {
+          message: "remove reading",
+          plan: nextWeekEditPlan({ removeRefs: ["reading"] }),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoMutationYet(turn);
+            assertPlanningDraftInSync(turn);
+          }
+        },
+        {
+          message: "remove the car listings one",
+          plan: nextWeekEditPlan({ removeRefs: ["the car listings one"] }),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoMutationYet(turn);
+            assert.match(turn.reply, /developer jobs/i);
+            assert.doesNotMatch(turn.reply, /car listings/i);
+            assertPlanningDraftInSync(turn);
+          }
+        },
+        {
+          message: "move the jobs to Friday",
+          plan: nextWeekEditPlan({ changes: [{ ref: "the jobs", dueText: "Friday" }] }),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoFalseSuccessClaim(turn);
+            assert.doesNotMatch(turn.reply, /plan is now empty/i, "the reported empty-plan regression must not reappear");
+            assert.match(turn.reply, /friday/i);
+            assert.match(turn.reply, /developer jobs/i);
+            assertPlanningDraftInSync(turn);
+          }
+        },
+        {
+          message: "show me the week plan",
+          plan: nextWeekShowCurrentPlan(),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoMutationYet(turn);
+            // Must show the CURRENT draft (Friday job only), not regenerate the original one.
+            assert.match(turn.reply, /friday/i);
+            assert.match(turn.reply, /developer jobs/i);
+            assert.doesNotMatch(turn.reply, /car listings/i, "must not have regenerated the original 3-item draft");
+            const draftLines = turn.reply.split("\n").filter((line) => /^\d+\./.test(line));
+            assert.equal(draftLines.length, 1, "the current draft has exactly one item");
+            assertPendingStateUnchanged(turn);
+          }
+        },
+        {
+          message: "yes",
+          // No plan: "yes" is handled by the exact confirm whitelist before the planner runs.
+          assert: async (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true, "confirming the draft must create the action item");
+            assert.match(turn.reply, /done\. i created/i);
+            assert.equal(turn.pendingOperationAfter, null, "the pending draft clears once applied");
+
+            const created = await prisma.actionItem.findMany({ where: { userId, sourceProvider: "weekly_plan" } });
+            assert.equal(created.length, 1, "exactly one action: the surviving draft item");
+            assert.match(created[0].title, /developer jobs/i);
+            const weekday = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(created[0].dueAt!);
+            assert.equal(weekday, "Friday");
+          }
+        },
+        {
+          message: "so what today",
+          plan: { topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /open task|goal/i);
+          }
+        }
+      ],
+      assertAll: (turns) => {
+        assert.equal(turns[4].mutationExecuted, false, "'show plan' must not have created anything");
+      }
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 2: planning cancel path -------------------------------------------------------
+
+test("scripted smoke 2: plan next week -> make it lighter -> cancel", async () => {
+  const server = buildServer();
+  const userId = `smoke-planning-cancel-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "planning-cancel-path",
+      turns: [
+        {
+          message: "plan next week",
+          plan: nextWeekStartPlan(),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.ok(turn.pendingOperationAfter);
+          }
+        },
+        {
+          message: "make it lighter",
+          plan: nextWeekEditPlan({ lighter: true }),
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoMutationYet(turn);
+            // Whether "lighter" found a confident reduction or asked for clarification, the
+            // pending draft must still exist either way — never silently dropped.
+            assert.ok(turn.pendingOperationAfter, "the pending plan draft must still exist after 'make it lighter'");
+          }
+        },
+        {
+          message: "cancel",
+          // No plan: "cancel" is handled by the exact cancel whitelist before the planner runs.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.pendingOperationAfter, null, "cancel must clear the pending plan");
+            assert.deepEqual(turn.visibleEntitiesAfter, [], "cancel must clear visible plan entities");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const created = await prisma.actionItem.count({ where: { userId, sourceProvider: "weekly_plan" } });
+    assert.equal(created, 0, "cancelling must never create an action");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 3: no stale replyDraft on a rejected planning edit ---------------------------
+
+test("scripted smoke 3: a rejected planning edit never lets the planner's replyDraft claim success", async () => {
+  const server = buildServer();
+  const userId = `smoke-no-stale-claim-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "no-stale-success-claim",
+      turns: [
+        { message: "plan next week", plan: nextWeekStartPlan() },
+        { message: "remove reading", plan: nextWeekEditPlan({ removeRefs: ["reading"] }) },
+        { message: "remove the car listings one", plan: nextWeekEditPlan({ removeRefs: ["the car listings one"] }) },
+        {
+          // Simulates the real transcript exactly: the planner's own replyDraft falsely claims
+          // the move already happened, for a turn that will actually be rejected (removing the
+          // only remaining item without an explicit removeAll).
+          message: "remove the jobs",
+          plan: {
+            topic: "next_week_planning",
+            intent: "edit_next_week_plan",
+            operations: [op("planning.next_week_edit", { removeRefs: ["the jobs"] })],
+            needsClarification: false,
+            clarificationQuestion: null,
+            replyDraft: "I've moved the job application to Friday. Your plan will now reflect that change."
+          },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoFalseSuccessClaim(turn);
+            assert.doesNotMatch(turn.reply, /i've moved/i);
+            assert.match(turn.reply, /remove everything/i, "must state the rejection reason, not a false success");
+            assertPendingStateUnchanged(turn);
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 4: action hygiene smoke -------------------------------------------------------
+//
+// Run with direct calls rather than runScriptedScenario: this is the one scenario whose own
+// mocked args (the numbered index to snooze/archive) can only be known from the PRECEDING
+// turn's reply — getActionItems sorts by dueAt, not creation order, so which seeded action
+// lands at index 1 vs 2 isn't fixed up front. Everywhere else in this file, a scenario's plan
+// is fully known ahead of time and goes through the shared harness.
+
+test("scripted smoke 4: clean up my actions -> snooze the overdue gym one -> clean up again -> archive the stale car one", async () => {
+  const server = buildServer();
+  const userId = `smoke-hygiene-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const gymAction = await createActionItem(userId, { source: "manual", title: "Do 2 strength sessions", priority: "medium", dueAt: daysAgo(4) });
+    const carAction = await createActionItem(userId, { source: "manual", title: "Check cheap car listings twice", priority: "medium", dueAt: daysAgo(3) });
+
+    mockPlan(hygieneStartPlan());
+    const startReply = await sendAgentMessage(server, userId, "clean up my actions");
+    assertNoGenericErrorRaw(startReply.reply);
+    assert.match(startReply.reply, /1\./);
+
+    const startEntities = (await getVisibleEntities(userId)) as Array<{ id: string; index?: number }>;
+    const gymIndex = startEntities.find((entity) => entity.id === gymAction.id)?.index ?? 0;
+    assert.ok(gymIndex > 0, "the seeded gym action must be visible and numbered");
+
+    mockPlan(hygieneApplyPlan([{ index: gymIndex, decision: "snooze", snoozeUntilText: "tomorrow" }]));
+    const snoozeReply = await sendAgentMessage(server, userId, "snooze the overdue gym one to tomorrow");
+    assertNoGenericErrorRaw(snoozeReply.reply);
+    assert.equal(snoozeReply.debug.mutationExecuted, true);
+    assert.match(snoozeReply.reply, /snoozed/i);
+
+    mockPlan(hygieneStartPlan());
+    const secondStartReply = await sendAgentMessage(server, userId, "clean up my actions");
+    assertNoGenericErrorRaw(secondStartReply.reply);
+    // The gym item is snoozed to tomorrow (not due yet) — only the car item remains.
+    assert.doesNotMatch(secondStartReply.reply, /strength sessions/i);
+    assert.match(secondStartReply.reply, /car listings/i);
+
+    const secondEntities = (await getVisibleEntities(userId)) as Array<{ id: string; index?: number }>;
+    assert.equal(secondEntities.length, 1, "only the still-open stale item should be listed again");
+    const carIndex = secondEntities.find((entity) => entity.id === carAction.id)?.index ?? 0;
+    assert.ok(carIndex > 0);
+
+    mockPlan(hygieneApplyPlan([{ index: carIndex, decision: "archive" }]));
+    const archiveReply = await sendAgentMessage(server, userId, "archive the stale car one");
+    assertNoGenericErrorRaw(archiveReply.reply);
+    assert.equal(archiveReply.debug.mutationExecuted, true);
+    assert.match(archiveReply.reply, /archived/i);
+
+    const gymAfter = await prisma.actionItem.findUnique({ where: { id: gymAction.id } });
+    const carAfter = await prisma.actionItem.findUnique({ where: { id: carAction.id } });
+    assert.equal(gymAfter?.status, "snoozed", "the gym item must only be snoozed, never archived");
+    assert.equal(carAfter?.status, "archived");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+function assertNoGenericErrorRaw(reply: string): void {
+  assert.doesNotMatch(reply, /agent v3 hit an error/i);
+}
+
+async function getVisibleEntities(userId: string, channel = "telegram"): Promise<unknown[]> {
+  const row = await prisma.agentConversationSession.findUnique({ where: { userId_channel: { userId, channel } } });
+  return Array.isArray(row?.visibleEntities) ? (row.visibleEntities as unknown[]) : [];
+}
+
+// --- Scenario 5: basic V3 product smoke (memory / Gmail / today) ---------------------------
+
+test("scripted smoke 5: remember a preference -> ask Gmail rules -> so what today", async () => {
+  const server = buildServer();
+  const userId = `smoke-memory-gmail-today-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "memory-gmail-today-smoke",
+      turns: [
+        {
+          message: "remember I prefer blunt feedback",
+          plan: { topic: "memory", intent: "store_preference", operations: [op("memory.create", { summary: "Prefers blunt feedback", type: "preference" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /remember/i);
+            assert.match(turn.reply, /blunt feedback/i);
+          }
+        },
+        {
+          message: "what email rules are active?",
+          plan: { topic: "gmail_rules", intent: "list_active_rules", operations: [op("gmail.rule.list")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /no active gmail rules/i);
+            // Default V3 chat must never push the user toward slash-command setup — that's the
+            // legacy-only surface.
+            assert.doesNotMatch(turn.reply, /\/gmail|\/setup|\/connect/i, "must not show a legacy slash-command setup wall");
+          }
+        },
+        {
+          message: "so what today",
+          plan: { topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /open task|goal/i);
+            assert.doesNotMatch(turn.reply, /\/action_hygiene|\/gmail_rules|\/sync_gmail/i, "must never recommend a slash command in normal v3 chat");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
