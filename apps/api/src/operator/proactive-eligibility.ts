@@ -1,5 +1,15 @@
 import type { NotificationSettings } from "@operator-agent/core";
-import type { ProactiveDecision, ProactiveMessageType } from "./proactive.js";
+import type { ContextBundle } from "../agent-runtime/types.js";
+import { formatMinutesOfDay } from "./daily-loop-settings.js";
+import {
+  decideProactiveOperatorMessage,
+  isWithinWindow,
+  minutesOfDayInTimezone,
+  MORNING_BRIEF_DEDUPE_KEY,
+  TIME_TRIGGER_WINDOW_MINUTES,
+  type ProactiveDecision,
+  type ProactiveMessageType
+} from "./proactive.js";
 
 /**
  * Layers real send-eligibility on top of decideProactiveOperatorMessage's own content decision
@@ -65,4 +75,95 @@ function isUserOptedIn(type: ProactiveMessageType, settings: NotificationSetting
   if (type === "morning_brief") return settings.morningBriefEnabled;
   if (type === "evening_checkin") return settings.eveningCheckinEnabled;
   return settings.gmailNudgeEnabled;
+}
+
+/**
+ * A single, most-specific, ordered diagnosis for "why didn't I get my morning brief?" — morning
+ * brief only, since it's the only moment actually wired to real delivery (apps/worker/src/
+ * v3-proactive-delivery.ts). Reuses decideProactiveOperatorMessage and its exported time-window
+ * helpers directly (isWithinWindow/minutesOfDayInTimezone/TIME_TRIGGER_WINDOW_MINUTES) rather
+ * than reimplementing the window/dedupe/candidate math, so this can never drift out of sync with
+ * what the decision module or apps/worker's own send-gate actually do.
+ *
+ * "missing_allowlist" is kept in the type for the vocabulary this diagnostic tool is expected to
+ * support, but is not currently reachable: an unset PROACTIVE_OPERATOR_ALLOWLIST means "open to
+ * every user" (established, tested behavior since the delivery pass) — genuinely non-blocking,
+ * not something to report as a problem. Only an allowlist that's SET but excludes this user
+ * (user_not_allowlisted) is ever actually a blocker.
+ */
+export type ProactiveDeliveryStatus =
+  | "delivery_disabled"
+  | "missing_allowlist"
+  | "user_not_allowlisted"
+  | "user_not_opted_in"
+  | "daily_loop_disabled"
+  | "outside_morning_window"
+  | "duplicate_dedupe_key"
+  | "no_candidate"
+  | "eligible";
+
+export interface ProactiveDeliveryStatusInput {
+  context: ContextBundle;
+  notificationSettings: NotificationSettings;
+  now: Date;
+  alreadySentDedupeKeys: Set<string>;
+  sentCountToday: number;
+  deliveryEnabled: boolean;
+  isAllowlisted: boolean;
+}
+
+export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput): ProactiveDeliveryStatus {
+  const settings = input.notificationSettings;
+
+  if (!input.deliveryEnabled) {
+    return "delivery_disabled";
+  }
+  if (!input.isAllowlisted) {
+    return "user_not_allowlisted";
+  }
+  if (!settings.morningBriefEnabled) {
+    return "user_not_opted_in";
+  }
+  if (!settings.dailyLoopEnabled) {
+    return "daily_loop_disabled";
+  }
+
+  const nowMinutes = minutesOfDayInTimezone(input.now, settings.timezone);
+  if (!isWithinWindow(nowMinutes, settings.morningTimeMinutes, TIME_TRIGGER_WINDOW_MINUTES)) {
+    return "outside_morning_window";
+  }
+
+  if (input.alreadySentDedupeKeys.has(MORNING_BRIEF_DEDUPE_KEY)) {
+    return "duplicate_dedupe_key";
+  }
+
+  const decision = decideProactiveOperatorMessage({
+    context: input.context,
+    notificationSettings: settings,
+    now: input.now,
+    alreadySentDedupeKeys: input.alreadySentDedupeKeys,
+    sentCountToday: input.sentCountToday
+  });
+
+  if (decision.decision === "no_message" || decision.type !== "morning_brief") {
+    return "no_candidate";
+  }
+
+  return "eligible";
+}
+
+const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string) => string> = {
+  delivery_disabled: (time) => `Morning brief is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
+  missing_allowlist: (time) => `Morning brief is on at ${time}, but no PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment.`,
+  user_not_allowlisted: (time) => `Morning brief is on at ${time}, but this user is not in PROACTIVE_OPERATOR_ALLOWLIST.`,
+  user_not_opted_in: () => "Morning brief is currently off — turn it on and I'll start sending it.",
+  daily_loop_disabled: (time) => `Morning brief is on at ${time}, but the daily loop itself is off, which also blocks delivery — turn the daily loop back on too.`,
+  outside_morning_window: (time) => `Morning brief is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
+  duplicate_dedupe_key: (time) => `Morning brief is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
+  no_candidate: (time) => `Morning brief is on at ${time}, but there isn't anything grounded to send right now (e.g. no active goals or open actions) — check back closer to ${time}.`,
+  eligible: (time) => `Settings look eligible — morning brief is on at ${time}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
+};
+
+export function formatProactiveDeliveryDiagnosis(status: ProactiveDeliveryStatus, settings: NotificationSettings): string {
+  return DIAGNOSIS_MESSAGE[status](formatMinutesOfDay(settings.morningTimeMinutes));
 }

@@ -248,7 +248,9 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     tool.name === "proactive.settings_propose_update" &&
     args.morningBriefEnabled === undefined &&
     args.eveningCheckinEnabled === undefined &&
-    args.gmailNudgeEnabled === undefined
+    args.gmailNudgeEnabled === undefined &&
+    !args.morningTimeText &&
+    !args.eveningTimeText
   ) {
     return {
       tool: tool.name,

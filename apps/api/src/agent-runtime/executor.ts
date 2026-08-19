@@ -14,6 +14,7 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getOrCreateNotificationSettings,
+  hasNotificationLog,
   snoozeActionItem,
   updateEmailSignalRule,
   updateNotificationSettings,
@@ -21,7 +22,7 @@ import {
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
-import { parseActionDueDate, type Goal, type NotificationSettings } from "@operator-agent/core";
+import { parseActionDueDate, proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv, type Goal, type NotificationSettings } from "@operator-agent/core";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
@@ -36,6 +37,8 @@ import {
 import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import { createActionItemFromEmailReview, formatGmailReviewListForChat, gmailReviewChatLabel, rejectEmailReviewForUser } from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
+import { formatProactiveDeliveryDiagnosis, getProactiveDeliveryStatus } from "../operator/proactive-eligibility.js";
+import { MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
 import {
   actionInputFromPlanSuggestion,
   buildNextWeekPlanContext,
@@ -53,6 +56,7 @@ import {
   generateAndSaveWeeklyReview,
   generateDeterministicWeeklyReview
 } from "../weekly-review/review.js";
+import { formatDateInTimezone } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
@@ -763,8 +767,27 @@ export async function executeOperation(
         const morningBriefEnabled = args.morningBriefEnabled as boolean | undefined;
         const eveningCheckinEnabled = args.eveningCheckinEnabled as boolean | undefined;
         const gmailNudgeEnabled = args.gmailNudgeEnabled as boolean | undefined;
+        const morningTimeText = args.morningTimeText as string | undefined;
+        const eveningTimeText = args.eveningTimeText as string | undefined;
 
-        const changes = describeProactiveSettingsChanges(settings, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled });
+        let morningTimeMinutes: number | undefined;
+        if (morningTimeText) {
+          morningTimeMinutes = parseTimeOfDayText(morningTimeText);
+          if (morningTimeMinutes === undefined) {
+            return { tool: operation.tool, status: "executed", summary: `I couldn't understand the morning time "${morningTimeText}". Try something like "9am" or "09:00".` };
+          }
+        }
+
+        let eveningTimeMinutes: number | undefined;
+        if (eveningTimeText) {
+          eveningTimeMinutes = parseTimeOfDayText(eveningTimeText);
+          if (eveningTimeMinutes === undefined) {
+            return { tool: operation.tool, status: "executed", summary: `I couldn't understand the evening time "${eveningTimeText}". Try something like "9:30pm" or "21:30".` };
+          }
+        }
+
+        const request = { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes };
+        const changes = describeProactiveSettingsChanges(settings, request);
 
         if (changes.length === 0) {
           return {
@@ -784,7 +807,7 @@ export async function executeOperation(
             operations: [
               {
                 tool: "proactive.settings_apply_update",
-                args: { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled },
+                args: request,
                 status: "valid",
                 requiresConfirmation: false
               }
@@ -797,16 +820,43 @@ export async function executeOperation(
         const morningBriefEnabled = args.morningBriefEnabled as boolean | undefined;
         const eveningCheckinEnabled = args.eveningCheckinEnabled as boolean | undefined;
         const gmailNudgeEnabled = args.gmailNudgeEnabled as boolean | undefined;
+        const morningTimeMinutes = args.morningTimeMinutes as number | undefined;
+        const eveningTimeMinutes = args.eveningTimeMinutes as number | undefined;
         const before = await getOrCreateNotificationSettings(userId);
 
-        const updated = await updateNotificationSettings(userId, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled });
-        const changes = describeProactiveSettingsChanges(before, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled });
+        const updated = await updateNotificationSettings(userId, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes });
+        const changes = describeProactiveSettingsChanges(before, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes });
 
         return {
           tool: operation.tool,
           status: "executed",
           summary: changes.length > 0 ? `Done — ${changes.map((change) => change.done).join(" and ")}.` : "Done — nothing needed to change.",
           result: updated
+        };
+      }
+
+      case "proactive.diagnose_morning_brief": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const now = new Date();
+        const sentForDate = formatDateInTimezone(now, settings.timezone);
+        const morningKey = MORNING_BRIEF_DEDUPE_KEY;
+        const alreadySentToday = await hasNotificationLog({ userId, type: morningKey, sentForDate });
+
+        const status = getProactiveDeliveryStatus({
+          context,
+          notificationSettings: settings,
+          now,
+          alreadySentDedupeKeys: alreadySentToday ? new Set([morningKey]) : new Set(),
+          sentCountToday: alreadySentToday ? 1 : 0,
+          deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
+          isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId)
+        });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatProactiveDeliveryDiagnosis(status, settings),
+          result: { status }
         };
       }
 
@@ -1021,10 +1071,12 @@ function formatGoalListForChat(goals: Goal[]): string {
 }
 
 function formatProactiveSettingsSummary(settings: NotificationSettings): string {
+  const morning = settings.morningBriefEnabled ? `on, around ${formatMinutesOfDay(settings.morningTimeMinutes)}` : "off";
+  const evening = settings.eveningCheckinEnabled ? `on, around ${formatMinutesOfDay(settings.eveningTimeMinutes)}` : "off";
   return [
     "Proactive messages:",
-    `- Morning brief: ${settings.morningBriefEnabled ? "on" : "off"}`,
-    `- Evening check-in: ${settings.eveningCheckinEnabled ? "on" : "off"}`,
+    `- Morning brief: ${morning}`,
+    `- Evening check-in: ${evening}`,
     `- Gmail nudge: ${settings.gmailNudgeEnabled ? "on" : "off"}`
   ].join("\n");
 }
@@ -1038,32 +1090,26 @@ interface ProactiveSettingsChangeRequest {
   morningBriefEnabled?: boolean;
   eveningCheckinEnabled?: boolean;
   gmailNudgeEnabled?: boolean;
+  morningTimeMinutes?: number;
+  eveningTimeMinutes?: number;
 }
 
 /**
  * Same shape as describeDailyLoopChanges below — compares a requested proactive-settings change
  * against the current settings and describes only the fields that would actually change, so
  * neither the pre-execution "You're about to..." nor the post-execution "Done — ..." phrasing
- * has to be derived from the other with string surgery.
+ * has to be derived from the other with string surgery. A combined "turn it on AND set the time"
+ * request (e.g. "set up a morning brief at 9am") is deliberately described as ONE fused change
+ * ("turn on the morning brief at 09:00"), not two separate ones, matching how the user actually
+ * phrased a single request. A time-only change on a currently-off (and not being turned on)
+ * moment gets an explicit "but X is still off" caveat, so the reply never implies delivery is
+ * about to start just because the time changed.
  */
 function describeProactiveSettingsChanges(current: NotificationSettings, request: ProactiveSettingsChangeRequest): ProactiveSettingsChangeDescription[] {
   const changes: ProactiveSettingsChangeDescription[] = [];
 
-  if (request.morningBriefEnabled !== undefined && request.morningBriefEnabled !== current.morningBriefEnabled) {
-    changes.push(
-      request.morningBriefEnabled
-        ? { proposal: "turn on the morning brief", done: "the morning brief is now on" }
-        : { proposal: "turn off the morning brief", done: "the morning brief is now off" }
-    );
-  }
-
-  if (request.eveningCheckinEnabled !== undefined && request.eveningCheckinEnabled !== current.eveningCheckinEnabled) {
-    changes.push(
-      request.eveningCheckinEnabled
-        ? { proposal: "turn on the evening check-in", done: "the evening check-in is now on" }
-        : { proposal: "turn off the evening check-in", done: "the evening check-in is now off" }
-    );
-  }
+  changes.push(...describeMomentChange("the morning brief", current.morningBriefEnabled, request.morningBriefEnabled, current.morningTimeMinutes, request.morningTimeMinutes));
+  changes.push(...describeMomentChange("the evening check-in", current.eveningCheckinEnabled, request.eveningCheckinEnabled, current.eveningTimeMinutes, request.eveningTimeMinutes));
 
   if (request.gmailNudgeEnabled !== undefined && request.gmailNudgeEnabled !== current.gmailNudgeEnabled) {
     changes.push(
@@ -1071,6 +1117,45 @@ function describeProactiveSettingsChanges(current: NotificationSettings, request
         ? { proposal: "turn on the Gmail nudge", done: "the Gmail nudge is now on" }
         : { proposal: "turn off the Gmail nudge", done: "the Gmail nudge is now off" }
     );
+  }
+
+  return changes;
+}
+
+function describeMomentChange(
+  label: string,
+  currentEnabled: boolean,
+  requestedEnabled: boolean | undefined,
+  currentTimeMinutes: number,
+  requestedTimeMinutes: number | undefined
+): ProactiveSettingsChangeDescription[] {
+  const enabledChanging = requestedEnabled !== undefined && requestedEnabled !== currentEnabled;
+  const timeChanging = requestedTimeMinutes !== undefined && requestedTimeMinutes !== currentTimeMinutes;
+
+  if (!enabledChanging && !timeChanging) {
+    return [];
+  }
+
+  if (enabledChanging && requestedEnabled && timeChanging) {
+    const time = formatMinutesOfDay(requestedTimeMinutes!);
+    return [{ proposal: `turn on ${label} at ${time}`, done: `${label} is now on at ${time}` }];
+  }
+
+  const changes: ProactiveSettingsChangeDescription[] = [];
+
+  if (enabledChanging) {
+    changes.push(
+      requestedEnabled
+        ? { proposal: `turn on ${label}`, done: `${label} is now on` }
+        : { proposal: `turn off ${label}`, done: `${label} is now off` }
+    );
+  }
+
+  if (timeChanging) {
+    const time = formatMinutesOfDay(requestedTimeMinutes!);
+    const resultingEnabled = requestedEnabled !== undefined ? requestedEnabled : currentEnabled;
+    const caveat = resultingEnabled ? "" : `, but ${label} is still off`;
+    changes.push({ proposal: `move ${label} time to ${time}`, done: `${label} time is now ${time}${caveat}` });
   }
 
   return changes;

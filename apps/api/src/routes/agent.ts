@@ -12,6 +12,7 @@ import type {
 } from "../agent-runtime/types.js";
 import { evaluateProactiveEligibility } from "../operator/proactive-eligibility.js";
 import { decideProactiveOperatorMessage, gmailNudgeDedupeKey, EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
+import { formatMinutesOfDay } from "../operator/daily-loop-settings.js";
 import { formatDateInTimezone, parseOptionalNow } from "../utils/datetime.js";
 
 export const AgentMessageRequestSchema = z.object({
@@ -83,7 +84,18 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
         notificationSettings
       });
 
-      return { decision, eligibility };
+      return {
+        decision,
+        eligibility: {
+          ...eligibility,
+          scheduledTime: decision.decision === "proposed_message" && decision.type === "morning_brief" ? formatMinutesOfDay(notificationSettings.morningTimeMinutes) : undefined,
+          optIn: {
+            morningBriefEnabled: notificationSettings.morningBriefEnabled,
+            eveningCheckinEnabled: notificationSettings.eveningCheckinEnabled,
+            gmailNudgeEnabled: notificationSettings.gmailNudgeEnabled
+          }
+        }
+      };
     }
   );
 }

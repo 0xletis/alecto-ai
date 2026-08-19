@@ -16,6 +16,22 @@ import { formatLocalDate, formatLocalTime, formatMinutesOfDay } from "./datetime
  * Kept in its own file, not apps/worker/src/index.ts, specifically so it can be imported by
  * tests without triggering index.ts's top-level `await runTick(); setInterval(...)` — the same
  * reason apps/worker/src/integration-sync.ts is its own file.
+ *
+ * Relationship to apps/api/src/operator/proactive-eligibility.ts's getProactiveDeliveryStatus
+ * (the "why didn't I get my morning brief?" diagnostic): both gate on the same six concerns —
+ * PROACTIVE_OPERATOR_DELIVERY_ENABLED, the allowlist, morningBriefEnabled, dailyLoopEnabled,
+ * time proximity, and dedupe — and both ultimately go through decideProactiveOperatorMessage for
+ * the actual content decision, so they can't drift on WHAT they check. They can't share the
+ * check itself as one function: apps/worker and apps/api are separate deployable packages that
+ * only talk over HTTP (this module calls decideProactiveOperatorMessage indirectly, through the
+ * unmodified preview route), so getProactiveDeliveryStatus's in-process reimplementation is the
+ * pragmatic alternative — kept drift-free by importing proactive.ts's own exported
+ * isWithinWindow/minutesOfDayInTimezone/TIME_TRIGGER_WINDOW_MINUTES rather than restating the
+ * window math. One intentional difference: this module's time gate below (line ~80) is an
+ * exact-minute match, not the ±TIME_TRIGGER_WINDOW_MINUTES window getProactiveDeliveryStatus
+ * uses — the worker ticks continuously and needs a fire-once-per-minute trigger, while the
+ * diagnostic is answering "was I ever in range," a broader question. This is a deliberate
+ * difference in what each layer needs, not a bug to reconcile.
  */
 
 export interface V3ProactiveNotificationSettingsLike {

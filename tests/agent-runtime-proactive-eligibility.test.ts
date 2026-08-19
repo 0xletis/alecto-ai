@@ -34,7 +34,15 @@ async function seedEligibleUser(userId: string, overrides: { morningBriefEnabled
 async function preview(server: ReturnType<typeof buildServer>, userId: string) {
   const response = await server.inject({ method: "GET", url: `/users/${userId}/operator/proactive/preview?now=${encodeURIComponent(MORNING_UTC)}` });
   assert.equal(response.statusCode, 200, `preview for ${userId} returned ${response.statusCode}: ${response.body}`);
-  return response.json() as { decision: { decision: string; type?: string }; eligibility: { wouldSend: boolean; blockedBy: string[] } };
+  return response.json() as {
+    decision: { decision: string; type?: string };
+    eligibility: {
+      wouldSend: boolean;
+      blockedBy: string[];
+      scheduledTime?: string;
+      optIn?: { morningBriefEnabled: boolean; eveningCheckinEnabled: boolean; gmailNudgeEnabled: boolean };
+    };
+  };
 }
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
@@ -69,7 +77,8 @@ test("delivery enabled + allowlisted (open) + user opted in: wouldSend is true w
       const response = await preview(server, userId);
       assert.equal(response.decision.decision, "proposed_message");
       assert.equal(response.decision.type, "morning_brief");
-      assert.deepEqual(response.eligibility, { wouldSend: true, blockedBy: [] });
+      assert.equal(response.eligibility.wouldSend, true);
+      assert.deepEqual(response.eligibility.blockedBy, []);
     });
   } finally {
     await server.close();
@@ -155,7 +164,29 @@ test("no candidate exists: blockedBy reflects the decision module's own reason, 
   }
 });
 
-test("the preview route never writes the DB while computing eligibility", async () => {
+test("11. the preview route reports scheduledTime and per-moment optIn alongside wouldSend/blockedBy", async () => {
+  const server = buildServer();
+  const userId = `eligibility-scheduled-time-optin-${randomUUID()}`;
+
+  try {
+    await seedEligibleUser(userId);
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
+      const response = await preview(server, userId);
+      assert.equal(response.eligibility.scheduledTime, "09:00");
+      assert.deepEqual(response.eligibility.optIn, {
+        morningBriefEnabled: true,
+        eveningCheckinEnabled: false,
+        gmailNudgeEnabled: false
+      });
+    });
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("12. the preview route never writes the DB while computing eligibility", async () => {
   const server = buildServer();
   const userId = `eligibility-no-db-write-${randomUUID()}`;
 

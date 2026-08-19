@@ -200,6 +200,82 @@ test("a request with no field specified asks for clarification and mutates nothi
   }
 });
 
+test("11. 'setup a morning brief at 01:06' proposes turning it on AND setting the time as one fused change", async () => {
+  const server = buildServer();
+  const userId = `proactive-settings-fused-on-time-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedNotificationSettings(userId);
+
+    mockPlan(proactiveProposeUpdatePlan({ morningBriefEnabled: true, morningTimeText: "01:06" }));
+    const proposeReply = await sendAgentMessage(server, userId, "can u setup a morning brief at 01:06 am");
+    assert.equal(proposeReply.reply, "You're about to turn on the morning brief at 01:06. Reply yes to confirm or cancel.");
+    assert.equal(proposeReply.debug.mutationExecuted, false);
+
+    const applyReply = await sendAgentMessage(server, userId, "yes");
+    assert.equal(applyReply.reply, "Done — the morning brief is now on at 01:06.");
+    assert.equal(applyReply.debug.mutationExecuted, true);
+
+    const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
+    assert.equal(updated?.morningBriefEnabled, true);
+    assert.equal(updated?.morningTimeMinutes, 66);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("12. 'move morning brief to 9' while off changes only the time and says it's still off", async () => {
+  const server = buildServer();
+  const userId = `proactive-settings-time-only-while-off-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, morningBriefEnabled: false, morningTimeMinutes: 480 } });
+
+    mockPlan(proactiveProposeUpdatePlan({ morningTimeText: "9" }));
+    const proposeReply = await sendAgentMessage(server, userId, "move morning brief to 9");
+    assert.match(proposeReply.reply, /move the morning brief time to 09:00/i);
+    assert.equal(proposeReply.debug.mutationExecuted, false);
+
+    const applyReply = await sendAgentMessage(server, userId, "yes");
+    assert.match(applyReply.reply, /morning brief time is now 09:00/i);
+    assert.match(applyReply.reply, /still off/i);
+    assert.equal(applyReply.debug.mutationExecuted, true);
+
+    const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
+    assert.equal(updated?.morningBriefEnabled, false, "a time-only change must never turn the moment on");
+    assert.equal(updated?.morningTimeMinutes, 540);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("13. 'what proactive messages are on?' includes the morning brief's scheduled time", async () => {
+  const server = buildServer();
+  const userId = `proactive-settings-show-time-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({
+      data: { userId, morningBriefEnabled: true, morningTimeMinutes: 66, eveningCheckinEnabled: false, gmailNudgeEnabled: false }
+    });
+
+    mockPlan(proactiveShowPlan());
+    const reply = await sendAgentMessage(server, userId, "what proactive messages are on?");
+
+    assert.match(reply.reply, /morning brief: on, around 01:06/i);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
 test("proactive.settings_apply_update can never be planned by the LLM directly, only reached via the confirm whitelist", async () => {
   const server = buildServer();
   const userId = `proactive-settings-no-direct-apply-${randomUUID()}`;

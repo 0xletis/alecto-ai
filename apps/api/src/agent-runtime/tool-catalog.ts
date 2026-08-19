@@ -360,7 +360,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "proactive.settings_show",
     description:
-      "Show which proactive nudges (morning brief, evening check-in, Gmail nudge) are currently on/off for the user. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?'.",
+      "Show which proactive nudges (morning brief, evening check-in, Gmail nudge) are currently on/off for the user, including their scheduled time when on. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?'.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({})
@@ -368,13 +368,15 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "proactive.settings_propose_update",
     description:
-      "Propose turning the morning brief / evening check-in / Gmail nudge on or off — shows what would change and opens a pending confirmation. Use for 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail nudges', 'stop Gmail nudges'. Set only the field(s) actually being changed. Never enables anything by itself — the user must still confirm.",
+      "Propose turning the morning brief / evening check-in / Gmail nudge on or off, and/or changing the morning-brief or evening-check-in time — shows what would change and opens a pending confirmation. Use for 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail nudges', 'stop Gmail nudges'. For a combined request like 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', set BOTH morningBriefEnabled: true AND morningTimeText — this turns it on AND sets the time in one proposal. For a time-only request like 'move morning brief to 9', 'change morning brief time to 9', set ONLY morningTimeText — do not also set morningBriefEnabled unless the user is actually asking to turn it on/off. Set only the field(s) actually being changed. Never enables anything by itself — the user must still confirm.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       morningBriefEnabled: z.boolean().optional().describe("Set true to turn the proactive morning brief on, false to turn it off."),
       eveningCheckinEnabled: z.boolean().optional().describe("Set true to turn the proactive evening check-in on, false to turn it off."),
-      gmailNudgeEnabled: z.boolean().optional().describe("Set true to turn the proactive Gmail review nudge on, false to turn it off.")
+      gmailNudgeEnabled: z.boolean().optional().describe("Set true to turn the proactive Gmail review nudge on, false to turn it off."),
+      morningTimeText: z.string().optional().describe("New natural-language time for the morning brief, e.g. '9am', '01:06'. Setting this alone does NOT turn the morning brief on — also set morningBriefEnabled: true if the user wants it turned on."),
+      eveningTimeText: z.string().optional().describe("New natural-language time for the evening check-in, e.g. '9:30pm', '21:30'. Setting this alone does NOT turn the evening check-in on.")
     })
   },
   {
@@ -386,8 +388,18 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({
       morningBriefEnabled: z.boolean().optional(),
       eveningCheckinEnabled: z.boolean().optional(),
-      gmailNudgeEnabled: z.boolean().optional()
+      gmailNudgeEnabled: z.boolean().optional(),
+      morningTimeMinutes: z.number().int().min(0).max(1439).optional(),
+      eveningTimeMinutes: z.number().int().min(0).max(1439).optional()
     })
+  },
+  {
+    name: "proactive.diagnose_morning_brief",
+    description:
+      "Diagnose why the proactive morning brief did or didn't (or won't) send — grounded in real settings and delivery state, never a generic settings summary. Use for 'why didn't I get my morning brief?', 'it's 9 and no morning brief', 'I didn't get the morning brief', 'where is my morning brief?'. Read-only.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
   },
   {
     name: "operator.today",

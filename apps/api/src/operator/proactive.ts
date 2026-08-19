@@ -64,7 +64,8 @@ export function gmailNudgeDedupeKey(reviewId: string): string {
 }
 
 const MAX_PROACTIVE_MESSAGES_PER_DAY = 3;
-const TIME_TRIGGER_WINDOW_MINUTES = 30;
+/** Exported so proactive-eligibility.ts's diagnostic status check uses the exact same window. */
+export const TIME_TRIGGER_WINDOW_MINUTES = 30;
 
 export function decideProactiveOperatorMessage(input: ProactiveDecisionInput): ProactiveDecision {
   const { context, notificationSettings, now, alreadySentDedupeKeys, sentCountToday } = input;
@@ -252,14 +253,16 @@ function rankOpenActions(actions: ActionItem[]): ActionItem[] {
   });
 }
 
-function minutesOfDayInTimezone(date: Date, timezone: string): number {
+/** Exported so proactive-eligibility.ts's diagnostic status check uses the exact same time math the decision module itself uses — no separate reimplementation to drift out of sync. */
+export function minutesOfDayInTimezone(date: Date, timezone: string): number {
   const parts = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(date);
   const hour = Number(parts.find((part) => part.type === "hour")?.value ?? "0");
   const minute = Number(parts.find((part) => part.type === "minute")?.value ?? "0");
   return hour * 60 + minute;
 }
 
-function isWithinWindow(nowMinutes: number, targetMinutes: number, windowMinutes: number): boolean {
+/** Exported for the same reason as minutesOfDayInTimezone above. */
+export function isWithinWindow(nowMinutes: number, targetMinutes: number, windowMinutes: number): boolean {
   return Math.abs(nowMinutes - targetMinutes) <= windowMinutes;
 }
 
