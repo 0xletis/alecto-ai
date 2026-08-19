@@ -91,7 +91,8 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "gmail.rule.apply_update",
   "daily_loop.settings_apply_update",
   "gmail.review.reject",
-  "gmail.review.to_action"
+  "gmail.review.to_action",
+  "proactive.settings_apply_update"
 ]);
 
 /** Exposed only for runtime.ts's dev/test-only planning trace, to classify which composeReply branch produced a reply without duplicating its branch logic. */
@@ -120,7 +121,8 @@ const HUMAN_ACTION: Record<string, string> = {
   "planning.next_week_apply": "create that plan",
   "weekly_review.save": "save that weekly review",
   "gmail.rule.apply_update": "update that Gmail rule",
-  "daily_loop.settings_apply_update": "update your daily loop settings"
+  "daily_loop.settings_apply_update": "update your daily loop settings",
+  "proactive.settings_apply_update": "update your proactive message settings"
 };
 
 function humanAction(tool: string): string {

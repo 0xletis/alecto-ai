@@ -230,6 +230,36 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     };
   }
 
+  // Same reasoning as daily_loop.settings_apply_update above: never planned by the LLM
+  // directly, only ever reached via the deterministic confirm whitelist re-executing an
+  // already-stored pendingOperation set by proactive.settings_propose_update.
+  if (tool.name === "proactive.settings_apply_update") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending proactive settings change",
+      rationale: operation.rationale
+    };
+  }
+
+  if (
+    tool.name === "proactive.settings_propose_update" &&
+    args.morningBriefEnabled === undefined &&
+    args.eveningCheckinEnabled === undefined &&
+    args.gmailNudgeEnabled === undefined
+  ) {
+    return {
+      tool: tool.name,
+      args,
+      status: "needs_clarification",
+      requiresConfirmation: false,
+      clarificationQuestion: "What would you like to change — the morning brief, the evening check-in, or the Gmail nudge?",
+      rationale: operation.rationale
+    };
+  }
+
   // Gmail rule creation: if an equivalent rule already exists (active or paused), there is
   // nothing to confirm — asking "shall I create it?" would be misleading when it either
   // already exists or would just create a confusing duplicate. Skip the confirmation gate

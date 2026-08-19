@@ -1305,3 +1305,92 @@ test("scripted smoke 18: proactive Gmail nudge -> user replies 'turn it into a t
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+// --- Scenario 19: proactive settings consent, end to end -------------------------------------
+//
+// Product correction (docs/10-v3-readiness-audit.md §15): PROACTIVE_OPERATOR_DELIVERY_ENABLED/
+// PROACTIVE_OPERATOR_ALLOWLIST are developer rollout controls, never the product UX. This
+// scenario is the actual product UX end to end: discussing a daily goal can surface a proactive-
+// support suggestion, which — exactly like every other settings change in this codebase — only
+// ever takes effect after an exact "yes"; then the same on/off toggle can be turned back off
+// through equally natural language, always confirmed, always grounded in the real DB state.
+
+test("scripted smoke 19: my goal is to go to the gym every day -> yes -> what proactive messages are on? -> stop morning briefs -> yes", async () => {
+  const server = buildServer();
+  const userId = `smoke-proactive-consent-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, morningBriefEnabled: false, eveningCheckinEnabled: false } });
+
+    const scenario: ScriptedScenario = {
+      name: "proactive-consent-smoke",
+      turns: [
+        {
+          message: "my goal is to go to the gym every day",
+          plan: {
+            topic: "proactive_settings",
+            intent: "suggest_proactive_support",
+            operations: [op("proactive.settings_propose_update", { morningBriefEnabled: true, eveningCheckinEnabled: true })],
+            needsClarification: false,
+            clarificationQuestion: null,
+            replyDraft: ""
+          },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /about to turn on the morning brief and turn on the evening check-in/i);
+            assertNoMutationYet(turn);
+            assert.ok(turn.pendingOperationAfter, "the suggestion opens a pending confirmation, same as any other settings proposal");
+          }
+        },
+        {
+          message: "yes",
+          // No plan: the exact confirm whitelist handles this before the planner ever runs.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true);
+            assert.match(turn.reply, /done — the morning brief is now on and the evening check-in is now on/i);
+            assert.equal(turn.pendingOperationAfter, null);
+          }
+        },
+        {
+          message: "what proactive messages are on?",
+          plan: { topic: "proactive_settings", intent: "show_proactive_settings", operations: [op("proactive.settings_show")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /morning brief: on/i);
+            assert.match(turn.reply, /evening check-in: on/i);
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "stop morning briefs",
+          plan: { topic: "proactive_settings", intent: "propose_proactive_settings_update", operations: [op("proactive.settings_propose_update", { morningBriefEnabled: false })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /about to turn off the morning brief/i);
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "yes",
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true);
+            assert.match(turn.reply, /done — the morning brief is now off/i);
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const finalSettings = await prisma.notificationSettings.findUnique({ where: { userId } });
+    assert.equal(finalSettings?.morningBriefEnabled, false, "final DB state must reflect the last confirmed change");
+    assert.equal(finalSettings?.eveningCheckinEnabled, true, "the evening check-in, never touched again, must remain on");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});

@@ -14,7 +14,9 @@ import {
   type ActionItemReminderType
 } from "@operator-agent/db";
 import { buildDailyCheckinPrompt } from "@operator-agent/core";
+import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
+import { runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -70,6 +72,10 @@ async function runTick() {
 
   await runDailyMorningBriefs(now, settings);
   await runDailyEveningReviews(now, settings);
+
+  // Cautious first real-delivery path for V3's Proactive Operator MVP — morning_brief only, off
+  // by default (PROACTIVE_OPERATOR_DELIVERY_ENABLED). See apps/worker/src/v3-proactive-delivery.ts.
+  await runV3ProactiveMorningBriefs(settings, { apiGet, sendTelegramMessage });
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
@@ -387,35 +393,6 @@ async function sendTelegramMessage(chatId: string, text: string) {
   }
 }
 
-function formatLocalTime(date: Date, timezone: string): string {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).formatToParts(date);
-
-  return `${getPart(parts, "hour")}:${getPart(parts, "minute")}`;
-}
-
-function formatMinutesOfDay(minutes: number | undefined): string {
-  const safeMinutes = Number.isInteger(minutes) && minutes !== undefined && minutes >= 0 && minutes <= 1439 ? minutes : 0;
-  const hour = Math.floor(safeMinutes / 60);
-  const minute = safeMinutes % 60;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-}
-
-function formatLocalDate(date: Date, timezone: string): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).formatToParts(date);
-
-  return `${getPart(parts, "year")}-${getPart(parts, "month")}-${getPart(parts, "day")}`;
-}
-
 function formatLocalWeekday(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
@@ -440,10 +417,6 @@ function parseLocalDateParts(date: Date, timezone: string): Date {
   }).formatToParts(date);
 
   return new Date(`${getPart(parts, "year")}-${getPart(parts, "month")}-${getPart(parts, "day")}T00:00:00Z`);
-}
-
-function getPart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
-  return parts.find((part) => part.type === type)?.value ?? "";
 }
 
 function formatInsight(insight: InsightReport) {

@@ -13,6 +13,7 @@ export * from "./goal-linking.js";
 export * from "./goal-guardrails.js";
 export * from "./goals.js";
 export * from "./gmail-autonomy.js";
+export * from "./proactive-operator-env.js";
 export * from "./insights.js";
 export * from "./ingestion.js";
 export * from "./inbound-message.js";

@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { getOrCreateNotificationSettings, hasNotificationLog } from "@operator-agent/db";
+import { proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { loadContext } from "../agent-runtime/context-loader.js";
 import { handleAgentMessage } from "../agent-runtime/runtime.js";
 import type {
@@ -9,6 +10,7 @@ import type {
   PublicAgentMessageResponse,
   PublicExecutedOperation
 } from "../agent-runtime/types.js";
+import { evaluateProactiveEligibility } from "../operator/proactive-eligibility.js";
 import { decideProactiveOperatorMessage, gmailNudgeDedupeKey, EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
 import { formatDateInTimezone, parseOptionalNow } from "../utils/datetime.js";
 
@@ -71,7 +73,17 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
         sentCountToday: alreadySentDedupeKeys.size
       });
 
-      return { decision };
+      // Informational only — env flags are developer rollout controls, not the product UX (see
+      // docs/10-v3-readiness-audit.md §15). apps/worker's own delivery code independently
+      // re-checks every one of these before an actual send; this route never writes the DB.
+      const eligibility = evaluateProactiveEligibility({
+        decision,
+        deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
+        isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId),
+        notificationSettings
+      });
+
+      return { decision, eligibility };
     }
   );
 }

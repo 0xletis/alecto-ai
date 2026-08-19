@@ -358,6 +358,38 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({})
   },
   {
+    name: "proactive.settings_show",
+    description:
+      "Show which proactive nudges (morning brief, evening check-in, Gmail nudge) are currently on/off for the user. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?'.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "proactive.settings_propose_update",
+    description:
+      "Propose turning the morning brief / evening check-in / Gmail nudge on or off — shows what would change and opens a pending confirmation. Use for 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail nudges', 'stop Gmail nudges'. Set only the field(s) actually being changed. Never enables anything by itself — the user must still confirm.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      morningBriefEnabled: z.boolean().optional().describe("Set true to turn the proactive morning brief on, false to turn it off."),
+      eveningCheckinEnabled: z.boolean().optional().describe("Set true to turn the proactive evening check-in on, false to turn it off."),
+      gmailNudgeEnabled: z.boolean().optional().describe("Set true to turn the proactive Gmail review nudge on, false to turn it off.")
+    })
+  },
+  {
+    name: "proactive.settings_apply_update",
+    description:
+      "Internal: applies the confirmed proactive settings change. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      morningBriefEnabled: z.boolean().optional(),
+      eveningCheckinEnabled: z.boolean().optional(),
+      gmailNudgeEnabled: z.boolean().optional()
+    })
+  },
+  {
     name: "operator.today",
     description: "Summarize what's on for today: open/due actions, active goals, today's logged progress.",
     mutates: false,

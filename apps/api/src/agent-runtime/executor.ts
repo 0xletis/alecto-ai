@@ -748,6 +748,68 @@ export async function executeOperation(
         };
       }
 
+      case "proactive.settings_show": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatProactiveSettingsSummary(settings),
+          result: settings
+        };
+      }
+
+      case "proactive.settings_propose_update": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const morningBriefEnabled = args.morningBriefEnabled as boolean | undefined;
+        const eveningCheckinEnabled = args.eveningCheckinEnabled as boolean | undefined;
+        const gmailNudgeEnabled = args.gmailNudgeEnabled as boolean | undefined;
+
+        const changes = describeProactiveSettingsChanges(settings, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled });
+
+        if (changes.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `That's already how it's set.\n\n${formatProactiveSettingsSummary(settings)}`
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `You're about to ${changes.map((change) => change.proposal).join(" and ")}. Reply yes to confirm or cancel.`,
+          pendingOperationUpdate: {
+            topic: "proactive_settings",
+            summary: changes.map((change) => change.proposal).join(" and "),
+            operations: [
+              {
+                tool: "proactive.settings_apply_update",
+                args: { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "proactive.settings_apply_update": {
+        const morningBriefEnabled = args.morningBriefEnabled as boolean | undefined;
+        const eveningCheckinEnabled = args.eveningCheckinEnabled as boolean | undefined;
+        const gmailNudgeEnabled = args.gmailNudgeEnabled as boolean | undefined;
+        const before = await getOrCreateNotificationSettings(userId);
+
+        const updated = await updateNotificationSettings(userId, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled });
+        const changes = describeProactiveSettingsChanges(before, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: changes.length > 0 ? `Done — ${changes.map((change) => change.done).join(" and ")}.` : "Done — nothing needed to change.",
+          result: updated
+        };
+      }
+
       case "daily_loop.settings_show": {
         const settings = await getOrCreateNotificationSettings(userId);
         return {
@@ -956,6 +1018,62 @@ function formatGoalListForChat(goals: Goal[]): string {
   lines.push("", "Goal editing through chat is not wired yet. Use /create_goal or tell me if you want me to remember context.");
 
   return lines.join("\n");
+}
+
+function formatProactiveSettingsSummary(settings: NotificationSettings): string {
+  return [
+    "Proactive messages:",
+    `- Morning brief: ${settings.morningBriefEnabled ? "on" : "off"}`,
+    `- Evening check-in: ${settings.eveningCheckinEnabled ? "on" : "off"}`,
+    `- Gmail nudge: ${settings.gmailNudgeEnabled ? "on" : "off"}`
+  ].join("\n");
+}
+
+interface ProactiveSettingsChangeDescription {
+  proposal: string;
+  done: string;
+}
+
+interface ProactiveSettingsChangeRequest {
+  morningBriefEnabled?: boolean;
+  eveningCheckinEnabled?: boolean;
+  gmailNudgeEnabled?: boolean;
+}
+
+/**
+ * Same shape as describeDailyLoopChanges below — compares a requested proactive-settings change
+ * against the current settings and describes only the fields that would actually change, so
+ * neither the pre-execution "You're about to..." nor the post-execution "Done — ..." phrasing
+ * has to be derived from the other with string surgery.
+ */
+function describeProactiveSettingsChanges(current: NotificationSettings, request: ProactiveSettingsChangeRequest): ProactiveSettingsChangeDescription[] {
+  const changes: ProactiveSettingsChangeDescription[] = [];
+
+  if (request.morningBriefEnabled !== undefined && request.morningBriefEnabled !== current.morningBriefEnabled) {
+    changes.push(
+      request.morningBriefEnabled
+        ? { proposal: "turn on the morning brief", done: "the morning brief is now on" }
+        : { proposal: "turn off the morning brief", done: "the morning brief is now off" }
+    );
+  }
+
+  if (request.eveningCheckinEnabled !== undefined && request.eveningCheckinEnabled !== current.eveningCheckinEnabled) {
+    changes.push(
+      request.eveningCheckinEnabled
+        ? { proposal: "turn on the evening check-in", done: "the evening check-in is now on" }
+        : { proposal: "turn off the evening check-in", done: "the evening check-in is now off" }
+    );
+  }
+
+  if (request.gmailNudgeEnabled !== undefined && request.gmailNudgeEnabled !== current.gmailNudgeEnabled) {
+    changes.push(
+      request.gmailNudgeEnabled
+        ? { proposal: "turn on the Gmail nudge", done: "the Gmail nudge is now on" }
+        : { proposal: "turn off the Gmail nudge", done: "the Gmail nudge is now off" }
+    );
+  }
+
+  return changes;
 }
 
 function formatDailyLoopSettingsSummary(settings: NotificationSettings): string {
