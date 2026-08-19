@@ -411,6 +411,56 @@ export function extractSafeSenderLabel(value: string): string {
   return truncatePlainText(withoutEmail || value, 80);
 }
 
+/**
+ * Compact, chat-appropriate label for one review item — real subject/sender/rule-name only,
+ * never an invented summary. Used by Agent Runtime v3's gmail.review.list (see
+ * apps/api/src/agent-runtime/executor.ts), distinct from the richer, grouped
+ * EmailReviewInboxItem shape above which the dedicated /email-reviews HTTP route uses.
+ */
+export function gmailReviewChatLabel(review: EmailReviewItem, rules: EmailSignalRule[]): string {
+  if (review.subject) {
+    return truncatePlainText(review.subject, 80);
+  }
+  if (review.from) {
+    return extractSafeSenderLabel(review.from);
+  }
+  const rule = rules.find((item) => item.id === review.ruleId);
+  return rule?.name ?? "Email";
+}
+
+/** Real snippet/evidence text only, safely truncated — undefined (omitted) rather than invented when neither is available. */
+export function gmailReviewChatDescription(review: EmailReviewItem): string | undefined {
+  if (review.snippet) {
+    return truncatePlainText(review.snippet, 140);
+  }
+  if (review.evidence) {
+    return truncatePlainText(review.evidence, 140);
+  }
+  return undefined;
+}
+
+/**
+ * Itemized (not bare-count) Gmail review list for normal V3 chat — each line grounded in that
+ * review's own real subject/sender/snippet/evidence, numbered so a follow-up like "turn the
+ * recruiter one into a task" or "reject 1" can resolve deterministically against this exact
+ * list (see apps/api/src/agent-runtime/validator.ts's resolveGmailReviewRef).
+ */
+export function formatGmailReviewListForChat(reviews: EmailReviewItem[], rules: EmailSignalRule[]): string {
+  if (reviews.length === 0) {
+    return "No email reviews are waiting.";
+  }
+
+  const lines = ["Pending Gmail reviews:"];
+  reviews.forEach((review, index) => {
+    const label = gmailReviewChatLabel(review, rules);
+    const description = gmailReviewChatDescription(review);
+    lines.push(`${index + 1}. ${label}${description ? ` — ${description}` : ""}`);
+  });
+  lines.push("", 'Reply naturally: "turn the recruiter one into a task", "reject the Endesa one", or reference by number.');
+
+  return lines.join("\n");
+}
+
 export async function formatEmailReviewDetailsForContext(userId: string, reviewId: string): Promise<string> {
   const review = await getEmailReviewItem(userId, reviewId);
 

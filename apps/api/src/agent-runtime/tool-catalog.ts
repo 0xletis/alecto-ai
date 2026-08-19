@@ -316,7 +316,8 @@ export const toolCatalog: ToolDefinition[] = [
   },
   {
     name: "gmail.review.list",
-    description: "List pending Gmail email reviews awaiting a decision.",
+    description:
+      "List pending Gmail email reviews awaiting a decision — shows each item's real subject/sender and a short snippet so the user can reference one naturally afterward (e.g. 'turn the recruiter one into a task'). Use for 'what emails need my attention?', 'what Gmail reviews are waiting?', 'show pending email reviews', 'anything important in Gmail?'.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -326,17 +327,27 @@ export const toolCatalog: ToolDefinition[] = [
   },
   {
     name: "gmail.review.reject",
-    description: "Reject a pending Gmail email review item.",
+    description:
+      "Reject (ignore) a pending Gmail email review item from the most recently shown list — only affects Alecto's own tracking, never the actual mailbox (no email is sent, replied to, archived, or labeled). Use for 'reject the Endesa one', 'ignore the first one', 'ignore that email review'. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording, e.g. 'Endesa', 'the recruiter one') when they described it in words — never invent a reviewId yourself.",
     mutates: true,
     requiresConfirmation: false,
-    argsSchema: z.object({ reviewId: z.string().min(1) })
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number.")
+    })
   },
   {
     name: "gmail.review.to_action",
-    description: "Convert a pending Gmail email review item into an action item.",
+    description:
+      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X'. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
     mutates: true,
     requiresConfirmation: false,
-    argsSchema: z.object({ reviewId: z.string().min(1) })
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number.")
+    })
   },
   {
     name: "operator.today",

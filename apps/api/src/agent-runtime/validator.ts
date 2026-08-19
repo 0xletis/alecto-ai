@@ -1,11 +1,13 @@
 import { parseActionDueDate } from "@operator-agent/core";
 import type { EmailSignalRule } from "@operator-agent/db";
+import { selectEmailRuleCandidate, type EmailRuleSelectionCandidate } from "../conversation/email-rule-selection.js";
 import { computeLighterPlanRemoval, readPendingNextWeekPlanSuggestions, resolvePlanSuggestionRef } from "../planning/next-week.js";
 import type { NextWeekPlanSuggestion } from "../server-types.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
 const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
+const GMAIL_REVIEW_REFERENCE_TOOLS = new Set(["gmail.review.reject", "gmail.review.to_action"]);
 
 export function validateOperations(operations: PlannedOperation[], context: ContextBundle): ValidatedOperation[] {
   return operations.map((operation) => validateOperation(operation, context));
@@ -92,6 +94,23 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     }
 
     args.selections = resolution.selections;
+  }
+
+  if (GMAIL_REVIEW_REFERENCE_TOOLS.has(tool.name) && !args.reviewId) {
+    const resolution = resolveGmailReviewRef(args as { index?: number; ref?: string }, context);
+
+    if (resolution.status === "needs_clarification") {
+      return {
+        tool: tool.name,
+        args,
+        status: "needs_clarification",
+        requiresConfirmation: false,
+        clarificationQuestion: resolution.question,
+        rationale: operation.rationale
+      };
+    }
+
+    args.reviewId = resolution.reviewId;
   }
 
   if (tool.name === "planning.next_week_edit" || tool.name === "planning.next_week_show_current") {
@@ -384,6 +403,52 @@ function resolveHygieneApplySelections(selections: HygieneApplySelectionArgs[], 
   }
 
   return { status: "resolved", selections: resolved };
+}
+
+interface GmailReviewRefResolution {
+  status: "resolved" | "needs_clarification";
+  reviewId?: string;
+  question?: string;
+}
+
+/**
+ * Resolves a gmail.review.reject/to_action reference deterministically against the session's
+ * ground-truth visible gmail_review entities (set by the most recent gmail.review.list) — never
+ * against hidden LLM memory, and never a fresh DB lookup (unlike gmail.rule.propose_update),
+ * since a review's identity here is only meaningful in the context of "the list you just showed
+ * me." An explicit numeric index always wins; free-text ref reuses the same
+ * exact/normalized-name-then-token-overlap matcher gmail-conversation.ts's legacy numbered-list
+ * flow already relies on (selectEmailRuleCandidate), generic over any {id, name, status}
+ * candidate shape.
+ */
+function resolveGmailReviewRef(args: { index?: number; ref?: string }, context: ContextBundle): GmailReviewRefResolution {
+  const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+
+  if (visibleReviews.length === 0) {
+    return {
+      status: "needs_clarification",
+      question: 'I don\'t have any Gmail reviews in view right now. Say "what emails need my attention?" to see them.'
+    };
+  }
+
+  if (typeof args.index === "number") {
+    const entity = visibleReviews.find((item) => item.index === args.index);
+    if (entity) {
+      return { status: "resolved", reviewId: entity.id };
+    }
+    return { status: "needs_clarification", question: `I don't see a #${args.index} in the list I just showed you — which one did you mean?` };
+  }
+
+  if (args.ref) {
+    const candidates: EmailRuleSelectionCandidate[] = visibleReviews.map((entity) => ({ id: entity.id, name: entity.label, status: "pending" }));
+    const selected = selectEmailRuleCandidate(args.ref, candidates);
+    if (selected) {
+      return { status: "resolved", reviewId: selected.id };
+    }
+    return { status: "needs_clarification", question: `I couldn't tell which email review "${args.ref}" refers to — which one did you mean?` };
+  }
+
+  return { status: "needs_clarification", question: "Which email review do you mean?" };
 }
 
 interface NextWeekEditChangeArgs {

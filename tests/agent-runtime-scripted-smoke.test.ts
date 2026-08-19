@@ -833,39 +833,38 @@ test("scripted smoke 11: create a task to apply tomorrow -> what should I do tod
   }
 });
 
-// --- Scenario 12: Gmail reviews / email-to-action smoke ---------------------------------------
+// --- Scenario 12: Gmail review triage smoke -----------------------------------------------------
 //
-// Part of the V3 global readiness audit. gmail.review.list/reject/to_action ARE wired end to
-// end (tool-catalog.ts, executor.ts, response-composer.ts HUMAN_ACTION entries) but — unlike
-// gmail.rule.*, planning.*, weekly_review.* — planner.ts's buildSystemPrompt has ZERO prompt
-// guidance telling the LLM when to plan them, and gmail.review.list's own summary is just a
-// bare count ("N email review(s)."), never per-item subjects — so there is no way for a real
-// (non-mocked) LLM turn to learn a review's id from the reply text either. This scenario proves
-// the tool mechanics work correctly via a direct plan (as this pass's audit requires), while the
-// audit doc records the missing planner guidance and missing itemized summary as real gaps.
-// Uses direct sendAgentMessage calls (like scenario 4) because the second turn needs the real
-// reviewId captured from the first turn's visible entities — no scripted turn can know it ahead
-// of time.
+// gmail.review.list/reject/to_action are now realistically reachable via normal chat:
+// planner.ts has explicit guidance for all three (previously zero), gmail.review.list's summary
+// is itemized (previously a bare count), and reject/to_action resolve natural references
+// ("the recruiter one", "Endesa") deterministically against the visible gmail_review entities
+// the list turn just stored — never a fresh DB lookup, never hidden LLM memory (see
+// validator.ts's resolveGmailReviewRef). Two reviews are seeded so this also proves resolution
+// picks the RIGHT one, not just "the only one."
 
-test("scripted smoke 12: what pending gmail reviews do I have? -> turn that email into a task", async () => {
+test("scripted smoke 12: what emails need attention? -> turn the recruiter one into a task -> reject Endesa -> what emails need attention?", async () => {
   const server = buildServer();
-  const userId = `smoke-gmail-reviews-${randomUUID()}`;
+  const userId = `smoke-gmail-review-triage-${randomUUID()}`;
 
   try {
     await seedUser(userId);
     const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
-    const rule = await prisma.emailSignalRule.create({
+    const recruiterRule = await prisma.emailSignalRule.create({
       data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" }
     });
-    const review = await prisma.emailReviewItem.create({
+    const endesaRule = await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Endesa bills", status: "active", createdBy: "user" }
+    });
+    const recruiterReview = await prisma.emailReviewItem.create({
       data: {
         userId,
         connectionId: connection.id,
-        ruleId: rule.id,
+        ruleId: recruiterRule.id,
         adapterId: "custom_email_review",
         provider: "gmail",
         providerMessageId: "recruiter-reply-1",
-        externalId: `gmail-review:${rule.id}:recruiter-reply-1`,
+        externalId: `gmail-review:${recruiterRule.id}:recruiter-reply-1`,
         subject: "Recruiter reply from Example Labs",
         from: "Recruiter <recruiter@example.com>",
         snippet: "Thanks for applying. Can we talk tomorrow?",
@@ -876,29 +875,79 @@ test("scripted smoke 12: what pending gmail reviews do I have? -> turn that emai
         status: "pending"
       }
     });
+    const endesaReview = await prisma.emailReviewItem.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        ruleId: endesaRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "endesa-bill-1",
+        externalId: `gmail-review:${endesaRule.id}:endesa-bill-1`,
+        subject: "Endesa factura",
+        from: "Endesa <noreply@endesa.com>",
+        snippet: "Your bill is ready to view",
+        evidence: "Your bill is ready to view",
+        confidence: 0.7,
+        reason: "custom_rule_match",
+        extracted: {},
+        status: "pending"
+      }
+    });
 
     mockPlan({ topic: "gmail_reviews", intent: "list_pending_reviews", operations: [op("gmail.review.list", { status: "pending" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
-    const listReply = await sendAgentMessage(server, userId, "what pending gmail reviews do I have?");
+    const listReply = await sendAgentMessage(server, userId, "what emails need my attention?");
     assertNoGenericErrorRaw(listReply.reply);
-    assert.match(listReply.reply, /1 email review/i);
+    assert.match(listReply.reply, /pending gmail reviews:/i, "must be itemized, not a bare count");
+    assert.match(listReply.reply, /recruiter reply from example labs/i);
+    assert.match(listReply.reply, /endesa factura/i);
+    assert.doesNotMatch(listReply.reply, /\/gmail|\/setup|\/connect/i, "must not show a legacy slash-command setup wall");
     assert.equal(listReply.debug.mutationExecuted, false);
 
-    const entities = (await getVisibleEntities(userId)) as Array<{ type: string; id: string }>;
-    const reviewEntity = entities.find((entity) => entity.type === "gmail_review" && entity.id === review.id);
-    assert.ok(reviewEntity, "the pending review must be stored as a visible entity so a follow-up can reference it");
+    const entitiesAfterList = (await getVisibleEntities(userId)) as Array<{ type: string; id: string; index?: number }>;
+    const reviewEntities = entitiesAfterList.filter((entity) => entity.type === "gmail_review");
+    assert.equal(reviewEntities.length, 2, "both pending reviews must be stored as visible entities");
+    assert.ok(reviewEntities.every((entity) => typeof entity.index === "number" && entity.index > 0));
 
-    mockPlan({ topic: "gmail_reviews", intent: "convert_review_to_action", operations: [op("gmail.review.to_action", { reviewId: review.id })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
-    const convertReply = await sendAgentMessage(server, userId, "turn that email into a task");
+    mockPlan({
+      topic: "gmail_reviews",
+      intent: "convert_review_to_action",
+      operations: [op("gmail.review.to_action", { ref: "recruiter" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const convertReply = await sendAgentMessage(server, userId, "turn the recruiter one into a task");
     assertNoGenericErrorRaw(convertReply.reply);
     assert.match(convertReply.reply, /turned the email review into task/i);
     assert.equal(convertReply.debug.mutationExecuted, true);
 
-    const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
-    assert.equal(reviewAfter?.status, "approved");
-    assert.ok(reviewAfter?.actionItemId, "the review must be linked to the action it created");
+    const recruiterAfterConvert = await prisma.emailReviewItem.findUnique({ where: { id: recruiterReview.id } });
+    assert.equal(recruiterAfterConvert?.status, "approved");
+    assert.ok(recruiterAfterConvert?.actionItemId, "the recruiter review must be linked to the action it created");
+    const endesaUnchangedAfterConvert = await prisma.emailReviewItem.findUnique({ where: { id: endesaReview.id } });
+    assert.equal(endesaUnchangedAfterConvert?.status, "pending", "only the targeted review may change");
 
-    const createdAction = await prisma.actionItem.findUnique({ where: { id: reviewAfter!.actionItemId! } });
-    assert.match(createdAction!.title, /recruiter reply/i);
+    mockPlan({
+      topic: "gmail_reviews",
+      intent: "reject_review",
+      operations: [op("gmail.review.reject", { ref: "Endesa" })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const rejectReply = await sendAgentMessage(server, userId, "reject the Endesa one");
+    assertNoGenericErrorRaw(rejectReply.reply);
+    assert.match(rejectReply.reply, /rejected/i);
+    assert.equal(rejectReply.debug.mutationExecuted, true);
+
+    const endesaAfterReject = await prisma.emailReviewItem.findUnique({ where: { id: endesaReview.id } });
+    assert.equal(endesaAfterReject?.status, "rejected");
+
+    mockPlan({ topic: "gmail_reviews", intent: "list_pending_reviews", operations: [op("gmail.review.list", { status: "pending" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const finalListReply = await sendAgentMessage(server, userId, "what emails need my attention?");
+    assertNoGenericErrorRaw(finalListReply.reply);
+    assert.match(finalListReply.reply, /no email reviews are waiting/i, "both reviews are now decided, so the pending list must be honestly empty");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

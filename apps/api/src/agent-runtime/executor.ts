@@ -14,7 +14,6 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getOrCreateNotificationSettings,
-  rejectEmailReviewItem,
   snoozeActionItem,
   updateEmailSignalRule,
   updateNotificationSettings,
@@ -35,6 +34,7 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
+import { createActionItemFromEmailReview, formatGmailReviewListForChat, gmailReviewChatLabel, rejectEmailReviewForUser } from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
 import {
   actionInputFromPlanSuggestion,
@@ -664,16 +664,29 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: items.length === 0 ? "No matching email reviews." : `${items.length} email review(s).`,
+          summary: formatGmailReviewListForChat(items, context.gmailRules),
           result: items,
-          entities: items.map(reviewToEntity)
+          entities: items.map((review, index) => reviewToEntity(review, index + 1, context.gmailRules))
         };
       }
 
       case "gmail.review.reject": {
-        const updated = await rejectEmailReviewItem(userId, args.reviewId as string);
-        if (!updated) return failed(operation.tool, "That email review no longer exists or was already decided.");
-        return { tool: operation.tool, status: "executed", summary: "Rejected the email review.", result: updated };
+        const result = await rejectEmailReviewForUser(userId, args.reviewId as string);
+        if (result.status === "not_found") {
+          return failed(operation.tool, "That email review no longer exists or was already decided.");
+        }
+        // Re-includes the OTHER still-pending reviews (re-numbered), not just this one's own
+        // outcome — otherwise applyExecutionSideEffects's per-turn REPLACE semantics for
+        // visibleEntities would silently drop them, breaking a very next "reject the other one"
+        // that never re-lists in between.
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: result.message,
+          result: result.review,
+          entities: remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+        };
       }
 
       case "gmail.review.to_action": {
@@ -682,21 +695,17 @@ export async function executeOperation(
         const review = reviews.find((item) => item.id === reviewId);
         if (!review) return failed(operation.tool, "That email review no longer exists or was already decided.");
 
-        const { actionItem } = await createActionItemIfNotExists(userId, {
-          source: "email_review",
-          sourceId: review.id,
-          title: review.subject ?? "Follow up from email",
-          description: review.snippet,
-          priority: "medium",
-          evidence: review.evidence
-        });
+        const { actionItem } = await createActionItemFromEmailReview(userId, review);
         await approveEmailReviewItem(userId, review.id, undefined, actionItem.id);
+        // Same reasoning as gmail.review.reject above: keep the other still-pending reviews
+        // visible alongside the newly created action, not just the action alone.
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
         return {
           tool: operation.tool,
           status: "executed",
           summary: `Turned the email review into task "${actionItem.title}".`,
           result: actionItem,
-          entities: [actionToEntity(actionItem)]
+          entities: [actionToEntity(actionItem), ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))]
         };
       }
 
@@ -846,8 +855,8 @@ function gmailRuleToEntity(rule: EmailSignalRule, index?: number): AgentEntity {
   return { type: "gmail_rule", id: rule.id, label: rule.name, index };
 }
 
-function reviewToEntity(review: EmailReviewItem): AgentEntity {
-  return { type: "gmail_review", id: review.id, label: review.subject ?? review.from ?? review.id };
+function reviewToEntity(review: EmailReviewItem, index: number, rules: EmailSignalRule[]): AgentEntity {
+  return { type: "gmail_review", id: review.id, label: gmailReviewChatLabel(review, rules), index };
 }
 
 function hygieneActionLabel(action: ActionHygieneAction): string {

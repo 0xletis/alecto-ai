@@ -89,7 +89,9 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "planning.next_week_apply",
   "weekly_review.save",
   "gmail.rule.apply_update",
-  "daily_loop.settings_apply_update"
+  "daily_loop.settings_apply_update",
+  "gmail.review.reject",
+  "gmail.review.to_action"
 ]);
 
 /** Exposed only for runtime.ts's dev/test-only planning trace, to classify which composeReply branch produced a reply without duplicating its branch logic. */
