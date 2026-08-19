@@ -131,3 +131,29 @@ export function sharesMeaningfulToken(left: string, right: string): boolean {
 export function containsUnsafeReflectionLanguage(text: string): boolean {
   return /\b(lazy|addict|addicted|undisciplined|diagnosis|disorder|pathological|hopeless|failure)\b/i.test(text);
 }
+
+/**
+ * Generic plain-text truncation extracted from apps/api/src/server.ts,
+ * where it was called ~29 times across email-review formatting, action
+ * sanitization, and Gmail sync — not specific to any one domain, which is
+ * why it lives here rather than in a domain-specific module.
+ */
+export function truncatePlainText(text: string, maxLength: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length > maxLength ? `${clean.slice(0, maxLength - 3)}...` : clean;
+}
+
+/**
+ * Generic error-to-loggable-string helper extracted from
+ * apps/api/src/server.ts, where it was used both by the legacy semantic
+ * router (stays in server.ts) and the legacy email-review conversation
+ * cluster (apps/api/src/legacy/email-review-conversation.ts), which also
+ * needs it.
+ */
+export function safeErrorForLog(error: unknown): string {
+  if (error && typeof error === "object" && "message" in error && typeof (error as { message?: unknown }).message === "string") {
+    return (error as { message: string }).message.slice(0, 240);
+  }
+
+  return "Unknown error";
+}
