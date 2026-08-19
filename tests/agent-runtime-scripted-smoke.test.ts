@@ -367,6 +367,9 @@ test("scripted smoke 5: remember a preference -> ask Gmail rules -> so what toda
 
   try {
     await seedUser(userId);
+    // A goal anchor, so "so what today" hits the normal operator.today flow this scenario is
+    // actually testing, not the new empty-user goal-anchor nudge (runtime.ts).
+    await createGoal(userId, { title: "Stay on top of email", category: "career", priority: "medium" });
 
     const scenario: ScriptedScenario = {
       name: "memory-gmail-today-smoke",
@@ -798,6 +801,9 @@ test("scripted smoke 11: create a task to apply tomorrow -> what should I do tod
 
   try {
     await seedUser(userId);
+    // A goal anchor, so "what should I do today?" hits the normal operator.today flow this
+    // scenario is actually testing, not the new empty-user goal-anchor nudge (runtime.ts).
+    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium" });
 
     const scenario: ScriptedScenario = {
       name: "action-crud-smoke",
@@ -1089,6 +1095,67 @@ test("scripted smoke 15: a configured knownTrigger still intervenes even with no
     assertNoGenericErrorRaw(reply.reply);
     assert.equal(reply.debug.llmPlannerAttempted, false, "a literal trigger match never needs the LLM tier");
     assert.deepEqual(reply.operationsPlanned, []);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 16: goal-anchor nudge smoke -------------------------------------------------------
+//
+// The small, deterministic pre-planner nudge (runtime.ts's shouldShowGoalAnchorNudge) that
+// closes the last pre-proactive-operator product question: an empty user (no active goals, no
+// configured triggers/failure modes) asking a broad operator/help question gets pointed toward
+// setting one real anchor, instead of Alecto having nothing to align against. Not full
+// onboarding, not proactive/unprompted — only ever a direct reply to the user's own broad
+// question, and it doesn't repeat on the very next one.
+
+test("scripted smoke 16: so what today (empty user) -> what can you help me with? -> seed a goal -> so what today", async () => {
+  const server = buildServer();
+  const userId = `smoke-goal-anchor-nudge-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "goal-anchor-nudge-smoke",
+      turns: [
+        {
+          message: "so what today",
+          // No plan: the nudge short-circuits before the planner ever runs, same mechanism as
+          // the exact confirm/cancel whitelist and the goal-aligned guardrail.
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /one real goal or guardrail/i);
+            assert.match(turn.reply, /\/create_goal/);
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "what can you help me with?",
+          // Still no goal/trigger configured, but the nudge was just shown — must not repeat,
+          // so this turn falls through to normal planning instead.
+          plan: { topic: "general", intent: "explain_capabilities", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "I can help with tasks, planning, Gmail tracking, and more." },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.doesNotMatch(turn.reply, /one real goal or guardrail/i, "must not repeat immediately on the very next broad question");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    // The user now sets a real anchor (as e.g. /create_goal already would).
+    await createGoal(userId, { title: "Find a new developer job", category: "career", priority: "high" });
+
+    mockPlan({ topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const afterGoalReply = await sendAgentMessage(server, userId, "so what today");
+
+    assert.doesNotMatch(afterGoalReply.reply, /one real goal or guardrail/i, "with a real anchor now set, the nudge must never fire again");
+    assert.match(afterGoalReply.reply, /open task|goal/i);
+    assert.equal(afterGoalReply.debug.llmPlannerAttempted, true, "must reach the normal operator.today flow now that an anchor exists");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

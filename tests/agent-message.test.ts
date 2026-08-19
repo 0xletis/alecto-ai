@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { prisma, updateUserOperatingProfile } from "../packages/db/src/index.ts";
+import { createGoal, prisma, updateUserOperatingProfile } from "../packages/db/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
 interface MockPlan {
@@ -780,6 +780,9 @@ test("agent/message: operator.today never recommends a slash command, suggests n
 
   try {
     await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    // A goal anchor, so "so what today" hits the normal operator.today flow this test is
+    // actually testing, not the new empty-user goal-anchor nudge (agent-runtime/runtime.ts).
+    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium" });
     await prisma.actionItem.createMany({
       data: [
         { userId, source: "manual", title: "Apply to jobs", status: "open", priority: "medium", evidence: "manual" },

@@ -72,6 +72,63 @@ const UNSUPPORTED_GMAIL_ACTION_REPLY =
 const GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE =
   /\b(let me know|notify me|keep me posted|tell me)\b|\bi wanna know\b|\bi want to know\b|\bwhen (i receive|i get|it arrives|they arrive)\b|\babout (those|these|that) emails?\b/i;
 
+// Deliberately narrow (allowlist, not blocklist): only genuinely broad, no-specific-capability
+// operator/help/orientation questions — never a specific capability request (Gmail, planning,
+// weekly review, action CRUD, goal.list's own phrases, etc.), which must always reach the
+// planner unchanged. See goal-anchor-nudge below.
+const BROAD_OPERATOR_QUESTION_RE =
+  /^(so )?what should i do( today)?\??$|^what can you help( me)?( with)?\??$|^help me get (organized|started)\??$|^so what('s| is)? today\??$|^how do i (start|get started|begin)\??$|^where do i start\??$|^what now\??$|^what'?s next\??$/i;
+
+const GOAL_ANCHOR_NUDGE_MARKER = "one real goal or guardrail";
+
+const GOAL_ANCHOR_NUDGE_REPLY = [
+  `I can help, but I work best with ${GOAL_ANCHOR_NUDGE_MARKER} to anchor to — right now you don't have one set.`,
+  "",
+  "A few examples:",
+  "1. Find a new developer job",
+  "2. Train 3x/week",
+  "3. Control impulsive spending/gambling/trading",
+  "4. Build a project",
+  "",
+  "Goal creation through chat isn't wired yet, so use /create_goal for now — or tell me the context and I'll remember it."
+].join("\n");
+
+/**
+ * True only for a genuinely empty user (no active goals, no configured knownTriggers/
+ * knownFailureModes — so the goal-aligned guardrail engine, goal-guardrails.ts, has nothing to
+ * work with either) asking a broad, capability-agnostic operator/help question, and only when
+ * the nudge wasn't the very last thing shown (checked against session.messages — no new schema,
+ * see wasGoalAnchorNudgeShownLast). This is deliberately conservative: any active goal, any
+ * configured trigger/failure mode, a pending operation, or a specific capability request all
+ * skip it, so it can never interrupt or repeat a real flow.
+ */
+function shouldShowGoalAnchorNudge(context: ContextBundle, message: string): boolean {
+  if (context.session.pendingOperation) {
+    return false;
+  }
+  if (context.activeGoals.length > 0) {
+    return false;
+  }
+  const profile = context.operatingProfile;
+  if ((profile.knownTriggers?.length ?? 0) > 0 || (profile.knownFailureModes?.length ?? 0) > 0) {
+    return false;
+  }
+  if (!BROAD_OPERATOR_QUESTION_RE.test(message.trim())) {
+    return false;
+  }
+  return !wasGoalAnchorNudgeShownLast(context.session);
+}
+
+function wasGoalAnchorNudgeShownLast(session: AgentSessionState): boolean {
+  for (let i = session.messages.length - 1; i >= 0; i -= 1) {
+    const entry = session.messages[i];
+    if (entry.role === "assistant") {
+      return entry.text.includes(GOAL_ANCHOR_NUDGE_MARKER);
+    }
+  }
+  return false;
+}
+
 // --- Dev/test-only planning trace (never active in production unless explicitly opted in) ---
 
 // Read fresh on every call, not cached at module load — tests toggle this per-turn via
@@ -302,6 +359,18 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
         topic: pending.topic
       });
     }
+  }
+
+  if (shouldShowGoalAnchorNudge(context, message)) {
+    return finalize(context, {
+      reply: GOAL_ANCHOR_NUDGE_REPLY,
+      operationsPlanned: [],
+      executedOps: [],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: "goal_anchor_nudge"
+    });
   }
 
   const { plan, plannerUsed } = await planMessage(message, context);
