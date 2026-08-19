@@ -126,23 +126,40 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "planning.next_week_edit",
     description:
-      "Edit the currently open next-week plan draft (from planning.next_week_start) before it's confirmed: remove suggestions and/or change a suggestion's day/time. Use for 'remove 2', 'change 1 to Tuesday', 'make it lighter' (drop some suggestions to reduce load), and similar. Only works while a plan draft is open.",
+      "Edit the currently open next-week plan draft (from planning.next_week_start) before it's confirmed. Supports removing/changing items by their 1-based number OR by a natural description of the item (its own title/topic wording), plus a deterministic 'lighter' request that drops lower-priority items. Use for 'remove 2', 'remove the YouTube one', 'change 1 to Tuesday', 'move the gym one to Friday', 'keep job applications and remove the rest', 'make it lighter'. Only works while a plan draft is open.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       removeIndexes: z
         .array(z.number().int().positive())
         .optional()
-        .describe("1-based positions to remove from the current draft."),
+        .describe("1-based positions to remove from the current draft, matching the numbers shown there. NEVER 0-based — the first item is 1, not 0. Use when the user gave a number."),
+      removeRefs: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Natural-language descriptions of items to remove, one per item, when the user described them in words instead of numbers — e.g. 'the YouTube one', 'reading', 'the car listings thing'. Use the item's own visible title/topic wording, not a paraphrase."),
       changes: z
         .array(
           z.object({
-            index: z.number().int().positive().describe("1-based position in the current draft to change."),
-            dueText: z.string().min(1).describe("New natural-language day/time for this suggestion, e.g. 'Tuesday', 'Friday morning'.")
+            index: z.number().int().positive().optional().describe("1-based position of the item to change, matching the numbers shown there (never 0-based). Set this OR ref, not both."),
+            ref: z.string().min(1).optional().describe("Natural-language description of the item to change, using its own visible title/topic wording, when the user described it in words. Set this OR index, not both."),
+            dueText: z.string().min(1).describe("New natural-language day/time for this item, e.g. 'Tuesday', 'Friday morning'.")
           })
         )
         .optional()
-        .describe("Day/time changes to apply.")
+        .describe("Day/time changes to apply."),
+      keepIndexes: z
+        .array(z.number().int().positive())
+        .optional()
+        .describe("1-based positions to KEEP; every other visible item is removed. Use for 'keep X and remove the rest' style requests."),
+      keepRefs: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Natural-language descriptions of items to KEEP, using their own visible title/topic wording; every other visible item is removed. Use for 'keep X and remove the rest' style requests."),
+      lighter: z
+        .boolean()
+        .optional()
+        .describe("Set true only when the user asked to make the plan lighter/shorter/less (e.g. 'make it lighter'). Code deterministically decides which lower-priority items to drop — do not also set removeIndexes/removeRefs for this request.")
     })
   },
   {
@@ -349,29 +366,44 @@ function zodObjectToPlannerJsonSchema(schema: z.ZodObject<Record<string, z.ZodTy
   return { type: "object", additionalProperties: false, properties, required: keys };
 }
 
+/**
+ * Builds the JSON Schema node for one field, then layers on a `description`
+ * (from zod's `.describe()`, if set) so the LLM actually sees the field's
+ * guidance — e.g. "1-based ... never 0-based" — rather than only a bare
+ * `{type: "number"}`. Every branch below must also encode `optional` into
+ * the type (adding `"null"`), matching OpenAI Structured Outputs' strict
+ * mode, which requires every property to be listed in `required` and models
+ * optionality via a nullable type instead of omission — a field that is
+ * `.optional()` but whose JSON type doesn't allow `null` leaves the LLM with
+ * no schema-valid way to say "not set" (it was previously missing on the
+ * array branch, which could make an optional array field like
+ * planning.next_week_edit's `changes` behave unpredictably).
+ */
 function zodFieldToPlannerJsonSchema(field: z.ZodTypeAny): Record<string, unknown> {
   const optional = field.isOptional();
   const inner = unwrapOptional(field);
+  const description = field.description ?? inner.description;
+
+  let schema: Record<string, unknown>;
 
   if (inner instanceof z.ZodArray) {
     const element = inner.element as z.ZodTypeAny;
     const items = element instanceof z.ZodObject ? zodObjectToPlannerJsonSchema(element) : zodFieldToPlannerJsonSchema(element);
-    return { type: "array", items };
-  }
-  if (inner instanceof z.ZodObject) {
-    return zodObjectToPlannerJsonSchema(inner);
-  }
-  if (inner instanceof z.ZodEnum) {
+    schema = optional ? { type: ["array", "null"], items } : { type: "array", items };
+  } else if (inner instanceof z.ZodObject) {
+    schema = zodObjectToPlannerJsonSchema(inner);
+  } else if (inner instanceof z.ZodEnum) {
     const values = inner.options as string[];
-    return optional ? { type: ["string", "null"], enum: [...values, null] } : { type: "string", enum: values };
+    schema = optional ? { type: ["string", "null"], enum: [...values, null] } : { type: "string", enum: values };
+  } else if (inner instanceof z.ZodNumber) {
+    schema = optional ? { type: ["number", "null"] } : { type: "number" };
+  } else if (inner instanceof z.ZodBoolean) {
+    schema = optional ? { type: ["boolean", "null"] } : { type: "boolean" };
+  } else {
+    schema = optional ? { type: ["string", "null"] } : { type: "string" };
   }
-  if (inner instanceof z.ZodNumber) {
-    return optional ? { type: ["number", "null"] } : { type: "number" };
-  }
-  if (inner instanceof z.ZodBoolean) {
-    return optional ? { type: ["boolean", "null"] } : { type: "boolean" };
-  }
-  return optional ? { type: ["string", "null"] } : { type: "string" };
+
+  return description ? { ...schema, description } : schema;
 }
 
 function unwrapOptional(schema: z.ZodTypeAny): z.ZodTypeAny {

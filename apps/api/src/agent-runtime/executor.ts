@@ -205,7 +205,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatPlanDraftSummary(formatPlanTitle(planContext), creatable, timezone),
+          summary: formatPlanDraftSummary(windowKind, creatable, timezone),
           result: creatable,
           entities: creatable.map((suggestion) => planSuggestionToEntity(suggestion)),
           pendingOperationUpdate: {
@@ -217,49 +217,24 @@ export async function executeOperation(
       }
 
       case "planning.next_week_edit": {
+        // The validator has already resolved every index/ref/day and guaranteed each
+        // removeIndexes/changes[].index exists in the current draft — this executor only
+        // ever runs with a fully-resolved, atomic edit, never a partially-invalid one.
         const pending = context.session.pendingOperation as AgentPendingOperation;
         const pendingArgs = pending.operations[0].args;
         const timezone = await getUserTimezone(userId);
         const current = readPendingNextWeekPlanSuggestions(pendingArgs.selections);
         const removeIndexes = new Set((args.removeIndexes as number[] | undefined) ?? []);
-        const changes = (args.changes as Array<{ index: number; dueText: string }> | undefined) ?? [];
+        const changes = (args.changes as Array<{ index: number; dueAt: Date }> | undefined) ?? [];
 
-        const notes: string[] = [];
-        const matchedRemoveIndexes = new Set(current.filter((s) => removeIndexes.has(s.index)).map((s) => s.index));
-        for (const index of removeIndexes) {
-          if (!matchedRemoveIndexes.has(index)) {
-            notes.push(`Item ${index}: not in the current plan.`);
-          }
-        }
-
-        let anyChangeApplied = false;
-        const changed = current
+        const renumbered = current
           .filter((suggestion) => !removeIndexes.has(suggestion.index))
           .map((suggestion) => {
             const change = changes.find((c) => c.index === suggestion.index);
-            if (!change) {
-              return suggestion;
-            }
-            const parsed = parseActionDueDate(change.dueText);
-            if (!parsed.dueAt) {
-              notes.push(`Item ${suggestion.index}: couldn't understand "${change.dueText}".`);
-              return suggestion;
-            }
-            anyChangeApplied = true;
-            return { ...suggestion, suggestedDueAt: parsed.dueAt };
-          });
+            return change ? { ...suggestion, suggestedDueAt: change.dueAt } : suggestion;
+          })
+          .map((suggestion, i) => ({ ...suggestion, index: i + 1 }));
 
-        for (const change of changes) {
-          if (!current.some((s) => s.index === change.index)) {
-            notes.push(`Item ${change.index}: not in the current plan.`);
-          }
-        }
-
-        if (matchedRemoveIndexes.size === 0 && !anyChangeApplied) {
-          return failed(operation.tool, notes.join(" ") || "I couldn't match any of those to the current plan.");
-        }
-
-        const renumbered = changed.map((suggestion, i) => ({ ...suggestion, index: i + 1 }));
         const windowKind = (pendingArgs.planWindowKind as PlanWindowKind | undefined) ?? "next_week";
         const planTitle = windowKind === "current_week" ? "This week plan" : "Next week plan";
 
@@ -267,7 +242,7 @@ export async function executeOperation(
           return {
             tool: operation.tool,
             status: "executed",
-            summary: [...notes, "The plan is now empty. Say cancel, or plan next week again to start over."].filter(Boolean).join(" "),
+            summary: "The plan is now empty. Say cancel, or plan next week again to start over.",
             entities: [],
             pendingOperationUpdate: {
               topic: "next_week_planning",
@@ -280,7 +255,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: [formatPlanDraftSummary(planTitle, renumbered, timezone), ...notes].filter(Boolean).join("\n"),
+          summary: formatPlanDraftSummary(windowKind, renumbered, timezone),
           entities: renumbered.map((suggestion) => planSuggestionToEntity(suggestion)),
           pendingOperationUpdate: {
             topic: "next_week_planning",
@@ -634,12 +609,12 @@ function formatPlanWeekday(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-GB", { timeZone: timezone, weekday: "long" }).format(date);
 }
 
-function formatPlanDraftSummary(planTitle: string, selections: NextWeekPlanSuggestion[], timezone: string): string {
+function formatPlanDraftSummary(windowKind: PlanWindowKind, selections: NextWeekPlanSuggestion[], timezone: string): string {
   return [
-    `Here's a draft plan for ${planTitle.toLowerCase()}:`,
+    `Here's a draft plan for ${windowKind === "current_week" ? "this week" : "next week"}:`,
     ...selections.map((suggestion) => `${suggestion.index}. ${formatPlanWeekday(suggestion.suggestedDueAt, timezone)} — ${suggestion.title}`),
     "",
-    "Reply: yes, remove <n>, change <n> to <day>, or cancel."
+    'Tell me naturally what to change — for example: "move the gym one to Friday", "remove the YouTube item", "make it lighter", or "yes" to create it.'
   ].join("\n");
 }
 

@@ -951,3 +951,126 @@ export async function buildNextWeekPlanContext(
     }
   };
 }
+
+const PLAN_REF_STOPWORDS = new Set([
+  "the", "a", "an", "one", "item", "thing", "things", "to", "of", "in", "on", "and",
+  "for", "my", "our", "that", "this", "those", "these", "it"
+]);
+
+/**
+ * Tokenizes plan-item reference text (a user's natural description, or an
+ * item's own title/goal text) for deterministic fuzzy matching: lowercased,
+ * punctuation-stripped (via normalizeForComparison), split on whitespace,
+ * filler words dropped, and anything under 3 characters dropped (too short
+ * to carry meaning or to compare reliably).
+ */
+function planRefTokens(text: string): string[] {
+  return normalizeForComparison(text)
+    .split(" ")
+    .filter((token) => token.length >= 3 && !PLAN_REF_STOPWORDS.has(token));
+}
+
+function commonPrefixLength(a: string, b: string): number {
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  return i;
+}
+
+/**
+ * Two tokens are considered the same word for plan-item matching if they're
+ * identical, or if they share a long-enough common prefix — covers simple
+ * plural/inflection drift ("job"/"jobs", "read"/"reading",
+ * "apply"/"applications") without a full stemmer. The threshold scales down
+ * for short tokens (a 3-letter word needs a full 3-letter prefix match) and
+ * caps at 4 for longer ones, so unrelated words that merely start with the
+ * same letter or two ("car"/"care") don't false-positive.
+ */
+function planTokensMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const minLen = Math.min(a.length, b.length);
+  const threshold = minLen <= 4 ? minLen : 4;
+  return commonPrefixLength(a, b) >= threshold;
+}
+
+function planSuggestionSearchText(suggestion: NextWeekPlanSuggestion): string {
+  return [suggestion.title, suggestion.goalTitle ?? ""].join(" ");
+}
+
+export type PlanSuggestionRefResolution =
+  | { status: "resolved"; index: number }
+  | { status: "ambiguous" }
+  | { status: "none" };
+
+/**
+ * Deterministically resolves a natural-language reference to one item in
+ * the current plan draft — never trusts a raw id/index invented by the LLM,
+ * only ever matches against the draft's own visible title/goal text. Used
+ * by Agent Runtime v3's planning.next_week_edit validator so replies like
+ * "remove the YouTube one" resolve the same way "remove 2" does: against
+ * ground-truth session state, not hidden LLM memory.
+ *
+ * Resolution order: exact normalized-title match first; if none, a token
+ * match (shared word, fuzzy on simple plural/inflection drift) against each
+ * item's title + goal title. Multiple candidates at either stage is
+ * "ambiguous", zero is "none" — both are the caller's cue to ask for
+ * clarification and change nothing, exactly like an unresolved numbered
+ * index.
+ */
+export function resolvePlanSuggestionRef(ref: string, current: NextWeekPlanSuggestion[]): PlanSuggestionRefResolution {
+  const normalizedRef = normalizeForComparison(ref);
+
+  const exactTitleMatches = current.filter((suggestion) => normalizeForComparison(suggestion.title) === normalizedRef);
+  if (exactTitleMatches.length === 1) {
+    return { status: "resolved", index: exactTitleMatches[0].index };
+  }
+  if (exactTitleMatches.length > 1) {
+    return { status: "ambiguous" };
+  }
+
+  const refTokens = planRefTokens(ref);
+  if (refTokens.length === 0) {
+    return { status: "none" };
+  }
+
+  const tokenMatches = current.filter((suggestion) => {
+    const itemTokens = planRefTokens(planSuggestionSearchText(suggestion));
+    return refTokens.some((refToken) => itemTokens.some((itemToken) => planTokensMatch(refToken, itemToken)));
+  });
+
+  if (tokenMatches.length === 1) {
+    return { status: "resolved", index: tokenMatches[0].index };
+  }
+  if (tokenMatches.length > 1) {
+    return { status: "ambiguous" };
+  }
+  return { status: "none" };
+}
+
+export type LighterPlanReduction = { status: "resolved"; removeIndexes: number[] } | { status: "unclear" };
+
+/**
+ * Deterministically decides which items a "make it lighter" request should
+ * drop — never left to the LLM to invent, so it can't hallucinate or
+ * casually remove a high-priority item. Only acts when there's a clear,
+ * strictly-smaller subset of lower-priority items to drop (by actionPriority
+ * first, falling back to the suggestion's own goal priority); if every item
+ * is the same priority, or the draft is already small, the request is
+ * "unclear" and the caller should ask for clarification instead of guessing.
+ */
+export function computeLighterPlanRemoval(current: NextWeekPlanSuggestion[]): LighterPlanReduction {
+  if (current.length <= 2) {
+    return { status: "unclear" };
+  }
+
+  const lowActionPriority = current.filter((suggestion) => (suggestion.actionPriority ?? "medium") === "low");
+  if (lowActionPriority.length > 0 && lowActionPriority.length < current.length) {
+    return { status: "resolved", removeIndexes: lowActionPriority.map((suggestion) => suggestion.index) };
+  }
+
+  const lowGoalPriority = current.filter((suggestion) => suggestion.priority === "low");
+  if (lowGoalPriority.length > 0 && lowGoalPriority.length < current.length) {
+    return { status: "resolved", removeIndexes: lowGoalPriority.map((suggestion) => suggestion.index) };
+  }
+
+  return { status: "unclear" };
+}

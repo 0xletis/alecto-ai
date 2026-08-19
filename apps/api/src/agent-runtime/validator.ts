@@ -1,5 +1,7 @@
-import type { UserOperatingProfile } from "@operator-agent/core";
+import { parseActionDueDate, type UserOperatingProfile } from "@operator-agent/core";
 import type { EmailSignalRule } from "@operator-agent/db";
+import { computeLighterPlanRemoval, readPendingNextWeekPlanSuggestions, resolvePlanSuggestionRef } from "../planning/next-week.js";
+import type { NextWeekPlanSuggestion } from "../server-types.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
@@ -122,7 +124,8 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
   }
 
   if (tool.name === "planning.next_week_edit") {
-    const openDraft = context.session.pendingOperation?.operations[0]?.tool === "planning.next_week_apply";
+    const pendingApplyOp = context.session.pendingOperation?.operations[0];
+    const openDraft = pendingApplyOp?.tool === "planning.next_week_apply";
 
     if (!openDraft) {
       return {
@@ -135,19 +138,27 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
       };
     }
 
-    const removeIndexes = (args.removeIndexes as number[] | undefined) ?? [];
-    const changes = (args.changes as Array<{ index: number; dueText: string }> | undefined) ?? [];
+    const current = readPendingNextWeekPlanSuggestions(pendingApplyOp.args.selections);
+    const resolution = resolveNextWeekEditArgs(args, current);
 
-    if (removeIndexes.length === 0 && changes.length === 0) {
+    if (resolution.status === "needs_clarification") {
       return {
         tool: tool.name,
         args,
         status: "needs_clarification",
         requiresConfirmation: false,
-        clarificationQuestion: "What would you like to change about the plan — remove an item, or change its day?",
+        clarificationQuestion: resolution.question,
         rationale: operation.rationale
       };
     }
+
+    // Rewrite to the executor's plain, pre-resolved shape — every index below is
+    // guaranteed to exist in `current` and every natural ref has already been resolved to
+    // one. The executor never re-resolves anything itself, so an invalid/ambiguous/unknown
+    // reference can never partially apply: this whole operation is "needs_clarification"
+    // instead, and nothing about it reaches the executor or touches session state.
+    args.removeIndexes = resolution.removeIndexes;
+    args.changes = resolution.changes;
   }
 
   // planning.next_week_apply is never planned by the LLM directly — it only ever runs via the
@@ -339,4 +350,151 @@ function resolveHygieneApplySelections(selections: HygieneApplySelectionArgs[], 
   }
 
   return { status: "resolved", selections: resolved };
+}
+
+interface NextWeekEditChangeArgs {
+  index?: number;
+  ref?: string;
+  dueText: string;
+}
+
+type NextWeekEditResolution =
+  | { status: "resolved"; removeIndexes: number[]; changes: Array<{ index: number; dueAt: Date }> }
+  | { status: "needs_clarification"; question: string };
+
+/**
+ * Deterministically resolves a whole planning.next_week_edit call — numbered
+ * indexes, natural-language refs, keep-the-rest inversion, and "lighter" —
+ * into a plain, pre-resolved shape the executor can apply without doing any
+ * resolution itself. Atomic by design: EVERY index/ref in the request
+ * (removeIndexes, removeRefs, changes[].index/ref, keepIndexes, keepRefs,
+ * lighter) must resolve against the current draft, or the whole call becomes
+ * "needs_clarification" and nothing is returned for partial application —
+ * this is what makes "remove 1" with a bad/stale index safe: it can never
+ * mutate the pending draft only partway, and a later "change 1 to Tuesday"
+ * still sees the untouched original draft.
+ */
+function resolveNextWeekEditArgs(args: Record<string, unknown>, current: NextWeekPlanSuggestion[]): NextWeekEditResolution {
+  const rawRemoveIndexes = (args.removeIndexes as number[] | undefined) ?? [];
+  const removeRefs = (args.removeRefs as string[] | undefined) ?? [];
+  const rawChanges = (args.changes as NextWeekEditChangeArgs[] | undefined) ?? [];
+  const keepIndexes = (args.keepIndexes as number[] | undefined) ?? [];
+  const keepRefs = (args.keepRefs as string[] | undefined) ?? [];
+  const lighter = args.lighter === true;
+
+  const nothingSpecified =
+    rawRemoveIndexes.length === 0 &&
+    removeRefs.length === 0 &&
+    rawChanges.length === 0 &&
+    keepIndexes.length === 0 &&
+    keepRefs.length === 0 &&
+    !lighter;
+
+  if (nothingSpecified) {
+    return {
+      status: "needs_clarification",
+      question: "What would you like to change about the plan — remove an item, change its day, or make it lighter?"
+    };
+  }
+
+  const currentIndexes = new Set(current.map((suggestion) => suggestion.index));
+  // Holds ready-made clarification questions, not raw tokens — the first one found is
+  // returned verbatim, so each push site phrases its own failure precisely (unknown index vs.
+  // unresolved ref vs. unparseable day all read differently to the user).
+  const unresolved: string[] = [];
+  const removeIndexes = new Set<number>();
+  const changes: Array<{ index: number; dueAt: Date }> = [];
+  const unknownIndex = (index: number) => unresolved.push(`There's no item ${index} in the current plan — say "yes" first to see the numbers, or describe the item in words.`);
+  const unresolvedRef = (ref: string) => unresolved.push(`I couldn't match "${ref}" to one item in the current plan — could you say its number instead, or describe it differently?`);
+  const unparseableDay = (dueText: string) => unresolved.push(`I couldn't understand the day "${dueText}" — try something like "Friday" or "Tuesday morning".`);
+
+  for (const index of rawRemoveIndexes) {
+    if (currentIndexes.has(index)) {
+      removeIndexes.add(index);
+    } else {
+      unknownIndex(index);
+    }
+  }
+
+  for (const ref of removeRefs) {
+    const resolution = resolvePlanSuggestionRef(ref, current);
+    if (resolution.status === "resolved") {
+      removeIndexes.add(resolution.index);
+    } else {
+      unresolvedRef(ref);
+    }
+  }
+
+  for (const change of rawChanges) {
+    // Date parsing happens here, not in the executor, so a change with an unparseable day is
+    // just as atomic as an unresolved index/ref — it fails the whole call via `unresolved`
+    // rather than silently no-op-ing one item while the rest of the edit goes through.
+    const parsedDueAt = parseActionDueDate(change.dueText).dueAt;
+
+    // Exact index wins over a ref on the same entry (the schema asks for only one, but this
+    // makes the precedence explicit and deterministic if both are ever set).
+    if (typeof change.index === "number") {
+      if (!currentIndexes.has(change.index)) {
+        unknownIndex(change.index);
+      } else if (!parsedDueAt) {
+        unparseableDay(change.dueText);
+      } else {
+        changes.push({ index: change.index, dueAt: parsedDueAt });
+      }
+      continue;
+    }
+    if (change.ref) {
+      const resolution = resolvePlanSuggestionRef(change.ref, current);
+      if (resolution.status !== "resolved") {
+        unresolvedRef(change.ref);
+      } else if (!parsedDueAt) {
+        unparseableDay(change.dueText);
+      } else {
+        changes.push({ index: resolution.index, dueAt: parsedDueAt });
+      }
+    }
+  }
+
+  if (keepIndexes.length > 0 || keepRefs.length > 0) {
+    const keep = new Set<number>();
+    for (const index of keepIndexes) {
+      if (currentIndexes.has(index)) {
+        keep.add(index);
+      } else {
+        unknownIndex(index);
+      }
+    }
+    for (const ref of keepRefs) {
+      const resolution = resolvePlanSuggestionRef(ref, current);
+      if (resolution.status === "resolved") {
+        keep.add(resolution.index);
+      } else {
+        unresolvedRef(ref);
+      }
+    }
+    for (const suggestion of current) {
+      if (!keep.has(suggestion.index)) {
+        removeIndexes.add(suggestion.index);
+      }
+    }
+  }
+
+  if (lighter) {
+    const reduction = computeLighterPlanRemoval(current);
+    if (reduction.status === "unclear") {
+      return {
+        status: "needs_clarification",
+        question: "I'm not confident which items to drop to make it lighter — tell me which one(s) to remove, or which day to keep light."
+      };
+    }
+    for (const index of reduction.removeIndexes) {
+      removeIndexes.add(index);
+    }
+  }
+
+  if (unresolved.length > 0) {
+    return { status: "needs_clarification", question: unresolved[0] };
+  }
+
+  return { status: "resolved", removeIndexes: [...removeIndexes], changes };
 }
