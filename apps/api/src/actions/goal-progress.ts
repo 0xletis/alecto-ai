@@ -1,4 +1,4 @@
-import { createExternalEventIfNotExists, getGoals, type ActionItem } from "@operator-agent/db";
+import { createEvents, createExternalEventIfNotExists, getGoals, type ActionItem } from "@operator-agent/db";
 
 /**
  * Extracted from apps/api/src/server.ts. Not action-hygiene-specific — used
@@ -36,4 +36,37 @@ export async function createGoalProgressFromCompletedAction(userId: string, acti
     ...created,
     goalTitle
   };
+}
+
+/**
+ * Extracted from apps/api/src/server.ts alongside
+ * createGoalProgressFromCompletedAction (same "create a goal progress
+ * event" domain, different trigger — an explicit custom metric log rather
+ * than an action completion). Used by the goal progress route,
+ * conversational custom progress logging, and applyPendingAction's
+ * goal_progress_log branch.
+ */
+export async function createCustomGoalProgressEvent(
+  userId: string,
+  goal: Awaited<ReturnType<typeof getGoals>>[number],
+  input: { metricKey?: string; value?: string | number | boolean; unit?: string; note?: string }
+) {
+  const events = await createEvents(userId, [
+    {
+      type: "custom.goal_progress_logged",
+      source: "manual",
+      data: {
+        goalId: goal.id,
+        goalTitle: goal.title,
+        ...(input.metricKey ? { metricKey: input.metricKey } : {}),
+        ...(input.value !== undefined ? { value: input.value } : {}),
+        ...(input.unit ? { unit: input.unit } : {}),
+        ...(input.note ? { note: input.note } : {})
+      },
+      confidence: 1,
+      evidence: [input.note ?? input.metricKey ?? goal.title]
+    }
+  ]);
+
+  return events[0];
 }
