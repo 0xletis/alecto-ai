@@ -661,3 +661,306 @@ test("scripted smoke 8: what are my daily loop settings? -> turn off daily revie
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+// --- Scenario 9: memory save + recall smoke -------------------------------------------------
+//
+// Part of the V3 global readiness audit (docs/10-v3-readiness-audit.md): confirms a saved
+// memory is actually retrievable through a later, differently-worded question in the same
+// conversation, not just that memory.create returns a success summary.
+
+test("scripted smoke 9: remember I prefer blunt feedback -> what do you remember about my feedback style?", async () => {
+  const server = buildServer();
+  const userId = `smoke-memory-recall-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "memory-recall-smoke",
+      turns: [
+        {
+          message: "remember I prefer blunt feedback",
+          plan: { topic: "memory", intent: "store_preference", operations: [op("memory.create", { summary: "Prefers blunt feedback", type: "communication_style" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /remember/i);
+            assert.match(turn.reply, /blunt feedback/i);
+            assert.equal(turn.mutationExecuted, true);
+          }
+        },
+        {
+          message: "what do you remember about my feedback style?",
+          plan: { topic: "memory", intent: "search_memory", operations: [op("memory.search", { query: "feedback" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            // Grounded in the actually-saved memory, not the LLM re-describing the earlier turn.
+            assert.match(turn.reply, /blunt feedback/i);
+            assertNoMutationYet(turn);
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 10: goals + progress smoke ------------------------------------------------------
+//
+// Part of the V3 global readiness audit. There is no dedicated goal.create/goal.list tool in
+// tool-catalog.ts (confirmed by grep during the audit) — "I want to find a developer job" is
+// realistically planned as a memory.create with type "goal_context" (that enum value exists
+// specifically for this), and "what are my active goals?" is realistically answered by
+// operator.today, whose summary reports only a COUNT of active goals, never their titles. This
+// scenario intentionally documents that gap rather than asserting goal titles appear.
+
+test("scripted smoke 10: I want to find a developer job -> I sent 3 CVs today -> what are my active goals?", async () => {
+  const server = buildServer();
+  const userId = `smoke-goals-progress-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    // Seeds the goal directly (as e.g. /create_goal or onboarding already would), since V3 chat
+    // itself has no way to create a queryable Goal record — see the gap noted above.
+    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium" });
+
+    const scenario: ScriptedScenario = {
+      name: "goals-progress-smoke",
+      turns: [
+        {
+          message: "I want to find a developer job",
+          plan: { topic: "memory", intent: "store_goal_context", operations: [op("memory.create", { summary: "Wants to find a developer job", type: "goal_context" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.equal(turn.mutationExecuted, true);
+          }
+        },
+        {
+          message: "I sent 3 CVs today",
+          plan: { topic: "progress_logging", intent: "log_job_applications", operations: [op("event.log_job_applications", { count: 3 })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /3 job application/i);
+            assert.equal(turn.mutationExecuted, true);
+          }
+        },
+        {
+          message: "what are my active goals?",
+          plan: { topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            // Real, grounded count — but only a count, never per-goal titles (the documented gap).
+            assert.match(turn.reply, /1 active goal/i);
+            assertNoMutationYet(turn);
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const loggedEvents = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+    assert.equal(loggedEvents, 3, "each logged CV must be its own event, grounded in real DB state");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 11: action CRUD smoke -----------------------------------------------------------
+//
+// Part of the V3 global readiness audit: exercises action.create/operator.today/action.complete
+// directly (not via action.hygiene_*), including single-visible-entity resolution (referencing
+// "it" with no explicit actionId, resolved against the one action just created).
+
+test("scripted smoke 11: create a task to apply tomorrow -> what should I do today? -> mark it done", async () => {
+  const server = buildServer();
+  const userId = `smoke-action-crud-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "action-crud-smoke",
+      turns: [
+        {
+          message: "create a task to apply tomorrow",
+          plan: { topic: "action_cleanup", intent: "create_action", operations: [op("action.create", { title: "Apply to jobs", dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /created task/i);
+            assert.match(turn.reply, /apply to jobs/i);
+            assert.equal(turn.mutationExecuted, true);
+          }
+        },
+        {
+          message: "what should I do today?",
+          plan: { topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /1 open task/i);
+            assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "mark it done",
+          // No actionId: resolved deterministically against the single visible action entity
+          // left by the create turn (validator.ts's ACTION_REFERENCE_TOOLS resolution).
+          plan: { topic: "action_cleanup", intent: "complete_action", operations: [op("action.complete", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /completed "apply to jobs"/i);
+            assert.equal(turn.mutationExecuted, true);
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    const created = await prisma.actionItem.findMany({ where: { userId, source: "manual" } });
+    assert.equal(created.length, 1);
+    assert.equal(created[0].status, "completed", "final DB state must match the reply's claim");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 12: Gmail reviews / email-to-action smoke ---------------------------------------
+//
+// Part of the V3 global readiness audit. gmail.review.list/reject/to_action ARE wired end to
+// end (tool-catalog.ts, executor.ts, response-composer.ts HUMAN_ACTION entries) but — unlike
+// gmail.rule.*, planning.*, weekly_review.* — planner.ts's buildSystemPrompt has ZERO prompt
+// guidance telling the LLM when to plan them, and gmail.review.list's own summary is just a
+// bare count ("N email review(s)."), never per-item subjects — so there is no way for a real
+// (non-mocked) LLM turn to learn a review's id from the reply text either. This scenario proves
+// the tool mechanics work correctly via a direct plan (as this pass's audit requires), while the
+// audit doc records the missing planner guidance and missing itemized summary as real gaps.
+// Uses direct sendAgentMessage calls (like scenario 4) because the second turn needs the real
+// reviewId captured from the first turn's visible entities — no scripted turn can know it ahead
+// of time.
+
+test("scripted smoke 12: what pending gmail reviews do I have? -> turn that email into a task", async () => {
+  const server = buildServer();
+  const userId = `smoke-gmail-reviews-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+    const rule = await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" }
+    });
+    const review = await prisma.emailReviewItem.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        ruleId: rule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "recruiter-reply-1",
+        externalId: `gmail-review:${rule.id}:recruiter-reply-1`,
+        subject: "Recruiter reply from Example Labs",
+        from: "Recruiter <recruiter@example.com>",
+        snippet: "Thanks for applying. Can we talk tomorrow?",
+        evidence: "Thanks for applying. Can we talk tomorrow?",
+        confidence: 0.9,
+        reason: "custom_rule_match",
+        extracted: {},
+        status: "pending"
+      }
+    });
+
+    mockPlan({ topic: "gmail_reviews", intent: "list_pending_reviews", operations: [op("gmail.review.list", { status: "pending" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const listReply = await sendAgentMessage(server, userId, "what pending gmail reviews do I have?");
+    assertNoGenericErrorRaw(listReply.reply);
+    assert.match(listReply.reply, /1 email review/i);
+    assert.equal(listReply.debug.mutationExecuted, false);
+
+    const entities = (await getVisibleEntities(userId)) as Array<{ type: string; id: string }>;
+    const reviewEntity = entities.find((entity) => entity.type === "gmail_review" && entity.id === review.id);
+    assert.ok(reviewEntity, "the pending review must be stored as a visible entity so a follow-up can reference it");
+
+    mockPlan({ topic: "gmail_reviews", intent: "convert_review_to_action", operations: [op("gmail.review.to_action", { reviewId: review.id })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const convertReply = await sendAgentMessage(server, userId, "turn that email into a task");
+    assertNoGenericErrorRaw(convertReply.reply);
+    assert.match(convertReply.reply, /turned the email review into task/i);
+    assert.equal(convertReply.debug.mutationExecuted, true);
+
+    const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(reviewAfter?.status, "approved");
+    assert.ok(reviewAfter?.actionItemId, "the review must be linked to the action it created");
+
+    const createdAction = await prisma.actionItem.findUnique({ where: { id: reviewAfter!.actionItemId! } });
+    assert.match(createdAction!.title, /recruiter reply/i);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Scenario 13: guardrail smoke --------------------------------------------------------------
+//
+// Part of the V3 global readiness audit. checkPolicyGuardrail (validator.ts) is entirely
+// data-driven off the user's OWN UserOperatingProfile.knownTriggers/knownFailureModes — it has
+// no hardcoded gambling/financial-risk detection. Legacy has a genuinely separate, LLM-classified
+// betting_intent/trading_intent + riskState mechanism (packages/core/src/message-processing.ts,
+// gated by the profile's distinct gamblingGuardrails field) that V3 does not have at all. This
+// scenario proves both halves: with no configured trigger, a risky-sounding message just flows
+// to normal planning (no special refusal — the gap); once the user's own profile has a matching
+// trigger configured, the SAME message is hard-blocked before the planner ever runs.
+
+test("scripted smoke 13: a risky message flows to normal planning with no configured trigger, but is hard-blocked once one is configured", async () => {
+  const server = buildServer();
+  const userId = `smoke-guardrail-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    const scenario: ScriptedScenario = {
+      name: "guardrail-smoke",
+      turns: [
+        {
+          message: "I want to bet 1000 on this because it feels safe, right?",
+          // No hardcoded gambling detection exists in V3 today, so this is treated as ordinary
+          // chat and reaches the (here, mocked) planner like any other message.
+          plan: { topic: "general", intent: "unclassified", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "I can't tell you that's safe. Want me to log it as a note instead?" },
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assertNoMutationYet(turn);
+            assert.doesNotMatch(turn.reply, /hard stop|slow down and talk it through/i, "must not accidentally already be hitting a guardrail with no trigger configured");
+          }
+        }
+      ]
+    };
+
+    await runScriptedScenario(server, userId, scenario);
+
+    // The user (elsewhere, e.g. via /profile) has configured this as a known trigger.
+    await prisma.userOperatingProfile.upsert({
+      where: { userId },
+      update: { knownTriggers: ["bet", "gambling"] },
+      create: { userId, knownTriggers: ["bet", "gambling"] }
+    });
+
+    // No plan: the guardrail short-circuits before the planner ever runs, same mechanism as the
+    // exact confirm/cancel whitelist.
+    const guardedReply = await sendAgentMessage(server, userId, "I want to bet 1000 on this because it feels safe, right?");
+    assert.equal(guardedReply.reply, "This touches something you've asked me to be careful about. I'm not going to act on it automatically — let's slow down and talk it through first.");
+    assert.equal(guardedReply.debug.mutationExecuted, false);
+    assert.equal(guardedReply.debug.llmPlannerAttempted, false, "the planner must never run once the guardrail is triggered");
+    assert.deepEqual(guardedReply.operationsPlanned, []);
+    assert.deepEqual(guardedReply.operationsExecuted, []);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
