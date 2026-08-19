@@ -21,7 +21,7 @@ import {
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
-import { parseActionDueDate, type NotificationSettings } from "@operator-agent/core";
+import { parseActionDueDate, type Goal, type NotificationSettings } from "@operator-agent/core";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
@@ -709,6 +709,15 @@ export async function executeOperation(
         };
       }
 
+      case "goal.list": {
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatGoalListForChat(context.activeGoals),
+          result: context.activeGoals
+        };
+      }
+
       case "operator.today": {
         const dueToday = context.openActions.filter((action) => action.dueAt && isToday(action.dueAt));
         const parts = [
@@ -925,6 +934,28 @@ function formatThinWeeklyReviewSummary(context: WeeklyReviewContext): string {
     openParts.length > 0 ? `Right now: ${openParts.join(", ")}.` : undefined,
     'Reply: "save this review" to keep it, or "cancel".'
   ].filter(Boolean).join("\n");
+}
+
+/**
+ * Grounded in real Goal rows only — title/category/priority/why, never an invented progress
+ * figure (targetMetrics/checkInConfig would need real event aggregation this tool doesn't do).
+ * Always ends with the same honest boundary: goal editing isn't wired through chat yet.
+ */
+function formatGoalListForChat(goals: Goal[]): string {
+  if (goals.length === 0) {
+    return "You don't have active goals set yet. Use /create_goal for now, or tell me what you want to work on and I can remember the context.";
+  }
+
+  const lines = ["Your active goals:"];
+  goals.forEach((goal, index) => {
+    lines.push(`${index + 1}. ${goal.title} — ${goal.category} — ${goal.priority}`);
+    if (goal.why) {
+      lines.push(`   Why: ${goal.why}`);
+    }
+  });
+  lines.push("", "Goal editing through chat is not wired yet. Use /create_goal or tell me if you want me to remember context.");
+
+  return lines.join("\n");
 }
 
 function formatDailyLoopSettingsSummary(settings: NotificationSettings): string {

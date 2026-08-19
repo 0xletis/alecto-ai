@@ -711,32 +711,34 @@ test("scripted smoke 9: remember I prefer blunt feedback -> what do you remember
 
 // --- Scenario 10: goals + progress smoke ------------------------------------------------------
 //
-// Part of the V3 global readiness audit. There is no dedicated goal.create/goal.list tool in
-// tool-catalog.ts (confirmed by grep during the audit) — "I want to find a developer job" is
-// realistically planned as a memory.create with type "goal_context" (that enum value exists
-// specifically for this), and "what are my active goals?" is realistically answered by
-// operator.today, whose summary reports only a COUNT of active goals, never their titles. This
-// scenario intentionally documents that gap rather than asserting goal titles appear.
+// Closes the goal-listing honesty gap the V3 global readiness audit identified: "what are my
+// goals?" now plans goal.list (apps/api/src/agent-runtime/executor.ts), which returns the
+// user's REAL active goal titles, not operator.today's bare count. Also proves the companion
+// honesty rule — an explicit "create a goal" request must never silently become a memory.create
+// that lets the user believe a real goal now exists.
 
-test("scripted smoke 10: I want to find a developer job -> I sent 3 CVs today -> what are my active goals?", async () => {
+test("scripted smoke 10: what are my goals? -> I sent 3 CVs today -> create a goal to run a marathon", async () => {
   const server = buildServer();
   const userId = `smoke-goals-progress-${randomUUID()}`;
 
   try {
     await seedUser(userId);
-    // Seeds the goal directly (as e.g. /create_goal or onboarding already would), since V3 chat
-    // itself has no way to create a queryable Goal record — see the gap noted above.
-    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium" });
+    // Goals still can't be created through V3 chat (by design, this pass) — seeded the way
+    // /create_goal or onboarding already would.
+    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium", why: "Build stable career capital." });
+    await createGoal(userId, { title: "Improve strength and energy", category: "health", priority: "high" });
 
     const scenario: ScriptedScenario = {
       name: "goals-progress-smoke",
       turns: [
         {
-          message: "I want to find a developer job",
-          plan: { topic: "memory", intent: "store_goal_context", operations: [op("memory.create", { summary: "Wants to find a developer job", type: "goal_context" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          message: "what are my goals?",
+          plan: { topic: "goals", intent: "list_active_goals", operations: [op("goal.list")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
           assert: (turn) => {
             assertNoGenericError(turn);
-            assert.equal(turn.mutationExecuted, true);
+            assert.match(turn.reply, /apply to developer jobs/i);
+            assert.match(turn.reply, /improve strength and energy/i);
+            assertNoMutationYet(turn);
           }
         },
         {
@@ -749,12 +751,20 @@ test("scripted smoke 10: I want to find a developer job -> I sent 3 CVs today ->
           }
         },
         {
-          message: "what are my active goals?",
-          plan: { topic: "operator_summary", intent: "daily_summary", operations: [op("operator.today")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
+          message: "create a goal to run a marathon",
+          plan: {
+            topic: "goals",
+            intent: "decline_goal_creation",
+            operations: [],
+            needsClarification: false,
+            clarificationQuestion: null,
+            replyDraft: "Goal creation through chat isn't wired yet — use /create_goal to add \"run a marathon\" as a real goal."
+          },
           assert: (turn) => {
             assertNoGenericError(turn);
-            // Real, grounded count — but only a count, never per-goal titles (the documented gap).
-            assert.match(turn.reply, /1 active goal/i);
+            assertNoFalseSuccessClaim(turn, [/goal (created|added|is now tracked)/i]);
+            assert.match(turn.reply, /not wired yet|isn't wired yet/i);
+            assert.match(turn.reply, /\/create_goal/);
             assertNoMutationYet(turn);
           }
         }
@@ -765,6 +775,10 @@ test("scripted smoke 10: I want to find a developer job -> I sent 3 CVs today ->
 
     const loggedEvents = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
     assert.equal(loggedEvents, 3, "each logged CV must be its own event, grounded in real DB state");
+    const goalCount = await prisma.goal.count({ where: { userId } });
+    assert.equal(goalCount, 2, "the declined 'run a marathon' request must not have created a third goal");
+    const memoryCount = await prisma.memoryEntry.count({ where: { userId } });
+    assert.equal(memoryCount, 0, "an explicit, declined goal-creation request must not fall back to a silent memory instead");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

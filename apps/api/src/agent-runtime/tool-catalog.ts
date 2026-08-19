@@ -350,6 +350,14 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "goal.list",
+    description:
+      "List the user's real active goals with title/category/priority/why. Use for 'what are my goals?', 'show my active goals', 'what am I working on?', 'which goals are active?', 'why did I set the X goal?'. Read-only — never creates, updates, or deletes a goal, and never invents or guesses a goal's details.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
     name: "operator.today",
     description: "Summarize what's on for today: open/due actions, active goals, today's logged progress.",
     mutates: false,
