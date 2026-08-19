@@ -1,5 +1,16 @@
-import { isRiskControlGoal, normalizeManualActionTitleKey, type Goal } from "@operator-agent/core";
-import { createActionItemIfNotExists, replacePendingAction, type ActionItem, type CreateActionItemInput } from "@operator-agent/db";
+import { isRiskControlGoal, normalizeManualActionTitleKey, parseActionDueDate, type Goal } from "@operator-agent/core";
+import {
+  createActionItemIfNotExists,
+  getActionItems,
+  getActiveMemories,
+  getOrCreateNotificationSettings,
+  replacePendingAction,
+  rejectPendingAction,
+  confirmPendingAction,
+  type ActionItem,
+  type CreateActionItemInput,
+  type PendingAction
+} from "@operator-agent/db";
 import { createOpenAIClient } from "@operator-agent/llm";
 import type { NextWeekPlanContext, NextWeekPlanSuggestion, PlanWindowKind } from "../server-types.js";
 import { isRecord } from "../utils/records.js";
@@ -9,8 +20,13 @@ import {
   addDaysToLocalDateString,
   formatDateInTimezone,
   localDateStartUtc,
-  pendingDecisionExpiry
+  pendingDecisionExpiry,
+  startOfLocalWeek,
+  isDateInRange
 } from "../utils/datetime.js";
+import { isSnoozedDue } from "../utils/action-item.js";
+import { getUserTimezone } from "../utils/user-timezone.js";
+import { buildWeeklyReviewContext, getLatestWeeklyReview } from "./weekly-review-conversation.js";
 
 /**
  * Legacy next-week/current-week planning conversation cluster, extracted
@@ -21,17 +37,22 @@ import {
  * implementation for Telegram's /plan_next_week slash command) and the
  * legacy /messages/process conversation surfaces.
  *
- * buildNextWeekPlanContext, resolveNextWeekPlanReply, and
- * createPlanForConversation deliberately stay in server.ts rather than
- * moving here: buildNextWeekPlanContext calls buildWeeklyReviewContext,
- * server.ts's separate ~500-line weekly-review context builder, and moving
- * either that function or this module's dependency on it was out of scope
- * for a planning-only pass — doing so would have meant either dragging the
- * whole weekly-review domain along (unrelated scope creep) or creating a
- * circular import back into server.ts. Those three functions instead import
- * everything they need from this module one-directionally. See
+ * buildNextWeekPlanContext and resolveNextWeekPlanReply originally stayed in
+ * server.ts because buildNextWeekPlanContext calls buildWeeklyReviewContext,
+ * server.ts's separate ~500-line weekly-review context builder — moving
+ * either function was out of scope for this module's original (planning-only)
+ * extraction pass. The Weekly-Review Legacy Cluster Extraction pass later
+ * moved buildWeeklyReviewContext itself into
+ * apps/api/src/legacy/weekly-review-conversation.ts, resolving that blocker;
+ * the `/messages/process` Third Extraction Readiness Audit then moved both
+ * functions here as the prerequisite for extracting the legacy
+ * /messages/process handler cluster into
+ * apps/api/src/legacy/messages-process.ts, which needs both (the latter
+ * transitively, via createPlanForConversation, which lives in that module
+ * and imports buildNextWeekPlanContext from here). See
  * docs/09-architecture-inventory.md's "Planning Legacy Conversation Cluster
- * Extraction" for the full boundary rationale.
+ * Extraction" and "`/messages/process` Third Extraction Readiness Audit" for
+ * the full boundary rationale.
  */
 
 export async function generateNextWeekPlanSuggestions(context: NextWeekPlanContext): Promise<NextWeekPlanSuggestion[]> {
@@ -1027,4 +1048,196 @@ export function detectPlanningRequestKind(message: string): PlanningRequestKind 
 
 export function looksLikeNextWeekPlanRequest(message: string): boolean {
   return detectPlanningRequestKind(message) === "next_week";
+}
+
+export async function buildNextWeekPlanContext(
+  userId: string,
+  now: Date,
+  timezone: string,
+  planWindowKind: PlanWindowKind = "next_week"
+): Promise<NextWeekPlanContext> {
+  const currentLocalDate = formatDateInTimezone(now, timezone);
+  const currentWeekStart = startOfLocalWeek(currentLocalDate);
+  const currentWeekEnd = addDaysToLocalDateString(currentWeekStart, 6);
+  const nextWeekStart = addDaysToLocalDateString(currentWeekStart, 7);
+  const nextWeekEnd = addDaysToLocalDateString(nextWeekStart, 6);
+  const planStartLocalDate = planWindowKind === "current_week" ? currentLocalDate : nextWeekStart;
+  const planEndLocalDate = planWindowKind === "current_week" ? currentWeekEnd : nextWeekEnd;
+  const planRangeStart = localDateStartUtc(planStartLocalDate, timezone);
+  const planRangeEnd = localDateStartUtc(addDaysToLocalDateString(planEndLocalDate, 1), timezone);
+  const weeklyContext = await buildWeeklyReviewContext(userId, undefined, timezone, now);
+  const [latestWeeklyReview, allActions, activeMemories] = await Promise.all([
+    getLatestWeeklyReview(userId),
+    getActionItems(userId, { status: "all", limit: 300 }),
+    getActiveMemories(userId)
+  ]);
+  const openActions = allActions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
+  const futureActionsNextWeek = openActions.filter((action) =>
+    isDateInRange(action.dueAt, planRangeStart, planRangeEnd) ||
+    isDateInRange(action.snoozedUntil, planRangeStart, planRangeEnd)
+  );
+
+  return {
+    userId,
+    timezone,
+    now,
+    planWindowKind,
+    planStartLocalDate,
+    planEndLocalDate,
+    nextWeekStartLocalDate: planStartLocalDate,
+    nextWeekEndLocalDate: planEndLocalDate,
+    nextWeekRangeStart: planRangeStart,
+    nextWeekRangeEnd: planRangeEnd,
+    latestWeeklyReview,
+    activeGoals: weeklyContext.activeGoals,
+    goalsWithNoProgress: weeklyContext.goalsWithoutProgress,
+    openActions,
+    staleActions: weeklyContext.actionHygiene.suggestedCleanupCandidates,
+    activeReflections: weeklyContext.activeReflections,
+    recentEventsSummary: weeklyContext.eventsByType,
+    guardrailGoals: weeklyContext.activeGoals.filter(isRiskControlGoal),
+    guardrailEvents: weeklyContext.guardrailEvents,
+    emailAttention: weeklyContext.emailAttention,
+    futureActionsNextWeek,
+    reviewedWeek: {
+      weekStartLocalDate: weeklyContext.weekStartLocalDate,
+      weekEndLocalDate: weeklyContext.weekEndLocalDate,
+      reviewedEndLocalDate: weeklyContext.reviewedEndLocalDate
+    }
+  };
+}
+
+export async function resolveNextWeekPlanReply(userId: string, pendingAction: PendingAction, message: string): Promise<string | undefined> {
+  const parsed = parseNextWeekPlanReply(message);
+
+  if (!parsed) {
+    return undefined;
+  }
+
+  if (parsed.operation === "skip" || parsed.operation === "cancel") {
+    await rejectPendingAction(userId, pendingAction.id);
+    return "Skipped next-week plan. No actions created.";
+  }
+
+  const timezone = typeof pendingAction.payload.timezone === "string" ? pendingAction.payload.timezone : await getUserTimezone(userId);
+  const suggestions = readPendingNextWeekPlanSuggestions(pendingAction.payload.suggestions);
+
+  if (parsed.operation === "show") {
+    return formatPendingNextWeekPlan(timezone, pendingAction.payload, suggestions);
+  }
+
+  if (parsed.operation === "remove") {
+    const kept = suggestions.filter((suggestion) => suggestion.index !== parsed.index)
+      .map((suggestion, index) => ({ ...suggestion, index: index + 1 }));
+
+    await replacePendingAction(userId, {
+      type: "next_week_plan",
+      summary: pendingAction.summary,
+      payload: {
+        ...pendingAction.payload,
+        suggestions: kept.map(toPendingNextWeekPlanSuggestion)
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return formatPendingNextWeekPlan(timezone, pendingAction.payload, kept);
+  }
+
+  if (parsed.operation === "edit") {
+    const suggestion = suggestions.find((item) => item.index === parsed.index);
+
+    if (!suggestion) {
+      return `No suggestion ${parsed.index}. Reply show plan to see the current list.`;
+    }
+
+    if (suggestion.creatable === false || suggestion.planKind === "cleanup") {
+      return `Suggestion ${parsed.index} is cleanup for an existing action. I did not move it. Use /action_hygiene or say: move ${suggestion.existingActionTitle ?? suggestion.title} to ${parsed.timeText}.`;
+    }
+
+    if (suggestion.duplicateRisk || suggestion.existingActionId) {
+      return `Suggestion ${parsed.index} is already covered by an existing action. I did not move it. To move the existing action, say: move ${suggestion.existingActionTitle ?? suggestion.title} to ${parsed.timeText}.`;
+    }
+
+    const planStart = getPendingPlanStart(pendingAction.payload);
+    const planEnd = getPendingPlanEnd(pendingAction.payload);
+    const parsedTime = parseActionDueDate(parsed.timeText, {
+      now: localDateStartUtc(planStart, timezone),
+      timezone,
+      preferences: await getOrCreateNotificationSettings(userId)
+    });
+    const dueAt = parsedTime.dueAt;
+
+    if (!dueAt || !planStart || !planEnd || dueAt < localDateStartUtc(planStart, timezone) || dueAt >= localDateStartUtc(addDaysToLocalDateString(planEnd, 1), timezone)) {
+      return "That edit does not land inside the planning window. Try: edit 2 to Friday morning.";
+    }
+
+    const updated = suggestions.map((item) => item.index === parsed.index ? { ...item, suggestedDueAt: dueAt } : item);
+
+    await replacePendingAction(userId, {
+      type: "next_week_plan",
+      summary: pendingAction.summary,
+      payload: {
+        ...pendingAction.payload,
+        suggestions: updated.map(toPendingNextWeekPlanSuggestion)
+      },
+      expiresAt: pendingDecisionExpiry()
+    });
+
+    return `Updated suggestion ${parsed.index}: ${suggestion.title} -> ${formatPlanDue(dueAt, timezone)}.`;
+  }
+
+  if (parsed.operation === "create") {
+    const selected = parsed.all ? suggestions : suggestions.filter((suggestion) => parsed.indexes.includes(suggestion.index));
+
+    if (selected.length === 0) {
+      return "No matching suggestions. Reply show plan to see the current list.";
+    }
+
+    const created: string[] = [];
+    const covered: string[] = [];
+    const skipped: string[] = [];
+    const context = await buildNextWeekPlanContext(
+      userId,
+      new Date(),
+      timezone,
+      pendingAction.payload.planWindowKind === "current_week" ? "current_week" : "next_week"
+    );
+
+    for (const suggestion of selected) {
+      if (suggestion.creatable === false || suggestion.planKind === "cleanup") {
+        skipped.push(formatSkippedNextWeekPlanSuggestion(suggestion));
+        continue;
+      }
+
+      const duplicate = findEquivalentOpenPlanAction(context, suggestion.title, suggestion.suggestedDueAt, suggestion.dedupeKey);
+
+      if (duplicate || suggestion.duplicateRisk) {
+        covered.push(`${suggestion.title}${duplicate?.title ? ` (${duplicate.title})` : ""}`);
+        continue;
+      }
+
+      const actionInput = actionInputFromPlanSuggestion(suggestion, pendingAction.payload);
+      const result = await createActionItemIfNotExists(userId, actionInput);
+
+      if (result.created) {
+        created.push(result.actionItem.title);
+      } else {
+        covered.push(result.actionItem.title);
+      }
+    }
+
+    await confirmPendingAction(userId, pendingAction.id);
+
+    return [
+      skipped.length > 0 ? "Skipped:" : undefined,
+      ...skipped.map((line) => `- ${line}`),
+      created.length > 0 ? "Created actions:" : undefined,
+      ...created.map((title) => `- ${title}`),
+      covered.length > 0 ? "Already covered:" : undefined,
+      ...covered.map((title) => `- ${title}`),
+      created.length === 0 && covered.length === 0 ? "No actions created." : undefined
+    ].filter(Boolean).join("\n");
+  }
+
+  return undefined;
 }

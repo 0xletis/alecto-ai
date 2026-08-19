@@ -101,3 +101,31 @@ export function startOfLocalWeek(localDate: string): string {
 export function isDateInRange(date: Date | undefined, start: Date, end: Date): boolean {
   return Boolean(date && date >= start && date < end);
 }
+
+/**
+ * Generic "one day from now" helper extracted from apps/api/src/server.ts,
+ * where it was called both by the legacy /messages/process pending-memory
+ * cluster (apps/api/src/legacy/messages-process.ts) and the check-in-route
+ * low-sleep/impulse pending-memory helper that stays in server.ts.
+ */
+export function tomorrow(): Date {
+  const date = new Date();
+  date.setDate(date.getDate() + 1);
+  return date;
+}
+
+/**
+ * Generic optional-date-string parser extracted from apps/api/src/server.ts,
+ * where it was defined once privately and called ~26 times across nearly
+ * every route's `now` query/body param plus the legacy pending-decision
+ * resolver (apps/api/src/legacy/messages-process.ts) — the most widely
+ * shared "now" parser in the whole cleanup series.
+ */
+export function parseOptionalNow(value: string | undefined): Date | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
