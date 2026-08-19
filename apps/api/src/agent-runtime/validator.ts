@@ -123,7 +123,7 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     args.selections = resolution.selections;
   }
 
-  if (tool.name === "planning.next_week_edit") {
+  if (tool.name === "planning.next_week_edit" || tool.name === "planning.next_week_show_current") {
     const pendingApplyOp = context.session.pendingOperation?.operations[0];
     const openDraft = pendingApplyOp?.tool === "planning.next_week_apply";
 
@@ -137,7 +137,12 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
         rationale: operation.rationale
       };
     }
+  }
 
+  if (tool.name === "planning.next_week_edit") {
+    // openDraft was already confirmed above; re-read here so TypeScript can narrow it back
+    // from ContextBundle without an extra cast.
+    const pendingApplyOp = context.session.pendingOperation!.operations[0];
     const current = readPendingNextWeekPlanSuggestions(pendingApplyOp.args.selections);
     const resolution = resolveNextWeekEditArgs(args, current);
 
@@ -494,6 +499,34 @@ function resolveNextWeekEditArgs(args: Record<string, unknown>, current: NextWee
 
   if (unresolved.length > 0) {
     return { status: "needs_clarification", question: unresolved[0] };
+  }
+
+  // An explicit change to an item always wins over a remove of that SAME item, whatever
+  // combination produced the conflict (a raw removeIndexes/removeRefs entry, keep-inversion,
+  // or "lighter"). This is what real "move X to Y" turns need: live testing showed the
+  // planner does not reliably follow the "never also list it in removeIndexes/removeRefs"
+  // prompt instruction, and repeatedly sends a redundant remove for the exact item it's also
+  // changing — rejecting the whole edit in that case (the previous behavior) made a plain
+  // "move the jobs to Friday" permanently unusable on a single-item draft. You cannot
+  // meaningfully both remove and change the same item, and "the user just told me the new
+  // day for it" is the more specific, more recent signal of the two.
+  for (const change of changes) {
+    removeIndexes.delete(change.index);
+  }
+
+  // Guards against exactly the failure a real Telegram transcript surfaced: "move the jobs
+  // to Friday" on a single-item draft got misinterpreted (or arrived alongside a stale
+  // removeIndexes) such that removeIndexes covered the whole draft, silently emptying it
+  // instead of changing its day. An edit that would remove every current item is rejected
+  // unless the user explicitly asked to clear the whole plan (`removeAll: true`) — this is
+  // checked on the FULLY merged removeIndexes (numeric + refs + keep-inversion + lighter),
+  // not just the raw arg, so no path into this function can bypass it.
+  if (removeIndexes.size >= current.length && args.removeAll !== true) {
+    return {
+      status: "needs_clarification",
+      question:
+        "That would remove everything in the plan. If you want to clear it completely, say so explicitly — otherwise tell me which item(s) to keep, or just the one to change."
+    };
   }
 
   return { status: "resolved", removeIndexes: [...removeIndexes], changes };

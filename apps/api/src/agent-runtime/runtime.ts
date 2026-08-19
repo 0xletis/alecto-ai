@@ -3,7 +3,7 @@ import { loadContext } from "./context-loader.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
 import { planMessage } from "./planner.js";
-import { composeReply, summarizePendingOperations } from "./response-composer.js";
+import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
 import { checkPolicyGuardrail, revalidateForExecution, validateOperations } from "./validator.js";
@@ -16,7 +16,9 @@ import type {
   AgentSessionState,
   ContextBundle,
   ExecutedOperation,
-  PlannedOperation
+  PlannedOperation,
+  PlanningTraceEntry,
+  ValidatedOperation
 } from "./types.js";
 
 const META_TOOLS = new Set(["confirmation.confirm", "confirmation.cancel", "clarification.ask"]);
@@ -66,14 +68,146 @@ const UNSUPPORTED_GMAIL_ACTION_REPLY =
 const GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE =
   /\b(let me know|notify me|keep me posted|tell me)\b|\bi wanna know\b|\bi want to know\b|\bwhen (i receive|i get|it arrives|they arrive)\b|\babout (those|these|that) emails?\b/i;
 
+// --- Dev/test-only planning trace (never active in production unless explicitly opted in) ---
+
+// Read fresh on every call, not cached at module load — tests toggle this per-turn via
+// process.env, and a module-level constant would freeze whatever value was set at import time.
+function isPlanningTraceEnabled(): boolean {
+  return process.env.AGENT_RUNTIME_PLANNING_TRACE === "true";
+}
+
+function isPlanningTool(tool: string | undefined | null): boolean {
+  return Boolean(tool && tool.startsWith("planning."));
+}
+
+interface PlanningTraceInputs {
+  message: string;
+  plannedOp: PlannedOperation | undefined;
+  validatedOp: ValidatedOperation | undefined;
+  executedOp: ExecutedOperation | undefined;
+  pendingOperationBefore: AgentPendingOperation | null;
+  visibleEntitiesBefore: AgentEntity[];
+  composerSource: string;
+}
+
+/**
+ * Builds and logs a full-pipeline trace for one planning.* turn — gated behind
+ * AGENT_RUNTIME_PLANNING_TRACE=true (unset/false in every real deployment) and only produced
+ * for turns that actually touch a planning tool or a planning pendingOperation, so it never
+ * adds overhead or log volume to normal traffic. Logs only the acting user's own message/plan
+ * for their own turn — never cross-user data — but stays behind the explicit opt-in anyway,
+ * matching "do not leak sensitive data in production logs."
+ */
+function recordPlanningTrace(inputs: PlanningTraceInputs, session: AgentSessionState): PlanningTraceEntry | undefined {
+  const involvesPlanning =
+    isPlanningTool(inputs.plannedOp?.tool) ||
+    isPlanningTool(inputs.pendingOperationBefore?.operations[0]?.tool) ||
+    isPlanningTool(session.pendingOperation?.operations[0]?.tool);
+
+  if (!isPlanningTraceEnabled() || !involvesPlanning) {
+    return undefined;
+  }
+
+  const entry: PlanningTraceEntry = {
+    message: inputs.message,
+    plannedTool: inputs.plannedOp?.tool ?? null,
+    plannedArgs: inputs.plannedOp?.args ?? null,
+    validationStatus: inputs.validatedOp?.status ?? null,
+    validationError: inputs.validatedOp?.error ?? inputs.validatedOp?.clarificationQuestion ?? null,
+    resolvedArgs: inputs.validatedOp?.args ?? null,
+    executorStatus: inputs.executedOp?.status ?? null,
+    executorSummary: inputs.executedOp?.summary ?? null,
+    pendingOperationBefore: inputs.pendingOperationBefore,
+    pendingOperationAfter: session.pendingOperation,
+    visibleEntitiesBefore: inputs.visibleEntitiesBefore,
+    visibleEntitiesAfter: session.visibleEntities,
+    composerSource: inputs.composerSource
+  };
+
+  console.log(`[planning-trace] user=${session.userId}`, JSON.stringify(entry));
+  return entry;
+}
+
+/** Classifies which composeReply branch produced a reply, for tracing only — mirrors composeReply's own priority order without duplicating its logic. */
+function inferComposerSource(input: {
+  clarificationQuestion?: string;
+  pendingConfirmationOps: ValidatedOperation[];
+  executedOps: ExecutedOperation[];
+  problemOps: ValidatedOperation[];
+  replyDraft: string;
+}): string {
+  if (input.clarificationQuestion) return "clarification_question";
+  if (input.pendingConfirmationOps.length > 0) return "pending_confirmation";
+  if (input.problemOps.length > 0 || input.executedOps.some((op) => op.status === "failed")) return "problem_correction";
+  if (input.executedOps.some((op) => (op.status === "executed" || op.status === "skipped") && isGroundTruthOnlyTool(op.tool))) {
+    return "ground_truth_only";
+  }
+  if (input.executedOps.some((op) => (op.status === "executed" || op.status === "skipped") && getToolDefinition(op.tool)?.mutates === false)) {
+    return "informational_summary";
+  }
+  if (input.replyDraft) return "reply_draft";
+  if (input.executedOps.some((op) => (op.status === "executed" || op.status === "skipped") && getToolDefinition(op.tool)?.mutates === true)) {
+    return "mutation_summary";
+  }
+  return "fallback_no_action";
+}
+
 export async function handleAgentMessage(request: AgentMessageRequest): Promise<AgentMessageResponse> {
   return runExclusive(request.userId, () => processAgentMessage(request));
 }
 
+const GENERIC_ERROR_REPLY = "I hit an unexpected problem there — please try again.";
+
+/**
+ * Last-resort safety net: ANY uncaught error anywhere in a turn (a DB hiccup, a malformed
+ * timezone, an unexpected shape from a dependency) must still produce a normal response with
+ * an honest reply, never crash the request and surface the Telegram layer's generic dev-safe
+ * "Agent v3 hit an error" text for what could be a perfectly ordinary turn — e.g. a
+ * transient failure on a brand-new user's very first message. Per-operation failures are
+ * already caught inside executeOperation and reported as a grounded "failed" result; this
+ * only catches what's truly unexpected, so it never masks or replaces that existing,
+ * more specific error reporting. Nothing about the turn is persisted when this fires (no
+ * saveSession call happened), so a crash here can never leave a half-written session.
+ */
 async function processAgentMessage(request: AgentMessageRequest): Promise<AgentMessageResponse> {
+  try {
+    if (process.env.AGENT_RUNTIME_FORCE_ERROR === "true") {
+      throw new Error("AGENT_RUNTIME_FORCE_ERROR: forced failure for testing the top-level safety net.");
+    }
+    return await processAgentMessageInner(request);
+  } catch (error) {
+    console.error(`[agent-runtime] unexpected error handling user=${request.userId}`, error);
+    return {
+      reply: GENERIC_ERROR_REPLY,
+      operationsPlanned: [],
+      operationsExecuted: [],
+      needsConfirmation: false,
+      debug: {
+        runtime: "agent_v3",
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        llmPlannerUsed: false,
+        toolValidationPassed: false,
+        mutationExecuted: false,
+        conversationTopic: null,
+        pendingOperation: false,
+        legacyPendingActionDetected: false
+      }
+    };
+  }
+}
+
+async function processAgentMessageInner(request: AgentMessageRequest): Promise<AgentMessageResponse> {
   const { userId, message, channel } = request;
   const context = await loadContext(userId, channel);
   appendMessage(context.session, "user", message);
+
+  // Captured before anything in this turn can mutate them — setPendingOperation/
+  // setVisibleEntities always reassign context.session.X to a new value rather than mutating
+  // the existing object in place, so these references safely keep representing "before" for
+  // the rest of the turn, including inside recordPlanningTrace's "after" comparison later.
+  const pendingOperationBefore = context.session.pendingOperation;
+  const visibleEntitiesBefore = context.session.visibleEntities;
 
   const guardrail = checkPolicyGuardrail(message, context.operatingProfile);
   if (guardrail.triggered) {
@@ -98,7 +232,7 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
   // observed to invent an unrelated action (e.g. listing Gmail rules) for a lone "yes".
   if (CONFIRM_WHITELIST.has(normalized)) {
     if (pending) {
-      return finalizeDeterministicConfirmation(context);
+      return finalizeDeterministicConfirmation(context, message);
     }
     return context.legacyPendingAction
       ? finalizeLegacyPendingActionConfirm(context)
@@ -106,7 +240,7 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
   }
   if (CANCEL_WHITELIST.has(normalized)) {
     if (pending) {
-      return finalizeDeterministicCancellation(context);
+      return finalizeDeterministicCancellation(context, message);
     }
     if (context.legacyPendingAction) {
       return finalizeLegacyPendingActionCancel(context, context.legacyPendingAction);
@@ -225,6 +359,20 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
     problemOps
   });
 
+  const plannedPlanningOp = plan.operations.find((op) => isPlanningTool(op.tool));
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: plannedPlanningOp,
+      validatedOp: validatedOps.find((op) => isPlanningTool(op.tool)),
+      executedOp: executedOps.find((op) => isPlanningTool(op.tool)),
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: inferComposerSource({ clarificationQuestion, pendingConfirmationOps, executedOps, problemOps, replyDraft: plan.replyDraft })
+    },
+    context.session
+  );
+
   return finalize(context, {
     reply,
     operationsPlanned: plan.operations,
@@ -232,7 +380,8 @@ async function processAgentMessage(request: AgentMessageRequest): Promise<AgentM
     plannerUsed,
     llmPlannerAttempted: true,
     toolValidationPassed,
-    topic
+    topic,
+    planningTrace
   });
 }
 
@@ -252,9 +401,11 @@ async function finalizeNoPendingReply(context: ContextBundle, tool: string): Pro
   });
 }
 
-async function finalizeDeterministicConfirmation(context: ContextBundle): Promise<AgentMessageResponse> {
+async function finalizeDeterministicConfirmation(context: ContextBundle, message: string): Promise<AgentMessageResponse> {
   const { userId } = context.session;
   const pending = context.session.pendingOperation as AgentPendingOperation;
+  const pendingOperationBefore = pending;
+  const visibleEntitiesBefore = context.session.visibleEntities;
 
   const revalidated = pending.operations.map((op) => revalidateForExecution(op));
   const readyOps = revalidated.filter((op) => op.status === "valid");
@@ -271,6 +422,19 @@ async function finalizeDeterministicConfirmation(context: ContextBundle): Promis
     problemOps: brokenOps
   });
 
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: undefined,
+      validatedOp: readyOps[0] ?? brokenOps[0],
+      executedOp: executedOps.find((op) => isPlanningTool(op.tool)),
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: inferComposerSource({ pendingConfirmationOps: [], executedOps, problemOps: brokenOps, replyDraft: "" })
+    },
+    context.session
+  );
+
   return finalize(context, {
     reply,
     operationsPlanned: pending.operations.map((op) => ({ tool: op.tool, args: op.args })),
@@ -278,25 +442,43 @@ async function finalizeDeterministicConfirmation(context: ContextBundle): Promis
     plannerUsed: "none",
     llmPlannerAttempted: false,
     toolValidationPassed: brokenOps.length === 0,
-    topic: pending.topic
+    topic: pending.topic,
+    planningTrace
   });
 }
 
-async function finalizeDeterministicCancellation(context: ContextBundle): Promise<AgentMessageResponse> {
+async function finalizeDeterministicCancellation(context: ContextBundle, message: string): Promise<AgentMessageResponse> {
   const pending = context.session.pendingOperation as AgentPendingOperation;
+  const pendingOperationBefore = pending;
+  const visibleEntitiesBefore = context.session.visibleEntities;
   setPendingOperation(context.session, null);
   setVisibleEntities(context.session, []);
 
   const reply = "Cancelled — I won't do that.";
+  const executedOps: ExecutedOperation[] = [{ tool: "confirmation.cancel", status: "executed", summary: reply }];
+
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: undefined,
+      validatedOp: undefined,
+      executedOp: undefined,
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: "cancellation"
+    },
+    context.session
+  );
 
   return finalize(context, {
     reply,
     operationsPlanned: [],
-    executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: reply }],
+    executedOps,
     plannerUsed: "none",
     llmPlannerAttempted: false,
     toolValidationPassed: true,
-    topic: pending.topic
+    topic: pending.topic,
+    planningTrace
   });
 }
 
@@ -366,6 +548,7 @@ interface FinalizeInput {
   llmPlannerAttempted: boolean;
   toolValidationPassed: boolean;
   topic: string | null;
+  planningTrace?: PlanningTraceEntry;
 }
 
 async function finalize(context: ContextBundle, input: FinalizeInput): Promise<AgentMessageResponse> {
@@ -390,7 +573,8 @@ async function finalize(context: ContextBundle, input: FinalizeInput): Promise<A
       mutationExecuted: input.executedOps.some((op) => op.status === "executed" && getToolDefinition(op.tool)?.mutates),
       conversationTopic: input.topic,
       pendingOperation: needsConfirmation,
-      legacyPendingActionDetected: Boolean(context.legacyPendingAction)
+      legacyPendingActionDetected: Boolean(context.legacyPendingAction),
+      ...(input.planningTrace ? { planningTrace: input.planningTrace } : {})
     }
   };
 }

@@ -216,6 +216,32 @@ export async function executeOperation(
         };
       }
 
+      case "planning.next_week_show_current": {
+        // Deliberately re-renders the stored draft as-is — no regeneration, no
+        // pendingOperationUpdate, no entities change. Session state (pendingOperation,
+        // visibleEntities) is untouched by design: this tool only ever reads.
+        const pending = context.session.pendingOperation as AgentPendingOperation;
+        const pendingArgs = pending.operations[0].args;
+        const timezone = await getUserTimezone(userId);
+        const current = readPendingNextWeekPlanSuggestions(pendingArgs.selections);
+        const windowKind = (pendingArgs.planWindowKind as PlanWindowKind | undefined) ?? "next_week";
+
+        if (current.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "The plan is now empty. Say cancel, or plan next week again to start over."
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatPlanDraftSummary(windowKind, current, timezone),
+          result: current
+        };
+      }
+
       case "planning.next_week_edit": {
         // The validator has already resolved every index/ref/day and guaranteed each
         // removeIndexes/changes[].index exists in the current draft — this executor only

@@ -54,6 +54,30 @@ export interface AgentDebugInfo {
    * defers to /confirm, or safely cancels it via /cancel's own DB function.
    */
   legacyPendingActionDetected: boolean;
+  /**
+   * Dev/test-only diagnostic snapshot of a planning.* turn's full pipeline, populated only
+   * when AGENT_RUNTIME_PLANNING_TRACE=true (never set in production) and only for turns that
+   * actually touch a planning tool or a planning pendingOperation. Contains the user's own
+   * message/plan args for their own turn, nothing cross-user — still gated behind the env
+   * var so it never appears in a normal response. See runtime.ts's recordPlanningTrace.
+   */
+  planningTrace?: PlanningTraceEntry;
+}
+
+export interface PlanningTraceEntry {
+  message: string;
+  plannedTool: string | null;
+  plannedArgs: Record<string, unknown> | null;
+  validationStatus: ValidatedOperationStatus | null;
+  validationError: string | null;
+  resolvedArgs: Record<string, unknown> | null;
+  executorStatus: ExecutedOperation["status"] | null;
+  executorSummary: string | null;
+  pendingOperationBefore: AgentPendingOperation | null;
+  pendingOperationAfter: AgentPendingOperation | null;
+  visibleEntitiesBefore: AgentEntity[];
+  visibleEntitiesAfter: AgentEntity[];
+  composerSource: string;
 }
 
 /** One operation as proposed by the planner, before validation. */

@@ -159,8 +159,20 @@ export const toolCatalog: ToolDefinition[] = [
       lighter: z
         .boolean()
         .optional()
-        .describe("Set true only when the user asked to make the plan lighter/shorter/less (e.g. 'make it lighter'). Code deterministically decides which lower-priority items to drop — do not also set removeIndexes/removeRefs for this request.")
+        .describe("Set true only when the user asked to make the plan lighter/shorter/less (e.g. 'make it lighter'). Code deterministically decides which lower-priority items to drop — do not also set removeIndexes/removeRefs for this request."),
+      removeAll: z
+        .boolean()
+        .optional()
+        .describe("Set true ONLY when the user explicitly asked to clear/empty the whole plan (e.g. 'remove everything', 'clear the plan'). Required to let an edit result in zero items — otherwise an edit that would empty the plan is safely rejected instead of silently applied, to guard against an accidental full removal.")
     })
+  },
+  {
+    name: "planning.next_week_show_current",
+    description:
+      "Show the currently open next-week plan draft again, unchanged — no regeneration, no edits. Use when the user asks to see/view/show the current draft (e.g. 'show me the plan', 'let me see the week plan', \"what's the plan\", 'show current draft') while a draft is open. Never use planning.next_week_start for this — that builds a brand-new draft from scratch and would discard any edits already made. Only works while a plan draft is open.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
   },
   {
     name: "planning.next_week_apply",

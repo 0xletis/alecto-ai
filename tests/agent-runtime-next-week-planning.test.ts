@@ -40,6 +40,8 @@ function mockPlan(plan: MockPlan): void {
 function clearMocks(): void {
   delete process.env.AGENT_RUNTIME_PLANNER_MOCK_RESPONSE;
   delete process.env.AGENT_RUNTIME_PLANNER_MOCK_THROW;
+  delete process.env.AGENT_RUNTIME_FORCE_ERROR;
+  delete process.env.AGENT_RUNTIME_PLANNING_TRACE;
 }
 
 async function send(server: ReturnType<typeof buildServer>, userId: string, message: string) {
@@ -67,11 +69,22 @@ function nextWeekStartPlan(): void {
   });
 }
 
-function nextWeekEditPlan(args: Record<string, unknown>): void {
+function nextWeekEditPlan(args: Record<string, unknown>, replyDraft = ""): void {
   mockPlan({
     topic: "next_week_planning",
     intent: "edit_next_week_plan",
     operations: [op("planning.next_week_edit", args)],
+    needsClarification: false,
+    clarificationQuestion: null,
+    replyDraft
+  });
+}
+
+function nextWeekShowCurrentPlan(): void {
+  mockPlan({
+    topic: "next_week_planning",
+    intent: "show_current_next_week_plan",
+    operations: [op("planning.next_week_show_current")],
     needsClarification: false,
     clarificationQuestion: null,
     replyDraft: ""
@@ -126,6 +139,25 @@ async function seedThreeSamePriorityGoals(userId: string): Promise<void> {
   }
 }
 
+/**
+ * Job + reading + car goals — deliberately mirrors the real Telegram transcript that
+ * surfaced this hardening pass's bugs (a draft narrowed down to "Apply to 3 developer jobs"
+ * and "Check cheap car listings twice" before the reported "move the jobs to Friday" bug).
+ * Three same-priority real suggestions avoids generateDeterministicNextWeekPlanSuggestions'
+ * "fewer than 3 -> pad with 3 fixed items" fallback.
+ */
+async function seedJobReadingCarGoals(userId: string): Promise<void> {
+  const goals = [
+    { title: "Apply to developer jobs", category: "career" },
+    { title: "Read more books this year", category: "learning" },
+    { title: "Buy a cheap car", category: "lifestyle" }
+  ];
+
+  for (const goal of goals) {
+    await createGoal(userId, { title: goal.title, category: goal.category, priority: "medium" });
+  }
+}
+
 function draftSelections(row: { pendingOperation: unknown } | null): Array<{ index: number; title: string; suggestedDueAt: string }> {
   const pendingOperation = row?.pendingOperation as
     | { operations: Array<{ args: { selections?: Array<{ index: number; title: string; suggestedDueAt: string }> } }> }
@@ -133,8 +165,28 @@ function draftSelections(row: { pendingOperation: unknown } | null): Array<{ ind
   return pendingOperation?.operations[0]?.args.selections ?? [];
 }
 
+function draftVisibleEntities(row: { visibleEntities: unknown } | null): Array<{ index?: number; label: string; type: string }> {
+  return (row?.visibleEntities as Array<{ index?: number; label: string; type: string }> | null) ?? [];
+}
+
 async function getSession(userId: string) {
   return prisma.agentConversationSession.findUnique({ where: { userId_channel: { userId, channel: "telegram" } } });
+}
+
+/** Invariant: pendingOperation's draft selections and visibleEntities must represent the exact same draft — same count, same index<->title pairing, in order. */
+function assertDraftInSync(
+  row: { pendingOperation: unknown; visibleEntities: unknown } | null,
+  messageForContext: string
+): void {
+  const selections = draftSelections(row);
+  const entities = draftVisibleEntities(row);
+  assert.equal(entities.length, selections.length, `${messageForContext}: visibleEntities count must match pendingOperation selections count`);
+  for (const selection of selections) {
+    const entity = entities.find((e) => e.index === selection.index);
+    assert.ok(entity, `${messageForContext}: visibleEntities must have an entry for index ${selection.index}`);
+    assert.equal(entity?.label, selection.title, `${messageForContext}: visibleEntities label must match the draft item's title at index ${selection.index}`);
+    assert.equal(entity?.type, "plan_suggestion");
+  }
 }
 
 test("agent/message: 'plan next week' returns a proposed draft plan", async () => {
@@ -763,6 +815,424 @@ test("agent/message: 'make it lighter' asks for clarification instead of guessin
 
     const after = await getSession(userId);
     assert.deepEqual(after?.pendingOperation, before?.pendingOperation, "an unclear 'lighter' request must not remove anything");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// --- Hardening pass: state-machine correctness bugs found in a real Telegram transcript
+// (first "plan next week" threw a generic error; after removing an item and moving the
+// remaining one, the draft went empty and the bot then claimed a false success; a "show me
+// the plan" follow-up regenerated a brand-new draft instead of showing the current one).
+
+test("regression A: the very first 'plan next week' from a brand-new user (no pre-existing User row) does not throw", async () => {
+  const server = buildServer();
+  const userId = `plan-first-turn-${randomUUID()}`;
+
+  try {
+    // Deliberately no seedUser() call — this is the exact shape of a real user's first-ever
+    // message: ensureUser(userId) has to create the User row itself, concurrently with other
+    // user-scoped queries in loadContext that may depend on it already existing.
+    nextWeekStartPlan();
+    const reply = await send(server, userId, "plan next week");
+
+    assert.match(reply.reply, /draft plan for next week:/i);
+    assert.notEqual(reply.reply, "I hit an unexpected problem there — please try again.");
+    assert.equal(reply.debug.pendingOperation, true);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression: the top-level safety net replies gracefully instead of crashing on an unexpected error, and a normal retry still works", async () => {
+  const server = buildServer();
+  const userId = `plan-safety-net-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    process.env.AGENT_RUNTIME_FORCE_ERROR = "true";
+    nextWeekStartPlan();
+    const firstReply = await send(server, userId, "plan next week");
+    assert.equal(firstReply.reply, "I hit an unexpected problem there — please try again.");
+    assert.equal(firstReply.debug.mutationExecuted, false);
+
+    delete process.env.AGENT_RUNTIME_FORCE_ERROR;
+    nextWeekStartPlan();
+    const secondReply = await send(server, userId, "plan next week");
+    assert.match(secondReply.reply, /draft plan for next week:/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression B: remove reading, remove the car listings one, then move the jobs to Friday — one item survives, it is Friday, the plan is not empty", async () => {
+  const server = buildServer();
+  const userId = `plan-move-jobs-friday-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    assertDraftInSync(await getSession(userId), "after plan next week");
+
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    let selections = draftSelections(await getSession(userId));
+    assert.equal(selections.length, 2);
+    assertDraftInSync(await getSession(userId), "after remove reading");
+
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    const afterCarRemoval = await send(server, userId, "remove the car listings one");
+    assert.equal(afterCarRemoval.debug.mutationExecuted, false);
+    selections = draftSelections(await getSession(userId));
+    assert.equal(selections.length, 1, "exactly one item (the job application) must remain");
+    assert.match(selections[0].title, /developer jobs/i);
+    assertDraftInSync(await getSession(userId), "after remove the car listings one");
+
+    nextWeekEditPlan({ changes: [{ ref: "the jobs", dueText: "Friday" }] });
+    const afterMove = await send(server, userId, "move the jobs to friday");
+
+    assert.equal(afterMove.debug.mutationExecuted, false);
+    selections = draftSelections(await getSession(userId));
+    assert.equal(selections.length, 1, "the plan must NOT become empty");
+    assert.match(selections[0].title, /developer jobs/i, "the item must not have been removed");
+    const weekday = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(new Date(selections[0].suggestedDueAt));
+    assert.equal(weekday, "Friday");
+    assertDraftInSync(await getSession(userId), "after move the jobs to friday");
+
+    assert.doesNotMatch(afterMove.reply, /the plan is now empty/i);
+    assert.match(afterMove.reply, /friday/i);
+    assert.match(afterMove.reply, /developer jobs/i);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression C: 'show me the week plan' shows the current pending draft, it does not regenerate the original draft", async () => {
+  const server = buildServer();
+  const userId = `plan-show-current-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    await send(server, userId, "remove the car listings one");
+
+    nextWeekEditPlan({ changes: [{ ref: "the jobs", dueText: "Friday" }] });
+    await send(server, userId, "move the jobs to friday");
+
+    const beforeShow = await getSession(userId);
+
+    nextWeekShowCurrentPlan();
+    const showReply = await send(server, userId, "show me the week plan");
+
+    assert.equal(showReply.debug.mutationExecuted, false);
+    assert.match(showReply.reply, /friday/i);
+    assert.match(showReply.reply, /developer jobs/i);
+    // Must NOT have regenerated the original draft: no car listings, no Monday-dated line,
+    // and only ever the one surviving item.
+    assert.doesNotMatch(showReply.reply, /car listings/i);
+    const draftLines = showReply.reply.split("\n").filter((line: string) => /^\d+\./.test(line));
+    assert.equal(draftLines.length, 1);
+
+    const afterShow = await getSession(userId);
+    assert.deepEqual(afterShow?.pendingOperation, beforeShow?.pendingOperation, "'show current plan' must not change the pending draft");
+    assert.deepEqual(afterShow?.visibleEntities, beforeShow?.visibleEntities, "'show current plan' must not change visible entities");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression D: an edit that would empty the plan is rejected unless the user explicitly asked to remove everything", async () => {
+  const server = buildServer();
+  const userId = `plan-reject-empty-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    await send(server, userId, "remove the car listings one");
+
+    const before = await getSession(userId);
+    assert.equal(draftSelections(before).length, 1);
+
+    // Without removeAll, removing the only remaining item must be rejected, not applied.
+    nextWeekEditPlan({ removeRefs: ["the jobs"] });
+    const reply = await send(server, userId, "remove the jobs");
+
+    assert.match(reply.reply, /remove everything/i);
+    assert.equal(reply.debug.mutationExecuted, false);
+
+    const after = await getSession(userId);
+    assert.deepEqual(after?.pendingOperation, before?.pendingOperation, "a rejected empty-the-plan edit must not mutate the draft");
+    assert.equal(draftSelections(after).length, 1, "the item must still be there");
+
+    // Explicit removeAll is the one way to actually empty it.
+    nextWeekEditPlan({ removeRefs: ["the jobs"], removeAll: true });
+    const removeAllReply = await send(server, userId, "remove everything, clear the plan");
+    assert.match(removeAllReply.reply, /plan is now empty/i);
+    assert.equal(draftSelections(await getSession(userId)).length, 0);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression D2: a redundant remove alongside a change to the SAME item does not block the move — the change wins, item survives", async () => {
+  const server = buildServer();
+  const userId = `plan-contradictory-edit-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    await send(server, userId, "remove the car listings one");
+
+    const before = await getSession(userId);
+    assert.equal(draftSelections(before).length, 1);
+
+    // Live testing showed the real planner does not reliably follow the "never also list it
+    // in removeIndexes/removeRefs" prompt instruction, and repeatedly sends a redundant
+    // remove alongside the change for the exact item being moved. Rejecting the whole edit
+    // in that case (an earlier version of this guard) made "move the jobs to Friday"
+    // permanently unusable on a single-item draft — the fix is for the explicit change to
+    // win over the redundant remove, not to block the edit entirely.
+    nextWeekEditPlan({ removeRefs: ["the jobs"], changes: [{ ref: "the jobs", dueText: "Friday" }] });
+    const reply = await send(server, userId, "move the jobs to friday");
+
+    assert.doesNotMatch(reply.reply, /remove everything/i);
+    assert.doesNotMatch(reply.reply, /plan is now empty/i);
+    assert.match(reply.reply, /friday/i);
+    assert.equal(reply.debug.mutationExecuted, false);
+
+    const after = await getSession(userId);
+    const selections = draftSelections(after);
+    assert.equal(selections.length, 1, "the item must survive a redundant remove+change on itself");
+    assert.match(selections[0].title, /developer jobs/i);
+    const weekday = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(new Date(selections[0].suggestedDueAt));
+    assert.equal(weekday, "Friday", "the change must actually apply, not just survive");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression D3: the same redundant-remove-vs-change conflict, expressed with numeric index instead of a ref, also resolves as a move", async () => {
+  const server = buildServer();
+  const userId = `plan-contradictory-edit-numeric-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    await send(server, userId, "remove the car listings one");
+
+    assert.equal(draftSelections(await getSession(userId)).length, 1);
+
+    // Same conflict as regression D2, but using removeIndexes/changes[].index (numeric) —
+    // the shape a confident planner might use once only one item is visible — instead of refs.
+    nextWeekEditPlan({ removeIndexes: [1], changes: [{ index: 1, dueText: "Friday" }] });
+    const reply = await send(server, userId, "move it to friday");
+
+    assert.doesNotMatch(reply.reply, /remove everything/i);
+    assert.doesNotMatch(reply.reply, /plan is now empty/i);
+    assert.match(reply.reply, /friday/i);
+
+    const selections = draftSelections(await getSession(userId));
+    assert.equal(selections.length, 1);
+    const weekday = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(new Date(selections[0].suggestedDueAt));
+    assert.equal(weekday, "Friday");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression E: the response composer never claims a change happened unless the executor result confirms it", async () => {
+  const server = buildServer();
+  const userId = `plan-no-false-claims-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    await send(server, userId, "remove the car listings one");
+
+    // The planner's own replyDraft falsely claims success for an edit that will actually be
+    // rejected (remove-all guard, no removeAll set) — the real Telegram transcript showed
+    // exactly this: "I've moved the job application to Friday" alongside a rejection.
+    nextWeekEditPlan({ removeRefs: ["the jobs"] }, "I've moved the job application to Friday. Your plan will now reflect that change.");
+    const reply = await send(server, userId, "remove the jobs");
+
+    assert.doesNotMatch(reply.reply, /i've moved/i);
+    assert.doesNotMatch(reply.reply, /reflect that change/i);
+    assert.match(reply.reply, /remove everything/i);
+    assert.equal(reply.debug.mutationExecuted, false);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression F: pendingOperation and visibleEntities stay in sync after every successful edit", async () => {
+  const server = buildServer();
+  const userId = `plan-invariant-sync-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    assertDraftInSync(await getSession(userId), "after start");
+
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    assertDraftInSync(await getSession(userId), "after remove reading");
+
+    nextWeekEditPlan({ changes: [{ ref: "the jobs", dueText: "Wednesday" }] });
+    await send(server, userId, "move the jobs to wednesday");
+    assertDraftInSync(await getSession(userId), "after move to wednesday");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression G: a failed edit leaves pendingOperation and visibleEntities byte-for-byte unchanged", async () => {
+  const server = buildServer();
+  const userId = `plan-invariant-failed-edit-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    const before = await getSession(userId);
+
+    // Unresolvable ref: nothing in the fixed 3-item fallback draft matches "xyz".
+    nextWeekEditPlan({ removeRefs: ["xyz nonexistent topic"] });
+    const reply = await send(server, userId, "remove the xyz thing");
+
+    assert.equal(reply.debug.mutationExecuted, false);
+    const after = await getSession(userId);
+    assert.deepEqual(after?.pendingOperation, before?.pendingOperation);
+    assert.deepEqual(after?.visibleEntities, before?.visibleEntities);
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression: planning.next_week_apply only creates the current pending draft's items after a chain of edits", async () => {
+  const server = buildServer();
+  const userId = `plan-apply-current-draft-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedJobReadingCarGoals(userId);
+
+    nextWeekStartPlan();
+    await send(server, userId, "plan next week");
+    nextWeekEditPlan({ removeRefs: ["reading"] });
+    await send(server, userId, "remove reading");
+    nextWeekEditPlan({ removeRefs: ["the car listings one"] });
+    await send(server, userId, "remove the car listings one");
+    nextWeekEditPlan({ changes: [{ ref: "the jobs", dueText: "Friday" }] });
+    await send(server, userId, "move the jobs to friday");
+
+    const applyReply = await send(server, userId, "yes");
+    assert.match(applyReply.reply, /done\. i created/i);
+    assert.equal(applyReply.debug.pendingOperation, false);
+
+    const created = await prisma.actionItem.findMany({ where: { userId, sourceProvider: "weekly_plan" } });
+    assert.equal(created.length, 1, "only the one surviving draft item must be created");
+    assert.match(created[0].title, /developer jobs/i);
+    const weekday = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(created[0].dueAt!);
+    assert.equal(weekday, "Friday");
+  } finally {
+    clearMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("regression: dev/test-only planning trace is populated end-to-end when AGENT_RUNTIME_PLANNING_TRACE=true, and absent otherwise", async () => {
+  const server = buildServer();
+  const userId = `plan-trace-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+
+    // Not enabled: no trace field at all.
+    nextWeekStartPlan();
+    const untracedReply = await send(server, userId, "plan next week");
+    assert.equal(untracedReply.debug.planningTrace, undefined);
+
+    process.env.AGENT_RUNTIME_PLANNING_TRACE = "true";
+    nextWeekEditPlan({ removeIndexes: [1] });
+    const tracedReply = await send(server, userId, "remove 1");
+
+    const trace = tracedReply.debug.planningTrace;
+    assert.ok(trace, "planningTrace must be present when tracing is enabled for a planning turn");
+    assert.equal(trace.message, "remove 1");
+    assert.equal(trace.plannedTool, "planning.next_week_edit");
+    assert.deepEqual(trace.plannedArgs, { removeIndexes: [1] });
+    assert.equal(trace.validationStatus, "valid");
+    assert.ok(trace.resolvedArgs?.removeIndexes);
+    assert.equal(trace.executorStatus, "executed");
+    assert.ok(trace.executorSummary);
+    assert.ok(trace.pendingOperationBefore, "must capture the draft as it was before this edit");
+    assert.ok(trace.pendingOperationAfter, "must capture the draft as it is after this edit");
+    assert.notDeepEqual(trace.pendingOperationBefore, trace.pendingOperationAfter, "before/after must differ for a successful edit");
+    assert.ok(Array.isArray(trace.visibleEntitiesBefore));
+    assert.ok(Array.isArray(trace.visibleEntitiesAfter));
+    assert.equal(typeof trace.composerSource, "string");
   } finally {
     clearMocks();
     await server.close();

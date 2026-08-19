@@ -14,8 +14,15 @@ import type { ContextBundle } from "./types.js";
 import { loadSession } from "./conversation-session.js";
 
 export async function loadContext(userId: string, channel: string): Promise<ContextBundle> {
+  // Deliberately awaited BEFORE the Promise.all below, not inside it: several of those
+  // queries (e.g. getOrCreateUserOperatingProfile) can INSERT a row with a foreign key to
+  // User.id. Running them concurrently with ensureUser's own upsert races against it — on a
+  // brand-new user's very first message, the FK insert can land before ensureUser's create
+  // has committed, throwing a foreign-key-violation that crashes the whole turn. Awaiting
+  // ensureUser first guarantees the User row exists before anything that depends on it runs.
+  const user = await ensureUser(userId);
+
   const [
-    user,
     activeGoals,
     openActions,
     recentEvents,
@@ -27,7 +34,6 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
     session,
     legacyPendingAction
   ] = await Promise.all([
-    ensureUser(userId),
     getActiveGoals(userId),
     getActionItems(userId, { status: "open", limit: 20 }),
     getRecentEvents(userId, 15),

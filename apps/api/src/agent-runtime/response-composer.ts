@@ -16,8 +16,13 @@ export interface ComposeReplyInput {
  * AND the executed tool isn't itself the direct answer to the question.
  */
 export function composeReply(input: ComposeReplyInput): string {
+  // Never blended with replyDraft: a clarification means the turn's own attempted
+  // operation was rejected (or nothing was attempted at all), so replyDraft — written by
+  // the planner BEFORE validation/execution ran — may itself be a premature, false success
+  // claim (e.g. "I've moved it to Friday" for a move that the validator actually rejected).
+  // The clarification question is the only thing here grounded in what actually happened.
   if (input.clarificationQuestion) {
-    return input.replyDraft ? `${input.replyDraft} ${input.clarificationQuestion}`.trim() : input.clarificationQuestion;
+    return input.clarificationQuestion;
   }
 
   if (input.pendingConfirmationOps.length > 0) {
@@ -78,6 +83,11 @@ export function composeReply(input: ComposeReplyInput): string {
 }
 
 const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create", "action.hygiene_apply", "planning.next_week_apply"]);
+
+/** Exposed only for runtime.ts's dev/test-only planning trace, to classify which composeReply branch produced a reply without duplicating its branch logic. */
+export function isGroundTruthOnlyTool(tool: string): boolean {
+  return GROUND_TRUTH_ONLY_TOOLS.has(tool);
+}
 
 /** "I couldn't <do the thing> because <reason>. Nothing was changed." — always names the failure, never implies success. */
 function correctionLine(tool: string, detail: string): string {
