@@ -1,3 +1,5 @@
+import { getLocalTodayRange } from "@operator-agent/core";
+
 /**
  * Generic, dependency-free local-datetime formatter extracted from
  * apps/api/src/server.ts, where it was defined once privately and called
@@ -64,4 +66,20 @@ export function daysBetweenLocalDates(fromDate: string, toDate: string): number 
 
 export function daysBetween(from: Date, to: Date): number {
   return Math.max(0, Math.floor((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)));
+}
+
+/**
+ * Generic local-date-string arithmetic helpers extracted from
+ * apps/api/src/server.ts, where they were used across daily brief, weekly
+ * review, and next-week planning — not specific to planning, which is why
+ * they live here rather than in
+ * apps/api/src/legacy/planning-conversation.ts (which also needs them).
+ */
+export function addDaysToLocalDateString(date: string, days: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days, 12, 0, 0, 0)).toISOString().slice(0, 10);
+}
+
+export function localDateStartUtc(localDate: string, timezone: string): Date {
+  return getLocalTodayRange(new Date(`${localDate}T12:00:00Z`), timezone).start;
 }

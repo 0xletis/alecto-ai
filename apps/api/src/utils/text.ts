@@ -107,3 +107,16 @@ export function ordinalSelectionIndex(text: string): number | undefined {
 
   return map[normalized];
 }
+
+/**
+ * Generic "do these two normalized strings share a meaningful (4+ char)
+ * word" helper extracted from apps/api/server.ts, where it was used across
+ * reflection matching, weekly-review draft safety checks, and next-week
+ * planning dedupe — not specific to planning, which is why it lives here
+ * rather than in apps/api/src/legacy/planning-conversation.ts (which also
+ * needs it).
+ */
+export function sharesMeaningfulToken(left: string, right: string): boolean {
+  const rightTokens = new Set(right.split(" ").filter((token) => token.length >= 4));
+  return left.split(" ").some((token) => token.length >= 4 && rightTokens.has(token));
+}
