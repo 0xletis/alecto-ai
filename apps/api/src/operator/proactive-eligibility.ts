@@ -85,16 +85,17 @@ function isUserOptedIn(type: ProactiveMessageType, settings: NotificationSetting
  * than reimplementing the window/dedupe/candidate math, so this can never drift out of sync with
  * what the decision module or apps/worker's own send-gate actually do.
  *
- * "missing_allowlist" is kept in the type for the vocabulary this diagnostic tool is expected to
- * support, but is not currently reachable: an unset PROACTIVE_OPERATOR_ALLOWLIST means "open to
- * every user" (established, tested behavior since the delivery pass) — genuinely non-blocking,
- * not something to report as a problem. Only an allowlist that's SET but excludes this user
- * (user_not_allowlisted) is ever actually a blocker.
+ * PROACTIVE_OPERATOR_ALLOWLIST is an OPTIONAL developer rollout limiter (docs/10-v3-readiness-
+ * audit.md §19) — unset/empty means "no further restriction," never a problem to report. Only an
+ * allowlist that's SET but excludes this specific user (user_not_allowlisted) is ever a blocker;
+ * there is deliberately no separate "missing allowlist" status, since a missing allowlist isn't
+ * an error condition — it's the normal, expected solo/dev-phase default. The "eligible" message
+ * below still names the allowlist's active/inactive state, so a developer reading it never has to
+ * wonder whether it's silently the culprit.
  */
 export type ProactiveDeliveryStatus =
   | "legacy_daily_loop_sent_instead"
   | "delivery_disabled"
-  | "missing_allowlist"
   | "user_not_allowlisted"
   | "user_not_opted_in"
   | "daily_loop_disabled"
@@ -169,21 +170,26 @@ export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput):
   return "eligible";
 }
 
-const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string) => string> = {
+const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string, allowlistActive: boolean) => string> = {
   legacy_daily_loop_sent_instead: (time) =>
     `You did get a morning message today around ${time} — but it came from the older legacy daily-loop system, not the V3 proactive morning brief you're asking about. Real V3 delivery is still a developer rollout control most users aren't on yet; ask "what proactive messages are on?" to check your V3 opt-in and scheduled time.`,
   delivery_disabled: (time) => `Morning brief is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
-  missing_allowlist: (time) => `Morning brief is on at ${time}, but no PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment.`,
-  user_not_allowlisted: (time) => `Morning brief is on at ${time}, but this user is not in PROACTIVE_OPERATOR_ALLOWLIST.`,
+  user_not_allowlisted: (time) => `Morning brief is on at ${time}, but a PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment and this user isn't on it.`,
   user_not_opted_in: () => "Morning brief is currently off — turn it on and I'll start sending it.",
   daily_loop_disabled: (time) => `Morning brief is on at ${time}, but the daily loop itself is off, which blocks both the V3 morning brief and the legacy daily-loop message — turn the daily loop back on too.`,
   outside_morning_window: (time) => `Morning brief is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
   duplicate_dedupe_key: (time) => `Morning brief is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
   no_candidate: (time) => `Morning brief is on at ${time}, but there isn't anything grounded to send right now (e.g. no active goals or open actions) — check back closer to ${time}.`,
-  eligible: (time) => `Settings look eligible — morning brief is on at ${time}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
+  eligible: (time, allowlistActive) =>
+    `Settings look eligible — morning brief is on at ${time}${allowlistActive ? ", and you're in the configured allowlist" : " (no allowlist is configured, so that's not restricting anyone)"}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
 };
 
-export function formatProactiveDeliveryDiagnosis(status: ProactiveDeliveryStatus, settings: NotificationSettings, legacyDailyLoopSentAt?: Date): string {
+export function formatProactiveDeliveryDiagnosis(
+  status: ProactiveDeliveryStatus,
+  settings: NotificationSettings,
+  legacyDailyLoopSentAt?: Date,
+  allowlistActive = false
+): string {
   // legacy_daily_loop_sent_instead reports the message's REAL sentAt, not the user's current
   // morningTimeMinutes — the legacy send can be from earlier today, before the scheduled time was
   // last changed, and reusing the current setting here would misstate when it actually went out.
@@ -192,5 +198,5 @@ export function formatProactiveDeliveryDiagnosis(status: ProactiveDeliveryStatus
       ? formatMinutesOfDay(minutesOfDayInTimezone(legacyDailyLoopSentAt, settings.timezone))
       : formatMinutesOfDay(settings.morningTimeMinutes);
 
-  return DIAGNOSIS_MESSAGE[status](time);
+  return DIAGNOSIS_MESSAGE[status](time, allowlistActive);
 }

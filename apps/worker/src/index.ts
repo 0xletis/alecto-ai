@@ -13,7 +13,7 @@ import {
   type ActionItem,
   type ActionItemReminderType
 } from "@operator-agent/db";
-import { buildDailyCheckinPrompt } from "@operator-agent/core";
+import { buildDailyCheckinPrompt, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
 import { runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
@@ -34,6 +34,7 @@ if (!telegramBotToken) {
 }
 
 console.log(`Worker started. API base URL: ${apiBaseUrl}`);
+logEffectiveProactiveDeliveryConfig();
 
 await runTick();
 setInterval(() => {
@@ -41,6 +42,20 @@ setInterval(() => {
     console.error("Worker tick failed", error);
   });
 }, tickMs);
+
+/** Logged once at startup so it's immediately visible whether the two developer rollout controls
+ * are actually live in THIS process — .env is only read at startup, so a stale env value here is
+ * the single most common source of "why isn't V3 sending" confusion. See
+ * docs/10-v3-readiness-audit.md §19. */
+function logEffectiveProactiveDeliveryConfig(): void {
+  const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
+  const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
+  const allowlistSummary = allowlistActive
+    ? `active (${process.env.PROACTIVE_OPERATOR_ALLOWLIST})`
+    : "inactive — no allowlist configured, every opted-in user is eligible";
+
+  console.log(`V3 proactive delivery config: PROACTIVE_OPERATOR_DELIVERY_ENABLED=${deliveryEnabled}, PROACTIVE_OPERATOR_ALLOWLIST=${allowlistSummary}`);
+}
 
 async function runTick() {
   const settings = await getUsersWithEnabledNotifications();

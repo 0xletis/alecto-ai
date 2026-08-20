@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { getOrCreateNotificationSettings, hasNotificationLog } from "@operator-agent/db";
-import { proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
+import { proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { loadContext } from "../agent-runtime/context-loader.js";
 import { handleAgentMessage } from "../agent-runtime/runtime.js";
 import type {
@@ -75,12 +75,15 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
       });
 
       // Informational only — env flags are developer rollout controls, not the product UX (see
-      // docs/10-v3-readiness-audit.md §15). apps/worker's own delivery code independently
+      // docs/10-v3-readiness-audit.md §15/§19). apps/worker's own delivery code independently
       // re-checks every one of these before an actual send; this route never writes the DB.
+      const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
+      const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
+      const isAllowlisted = proactiveOperatorAllowlistFromEnv()(userId);
       const eligibility = evaluateProactiveEligibility({
         decision,
-        deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
-        isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId),
+        deliveryEnabled,
+        isAllowlisted,
         notificationSettings
       });
 
@@ -88,6 +91,11 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
         decision,
         eligibility: {
           ...eligibility,
+          deliveryEnabled,
+          allowlistActive,
+          // Only meaningful when an allowlist is actually configured — with none active, every
+          // opted-in user is eligible, so reporting a match here would be a non-answer.
+          allowlistMatched: allowlistActive ? isAllowlisted : undefined,
           scheduledTime: decision.decision === "proposed_message" && decision.type === "morning_brief" ? formatMinutesOfDay(notificationSettings.morningTimeMinutes) : undefined,
           optIn: {
             morningBriefEnabled: notificationSettings.morningBriefEnabled,

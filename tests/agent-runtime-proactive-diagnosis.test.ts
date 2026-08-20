@@ -85,7 +85,8 @@ test("6. not allowlisted: diagnosis explains user_not_allowlisted", async () => 
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: "someone-else" }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /not in PROACTIVE_OPERATOR_ALLOWLIST/i);
+      assert.match(reply, /PROACTIVE_OPERATOR_ALLOWLIST is configured/i);
+      assert.match(reply, /this user isn't on it/i);
     });
   } finally {
     clearAgentRuntimeMocks();
@@ -256,6 +257,29 @@ test("13. if V3 itself already sent today, that takes priority over a stale earl
     const reply = await diagnose(server, userId);
     assert.match(reply, /already sent today/i, "must report V3's own successful send");
     assert.doesNotMatch(reply, /legacy daily-loop/i, "must not resurface the earlier, now-irrelevant legacy send");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("14. with no allowlist configured, the eligible diagnosis names that fact plainly — never as a missing_allowlist error", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-no-allowlist-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const morningTimeMinutes = currentMinutesUtc();
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
+      const reply = await diagnose(server, userId);
+      assert.match(reply, /settings look eligible/i);
+      assert.match(reply, /no allowlist is configured/i);
+      assert.doesNotMatch(reply, /missing|error|misconfigured|not restricting anyone is (wrong|bad)/i, "a missing allowlist is the normal solo/dev-phase default, not a problem to flag");
+    });
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

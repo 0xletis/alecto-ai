@@ -23,7 +23,7 @@ import {
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
-import { parseActionDueDate, proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv, type Goal, type NotificationSettings } from "@operator-agent/core";
+import { parseActionDueDate, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv, type Goal, type NotificationSettings } from "@operator-agent/core";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
@@ -847,6 +847,7 @@ export async function executeOperation(
         ]);
         const legacyDailyLoopSentAt = legacyDailyLoopLog?.sentAt;
 
+        const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
         const status = getProactiveDeliveryStatus({
           context,
           notificationSettings: settings,
@@ -861,7 +862,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatProactiveDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt),
+          summary: formatProactiveDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive),
           result: { status }
         };
       }

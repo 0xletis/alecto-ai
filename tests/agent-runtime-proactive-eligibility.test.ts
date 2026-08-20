@@ -39,10 +39,17 @@ async function preview(server: ReturnType<typeof buildServer>, userId: string) {
     eligibility: {
       wouldSend: boolean;
       blockedBy: string[];
+      deliveryEnabled?: boolean;
+      allowlistActive?: boolean;
+      allowlistMatched?: boolean;
       scheduledTime?: string;
       optIn?: { morningBriefEnabled: boolean; eveningCheckinEnabled: boolean; gmailNudgeEnabled: boolean };
     };
   };
+}
+
+function randomTelegramUserId(): string {
+  return `telegram:${Math.floor(100000000 + Math.random() * 800000000)}`;
 }
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
@@ -66,7 +73,7 @@ function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<voi
   });
 }
 
-test("delivery enabled + allowlisted (open) + user opted in: wouldSend is true with no blockers", async () => {
+test("1. delivery enabled + opted in + no allowlist configured: eligible, allowlistActive is false", async () => {
   const server = buildServer();
   const userId = `eligibility-all-clear-${randomUUID()}`;
 
@@ -79,6 +86,9 @@ test("delivery enabled + allowlisted (open) + user opted in: wouldSend is true w
       assert.equal(response.decision.type, "morning_brief");
       assert.equal(response.eligibility.wouldSend, true);
       assert.deepEqual(response.eligibility.blockedBy, []);
+      assert.equal(response.eligibility.deliveryEnabled, true);
+      assert.equal(response.eligibility.allowlistActive, false, "no allowlist configured means it must not restrict anyone");
+      assert.equal(response.eligibility.allowlistMatched, undefined, "allowlistMatched is only meaningful when an allowlist is active");
     });
   } finally {
     await server.close();
@@ -86,7 +96,46 @@ test("delivery enabled + allowlisted (open) + user opted in: wouldSend is true w
   }
 });
 
-test("delivery disabled: blockedBy includes delivery_disabled, wouldSend is false", async () => {
+test("2. delivery enabled + opted in + allowlist contains the full telegram:<id> form: eligible, allowlistMatched is true", async () => {
+  const server = buildServer();
+  const userId = randomTelegramUserId();
+
+  try {
+    await seedEligibleUser(userId);
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: userId }, async () => {
+      const response = await preview(server, userId);
+      assert.equal(response.eligibility.wouldSend, true);
+      assert.equal(response.eligibility.allowlistActive, true);
+      assert.equal(response.eligibility.allowlistMatched, true);
+    });
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("3. delivery enabled + opted in + allowlist contains only the bare numeric Telegram id: eligible, still matches", async () => {
+  const server = buildServer();
+  const userId = randomTelegramUserId();
+  const bareNumericId = userId.replace("telegram:", "");
+
+  try {
+    await seedEligibleUser(userId);
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: bareNumericId }, async () => {
+      const response = await preview(server, userId);
+      assert.equal(response.eligibility.wouldSend, true, "a bare numeric id in the allowlist must be normalized to telegram:<id> and match");
+      assert.equal(response.eligibility.allowlistActive, true);
+      assert.equal(response.eligibility.allowlistMatched, true);
+    });
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("6. delivery disabled: blockedBy includes delivery_disabled, wouldSend is false", async () => {
   const server = buildServer();
   const userId = `eligibility-delivery-disabled-${randomUUID()}`;
 
@@ -97,6 +146,7 @@ test("delivery disabled: blockedBy includes delivery_disabled, wouldSend is fals
       const response = await preview(server, userId);
       assert.equal(response.eligibility.wouldSend, false);
       assert.ok(response.eligibility.blockedBy.includes("delivery_disabled"));
+      assert.equal(response.eligibility.deliveryEnabled, false);
     });
   } finally {
     await server.close();
@@ -104,17 +154,19 @@ test("delivery disabled: blockedBy includes delivery_disabled, wouldSend is fals
   }
 });
 
-test("not allowlisted: blockedBy includes not_allowlisted, wouldSend is false", async () => {
+test("4. allowlist active but excludes this user: blockedBy includes not_allowlisted, allowlistMatched is false", async () => {
   const server = buildServer();
-  const userId = `eligibility-not-allowlisted-${randomUUID()}`;
+  const userId = randomTelegramUserId();
 
   try {
     await seedEligibleUser(userId);
 
-    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: "someone-else" }, async () => {
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: "telegram:999999999" }, async () => {
       const response = await preview(server, userId);
       assert.equal(response.eligibility.wouldSend, false);
       assert.ok(response.eligibility.blockedBy.includes("not_allowlisted"));
+      assert.equal(response.eligibility.allowlistActive, true);
+      assert.equal(response.eligibility.allowlistMatched, false);
     });
   } finally {
     await server.close();
@@ -122,7 +174,7 @@ test("not allowlisted: blockedBy includes not_allowlisted, wouldSend is false", 
   }
 });
 
-test("user has not opted in at the settings level: blockedBy includes user_not_opted_in, but the content preview still shows what it would say", async () => {
+test("5. user has not opted in at the settings level, no allowlist configured: blockedBy includes user_not_opted_in, but the content preview still shows what it would say", async () => {
   const server = buildServer();
   const userId = `eligibility-not-opted-in-${randomUUID()}`;
 
