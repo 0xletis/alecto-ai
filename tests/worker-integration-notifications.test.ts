@@ -116,6 +116,17 @@ test("scheduled Gmail sync review notification respects disabled preference", ()
   assert.deepEqual(messages, []);
 });
 
+test("scheduled Gmail sync review notification can be suppressed when V3 owns the nudge", () => {
+  const messages = formatIntegrationSyncNotifications(
+    gmailResponse([
+      emailSummary({ adapterId: "work_action_email", reviewItemsCreated: 2 })
+    ]),
+    { suppressGmailReviewNotification: true }
+  );
+
+  assert.deepEqual(messages, []);
+});
+
 test("scheduled Gmail sync helper requires explicit scheduled mode and tracks background interval separately", () => {
   const now = new Date("2026-08-12T10:00:00.000Z");
   const runtime = gmailScheduledSyncRuntimeFromEnv({
@@ -406,6 +417,116 @@ test("scheduled integration worker continues after one Gmail failure and bundles
   ]);
   assert.deepEqual(logs, [
     "Gmail background sync succeeded: userId=telegram:2 connectionId=working checked=1 newReviews=2 notificationSent=yes nextDueAt=2026-08-12T10:15:00.000Z"
+  ]);
+});
+
+test("scheduled integration worker skips legacy Gmail review notification when V3 Gmail nudge is eligible", async () => {
+  const now = new Date("2026-08-12T10:00:00.000Z");
+  const sent: Array<{ chatId: string; text: string }> = [];
+
+  const result = await runScheduledIntegrationSync({
+    now,
+    integrationSyncEnabled: true,
+    gmailRuntime: {
+      scheduledSyncEnabled: true,
+      defaultIntervalMinutes: 15
+    },
+    getConnections: async () => [
+      connection({
+        id: "working",
+        userId: "telegram:1",
+        config: { gmailAutonomy: { syncMode: "scheduled", syncIntervalMinutes: 15 } }
+      })
+    ],
+    getActiveGmailRuleCount: async () => 1,
+    getNotificationSettings: async (userId) => ({
+      userId,
+      telegramUserId: "1",
+      dailyLoopEnabled: true,
+      morningBriefEnabled: false,
+      eveningCheckinEnabled: false,
+      gmailNudgeEnabled: true,
+      timezone: "Europe/Madrid",
+      defaultActionTimeMinutes: 540,
+      morningTimeMinutes: 540,
+      afternoonTimeMinutes: 900,
+      eveningTimeMinutes: 1140,
+      tonightTimeMinutes: 1200,
+      dailyCheckinEnabled: false,
+      dailyInsightEnabled: false,
+      weeklyInsightEnabled: false,
+      createdAt: now,
+      updatedAt: now
+    }),
+    apiGet: async () => ({
+      decision: { decision: "proposed_message", type: "gmail_nudge", dedupeKey: "v3_gmail_nudge:review-1" },
+      eligibility: { wouldSend: true, blockedBy: [] }
+    }),
+    apiPost: async () => gmailResponse([emailSummary({ adapterId: "work_action_email", reviewItemsCreated: 2 })]) as IntegrationSyncResponse,
+    sendTelegramMessage: async (chatId, text) => {
+      sent.push({ chatId, text });
+    },
+    logger: { log() {}, error() {} }
+  });
+
+  assert.deepEqual(result.processedConnectionIds, ["working"]);
+  assert.deepEqual(result.notifiedUserIds, []);
+  assert.deepEqual(sent, [], "legacy must not send the bundled Gmail-review nudge when V3 owns it");
+});
+
+test("scheduled integration worker keeps legacy Gmail review notification when V3 Gmail nudge is not eligible", async () => {
+  const now = new Date("2026-08-12T10:00:00.000Z");
+  const sent: Array<{ chatId: string; text: string }> = [];
+
+  const result = await runScheduledIntegrationSync({
+    now,
+    integrationSyncEnabled: true,
+    gmailRuntime: {
+      scheduledSyncEnabled: true,
+      defaultIntervalMinutes: 15
+    },
+    getConnections: async () => [
+      connection({
+        id: "working",
+        userId: "telegram:1",
+        config: { gmailAutonomy: { syncMode: "scheduled", syncIntervalMinutes: 15 } }
+      })
+    ],
+    getActiveGmailRuleCount: async () => 1,
+    getNotificationSettings: async (userId) => ({
+      userId,
+      telegramUserId: "1",
+      dailyLoopEnabled: true,
+      morningBriefEnabled: false,
+      eveningCheckinEnabled: false,
+      gmailNudgeEnabled: false,
+      timezone: "Europe/Madrid",
+      defaultActionTimeMinutes: 540,
+      morningTimeMinutes: 540,
+      afternoonTimeMinutes: 900,
+      eveningTimeMinutes: 1140,
+      tonightTimeMinutes: 1200,
+      dailyCheckinEnabled: false,
+      dailyInsightEnabled: false,
+      weeklyInsightEnabled: false,
+      createdAt: now,
+      updatedAt: now
+    }),
+    apiGet: async () => ({
+      decision: { decision: "proposed_message", type: "gmail_nudge", dedupeKey: "v3_gmail_nudge:review-1" },
+      eligibility: { wouldSend: false, blockedBy: ["user_not_opted_in"] }
+    }),
+    apiPost: async () => gmailResponse([emailSummary({ adapterId: "work_action_email", reviewItemsCreated: 2 })]) as IntegrationSyncResponse,
+    sendTelegramMessage: async (chatId, text) => {
+      sent.push({ chatId, text });
+    },
+    logger: { log() {}, error() {} }
+  });
+
+  assert.deepEqual(result.processedConnectionIds, ["working"]);
+  assert.deepEqual(result.notifiedUserIds, ["telegram:1"]);
+  assert.deepEqual(sent, [
+    { chatId: "1", text: '2 Gmail reviews are waiting: 2 work-action. Say "email reviews" to handle them.' }
   ]);
 });
 

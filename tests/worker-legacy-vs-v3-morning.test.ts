@@ -55,7 +55,7 @@ async function seedUser(userId: string, telegramUserId: string, overrides: { mor
 }
 
 function settingsFor(userId: string, telegramUserId: string, overrides: Partial<V3ProactiveNotificationSettingsLike> = {}): V3ProactiveNotificationSettingsLike[] {
-  return [{ userId, telegramUserId, dailyLoopEnabled: true, morningBriefEnabled: true, timezone: "Europe/Madrid", morningTimeMinutes: 540, ...overrides }];
+  return [{ userId, telegramUserId, dailyLoopEnabled: true, morningBriefEnabled: true, gmailNudgeEnabled: false, timezone: "Europe/Madrid", morningTimeMinutes: 540, ...overrides }];
 }
 
 test("2. V3 opted in + V3 delivery actually live + legacy dailyLoopEnabled true never produces two sends", async () => {

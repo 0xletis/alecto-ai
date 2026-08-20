@@ -22,6 +22,7 @@ export interface ScheduledIntegrationSyncOptions {
   gmailRuntime?: GmailScheduledSyncRuntime;
   getConnections?: () => Promise<IntegrationConnection[]>;
   getActiveGmailRuleCount?: (connection: IntegrationConnection) => Promise<number>;
+  apiGet?: <T>(path: string) => Promise<T>;
   apiPost: <T>(path: string, body: unknown) => Promise<T>;
   sendTelegramMessage: (chatId: string, text: string) => Promise<void>;
   getNotificationSettings?: typeof getOrCreateNotificationSettings;
@@ -41,6 +42,20 @@ interface GmailBackgroundSyncSuccessLog {
   newReviewItemCount: number;
   notificationQueued: boolean;
   nextDueAt?: string;
+}
+
+interface ProactivePreviewResponse {
+  decision:
+    | { decision: "no_message"; reason: string }
+    | {
+        decision: "proposed_message";
+        type: "morning_brief" | "evening_checkin" | "gmail_nudge";
+        dedupeKey: string;
+      };
+  eligibility?: {
+    wouldSend: boolean;
+    blockedBy: string[];
+  };
 }
 
 export async function runScheduledIntegrationSync(
@@ -102,9 +117,16 @@ export async function runScheduledIntegrationSync(
       );
       processedConnectionIds.push(connection.id);
 
+      const summary = connection.integrationId === "gmail" ? summarizeGmailSyncResponse(response) : undefined;
+      const suppressLegacyGmailReviewNotification =
+        connection.integrationId === "gmail" && summary && summary.newReviewItemCount > 0
+          ? await shouldSuppressLegacyGmailReviewNotification(connection.userId, now, options.apiGet, logger)
+          : false;
+
       const messages = formatIntegrationSyncNotifications(response, {
         gmailReviewNotificationsEnabled:
-          connection.integrationId === "gmail" ? gmailReviewNotificationsEnabled(connection.config) : true
+          connection.integrationId === "gmail" ? gmailReviewNotificationsEnabled(connection.config) : true,
+        suppressGmailReviewNotification: suppressLegacyGmailReviewNotification
       });
 
       if (messages.length > 0) {
@@ -115,12 +137,11 @@ export async function runScheduledIntegrationSync(
       }
 
       if (connection.integrationId === "gmail") {
-        const summary = summarizeGmailSyncResponse(response);
         gmailSuccessLogs.push({
           userId: connection.userId,
           connectionId: connection.id,
-          checkedCount: summary.checkedCount,
-          newReviewItemCount: summary.newReviewItemCount,
+          checkedCount: summary?.checkedCount ?? 0,
+          newReviewItemCount: summary?.newReviewItemCount ?? 0,
           notificationQueued: messages.length > 0,
           nextDueAt: gmailEligibility
             ? new Date(now.getTime() + Math.max(1, gmailEligibility.intervalMinutes) * 60_000).toISOString()
@@ -177,6 +198,25 @@ export async function runScheduledIntegrationSync(
 
 async function defaultActiveGmailRuleCount(connection: IntegrationConnection): Promise<number> {
   return (await getActiveEmailSignalRulesForConnection(connection.userId, connection.id)).length;
+}
+
+async function shouldSuppressLegacyGmailReviewNotification(
+  userId: string,
+  now: Date,
+  apiGet: ScheduledIntegrationSyncOptions["apiGet"],
+  logger: Pick<Console, "log" | "error">
+): Promise<boolean> {
+  if (!apiGet) {
+    return false;
+  }
+
+  try {
+    const preview = await apiGet<ProactivePreviewResponse>(`/users/${userId}/operator/proactive/preview?now=${encodeURIComponent(now.toISOString())}`);
+    return preview.decision.decision === "proposed_message" && preview.decision.type === "gmail_nudge" && preview.eligibility?.wouldSend === true;
+  } catch (error) {
+    logger.error?.(`V3 proactive Gmail nudge preview failed for ${userId}; keeping legacy Gmail review notification fallback.`, error);
+    return false;
+  }
 }
 
 function summarizeGmailSyncResponse(response: IntegrationSyncResponse): { checkedCount: number; newReviewItemCount: number } {

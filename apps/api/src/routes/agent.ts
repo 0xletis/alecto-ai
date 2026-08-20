@@ -101,7 +101,8 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
             morningBriefEnabled: notificationSettings.morningBriefEnabled,
             eveningCheckinEnabled: notificationSettings.eveningCheckinEnabled,
             gmailNudgeEnabled: notificationSettings.gmailNudgeEnabled
-          }
+          },
+          pendingGmailReviewCount: context.gmailReviews.length
         }
       };
     }

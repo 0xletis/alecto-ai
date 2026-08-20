@@ -61,6 +61,7 @@ export type GmailErrorStage =
 
 export interface IntegrationSyncNotificationOptions {
   gmailReviewNotificationsEnabled?: boolean;
+  suppressGmailReviewNotification?: boolean;
 }
 
 export function formatIntegrationSyncNotifications(
@@ -72,7 +73,7 @@ export function formatIntegrationSyncNotifications(
     const reviewTotal = response.emailSummaries.reduce((sum, summary) => sum + summary.reviewItemsCreated, 0);
     const messages: string[] = [];
 
-    if (reviewTotal > 0 && options.gmailReviewNotificationsEnabled !== false) {
+    if (reviewTotal > 0 && options.gmailReviewNotificationsEnabled !== false && options.suppressGmailReviewNotification !== true) {
       const groupSummary = formatGmailReviewGroupSummary(response.emailSummaries);
       messages.push(
         `${reviewTotal} Gmail review${reviewTotal === 1 ? "" : "s"} ${reviewTotal === 1 ? "is" : "are"} waiting${groupSummary ? `: ${groupSummary}` : ""}. Say "email reviews" to handle ${reviewTotal === 1 ? "it" : "them"}.`

@@ -16,7 +16,7 @@ import {
 import { buildDailyCheckinPrompt, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
-import { runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
+import { runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
 import { runLegacyDailyLoopMorningBriefs } from "./legacy-daily-loop-morning.js";
 
 config({
@@ -94,13 +94,15 @@ async function runTick() {
   await runLegacyDailyLoopMorningBriefs(settings, { apiGet, sendTelegramMessage });
   await runDailyEveningReviews(now, settings);
 
-  // Cautious first real-delivery path for V3's Proactive Operator MVP — morning_brief only, off
-  // by default (PROACTIVE_OPERATOR_DELIVERY_ENABLED). See apps/worker/src/v3-proactive-delivery.ts.
+  // V3 proactive delivery remains opt-in and env-gated. morning_brief is time-triggered; Gmail
+  // nudges only surface already-created EmailReviewItems and never scan Gmail by themselves.
   await runV3ProactiveMorningBriefs(settings, { apiGet, sendTelegramMessage });
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
   }
+
+  await runV3ProactiveGmailNudges(settings, { now, apiGet, sendTelegramMessage });
 
   await sendDueActionReminders(now);
 }
@@ -168,6 +170,7 @@ async function runIntegrationSync(now: Date) {
     now,
     integrationSyncEnabled,
     integrationSyncIntervalMinutes,
+    apiGet,
     apiPost,
     sendTelegramMessage
   });
@@ -433,6 +436,8 @@ interface NotificationSettings {
   weeklyInsightDay?: string;
   weeklyInsightTime?: string;
   dailyLoopEnabled: boolean;
+  morningBriefEnabled: boolean;
+  gmailNudgeEnabled: boolean;
   timezone: string;
   morningTimeMinutes: number;
   eveningTimeMinutes: number;

@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, createGoal, createNotificationLog, hasNotificationLog, prisma } from "../packages/db/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
-import { runV3ProactiveMorningBriefs, type V3ProactiveNotificationSettingsLike } from "../apps/worker/src/v3-proactive-delivery.ts";
+import { runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs, type V3ProactiveNotificationSettingsLike } from "../apps/worker/src/v3-proactive-delivery.ts";
+import { clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
- * apps/worker/src/v3-proactive-delivery.ts — the first real delivery path for Agent Runtime
- * v3's Proactive Operator MVP, morning_brief ONLY, off by default. `apiGet` is wired to a real
+ * apps/worker/src/v3-proactive-delivery.ts — the real delivery path for Agent Runtime
+ * v3's Proactive Operator MVP, morning_brief and gmail_nudge only, off by default. `apiGet` is wired to a real
  * in-process `buildServer()` via `server.inject` (no real network, but the REAL, unmodified
  * preview route + decision module run for real) — sendTelegramMessage is a plain stub so no
  * test ever touches the real Telegram API. This deliberately re-uses the real preview route
@@ -16,6 +17,7 @@ import { runV3ProactiveMorningBriefs, type V3ProactiveNotificationSettingsLike }
  */
 
 const MORNING_UTC = new Date("2026-08-20T07:00:00.000Z"); // 09:00 Europe/Madrid
+const GMAIL_NUDGE_UTC = new Date("2026-08-20T11:00:00.000Z"); // 13:00 Europe/Madrid
 const MORNING_SENT_FOR_DATE = "2026-08-20";
 const MORNING_DEDUPE_KEY = "v3_morning_brief";
 
@@ -40,14 +42,19 @@ function stubTelegram(options: { fail?: boolean } = {}) {
   return { send, sent };
 }
 
-async function seedMorningUser(userId: string, telegramUserId: string, overrides: { eveningTimeMinutes?: number; morningBriefEnabled?: boolean } = {}) {
+async function seedMorningUser(
+  userId: string,
+  telegramUserId: string,
+  overrides: { dailyLoopEnabled?: boolean; eveningTimeMinutes?: number; morningBriefEnabled?: boolean; gmailNudgeEnabled?: boolean } = {}
+) {
   await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
   await prisma.notificationSettings.create({
     data: {
       userId,
       telegramUserId,
-      dailyLoopEnabled: true,
+      dailyLoopEnabled: overrides.dailyLoopEnabled ?? true,
       morningBriefEnabled: overrides.morningBriefEnabled ?? true,
+      gmailNudgeEnabled: overrides.gmailNudgeEnabled ?? false,
       morningTimeMinutes: 540,
       eveningTimeMinutes: overrides.eveningTimeMinutes ?? 1140,
       timezone: "Europe/Madrid"
@@ -56,7 +63,32 @@ async function seedMorningUser(userId: string, telegramUserId: string, overrides
 }
 
 function settingsFor(userId: string, telegramUserId: string, overrides: Partial<V3ProactiveNotificationSettingsLike> = {}): V3ProactiveNotificationSettingsLike[] {
-  return [{ userId, telegramUserId, dailyLoopEnabled: true, morningBriefEnabled: true, timezone: "Europe/Madrid", morningTimeMinutes: 540, ...overrides }];
+  return [{ userId, telegramUserId, dailyLoopEnabled: true, morningBriefEnabled: true, gmailNudgeEnabled: false, timezone: "Europe/Madrid", morningTimeMinutes: 540, ...overrides }];
+}
+
+async function seedPendingGmailReview(userId: string, overrides: { subject?: string; from?: string; snippet?: string } = {}) {
+  const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+  const rule = await prisma.emailSignalRule.create({
+    data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" }
+  });
+  return prisma.emailReviewItem.create({
+    data: {
+      userId,
+      connectionId: connection.id,
+      ruleId: rule.id,
+      adapterId: "custom_email_review",
+      provider: "gmail",
+      providerMessageId: "m1",
+      externalId: `gmail-review:${rule.id}:m1`,
+      subject: overrides.subject ?? "Recruiter reply from Example Labs",
+      from: overrides.from ?? "recruiter@example.com",
+      snippet: overrides.snippet ?? "Can we talk tomorrow?",
+      confidence: 0.9,
+      reason: "custom_rule_match",
+      extracted: {},
+      status: "pending"
+    }
+  });
 }
 
 test("1. delivery disabled: no send, no NotificationLog", async () => {
@@ -249,48 +281,201 @@ test("6. an evening_checkin candidate is never sent this pass", async () => {
   }
 });
 
-test("7. a gmail_nudge candidate is never sent this pass", async () => {
+test("7. a gmail_nudge candidate is delivered, logged, and stored as visible review context", async () => {
   const server = buildServer();
-  const userId = `delivery-gmail-not-sent-${randomUUID()}`;
+  const userId = `delivery-gmail-sent-${randomUUID()}`;
 
   try {
-    await seedMorningUser(userId, "777777");
-    await createNotificationLog({ userId, type: MORNING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE });
-    const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
-    const rule = await prisma.emailSignalRule.create({ data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" } });
-    await prisma.emailReviewItem.create({
-      data: {
-        userId,
-        connectionId: connection.id,
-        ruleId: rule.id,
-        adapterId: "custom_email_review",
-        provider: "gmail",
-        providerMessageId: "m1",
-        externalId: `gmail-review:${rule.id}:m1`,
-        subject: "Recruiter reply from Example Labs",
-        confidence: 0.9,
-        reason: "custom_rule_match",
-        extracted: {},
-        status: "pending"
-      }
-    });
+    await seedMorningUser(userId, "777777", { gmailNudgeEnabled: true });
+    const review = await seedPendingGmailReview(userId);
     const telegram = stubTelegram();
 
     const preview = await injectApiGet(server)<{ decision: { decision: string; type?: string } }>(
-      `/users/${userId}/operator/proactive/preview?now=${encodeURIComponent(MORNING_UTC.toISOString())}`
+      `/users/${userId}/operator/proactive/preview?now=${encodeURIComponent(GMAIL_NUDGE_UTC.toISOString())}`
     );
     assert.equal(preview.decision.decision, "proposed_message");
     assert.equal(preview.decision.type, "gmail_nudge", "test setup sanity check: the preview route must actually offer a gmail_nudge here");
 
-    await runV3ProactiveMorningBriefs(settingsFor(userId, "777777"), {
-      now: MORNING_UTC,
+    const results = await runV3ProactiveGmailNudges(settingsFor(userId, "777777", { gmailNudgeEnabled: true }), {
+      now: GMAIL_NUDGE_UTC,
+      deliveryEnabled: true,
+      isAllowed: () => true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    assert.equal(results[0].status, "sent");
+    assert.equal(telegram.sent.length, 1);
+    assert.equal(telegram.sent[0].chatId, "777777");
+    assert.match(telegram.sent[0].text, /one email looks actionable/i);
+    assert.match(telegram.sent[0].text, /recruiter reply from example labs/i);
+    assert.equal(await hasNotificationLog({ userId, type: `v3_gmail_nudge:${review.id}`, sentForDate: MORNING_SENT_FOR_DATE }), true);
+
+    const session = await prisma.agentConversationSession.findUnique({ where: { userId_channel: { userId, channel: "telegram" } } });
+    const visibleEntities = (Array.isArray(session?.visibleEntities) ? session?.visibleEntities : []) as Array<{ type: string; id: string; index?: number }>;
+    assert.deepEqual(visibleEntities.map((entity) => ({ type: entity.type, id: entity.id, index: entity.index })), [
+      { type: "gmail_review", id: review.id, index: 1 }
+    ]);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("7b. a failed gmail_nudge send writes no NotificationLog and no visible review context", async () => {
+  const server = buildServer();
+  const userId = `delivery-gmail-send-fails-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "777778", { gmailNudgeEnabled: true });
+    const review = await seedPendingGmailReview(userId);
+    const telegram = stubTelegram({ fail: true });
+
+    const results = await runV3ProactiveGmailNudges(settingsFor(userId, "777778", { gmailNudgeEnabled: true }), {
+      now: GMAIL_NUDGE_UTC,
+      deliveryEnabled: true,
+      isAllowed: () => true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send,
+      logger: { log() {}, error() {} }
+    });
+
+    assert.equal(results[0].status, "send_failed");
+    assert.equal(await hasNotificationLog({ userId, type: `v3_gmail_nudge:${review.id}`, sentForDate: MORNING_SENT_FOR_DATE }), false);
+    const session = await prisma.agentConversationSession.findUnique({ where: { userId_channel: { userId, channel: "telegram" } } });
+    assert.equal(session, null);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("7c. duplicate Gmail nudge NotificationLog suppresses a second send", async () => {
+  const server = buildServer();
+  const userId = `delivery-gmail-dedupe-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "777779", { gmailNudgeEnabled: true });
+    const review = await seedPendingGmailReview(userId);
+    await createNotificationLog({ userId, type: `v3_gmail_nudge:${review.id}`, sentForDate: MORNING_SENT_FOR_DATE });
+    const telegram = stubTelegram();
+
+    const results = await runV3ProactiveGmailNudges(settingsFor(userId, "777779", { gmailNudgeEnabled: true }), {
+      now: GMAIL_NUDGE_UTC,
+      deliveryEnabled: true,
+      isAllowed: () => true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    assert.equal(results[0].status, "skipped");
+    assert.equal(results[0].reason, "no_eligible_candidate");
+    assert.equal(telegram.sent.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("7d. Gmail nudges require per-user opt-in and allowlist access", async () => {
+  const server = buildServer();
+  const optedOutUserId = `delivery-gmail-opted-out-${randomUUID()}`;
+  const blockedUserId = `delivery-gmail-blocked-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(optedOutUserId, "777780", { gmailNudgeEnabled: false });
+    await seedPendingGmailReview(optedOutUserId);
+    await seedMorningUser(blockedUserId, "777781", { gmailNudgeEnabled: true });
+    await seedPendingGmailReview(blockedUserId);
+    const telegram = stubTelegram();
+
+    const results = await runV3ProactiveGmailNudges(
+      [
+        ...settingsFor(optedOutUserId, "777780", { gmailNudgeEnabled: false }),
+        ...settingsFor(blockedUserId, "777781", { gmailNudgeEnabled: true })
+      ],
+      {
+        now: GMAIL_NUDGE_UTC,
+        deliveryEnabled: true,
+        isAllowed: (userId) => userId !== blockedUserId,
+        apiGet: injectApiGet(server),
+        sendTelegramMessage: telegram.send
+      }
+    );
+
+    assert.deepEqual(results.map((result) => result.reason), ["user_not_opted_in", "not_allowlisted"]);
+    assert.equal(telegram.sent.length, 0);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [optedOutUserId, blockedUserId] } } });
+  }
+});
+
+test("7e. no configured allowlist plus opt-in is eligible for Gmail nudge delivery", async () => {
+  const server = buildServer();
+  const userId = `delivery-gmail-no-allowlist-${randomUUID()}`;
+  const previousAllowlist = process.env.PROACTIVE_OPERATOR_ALLOWLIST;
+
+  try {
+    delete process.env.PROACTIVE_OPERATOR_ALLOWLIST;
+    await seedMorningUser(userId, "777782", { gmailNudgeEnabled: true });
+    await seedPendingGmailReview(userId);
+    const telegram = stubTelegram();
+
+    const results = await runV3ProactiveGmailNudges(settingsFor(userId, "777782", { gmailNudgeEnabled: true }), {
+      now: GMAIL_NUDGE_UTC,
       deliveryEnabled: true,
       apiGet: injectApiGet(server),
       sendTelegramMessage: telegram.send
     });
 
-    assert.equal(telegram.sent.length, 0, "gmail_nudge must stay preview-only this pass");
+    assert.equal(results[0].status, "sent");
+    assert.equal(telegram.sent.length, 1);
   } finally {
+    if (previousAllowlist === undefined) {
+      delete process.env.PROACTIVE_OPERATOR_ALLOWLIST;
+    } else {
+      process.env.PROACTIVE_OPERATOR_ALLOWLIST = previousAllowlist;
+    }
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("7f. after a delivered Gmail nudge, the user's reply can use existing V3 review-to-action triage", async () => {
+  const server = buildServer();
+  const userId = `delivery-gmail-reply-flow-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "777783", { gmailNudgeEnabled: true });
+    const review = await seedPendingGmailReview(userId);
+    const telegram = stubTelegram();
+
+    await runV3ProactiveGmailNudges(settingsFor(userId, "777783", { gmailNudgeEnabled: true }), {
+      now: GMAIL_NUDGE_UTC,
+      deliveryEnabled: true,
+      isAllowed: () => true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    mockPlan({
+      topic: "gmail_reviews",
+      intent: "convert_review_to_action",
+      operations: [op("gmail.review.to_action", { index: 1 })],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+    const reply = await sendAgentMessage(server, userId, "turn it into a task");
+
+    assert.match(reply.reply, /turned the email review into task/i);
+    assert.equal(reply.debug.mutationExecuted, true);
+    const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(reviewAfter?.status, "approved");
+    assert.ok(reviewAfter?.actionItemId);
+  } finally {
+    clearAgentRuntimeMocks();
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });
   }

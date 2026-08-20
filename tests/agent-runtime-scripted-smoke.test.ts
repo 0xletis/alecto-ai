@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { completeActionItem, createActionItem, createEvent, createGoal, prisma } from "../packages/db/src/index.ts";
+import { runV3ProactiveGmailNudges } from "../apps/worker/src/v3-proactive-delivery.ts";
 import { clearAgentRuntimeMocks, mockGuardrail, mockPlan, op, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertNoFalseSuccessClaim,
@@ -1246,13 +1247,11 @@ test("scripted smoke 17: proactive evening check-in nudge -> user replies with b
 
 // --- Scenario 18: proactive Gmail nudge -> reply is handled by existing review-to-action path ---
 //
-// Same shape as scenario 17: the proactive decision is previewed (not sent — see
-// docs/10-v3-readiness-audit.md §13), then the user's natural reply is routed entirely through
-// the EXISTING Gmail review triage capability (validator.ts's resolveGmailReviewRef). Actual
-// delivery isn't wired this pass, so a real send would need to also record the referenced
-// review as a visible session entity for a bare "turn it into a task" reply (with no "the
-// recruiter one" qualifier) to resolve without repeating itself — that's simulated directly
-// here via the session row, standing in for what a future delivery step would do.
+// Same shape as scenario 17: the proactive decision is previewed, then delivered by the worker's
+// real V3 Gmail-nudge helper with Telegram stubbed. Delivery records the nudged review as a
+// visible session entity, so the user's next natural reply is routed through the EXISTING Gmail
+// review triage capability (validator.ts's resolveGmailReviewRef), not a proactive-specific
+// reply parser.
 
 test("scripted smoke 18: proactive Gmail nudge -> user replies 'turn it into a task' -> existing triage creates the action", async () => {
   const server = buildServer();
@@ -1260,7 +1259,7 @@ test("scripted smoke 18: proactive Gmail nudge -> user replies 'turn it into a t
 
   try {
     await seedUser(userId);
-    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningTimeMinutes: 540, eveningTimeMinutes: 1140, timezone: "Europe/Madrid" } });
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, gmailNudgeEnabled: true, morningTimeMinutes: 540, eveningTimeMinutes: 1140, timezone: "Europe/Madrid" } });
     const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
     const rule = await prisma.emailSignalRule.create({ data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" } });
     const review = await prisma.emailReviewItem.create({
@@ -1292,16 +1291,36 @@ test("scripted smoke 18: proactive Gmail nudge -> user replies 'turn it into a t
     assert.equal(decision.type, "gmail_nudge");
     assert.match(decision.message, /recruiter reply from example labs/i);
 
-    // Stands in for a future delivery step recording the nudged review as a visible entity —
-    // this pass only builds the decision layer (see file-level comment above), not delivery.
-    await prisma.agentConversationSession.create({
-      data: { userId, channel: "telegram", visibleEntities: [{ type: "gmail_review", id: review.id, label: "Recruiter reply from Example Labs", index: 1 }] }
+    const sent: Array<{ chatId: string; text: string }> = [];
+    await runV3ProactiveGmailNudges([
+      {
+        userId,
+        telegramUserId: "131800",
+        dailyLoopEnabled: true,
+        morningBriefEnabled: false,
+        gmailNudgeEnabled: true,
+        timezone: "Europe/Madrid",
+        morningTimeMinutes: 540
+      }
+    ], {
+      now: new Date("2026-08-20T11:00:00.000Z"),
+      deliveryEnabled: true,
+      isAllowed: () => true,
+      apiGet: async (path) => {
+        const response = await server.inject({ method: "GET", url: path });
+        assert.equal(response.statusCode, 200);
+        return response.json();
+      },
+      sendTelegramMessage: async (chatId, text) => {
+        sent.push({ chatId, text });
+      }
     });
+    assert.equal(sent.length, 1);
 
     mockPlan({
       topic: "gmail_reviews",
       intent: "convert_review_to_action",
-      operations: [op("gmail.review.to_action", { ref: "recruiter" })],
+      operations: [op("gmail.review.to_action", { index: 1 })],
       needsClarification: false,
       clarificationQuestion: null,
       replyDraft: ""

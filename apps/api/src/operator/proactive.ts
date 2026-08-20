@@ -1,7 +1,7 @@
 import type { ActionItem } from "@operator-agent/db";
 import type { NotificationSettings } from "@operator-agent/core";
 import { GOAL_ANCHOR_NUDGE_REPLY } from "../agent-runtime/runtime.js";
-import type { ContextBundle } from "../agent-runtime/types.js";
+import type { AgentEntity, ContextBundle } from "../agent-runtime/types.js";
 import { gmailReviewChatDescription, gmailReviewChatLabel } from "../email-reviews/email-review-service.js";
 import { formatDateInTimezone } from "../utils/datetime.js";
 
@@ -34,6 +34,8 @@ export interface ProactiveMessageProposal {
   suggestedReplies: string[];
   /** Passed to NotificationLog as `type` — stable per moment (or per specific item, for gmail_nudge) so a repeat check is a single hasNotificationLog lookup. */
   dedupeKey: string;
+  /** Optional visible entities a real delivery should persist so the user's next reply can refer to "it" or "the first one." */
+  entities?: AgentEntity[];
   /** Lower is more important; used to pick one when multiple moments are eligible at once. */
   priority: number;
   safeToSend: boolean;
@@ -253,6 +255,7 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
     reasons: [`pending gmail review: "${label}"`],
     suggestedReplies: ["turn it into a task", "ignore it"],
     dedupeKey,
+    entities: [{ type: "gmail_review", id: review.id, label, index: 1 }],
     priority: 3,
     safeToSend: true
   };
