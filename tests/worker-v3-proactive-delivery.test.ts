@@ -469,7 +469,7 @@ test("7f. after a delivered Gmail nudge, the user's reply can use existing V3 re
     });
     const reply = await sendAgentMessage(server, userId, "turn it into a task");
 
-    assert.match(reply.reply, /turned the email review into task/i);
+    assert.match(reply.reply, /created task/i);
     assert.equal(reply.debug.mutationExecuted, true);
     const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
     assert.equal(reviewAfter?.status, "approved");

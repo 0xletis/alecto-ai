@@ -955,7 +955,7 @@ test("scripted smoke 12: what emails need attention? -> turn the recruiter one i
     });
     const convertReply = await sendAgentMessage(server, userId, "turn the recruiter one into a task");
     assertNoGenericErrorRaw(convertReply.reply);
-    assert.match(convertReply.reply, /turned the email review into task/i);
+    assert.match(convertReply.reply, /created task/i);
     assert.equal(convertReply.debug.mutationExecuted, true);
 
     const recruiterAfterConvert = await prisma.emailReviewItem.findUnique({ where: { id: recruiterReview.id } });
@@ -1327,7 +1327,7 @@ test("scripted smoke 18: proactive Gmail nudge -> user replies 'turn it into a t
     });
     const reply = await sendAgentMessage(server, userId, "turn it into a task");
     assertNoGenericErrorRaw(reply.reply);
-    assert.match(reply.reply, /turned the email review into task/i);
+    assert.match(reply.reply, /created task/i);
     assert.equal(reply.debug.mutationExecuted, true);
 
     const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });

@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { mock } from "node:test";
+import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime } from "../apps/api/src/utils/datetime.ts";
 import { buildServer, clearAgentRuntimeMocks, getAgentSession, mockPlan, op, prisma, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
@@ -26,7 +27,15 @@ async function seedReview(
   userId: string,
   connectionId: string,
   ruleId: string,
-  overrides: { subject?: string; from?: string; snippet?: string; providerMessageId: string }
+  overrides: {
+    subject?: string;
+    from?: string;
+    snippet?: string;
+    evidence?: string;
+    providerMessageId: string;
+    extracted?: Record<string, unknown>;
+    proposedEventType?: string;
+  }
 ) {
   return prisma.emailReviewItem.create({
     data: {
@@ -40,10 +49,11 @@ async function seedReview(
       subject: overrides.subject,
       from: overrides.from,
       snippet: overrides.snippet,
-      evidence: overrides.snippet,
+      evidence: overrides.evidence ?? overrides.snippet,
+      proposedEventType: overrides.proposedEventType,
       confidence: 0.8,
       reason: "custom_rule_match",
-      extracted: {},
+      extracted: overrides.extracted ?? {},
       status: "pending"
     }
   });
@@ -55,6 +65,10 @@ function gmailReviewListPlan(): MockPlan {
 
 function gmailReviewToActionPlan(args: Record<string, unknown>): MockPlan {
   return { topic: "gmail_reviews", intent: "convert_review_to_action", operations: [op("gmail.review.to_action", args)], needsClarification: false, clarificationQuestion: null, replyDraft: "" };
+}
+
+function actionListPlan(operations = [op("action.list", { status: "all", limit: 10 })]): MockPlan {
+  return { topic: "actions", intent: "list_actions", operations, needsClarification: false, clarificationQuestion: null, replyDraft: "" };
 }
 
 function gmailReviewRejectPlan(args: Record<string, unknown>): MockPlan {
@@ -149,16 +163,293 @@ test("4. 'turn the recruiter one into a task' resolves the right review and crea
     mockPlan(gmailReviewToActionPlan({ ref: "recruiter" }));
     const reply = await sendAgentMessage(server, userId, "turn the recruiter one into a task");
 
-    assert.match(reply.reply, /turned the email review into task/i);
+    assert.match(reply.reply, /created task/i);
+    assert.match(reply.reply, /reply to recruiter/i);
     assert.equal(reply.debug.mutationExecuted, true);
 
     const recruiterAfter = await prisma.emailReviewItem.findUnique({ where: { id: recruiterReview.id } });
     assert.equal(recruiterAfter?.status, "approved");
     assert.ok(recruiterAfter?.actionItemId);
+    const action = await prisma.actionItem.findUniqueOrThrow({ where: { id: recruiterAfter.actionItemId } });
+    assert.match(action.title, /reply to recruiter/i);
+    assert.doesNotMatch(action.title, /follow up on/i);
 
     const endesaAfter = await prisma.emailReviewItem.findUnique({ where: { id: endesaReview.id } });
     assert.equal(endesaAfter?.status, "pending", "only the referenced review may change");
   } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Gmail review to task creates a specific Node.js upgrade action and respects tomorrow morning", async () => {
+  const server = buildServer();
+  const userId = `gmail-review-node-upgrade-${randomUUID()}`;
+  const timezone = "Europe/Madrid";
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone } });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Platform notices",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const review = await seedReview(userId, connectionId, rule.id, {
+      subject: "[Action Required] Node.js 20 is being discontinued on October 1st, 2026",
+      from: "Settings <settings@example.com>",
+      snippet: "Hi there, Please upgrade to Node.js 24 as soon as possible. After October 1st, new builds using Node.js 20 will fail.",
+      extracted: { project: "Settings" },
+      proposedEventType: "work_action_required",
+      providerMessageId: "node-upgrade"
+    });
+
+    mockPlan(gmailReviewListPlan());
+    await sendAgentMessage(server, userId, "show me the item to review");
+
+    const expectedLocalDate = addDaysToLocalDateString(formatDateInTimezone(new Date(), timezone), 1);
+    mockPlan(gmailReviewToActionPlan({ index: 1, dueText: "tomorrow morning" }));
+    const reply = await sendAgentMessage(server, userId, "turn it into a task for tomorrow morning");
+
+    assert.equal(reply.debug.mutationExecuted, true);
+    assert.match(reply.reply, /created task/i);
+    assert.match(reply.reply, /node\.js/i);
+    assert.match(reply.reply, /tomorrow morning|09:00|9:00/i);
+
+    const updatedReview = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(updatedReview?.status, "approved");
+    assert.ok(updatedReview?.actionItemId);
+
+    const action = await prisma.actionItem.findUniqueOrThrow({ where: { id: updatedReview.actionItemId } });
+    assert.match(action.title, /node\.js/i);
+    assert.match(action.title, /upgrade|24/i);
+    assert.doesNotMatch(action.title, /follow up on settings/i);
+    assert.ok(action.dueAt, "dueAt should be stored for tomorrow morning");
+    assert.equal(formatDateInTimezone(action.dueAt!, timezone), expectedLocalDate);
+    assert.match(formatLocalDateTime(action.dueAt!, timezone), /09:00/);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Generic Gmail review to task still derives a specific Node.js upgrade action", async () => {
+  const server = buildServer();
+  const userId = `gmail-review-node-generic-${randomUUID()}`;
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Platform notices",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const review = await seedReview(userId, connectionId, rule.id, {
+      subject: "[Action Required] Node.js 20 is being discontinued on October 1st, 2026",
+      from: "Settings <settings@example.com>",
+      snippet: "Hi there, Please upgrade to Node.js 24 as soon as possible. After October 1st, new builds using Node.js 20 will fail.",
+      extracted: { project: "Settings" },
+      proposedEventType: "work_action_required",
+      providerMessageId: "node-upgrade-generic"
+    });
+
+    mockPlan(gmailReviewListPlan());
+    await sendAgentMessage(server, userId, "show me the item to review");
+
+    mockPlan(gmailReviewToActionPlan({ index: 1 }));
+    const reply = await sendAgentMessage(server, userId, "turn it into a task");
+
+    assert.match(reply.reply, /created task/i);
+    assert.match(reply.reply, /upgrade node\.js to 24/i);
+
+    const updatedReview = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.ok(updatedReview?.actionItemId);
+    const action = await prisma.actionItem.findUniqueOrThrow({ where: { id: updatedReview.actionItemId } });
+    assert.equal(action.title, "Upgrade Node.js to 24");
+    assert.doesNotMatch(action.title, /follow up on settings/i);
+    assert.ok(action.dueAt);
+    assert.equal(formatDateInTimezone(action.dueAt!, "Europe/Madrid"), "2026-10-01");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Invoice Gmail review to task creates a concrete bill review action", async () => {
+  const server = buildServer();
+  const userId = `gmail-review-invoice-action-${randomUUID()}`;
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Endesa bills",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const review = await seedReview(userId, connectionId, rule.id, {
+      subject: "Endesa factura agosto",
+      from: "Endesa <no-reply@endesa.com>",
+      snippet: "Tu factura ya está disponible. Importe aproximado 60 euros.",
+      providerMessageId: "endesa-invoice"
+    });
+
+    mockPlan(gmailReviewListPlan());
+    await sendAgentMessage(server, userId, "show me the item to review");
+
+    mockPlan(gmailReviewToActionPlan({ index: 1 }));
+    const reply = await sendAgentMessage(server, userId, "turn it into a task");
+
+    assert.match(reply.reply, /created task/i);
+    assert.match(reply.reply, /endesa/i);
+
+    const updatedReview = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.ok(updatedReview?.actionItemId);
+    const action = await prisma.actionItem.findUniqueOrThrow({ where: { id: updatedReview.actionItemId } });
+    assert.match(action.title, /review endesa bill/i);
+    assert.doesNotMatch(action.title, /follow up/i);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Gmail review-to-task transcript creates a clean Nest.js task, honors user timing, and lists tasks once", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-08-20T10:00:00.000Z") });
+  const server = buildServer();
+  const userId = `gmail-review-nest-transcript-${randomUUID()}`;
+  const timezone = "Europe/Madrid";
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone, morningTimeMinutes: 540 } });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Platform notices",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const review = await seedReview(userId, connectionId, rule.id, {
+      subject: "[Action Required] Nest.js 20 is being discontinued on October 1st, 2026",
+      from: "Settings <settings@example.com>",
+      snippet: "Hi there, please upgrade to Nest.js 24 as soon as possible. After October 1st, new builds using Nest.js 20 will fail.",
+      extracted: { project: "Settings" },
+      proposedEventType: "work_action_required",
+      providerMessageId: "nest-upgrade-transcript"
+    });
+
+    mockPlan(gmailReviewListPlan());
+    const listReply = await sendAgentMessage(server, userId, "show me the item to review");
+    assert.match(listReply.reply, /pending gmail reviews/i);
+    assert.match(listReply.reply, /nest\.js 20/i);
+
+    mockPlan(gmailReviewToActionPlan({ index: 1, dueText: "tomorrow morning" }));
+    const conversionReply = await sendAgentMessage(server, userId, "turn it into a task for tomorrow morning");
+
+    assert.equal(conversionReply.debug.mutationExecuted, true);
+    assert.match(conversionReply.reply, /created task/i);
+    assert.match(conversionReply.reply, /upgrade nest\.js to 24/i);
+    assert.doesNotMatch(conversionReply.reply, /as soon as po/i);
+    assert.doesNotMatch(conversionReply.reply, /upgrade nest\.js 24/i);
+    assert.doesNotMatch(conversionReply.reply, /01\/10\/2026|2026-10-01/i);
+
+    const updatedReview = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(updatedReview?.status, "approved");
+    assert.ok(updatedReview?.actionItemId);
+
+    const action = await prisma.actionItem.findUniqueOrThrow({ where: { id: updatedReview.actionItemId } });
+    assert.equal(action.title, "Upgrade Nest.js to 24");
+    assert.doesNotMatch(action.title, /as soon as po/i);
+    assert.ok(action.dueAt, "dueAt should be stored");
+    assert.equal(formatDateInTimezone(action.dueAt!, timezone), "2026-08-21");
+    assert.match(formatLocalDateTime(action.dueAt!, timezone), /09:00/);
+
+    mockPlan(actionListPlan([op("action.list", { status: "all", limit: 10 }), op("action.list", { status: "all", limit: 10 })]));
+    const tasksReply = await sendAgentMessage(server, userId, "show all tasks");
+    assert.equal((tasksReply.reply.match(/Found \d+ action item\(s\)/g) ?? []).length, 1);
+    assert.match(tasksReply.reply, /upgrade nest\.js to 24/i);
+  } finally {
+    mock.timers.reset();
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Gmail review-to-task extracts tomorrow morning from the user message when planner omits dueText", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-08-20T10:00:00.000Z") });
+  const server = buildServer();
+  const userId = `gmail-review-nest-timing-fallback-${randomUUID()}`;
+  const timezone = "Europe/Madrid";
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone, morningTimeMinutes: 540 } });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Platform notices",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const review = await seedReview(userId, connectionId, rule.id, {
+      subject: "[Action Required] Nest.js 20 is being discontinued on October 1st, 2026",
+      from: "Settings <settings@example.com>",
+      snippet: "Hi there, please upgrade to Nest.js 24 as soon as possible. After October 1st, new builds using Nest.js 20 will fail.",
+      extracted: { project: "Settings" },
+      proposedEventType: "work_action_required",
+      providerMessageId: "nest-upgrade-timing-fallback"
+    });
+
+    mockPlan(gmailReviewListPlan());
+    await sendAgentMessage(server, userId, "show me the item to review");
+
+    mockPlan(gmailReviewToActionPlan({ index: 1 }));
+    const reply = await sendAgentMessage(server, userId, "turn it into a task for tomorrow morning");
+
+    assert.match(reply.reply, /created task/i);
+    assert.match(reply.reply, /upgrade nest\.js to 24/i);
+    assert.doesNotMatch(reply.reply, /01\/10\/2026|2026-10-01/i);
+
+    const updatedReview = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.ok(updatedReview?.actionItemId);
+    const action = await prisma.actionItem.findUniqueOrThrow({ where: { id: updatedReview.actionItemId } });
+    assert.equal(action.title, "Upgrade Nest.js to 24");
+    assert.ok(action.dueAt);
+    assert.equal(formatDateInTimezone(action.dueAt!, timezone), "2026-08-21");
+    assert.match(formatLocalDateTime(action.dueAt!, timezone), /09:00/);
+  } finally {
+    mock.timers.reset();
     clearAgentRuntimeMocks();
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });

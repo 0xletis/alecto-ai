@@ -91,7 +91,7 @@ import {
   generateAndSaveWeeklyReview,
   generateDeterministicWeeklyReview
 } from "../weekly-review/review.js";
-import { formatDateInTimezone } from "../utils/datetime.js";
+import { formatDateInTimezone, formatLocalDateTime } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
@@ -956,19 +956,27 @@ export async function executeOperation(
 
       case "gmail.review.to_action": {
         const reviewId = args.reviewId as string;
+        const plannedDueText = typeof args.dueText === "string" ? args.dueText.trim() : "";
+        const dueText = plannedDueText || extractGmailReviewActionDueText(message);
         const reviews = await getEmailReviewItems(userId, { status: "pending", limit: 50 });
         const review = reviews.find((item) => item.id === reviewId);
         if (!review) return failed(operation.tool, "That email review no longer exists or was already decided.");
 
-        const { actionItem } = await createActionItemFromEmailReview(userId, review);
+        const { actionItem, created } = await createActionItemFromEmailReview(userId, review, { dueText });
         await approveEmailReviewItem(userId, review.id, undefined, actionItem.id);
         // Same reasoning as gmail.review.reject above: keep the other still-pending reviews
         // visible alongside the newly created action, not just the action alone.
         const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const settings = await getOrCreateNotificationSettings(userId);
+        const dueLabel = actionItem.dueAt
+          ? dueText?.trim()
+            ? ` for ${dueText.trim()} (${formatLocalDateTime(actionItem.dueAt, settings.timezone)})`
+            : ` for ${formatLocalDateTime(actionItem.dueAt, settings.timezone)}`
+          : "";
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Turned the email review into task "${actionItem.title}".`,
+          summary: `${created ? "Created task" : "Task already exists"}: "${actionItem.title}"${dueLabel}.`,
           result: actionItem,
           entities: [actionToEntity(actionItem), ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))]
         };
@@ -1435,6 +1443,39 @@ export async function executeOperation(
   } catch (error) {
     return failed(operation.tool, error instanceof Error ? error.message : "Unknown execution error.");
   }
+}
+
+function extractGmailReviewActionDueText(message: string): string | undefined {
+  const text = message.replace(/\s+/g, " ").trim();
+  if (!text) {
+    return undefined;
+  }
+
+  const relativeDayMatch = text.match(
+    /\b(?:for|by|before|on|to|until|at)\s+((?:today|tomorrow|tonight|now)(?:\s+(?:morning|afternoon|evening|tonight))?)\b/i
+  );
+  if (relativeDayMatch?.[1]) {
+    return relativeDayMatch[1].trim();
+  }
+
+  const bareRelativeDayMatch = text.match(/\b((?:today|tomorrow|tonight|now)(?:\s+(?:morning|afternoon|evening|tonight))?)\b/i);
+  if (bareRelativeDayMatch?.[1]) {
+    return bareRelativeDayMatch[1].trim();
+  }
+
+  const weekday = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)";
+  const weekdayMatch = text.match(new RegExp(`\\b(?:for|by|before|on|to|until)\\s+((?:next\\s+)?${weekday}(?:\\s+(?:morning|afternoon|evening|tonight))?)\\b`, "i"));
+  if (weekdayMatch?.[1]) {
+    return weekdayMatch[1].trim();
+  }
+
+  const month = "(?:january|february|march|april|may|june|july|august|september|october|november|december)";
+  const dateMatch = text.match(new RegExp(`\\b(by|before|on)\\s+(${month}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,\\s*\\d{4})?)\\b`, "i"));
+  if (dateMatch?.[1] && dateMatch[2]) {
+    return `${dateMatch[1]} ${dateMatch[2]}`.trim();
+  }
+
+  return undefined;
 }
 
 function failed(tool: string, error: string): ExecutedOperation {

@@ -265,6 +265,8 @@ export async function createActionItemFromEmailReview(
 
   if (dueAt) {
     actionInput.dueAt = dueAt;
+  } else if (!actionInput.dueAt) {
+    actionInput.dueAt = await parseEmailReviewDetectedDeadline(userId, review, options.now);
   }
 
   const rule = (await getEmailSignalRules(userId)).find((item) => item.id === review.ruleId);
@@ -285,6 +287,27 @@ export async function createActionItemFromEmailReview(
   return createActionItemIfNotExists(userId, actionInput);
 }
 
+export async function parseEmailReviewDetectedDeadline(
+  userId: string,
+  review: EmailReviewItem,
+  now = new Date()
+): Promise<Date | undefined> {
+  const deadlineText = detectedDeadlineTextFromEmailReview(review, now);
+
+  if (!deadlineText) {
+    return undefined;
+  }
+
+  const settings = await getOrCreateNotificationSettings(userId);
+  const parsed = parseActionDueDate(deadlineText, {
+    now,
+    timezone: settings.timezone,
+    preferences: settings
+  });
+
+  return parsed.invalidReason === "past_explicit_time" ? undefined : parsed.dueAt ?? undefined;
+}
+
 export async function parseEmailReviewActionDueAt(userId: string, dueText: string | undefined, now = new Date()): Promise<Date | undefined> {
   if (!dueText?.trim()) {
     return undefined;
@@ -302,6 +325,46 @@ export async function parseEmailReviewActionDueAt(userId: string, dueText: strin
   }
 
   return parsed.dueAt ?? undefined;
+}
+
+function detectedDeadlineTextFromEmailReview(review: EmailReviewItem, now: Date): string | undefined {
+  const text = cleanEmailFragment([review.subject, review.snippet, review.evidence].filter(Boolean).join(" "));
+  const match = text.match(
+    /\b(?:by|before|after|on)?\s*(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b/i
+  );
+
+  if (!match?.[1] || !match[2]) {
+    return undefined;
+  }
+
+  const month = monthNumber(match[1]);
+  const day = Number(match[2]);
+
+  if (!month || day < 1 || day > 31) {
+    return undefined;
+  }
+
+  const year = match[3] ? Number(match[3]) : now.getFullYear();
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function monthNumber(month: string): number | undefined {
+  const months = [
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december"
+  ];
+  const index = months.indexOf(month.toLowerCase());
+  return index === -1 ? undefined : index + 1;
 }
 
 export async function rejectEmailReviewForUser(userId: string, reviewId: string): Promise<{ status: "not_found" | "ok"; review?: EmailReviewItem; message: string }> {
@@ -578,12 +641,11 @@ export function buildActionTitle(review: EmailReviewItem, project?: string): str
   const subject = cleanEmailFragment(review.subject ?? "");
   const bodyText = cleanEmailFragment(extractBodyLikeText(review.evidence) || review.snippet || "");
   const subjectAction = actionTitleFromText(subject);
+  const bodyAction = actionTitleFromText(bodyText);
 
   if (subjectAction && !/^follow up on\b/i.test(subjectAction)) {
     return subjectAction;
   }
-
-  const bodyAction = actionTitleFromText(bodyText);
 
   if (bodyAction) {
     return bodyAction;
@@ -591,6 +653,12 @@ export function buildActionTitle(review: EmailReviewItem, project?: string): str
 
   if (subjectAction) {
     return subjectAction;
+  }
+
+  const contextualAction = contextualActionTitleFromReview(review, subject, bodyText);
+
+  if (contextualAction) {
+    return contextualAction;
   }
 
   if (project) {
@@ -627,13 +695,14 @@ export function cleanActionPhrase(value: string): string {
     .replace(/\s+/g, " ")
     .replace(/^follow up on\s+/i, "")
     .replace(/^the\s+/i, "")
-    .trim();
+    .trim()
+    .replace(/^[\s"'`]+|[\s"'`.,;:!?]+$/g, "");
 
   if (!cleaned) {
     return "Review work action";
   }
 
-  const capped = truncatePlainText(cleaned, 80);
+  const capped = truncateActionText(cleaned, 80);
   return `${capped.charAt(0).toUpperCase()}${capped.slice(1)}`;
 }
 
@@ -642,11 +711,14 @@ export function cleanActionObject(value: string): string {
     .replace(/&[a-z0-9#]+;/gi, " ")
     .replace(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/gi, " ")
     .replace(/\b(?:subject|from|snippet|body):.*$/i, "")
+    .replace(/\s+(?:as soon as possible|asap)\b[\s\S]*$/i, "")
+    .replace(/\s+(?:after|before|by|on)\s+\w+\s+\d{1,2}(?:st|nd|rd|th)?(?:,\s*\d{4})?\b[\s\S]*$/i, "")
     .replace(/\s+/g, " ")
     .replace(/^the\s+/i, "")
-    .trim();
+    .trim()
+    .replace(/^[\s"'`]+|[\s"'`.,;:!?]+$/g, "");
 
-  return truncatePlainText(cleaned || "work action", 73);
+  return truncateActionText(cleaned || "work action", 73);
 }
 
 export function actionTitleFromText(text: string): string | undefined {
@@ -654,6 +726,26 @@ export function actionTitleFromText(text: string): string | undefined {
 
   if (!clean) {
     return undefined;
+  }
+
+  const upgradeObjectMatch = clean.match(/\b(?:please\s+)?upgrade\s+(.+?)\s+to\s+(.+?)(?:\s+as soon as possible|\s+before\b|\s+by\b|\s+after\b|\s+and\b|$)/i);
+
+  if (upgradeObjectMatch?.[1] && upgradeObjectMatch[2] && !/^to$/i.test(upgradeObjectMatch[1].trim())) {
+    return `Upgrade ${cleanActionObject(upgradeObjectMatch[1])} to ${cleanActionObject(upgradeObjectMatch[2])}`;
+  }
+
+  const upgradeMatch = clean.match(/\b(?:please\s+)?upgrade\s+to\s+(.+?)(?:\s+as soon as possible|\s+before\b|\s+by\b|\s+after\b|\s+and\b|$)/i);
+
+  if (upgradeMatch?.[1]) {
+    return upgradeActionTitle(upgradeMatch[1]);
+  }
+
+  const upgradeVersionMatch = clean.match(
+    /\b(?:please\s+)?upgrade\s+([a-z0-9][a-z0-9.+#/-]*(?:\s+[a-z0-9][a-z0-9.+#/-]*){0,3})\s+(\d+(?:\.\d+)*)(?:\s+as soon as possible|\s+asap|\s+before\b|\s+by\b|\s+after\b|\s+and\b|[.!?]|$)/i
+  );
+
+  if (upgradeVersionMatch?.[1] && upgradeVersionMatch[2]) {
+    return `Upgrade ${cleanActionObject(upgradeVersionMatch[1])} to ${upgradeVersionMatch[2]}`;
   }
 
   const reviewMatch = clean.match(/\b(?:please\s+)?review (?:the )?(.+?)(?:\s+by\b|\s+and\b|[.!?]|$)/i);
@@ -681,6 +773,59 @@ export function actionTitleFromText(text: string): string | undefined {
   }
 
   return undefined;
+}
+
+function contextualActionTitleFromReview(review: EmailReviewItem, subject: string, bodyText: string): string | undefined {
+  const from = cleanEmailFragment(review.from ?? "");
+  const combined = `${subject} ${bodyText} ${from}`;
+
+  if (/\b(?:invoice|bill|factura|recibo)\b/i.test(combined)) {
+    const vendor = invoiceVendorFromText(subject) ?? invoiceVendorFromText(from);
+    return vendor ? `Review ${vendor} bill` : "Review invoice";
+  }
+
+  if (/\b(?:recruiter|talent acquisition|interview|availability|available|can we talk|schedule a call|schedule an interview)\b/i.test(combined)) {
+    return /\b(?:availability|available|can we talk|schedule)\b/i.test(combined)
+      ? "Reply to recruiter about availability"
+      : "Reply to recruiter";
+  }
+
+  return undefined;
+}
+
+function upgradeActionTitle(rawObject: string): string {
+  const object = cleanActionObject(rawObject);
+  const versionMatch = object.match(/^(.+?)\s+(\d+(?:\.\d+)*)$/);
+
+  if (versionMatch?.[1] && versionMatch[2]) {
+    return `Upgrade ${cleanActionObject(versionMatch[1])} to ${versionMatch[2]}`;
+  }
+
+  return `Upgrade ${object}`;
+}
+
+function truncateActionText(text: string, maxLength: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  if (clean.length <= maxLength) {
+    return clean;
+  }
+
+  const slice = clean.slice(0, maxLength - 3);
+  const wordBoundary = slice.search(/\s+\S*$/);
+  const capped = wordBoundary > 20 ? slice.slice(0, wordBoundary) : slice;
+  return `${capped.trimEnd()}...`;
+}
+
+function invoiceVendorFromText(text: string): string | undefined {
+  const beforeKeyword = text.match(/^(.+?)\s+(?:invoice|bill|factura|recibo)\b/i)?.[1];
+  const candidate = beforeKeyword ?? text.match(/\b(?:from|de)\s+(.+?)\s+(?:invoice|bill|factura|recibo)\b/i)?.[1];
+
+  if (!candidate) {
+    return undefined;
+  }
+
+  const cleaned = cleanActionObject(candidate.replace(/^\[[^\]]+\]\s*/, ""));
+  return cleaned && !/^(your|new|monthly|latest|the)$/i.test(cleaned) ? cleaned : undefined;
 }
 
 export function extractBodyLikeText(text?: string): string | undefined {

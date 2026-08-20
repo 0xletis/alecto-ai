@@ -2343,7 +2343,7 @@ test("email review inbox supports numbered natural review handling", async () =>
       payload: { userId: reviewUserId, message: "turn 3 into an action tomorrow" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Action created from email review: Endesa factura/);
+    assert.match(response.json().reply, /Action created from email review: Review Endesa bill/);
     assert.equal(await prisma.actionItem.count({ where: { userId: reviewUserId, source: "email_review" } }), 1);
     assert.equal(await prisma.emailReviewItem.count({ where: { userId: reviewUserId, status: "pending" } }), 0);
 
@@ -2781,7 +2781,7 @@ test("email review bulk rest only mutates currently pending visible reviews", as
       payload: { userId: reviewUserId, message: "turn 2 into an action for rating Endesa this week" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Action created from email review: Endesa factura 2/);
+    assert.match(response.json().reply, /Action created from email review: Review Endesa bill/);
 
     response = await server.inject({
       method: "POST",

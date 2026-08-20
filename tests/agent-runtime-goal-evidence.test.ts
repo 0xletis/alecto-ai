@@ -307,7 +307,7 @@ test("9. non-job example: an Endesa-bills goal links a matching Gmail review to 
     mockPlan({ topic: "gmail_reviews", intent: "convert_review_to_action", operations: [op("gmail.review.to_action", { ref: "Endesa" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "turn the Endesa one into a task");
 
-    assert.match(reply.reply, /turned the email review into task/i);
+    assert.match(reply.reply, /created task/i);
     const action = await prisma.actionItem.findFirst({ where: { userId, sourceProvider: "gmail" } });
     assert.ok(action, "an action must have been created from the Endesa review");
     assert.equal(action?.goalId, goal.id, "the action must be linked to the Endesa-bills goal via the same generic matcher used for job-search actions — no job-search-specific code path involved");

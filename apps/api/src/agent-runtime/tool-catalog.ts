@@ -361,13 +361,14 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.to_action",
     description:
-      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X'. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
+      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X'. If the user asks for a due time, pass their exact timing phrase as dueText (e.g. 'tomorrow morning', 'next Monday'). Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
       reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
       index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
-      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number.")
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number."),
+      dueText: z.string().min(1).optional().describe("Natural-language due time requested by the user, e.g. 'tomorrow morning', 'tomorrow afternoon', 'next Monday'.")
     })
   },
   {

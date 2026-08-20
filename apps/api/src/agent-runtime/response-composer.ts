@@ -145,9 +145,17 @@ function executedSummaries(
   ops: ExecutedOperation[],
   matches: (tool: ReturnType<typeof getToolDefinition>) => boolean
 ): string[] {
+  const seen = new Set<string>();
   return ops
     .filter((op) => (op.status === "executed" || op.status === "skipped") && matches(getToolDefinition(op.tool)))
-    .map((op) => op.summary);
+    .map((op) => op.summary)
+    .filter((summary) => {
+      if (seen.has(summary)) {
+        return false;
+      }
+      seen.add(summary);
+      return true;
+    });
 }
 
 function joinSentences(lines: string[]): string {
