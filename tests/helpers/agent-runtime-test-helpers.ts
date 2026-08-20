@@ -121,4 +121,81 @@ export async function getAgentSession(userId: string, channel = "telegram"): Pro
   return prisma.agentConversationSession.findUnique({ where: { userId_channel: { userId, channel } } });
 }
 
+/**
+ * Shared smoke-transcript assertions — pulled out of several near-duplicate copies (each test
+ * file previously defined its own assertNoGenericAgentError) so new V3 transcript-shaped tests
+ * have one place to import guard-rail-style assertions from, rather than re-copying them again.
+ * Each one targets a specific, previously-real regression rather than being a generic sanity
+ * check, so a failure here should point straight at which bug class came back.
+ */
+
+/** The top-level safety-net reply (processAgentMessage's catch-all) must never leak for an
+ * ordinary, well-formed turn — its presence means something crashed instead of being handled. */
+export function assertNoGenericAgentError(reply: AgentMessageResponseJson, context?: string): void {
+  assert.notEqual(reply.reply, "I hit an unexpected problem there — please try again.", context);
+  assert.doesNotMatch(reply.reply, /unexpected problem/i, context);
+}
+
+/** A clear operational/domain command (Gmail autonomy, sync, review triage, action completion,
+ * etc.) must never be intercepted by the goal-avoidance guardrail — regression: "check gmail
+ * every hour" was classified as avoidance of an unrelated active reading goal. */
+export function assertNoAvoidanceWhenOperationalCommand(reply: AgentMessageResponseJson, context?: string): void {
+  assert.doesNotMatch(reply.reply, /avoidance|conflicts with your goal|pulling you away from your goal/i, context);
+  assert.notEqual(reply.debug.conversationTopic, "guardrail", context);
+}
+
+/** A read-only Gmail status/schedule question ("when do you check Gmail?") must never trigger a
+ * real gmail.sync — regression: it ran a real 45-50s sync and created EmailReviewItems for what
+ * was only ever a status question. */
+export function assertNoUnexpectedGmailSyncForStatus(reply: AgentMessageResponseJson, context?: string): void {
+  const tools = reply.operationsPlanned.map((operation) => operation.tool);
+  assert.ok(!tools.includes("gmail.sync"), `${context ? `${context}: ` : ""}must not call gmail.sync for a status query — planned: ${tools.join(", ") || "(none)"}`);
+  assert.doesNotMatch(reply.reply, /messages checked/i, context);
+}
+
+/** composeReply's groundTruthOnly/informationalSummaries branches must never show the same tool
+ * summary line twice — regression: a compound turn executing a ground-truth-only tool AND a
+ * separately-informational tool in the same turn could double-count or silently drop one half. */
+export function assertNoDuplicateToolSummary(reply: AgentMessageResponseJson, context?: string): void {
+  const lines = reply.reply
+    .split(/\n\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  for (const line of lines) {
+    assert.ok(!seen.has(line), `${context ? `${context}: ` : ""}duplicate summary line: "${line}"`);
+    seen.add(line);
+  }
+}
+
+/** Whenever a turn ends in a clarification question (or an intentionally ambiguous reference),
+ * nothing may have actually mutated — a clarification is only honest if nothing was silently
+ * decided on the user's behalf while asking. */
+export function assertNoMutationWhenClarificationExpected(reply: AgentMessageResponseJson, context?: string): void {
+  assert.equal(reply.debug.mutationExecuted, false, context);
+  assert.ok(
+    reply.operationsExecuted.every((operation) => operation.status !== "executed"),
+    `${context ? `${context}: ` : ""}an operation executed despite an expected clarification`
+  );
+}
+
+/**
+ * Env-gated, human-readable one-liner for a single transcript turn — complements (never
+ * replaces) the structured `[agent-runtime-diagnostics]` JSON lines runtime.ts's own
+ * logAgentRuntimeDiagnostics already emits (matched domain shortcut, whether the guardrail was
+ * reached or skipped, raw planner ops, reconciled ops, mutation tools) whenever
+ * AGENT_RUNTIME_DIAGNOSTICS=true. This just makes a whole multi-turn transcript easy to scan at a
+ * glance in test output; it prints nothing at all when the env var isn't set, so it never adds
+ * noise to a normal test run.
+ */
+export function logTranscriptStep(label: string, message: string, reply: AgentMessageResponseJson): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  const tools = reply.operationsPlanned.map((operation) => operation.tool).join(", ") || "(none)";
+  console.log(
+    `[smoke-transcript] ${label}: "${message}" -> tools=[${tools}] mutation=${reply.debug.mutationExecuted} topic=${reply.debug.conversationTopic ?? "null"} plannerUsed=${reply.debug.plannerUsed}`
+  );
+}
+
 export { buildServer, prisma };
