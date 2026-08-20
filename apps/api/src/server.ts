@@ -111,6 +111,7 @@ import {
   getIntegrationConnections,
   approvePendingGmailReviewItemsForSemanticEvent,
   rejectEmailReviewItem,
+  reassignActiveEmailSignalRulesToConnection,
   completeActionItem,
   archiveActionItem,
   rescheduleActionItem,
@@ -228,7 +229,7 @@ import {
   noActiveGmailRulesMessage,
   reactivateOrReuseBuiltInEmailRule
 } from "./legacy/gmail-conversation.js";
-import { buildGmailOAuthUrl, decodeGmailOAuthState, gmailOAuthConfig, gmailOAuthMissingConfigMessage } from "./gmail/oauth.js";
+import { buildGmailOAuthUrl, decodeGmailOAuthState, gmailOAuthConfig, gmailOAuthLocalhostCallbackWarning, gmailOAuthMissingConfigMessage } from "./gmail/oauth.js";
 import { createGoalProgressFromCompletedAction, createCustomGoalProgressEvent } from "./actions/goal-progress.js";
 import { formatActionCreatedReply, maybeCreateManualActionFromText } from "./actions/manual-action.js";
 import {
@@ -941,7 +942,8 @@ export function buildServer() {
     }
 
     return {
-      url: buildGmailOAuthUrl(request.params.userId, config)
+      url: buildGmailOAuthUrl(request.params.userId, config),
+      localCallbackWarning: gmailOAuthLocalhostCallbackWarning(config)
     };
   });
 
@@ -973,16 +975,28 @@ export function buildServer() {
         const token = await exchangeGmailOAuthCode(request.query.code, config);
         const email = await getGmailProfileEmail(token.accessToken);
 
-        await createGmailConnection(userId, buildEncryptedGmailConnectionConfig({
+        const connection = await createGmailConnection(userId, buildEncryptedGmailConnectionConfig({
           provider: "gmail",
           scope: "gmail.readonly",
           email
         }, token));
+        const activeRulesPreserved = await preserveActiveGmailRulesForOAuthReconnect(userId, connection, email);
+        console.info(
+          `Gmail OAuth connected for user=${userId} email=${email ?? "unknown"} connection=${connection.id} activeRulesPreserved=${activeRulesPreserved}`
+        );
+
+        return reply
+          .type("text/plain")
+          .send([
+            `Gmail connected${email ? ` for ${email}` : ""}.`,
+            activeRulesPreserved > 0
+              ? `Preserved ${activeRulesPreserved} active Gmail rule${activeRulesPreserved === 1 ? "" : "s"}.`
+              : "No active Gmail rules needed moving.",
+            "You can return to Telegram."
+          ].join(" "));
       } catch (error) {
         return reply.status(400).type("text/plain").send(safeGmailErrorMessage(error));
       }
-
-      return reply.type("text/plain").send("Gmail connected. You can return to Telegram.");
     }
   );
 
@@ -4362,6 +4376,53 @@ function normalizeGithubPublicConnectionInput(input: GithubPublicConnectionInput
     authorLogin: input.authorLogin?.trim().toLowerCase(),
     includeRepoActivity: input.includeRepoActivity ?? !input.authorLogin
   };
+}
+
+async function preserveActiveGmailRulesForOAuthReconnect(
+  userId: string,
+  connectedConnection: IntegrationConnection,
+  email: string | undefined
+): Promise<number> {
+  const [connections, rules] = await Promise.all([
+    getIntegrationConnections(userId),
+    getEmailSignalRules(userId)
+  ]);
+  const activeRuleConnectionIds = new Set(rules.filter((rule) => rule.status === "active").map((rule) => rule.connectionId));
+  const candidateConnections = connections.filter(
+    (connection) =>
+      connection.integrationId === "gmail" &&
+      connection.status !== "archived" &&
+      connection.id !== connectedConnection.id &&
+      activeRuleConnectionIds.has(connection.id)
+  );
+
+  if (candidateConnections.length === 0) {
+    return 0;
+  }
+
+  const normalizedEmail = normalizeGmailAccountEmail(email);
+  const sameAccountConnections = normalizedEmail
+    ? candidateConnections.filter((connection) => normalizeGmailAccountEmail(connection.config.email) === normalizedEmail)
+    : [];
+  const sourceConnections =
+    sameAccountConnections.length > 0
+      ? sameAccountConnections
+      : candidateConnections.length === 1
+        ? candidateConnections
+        : [];
+
+  if (sourceConnections.length === 0) {
+    return 0;
+  }
+
+  return reassignActiveEmailSignalRulesToConnection(userId, {
+    fromConnectionIds: sourceConnections.map((connection) => connection.id),
+    toConnectionId: connectedConnection.id
+  });
+}
+
+function normalizeGmailAccountEmail(value: unknown): string | undefined {
+  return typeof value === "string" && value.includes("@") ? value.trim().toLowerCase() : undefined;
 }
 
 function findDuplicateGithubConnection(

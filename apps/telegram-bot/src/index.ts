@@ -741,7 +741,9 @@ bot.command("connect_gmail", async (ctx) => {
     const response = await apiGet<GmailOAuthUrlResponse>(
       `/users/${getTelegramUserId(ctx)}/integrations/gmail/oauth-url`
     );
-    await ctx.reply(`Connect Gmail:\n${response.url}`);
+    await ctx.reply(
+      [`Connect Gmail:\n${response.url}`, response.localCallbackWarning].filter(Boolean).join("\n\n")
+    );
   } catch (error) {
     await replyWithIntegrationMessage(ctx, safeIntegrationErrorMessage(error));
   }
@@ -4682,6 +4684,7 @@ interface IntegrationConnectionsResponse {
 
 interface GmailOAuthUrlResponse {
   url: string;
+  localCallbackWarning?: string;
 }
 
 interface EmailRulesResponse {

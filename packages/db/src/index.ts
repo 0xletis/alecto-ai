@@ -1237,6 +1237,43 @@ export async function updateEmailSignalRule(
   return toEmailSignalRule(rule);
 }
 
+export async function reassignActiveEmailSignalRulesToConnection(
+  userId: string,
+  input: { fromConnectionIds: string[]; toConnectionId: string }
+): Promise<number> {
+  await ensureUser(userId);
+
+  const fromConnectionIds = [...new Set(input.fromConnectionIds.filter((id) => id && id !== input.toConnectionId))];
+  if (fromConnectionIds.length === 0) {
+    return 0;
+  }
+
+  const targetConnection = await prisma.integrationConnection.findFirst({
+    where: {
+      id: input.toConnectionId,
+      userId,
+      integrationId: "gmail"
+    }
+  });
+
+  if (!targetConnection) {
+    return 0;
+  }
+
+  const result = await prisma.emailSignalRule.updateMany({
+    where: {
+      userId,
+      status: "active",
+      connectionId: { in: fromConnectionIds }
+    },
+    data: {
+      connectionId: input.toConnectionId
+    }
+  });
+
+  return result.count;
+}
+
 export async function updateEmailSignalRuleDefinition(
   userId: string,
   ruleId: string,

@@ -17,17 +17,20 @@ function installGmailOAuthEnv(): () => void {
   const previous = {
     GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
-    GMAIL_REDIRECT_URI: process.env.GMAIL_REDIRECT_URI
+    GMAIL_REDIRECT_URI: process.env.GMAIL_REDIRECT_URI,
+    ALECTO_SECRET_ENCRYPTION_KEY: process.env.ALECTO_SECRET_ENCRYPTION_KEY
   };
 
   process.env.GOOGLE_CLIENT_ID = "test-gmail-client-id.apps.googleusercontent.com";
   process.env.GOOGLE_CLIENT_SECRET = "test-gmail-client-secret";
   process.env.GMAIL_REDIRECT_URI = "http://localhost:3000/oauth/gmail/callback";
+  process.env.ALECTO_SECRET_ENCRYPTION_KEY = "test-secret-encryption-key";
 
   return () => {
     restoreEnv("GOOGLE_CLIENT_ID", previous.GOOGLE_CLIENT_ID);
     restoreEnv("GOOGLE_CLIENT_SECRET", previous.GOOGLE_CLIENT_SECRET);
     restoreEnv("GMAIL_REDIRECT_URI", previous.GMAIL_REDIRECT_URI);
+    restoreEnv("ALECTO_SECRET_ENCRYPTION_KEY", previous.ALECTO_SECRET_ENCRYPTION_KEY);
   };
 }
 
@@ -204,7 +207,48 @@ async function runAgentTranscript(
   return replies;
 }
 
-function restoreEnv(key: "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET" | "GMAIL_REDIRECT_URI", value: string | undefined): void {
+function installGmailOAuthFetchMock(email = "letiskate@gmail.com"): () => void {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+
+    if (url === "https://oauth2.googleapis.com/token") {
+      return new Response(
+        JSON.stringify({
+          access_token: "test-access-token",
+          refresh_token: "test-refresh-token",
+          expires_in: 3600,
+          token_type: "Bearer",
+          scope: "https://www.googleapis.com/auth/gmail.readonly"
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+
+    if (url === "https://gmail.googleapis.com/gmail/v1/users/me/profile") {
+      return new Response(JSON.stringify({ emailAddress: email }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    return new Response("unexpected fetch", { status: 500 });
+  }) as typeof fetch;
+
+  return () => {
+    globalThis.fetch = previousFetch;
+  };
+}
+
+function gmailOAuthCallbackUrl(userId: string): string {
+  const state = Buffer.from(JSON.stringify({ userId }), "utf8").toString("base64url");
+  return `/oauth/gmail/callback?code=test-oauth-code&state=${state}`;
+}
+
+function restoreEnv(
+  key: "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET" | "GMAIL_REDIRECT_URI" | "ALECTO_SECRET_ENCRYPTION_KEY",
+  value: string | undefined
+): void {
   if (value === undefined) {
     delete process.env[key];
   } else {
@@ -266,6 +310,7 @@ test("V3 Gmail sync auth and token failures return safe reconnect action", async
     assert.deepEqual(plannedTools(expired), ["gmail.sync"]);
     assert.match(expired.reply, /Gmail authorization expired\. Reconnect Gmail\./);
     assert.match(expired.reply, /Reconnect Gmail here:\nhttps:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(expired.reply, /Open this link on the same machine running Alecto/i);
     assert.doesNotMatch(expired.reply, /accessToken|refreshToken|ciphertext|authTag|provider raw/i);
 
     configureAgentRuntimeServices({
@@ -277,6 +322,7 @@ test("V3 Gmail sync auth and token failures return safe reconnect action", async
     assert.deepEqual(plannedTools(decrypt), ["gmail.sync"]);
     assert.match(decrypt.reply, /Gmail token could not be read\/decrypted\. Reconnect Gmail\./);
     assert.match(decrypt.reply, /Reconnect Gmail here:\nhttps:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(decrypt.reply, /Open this link on the same machine running Alecto/i);
     assert.doesNotMatch(decrypt.reply, /accessToken|refreshToken|ciphertext|authTag|provider raw/i);
   } finally {
     clearAgentRuntimeMocks();
@@ -425,6 +471,7 @@ test("V3 Gmail status, sync, and built-in rule enablement share canonical expire
     assert.deepEqual(plannedTools(status), ["gmail.status"]);
     assert.match(status.reply, /Gmail authorization is expired/i);
     assert.match(status.reply, /Reconnect Gmail here:\nhttps:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(status.reply, /Open this link on the same machine running Alecto/i);
     assert.match(status.reply, /Last synced: 2026-08-13\./);
     assert.match(status.reply, /Naturgy invoices/);
     assert.match(status.reply, /Aigues de Barcelona invoices/);
@@ -435,6 +482,7 @@ test("V3 Gmail status, sync, and built-in rule enablement share canonical expire
     assert.deepEqual(plannedTools(sync), ["gmail.sync"]);
     assert.match(sync.reply, /Gmail authorization is expired/i);
     assert.match(sync.reply, /Reconnect Gmail here:\nhttps:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(sync.reply, /Open this link on the same machine running Alecto/i);
     assert.match(sync.reply, /You have 4 active Gmail rules, but sync cannot run until Gmail is reconnected\./);
     assert.match(sync.reply, /Naturgy invoices/);
     assert.match(sync.reply, /Aigues de Barcelona invoices/);
@@ -457,6 +505,88 @@ test("V3 Gmail status, sync, and built-in rule enablement share canonical expire
   } finally {
     clearAgentRuntimeMocks();
     resetAgentRuntimeServicesForTests();
+    restore();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Gmail OAuth reconnect preserves active rules for V3 status and sync", async () => {
+  const restoreEnv = installGmailOAuthEnv();
+  const restoreFetch = installGmailOAuthFetchMock("letiskate@gmail.com");
+  const server = buildServer();
+  const userId = `gmail-reconnect-lifecycle-${randomUUID()}`;
+  let syncCalls = 0;
+
+  try {
+    await seedUser(userId);
+    await seedExpiredDuplicateGmailState(userId);
+    configureAgentRuntimeServices({
+      syncGmailForUser: async () => {
+        syncCalls += 1;
+        return "Gmail sync: 4 messages checked, 1 new item.";
+      }
+    });
+
+    const callback = await server.inject({
+      method: "GET",
+      url: gmailOAuthCallbackUrl(userId)
+    });
+    assert.equal(callback.statusCode, 200);
+    assert.match(callback.body, /Gmail connected/i);
+    assert.doesNotMatch(callback.body, /accessToken|refreshToken|ciphertext|authTag/i);
+
+    const status = await sendAgentMessage(server, userId, "gmail status");
+    assertNoGenericAgentError(status);
+    assert.deepEqual(plannedTools(status), ["gmail.status"]);
+    assert.match(status.reply, /Gmail is connected as letiskate@gmail\.com/i);
+    assert.match(status.reply, /Naturgy invoices/);
+    assert.match(status.reply, /Aigues de Barcelona invoices/);
+    assert.match(status.reply, /Endesa bills/);
+    assert.match(status.reply, /Work action emails/);
+    assert.doesNotMatch(status.reply, /authorization is expired|Reconnect Gmail here|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+
+    const sync = await sendAgentMessage(server, userId, "sync gmail");
+    assertNoGenericAgentError(sync);
+    assert.deepEqual(plannedTools(sync), ["gmail.sync"]);
+    assert.match(sync.reply, /Gmail sync: 4 messages checked, 1 new item\./);
+    assert.doesNotMatch(sync.reply, /authorization is expired|Reconnect Gmail here|no email tracking rules are active/i);
+    assert.equal(syncCalls, 1);
+
+    const activeRules = await prisma.emailSignalRule.findMany({
+      where: { userId, status: "active" },
+      orderBy: { name: "asc" }
+    });
+    assert.equal(activeRules.length, 4);
+    assert.equal(new Set(activeRules.map((rule) => rule.connectionId)).size, 1);
+  } finally {
+    clearAgentRuntimeMocks();
+    resetAgentRuntimeServicesForTests();
+    restoreFetch();
+    restoreEnv();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Gmail OAuth URL response warns when callback URL is localhost", async () => {
+  const restore = installGmailOAuthEnv();
+  const server = buildServer();
+  const userId = `gmail-oauth-url-warning-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const response = await server.inject({
+      method: "GET",
+      url: `/users/${userId}/integrations/gmail/oauth-url`
+    });
+    const body = response.json();
+
+    assert.equal(response.statusCode, 200);
+    assert.match(body.url, /^https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(body.localCallbackWarning, /Open this link on the same machine running Alecto/i);
+    assert.doesNotMatch(JSON.stringify(body), /accessToken|refreshToken|ciphertext|authTag/i);
+  } finally {
     restore();
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });

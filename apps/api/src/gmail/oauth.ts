@@ -26,6 +26,19 @@ export function buildGmailOAuthUrl(userId: string, config: Pick<GmailOAuthConfig
   return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
 }
 
+export function gmailOAuthLocalhostCallbackWarning(config: Pick<GmailOAuthConfig, "redirectUri">): string | undefined {
+  try {
+    const url = new URL(config.redirectUri);
+    if (url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "::1") {
+      return "Open this link on the same machine running Alecto, or configure a public callback URL.";
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+}
+
 export function decodeGmailOAuthState(state: string): string | undefined {
   try {
     const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8")) as { userId?: unknown };

@@ -61,7 +61,7 @@ import {
   isGmailRuleAlreadyInTargetState,
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
-import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
+import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthLocalhostCallbackWarning, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
 import { buildGmailAutonomyState } from "../conversation/gmail-autonomy.js";
 import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
@@ -1817,7 +1817,7 @@ function formatCanonicalGmailSyncBlock(userId: string, state: Awaited<ReturnType
   if (!connection || state.authState === "disconnected") {
     return [
       "Gmail is not connected yet.",
-      oauthUrl ? `Connect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      ...gmailOAuthActionLines("Connect Gmail here", oauthUrl),
       "After connecting, enable an email rule before any Gmail scan can run."
     ].join("\n");
   }
@@ -1825,7 +1825,7 @@ function formatCanonicalGmailSyncBlock(userId: string, state: Awaited<ReturnType
   if (state.authState === "expired" || state.authState === "error") {
     return [
       gmailConnectionProblemLine(connection),
-      oauthUrl ? `Reconnect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      ...gmailOAuthActionLines("Reconnect Gmail here", oauthUrl),
       state.activeRules.length > 0
         ? `You have ${state.activeRules.length} active Gmail rule${state.activeRules.length === 1 ? "" : "s"}, but sync cannot run until Gmail is reconnected.`
         : "Sync cannot run until Gmail is reconnected.",
@@ -1865,7 +1865,7 @@ function formatGmailConnectionStatusForChat(
   if (!connection || connection.status === "archived") {
     return [
       "Gmail is not connected yet.",
-      oauthUrl ? `Connect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      ...gmailOAuthActionLines("Connect Gmail here", oauthUrl),
       "Access is readonly. Alecto cannot send emails or change labels.",
       "After connecting, enable an email rule before any Gmail scan can run.",
       ...ruleLines
@@ -1881,7 +1881,7 @@ function formatGmailConnectionStatusForChat(
   if (connection.status === "error") {
     return [
       gmailConnectionProblemLine(connection),
-      oauthUrl ? `Reconnect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      ...gmailOAuthActionLines("Reconnect Gmail here", oauthUrl),
       `Last synced: ${lastSyncedLabel}.`,
       ...ruleLines
     ].join("\n");
@@ -2077,12 +2077,22 @@ function appendGmailSyncReconnectLink(userId: string, summary: string): string {
   }
 
   const label = lower.includes("not connected") ? "Connect Gmail here" : "Reconnect Gmail here";
-  return `${summary}\n\n${label}:\n${oauthUrl}`;
+  return [summary, "", ...gmailOAuthActionLines(label, oauthUrl)].filter((line) => line !== undefined).join("\n");
 }
 
 function gmailOAuthUrlForUser(userId: string): string | undefined {
   const config = gmailOAuthConfig();
   return config ? buildGmailOAuthUrl(userId, config) : undefined;
+}
+
+function gmailOAuthActionLines(label: string, oauthUrl: string | undefined): string[] {
+  if (!oauthUrl) {
+    return [gmailOAuthMissingConfigMessage()];
+  }
+
+  const config = gmailOAuthConfig();
+  const warning = config ? gmailOAuthLocalhostCallbackWarning(config) : undefined;
+  return [`${label}:\n${oauthUrl}`, ...(warning ? [warning] : [])];
 }
 
 function gmailConnectionProblemLine(connection: IntegrationConnection): string {

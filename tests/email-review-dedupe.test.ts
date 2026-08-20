@@ -385,7 +385,7 @@ test("Gmail OAuth callback stores encrypted tokens and integration output redact
     });
 
     assert.equal(callback.statusCode, 200);
-    assert.equal(callback.body, "Gmail connected. You can return to Telegram.");
+    assert.equal(callback.body, "Gmail connected for user@example.com. No active Gmail rules needed moving. You can return to Telegram.");
     assert.doesNotMatch(callback.body, /secret-access-token|secret-refresh-token|ciphertext|accessToken|refreshToken/);
 
     const connection = await prisma.integrationConnection.findFirstOrThrow({
