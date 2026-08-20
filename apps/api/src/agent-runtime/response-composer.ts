@@ -92,7 +92,15 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "daily_loop.settings_apply_update",
   "gmail.review.reject",
   "gmail.review.to_action",
-  "proactive.settings_apply_update"
+  "proactive.settings_apply_update",
+  // A real-LLM eval run found the planner's pre-execution replyDraft claiming evidence "counted
+  // toward" a goal even when this call fell back to the genuinely unlinked path — its own summary
+  // is specifically written to state the truth about whether/what was linked, so that truth must
+  // always be what's shown, never the LLM's optimism. NOT goal.log_evidence too, deliberately:
+  // that tool is routinely planned in the SAME turn as action.create (e.g. "I have an interview
+  // tomorrow"), and groundTruthOnly below suppresses every OTHER op's summary in the turn, not
+  // just replyDraft — adding it here silently dropped the action.create half of that reply.
+  "event.log_custom_progress"
 ]);
 
 /** Exposed only for runtime.ts's dev/test-only planning trace, to classify which composeReply branch produced a reply without duplicating its branch logic. */

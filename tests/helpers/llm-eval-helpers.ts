@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { countEvidenceForMetric } from "../../packages/core/src/goal-evidence.ts";
 import type { Goal } from "../../packages/core/src/goals.ts";
 import { getEventsSince, prisma } from "../../packages/db/src/index.ts";
@@ -17,6 +18,45 @@ import type { AgentMessageResponseJson } from "./agent-runtime-test-helpers.ts";
  * PROPERTIES that actually matter — a banned word never appears, the right goal is named, real DB
  * evidence exists and is linked to the right signal — never on an exact sentence.
  */
+
+/**
+ * `pnpm test`/`pnpm test:llm` run plain `tsx --test`, which — unlike `apps/api/src/index.ts`'s
+ * own `dotenv.config()` call at process startup — never reads the repo's root `.env` file. A key
+ * placed only in `.env` (not actually exported in the shell) was therefore invisible to this file
+ * even with `RUN_LLM_EVALS=true` set, producing a confusing "OPENAI_API_KEY is missing" skip
+ * despite the key genuinely being configured. No `dotenv` dependency needed for this: a minimal,
+ * repo-root-relative parser, run once at import time before OPENAI_KEY_PRESENT below is computed.
+ * Never overrides a variable already present in the environment (an explicit shell export or CI
+ * secret always wins over the `.env` file).
+ */
+function loadDotEnvIfPresent(): void {
+  const repoRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const envPath = path.join(repoRoot, ".env");
+  if (!existsSync(envPath)) {
+    return;
+  }
+
+  for (const rawLine of readFileSync(envPath, "utf8").split("\n")) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) {
+      continue;
+    }
+    const eqIndex = line.indexOf("=");
+    if (eqIndex === -1) {
+      continue;
+    }
+    const key = line.slice(0, eqIndex).trim();
+    let value = line.slice(eqIndex + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key && !(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadDotEnvIfPresent();
 
 export const OPENAI_KEY_PRESENT = Boolean(process.env.OPENAI_API_KEY);
 export const LLM_EVALS_REQUESTED = process.env.RUN_LLM_EVALS === "true";

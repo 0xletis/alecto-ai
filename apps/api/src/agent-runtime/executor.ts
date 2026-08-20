@@ -477,13 +477,32 @@ export async function executeOperation(
 
       case "goal.log_evidence": {
         let signalKey = args.signalKey as string | undefined;
-        const eventType = args.eventType as string | undefined;
+        let eventType = args.eventType as string | undefined;
         const goalRef = args.goalRef as string | undefined;
         const count = (args.count as number | undefined) ?? 1;
         const notes = args.notes as string | undefined;
 
+        const currentFocusGoal = resolveCurrentFocusGoal(context);
+
         if (!eventType && !signalKey) {
-          return failed(operation.tool, "I need either a known signal type or a custom signal key to log this — try describing it again.");
+          // A real-LLM eval run caught this too: even with the target goal's own real signals now
+          // included in the planner's context payload, a call sometimes still omits both fields
+          // entirely (no bad guess, just nothing) — rather than failing outright, check the one
+          // goal this evidence is actually about (goalRef, else conversation focus): if it has
+          // EXACTLY ONE declared signal, there is no real ambiguity about what a plain progress
+          // report against it could mean, so use that signal automatically. Two or more declared
+          // signals is genuinely ambiguous — that case still fails honestly below.
+          const referencedForMissingSignal = goalRef ? resolveGoalReferenceTargets(goalRef, context.activeGoals, currentFocusGoal) : undefined;
+          const targetGoalForMissingSignal = referencedForMissingSignal?.status === "matched" ? referencedForMissingSignal.goals[0] : currentFocusGoal;
+          const onlyMetric = targetGoalForMissingSignal?.targetMetrics?.length === 1 ? targetGoalForMissingSignal.targetMetrics[0] : undefined;
+
+          if (onlyMetric?.signalKey) {
+            signalKey = onlyMetric.signalKey;
+          } else if (onlyMetric?.eventType) {
+            eventType = onlyMetric.eventType;
+          } else {
+            return failed(operation.tool, "I need either a known signal type or a custom signal key to log this — try describing it again.");
+          }
         }
 
         // eventType used to be a hardcoded 5-value career-only enum, which meant a real,
@@ -498,13 +517,41 @@ export async function executeOperation(
         // whether the event itself can be logged. signalKey stays strict — unlike a registered
         // eventType, a custom signalKey has no existence at all outside some goal's own
         // declaration, so an unmatched one is never valid (unchanged from before this pass).
+        // A real-LLM eval run caught this exact case: the planner sometimes sets BOTH eventType
+        // and signalKey to the same guessed value (e.g. eventType: "tea_cups_drunk", signalKey:
+        // "tea_cups_drunk" — the custom key duplicated into the wrong field). An invalid eventType
+        // only fails the whole call when there's no signalKey to fall back to; when one is also
+        // present, the bad eventType is simply ignored and signalKey drives the rest of this case,
+        // since it's the one field that's actually meaningful here.
         const parsedEventType = eventType ? EventTypeSchema.safeParse(eventType) : undefined;
-        if (eventType && !parsedEventType?.success) {
+        if (eventType && !parsedEventType?.success && !signalKey) {
           return failed(operation.tool, `"${eventType}" isn't a real event type I can log — try describing what happened again.`);
         }
-        const verifiedEventType: EventTypeId | undefined = parsedEventType?.success ? parsedEventType.data : undefined;
+        let verifiedEventType: EventTypeId | undefined = parsedEventType?.success ? parsedEventType.data : undefined;
 
-        const currentFocusGoal = resolveCurrentFocusGoal(context);
+        // A second real-LLM eval finding: the planner sometimes supplies a genuinely VALID
+        // eventType (a real registered type, e.g. "learning.reading_session_completed") AND a
+        // signalKey in the same call, as a hedge. Blindly preferring eventType (the old behavior)
+        // logged the event under a type the target goal never declares at all when the goal's
+        // real metric is signalKey-based — an orphaned event goal.status can never count, with a
+        // confident-sounding reply on top. Once the one goal this evidence is about is known (via
+        // goalRef, else conversation focus), whichever field THAT goal actually declares wins; the
+        // other is dropped. Left unchanged (falls through to the pre-existing eventType-first
+        // default) when no target goal can be resolved at all, or when both/neither are declared.
+        if (verifiedEventType && signalKey) {
+          const referencedForBothFields = goalRef ? resolveGoalReferenceTargets(goalRef, context.activeGoals, currentFocusGoal) : undefined;
+          const targetGoalForBothFields = referencedForBothFields?.status === "matched" ? referencedForBothFields.goals[0] : currentFocusGoal;
+          if (targetGoalForBothFields) {
+            const metrics = targetGoalForBothFields.targetMetrics ?? [];
+            const declaresSignalKey = metrics.some((metric) => metric.signalKey === signalKey);
+            const declaresEventType = metrics.some((metric) => metric.eventType === verifiedEventType);
+            if (declaresSignalKey && !declaresEventType) {
+              verifiedEventType = undefined;
+            } else if (declaresEventType && !declaresSignalKey) {
+              signalKey = undefined;
+            }
+          }
+        }
 
         if (signalKey && findGoalsForSignalKey(context.activeGoals, signalKey).length === 0) {
           // No active goal declares this EXACT key. Only even attempt a fallback when the
@@ -591,17 +638,54 @@ export async function executeOperation(
       }
 
       case "event.log_custom_progress": {
+        const label = args.label as string;
+        const value = args.value as string | undefined;
+        const notes = args.notes as string | undefined;
+
+        // A real-LLM eval run found the planner sometimes reaches for this generic, unlinked
+        // fallback tool even when the goal in conversational focus already declares a matching
+        // custom signal (e.g. "had 2 teas today" against a "cups of tea drunk" signal) — despite
+        // explicit prompt guidance to prefer goal.log_evidence instead. Rather than depending only
+        // on that guidance holding, this checks the focused goal for a metric whose OWN label
+        // matches (case-insensitively) the given label — if found, logs REAL, linked evidence
+        // through the same shape goal.log_evidence writes, so goal.status can actually count it;
+        // only when nothing matches does this fall back to genuinely unlinked progress. Either way
+        // this tool is GROUND_TRUTH_ONLY (see response-composer.ts) — its own honest summary is
+        // always what's shown, never an LLM's pre-execution guess about whether something linked.
+        const focusGoal = resolveCurrentFocusGoal(context);
+        const matchedMetric = focusGoal?.targetMetrics?.find((metric) => metric.label.trim().toLowerCase() === label.trim().toLowerCase());
+        const matchedEventType = matchedMetric?.eventType ? EventTypeSchema.safeParse(matchedMetric.eventType) : undefined;
+
+        if (matchedMetric && (matchedMetric.signalKey || matchedEventType?.success)) {
+          const created = await createEvents(userId, [
+            {
+              type: matchedEventType?.success ? matchedEventType.data : CUSTOM_SIGNAL_EVENT_TYPE,
+              source: "manual" as const,
+              confidence: 1,
+              data: matchedMetric.signalKey ? { signalKey: matchedMetric.signalKey, notes } : notes ? { notes } : undefined,
+              evidence: [notes, message].filter(Boolean) as string[]
+            }
+          ]);
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `Logged ${matchedMetric.label}${value ? ` (${value})` : ""}${notes ? ` (${notes})` : ""}. This counts toward your "${focusGoal!.title}" goal.`,
+            result: created,
+            entities: [goalToEntity(focusGoal!)]
+          };
+        }
+
         const created = await createEvent(userId, {
           type: "custom.goal_progress_logged",
           source: "manual",
           confidence: 1,
-          data: { label: args.label, value: args.value },
-          evidence: [args.notes as string | undefined, message].filter(Boolean) as string[]
+          data: { label, value },
+          evidence: [notes, message].filter(Boolean) as string[]
         });
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged progress: ${args.label}${args.value ? ` (${args.value})` : ""}.`,
+          summary: `Logged progress: ${label}${value ? ` (${value})` : ""}. This isn't linked to a specific goal signal, so it won't show up in that goal's status.`,
           result: created
         };
       }
