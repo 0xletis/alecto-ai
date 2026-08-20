@@ -16,12 +16,14 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getEventsSince,
+  getIntegrationConnection,
   getOrCreateNotificationSettings,
   getNotificationLog,
   hasNotificationLog,
   rescheduleActionItem,
   snoozeActionItem,
   updateEmailSignalRule,
+  updateIntegrationConnectionConfig,
   updateNotificationSettings,
   type ActionItem,
   type EmailReviewItem,
@@ -32,19 +34,23 @@ import {
   countEvidenceForMetric,
   CUSTOM_SIGNAL_EVENT_TYPE,
   describeGoalEvidenceMatch,
+  effectiveGmailSyncIntervalMinutes,
   ensureBookGoalProgressSignal,
   EventTypeSchema,
   findCompatibleProgressMetric,
   findGoalsForEventType,
   findGoalsForSignalKey,
   getEmailAdapterDefinition,
+  gmailScheduledSyncRuntimeFromEnv,
   goalHasOnlyCompletionSignals,
   isProgressShapedSignalText,
   parseActionDueDate,
   proactiveOperatorAllowlistActiveFromEnv,
   proactiveOperatorAllowlistFromEnv,
   proactiveOperatorDeliveryEnabledFromEnv,
+  readGmailAutonomyPreferences,
   resolveActiveGoalReference,
+  writeGmailAutonomyPreferences,
   type EventTypeId,
   type Goal,
   type GoalMetric,
@@ -64,7 +70,7 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthLocalhostCallbackWarning, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
-import { buildGmailAutonomyState } from "../conversation/gmail-autonomy.js";
+import { buildGmailAutonomyState, formatIntervalMinutes, gmailSyncModeSentence } from "../conversation/gmail-autonomy.js";
 import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   approveEmailReviewForUser,
@@ -854,6 +860,116 @@ export async function executeOperation(
           summary,
           result: { message: summary }
         };
+      }
+
+      case "gmail.autonomy.status": {
+        const state = await buildGmailAutonomyState(userId);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatGmailAutonomyStatusForChat(state),
+          result: {
+            syncMode: state.syncMode,
+            syncIntervalMinutes: state.syncIntervalMinutes,
+            scheduledSyncEnabled: state.scheduledSyncEnabled,
+            reviewNotificationEnabled: state.reviewNotificationEnabled
+          }
+        };
+      }
+
+      case "gmail.autonomy.propose_update": {
+        const state = await buildGmailAutonomyState(userId);
+        if (!state.gmailConnected || !state.primaryConnection) {
+          return failed(operation.tool, "Gmail is not connected yet. Say 'connect Gmail' first.");
+        }
+
+        const syncMode = args.syncMode as "manual_only" | "scheduled";
+        const intervalMinutes = args.intervalMinutes as number | undefined;
+
+        if (syncMode === "scheduled" && !(typeof intervalMinutes === "number" && intervalMinutes > 0)) {
+          return failed(operation.tool, "I need a real interval to schedule Gmail checks — try 'every hour' or 'every 30 minutes'.");
+        }
+
+        // Already in the requested state — say so honestly rather than opening a pointless
+        // confirmation for a no-op change.
+        if (syncMode === "manual_only" && state.syncMode === "manual_only") {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "Gmail is already manual only. Nothing to change.",
+            result: state
+          };
+        }
+        if (syncMode === "scheduled" && state.syncMode === "scheduled" && state.syncIntervalMinutes === intervalMinutes) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `Gmail is already set to scheduled checks every ${formatIntervalMinutes(intervalMinutes!)}. Nothing to change.`,
+            result: state
+          };
+        }
+
+        const proposalLine =
+          syncMode === "manual_only"
+            ? "You're about to make Gmail manual only. I'll only check Gmail when you say \"sync Gmail\"."
+            : `You're about to check Gmail every ${formatIntervalMinutes(intervalMinutes!)}.`;
+        const alertsLine = `Gmail alerts are ${state.reviewNotificationEnabled ? "on" : "off"}.`;
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `${proposalLine} ${alertsLine} Reply yes to confirm or cancel.`,
+          result: state,
+          pendingOperationUpdate: {
+            topic: "gmail_autonomy",
+            summary: syncMode === "manual_only" ? "make Gmail manual only" : `set Gmail scheduled checks every ${formatIntervalMinutes(intervalMinutes!)}`,
+            operations: [
+              {
+                tool: "gmail.autonomy.apply_update",
+                args: {
+                  connectionId: state.primaryConnection.id,
+                  syncMode,
+                  ...(syncMode === "scheduled" ? { intervalMinutes } : {})
+                },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "gmail.autonomy.apply_update": {
+        const connectionId = args.connectionId as string;
+        const syncMode = args.syncMode as "manual_only" | "scheduled";
+        const intervalMinutes = args.intervalMinutes as number | undefined;
+
+        const connection = await getIntegrationConnection(userId, connectionId);
+        if (!connection) {
+          return failed(operation.tool, "That Gmail connection no longer exists.");
+        }
+
+        // writeGmailAutonomyPreferences (packages/core/src/gmail-autonomy.ts) merges into the
+        // connection's own config — the SAME field evaluateGmailBackgroundSyncEligibility /
+        // shouldSyncGmailConnectionOnSchedule (packages/core, used by the worker's actual
+        // scheduled-sync tick) reads. This is a real, persisted write, not a preference the
+        // worker has no way to see — no separate settings table, no risk of the two disagreeing.
+        const nextConfig = writeGmailAutonomyPreferences(connection.config, {
+          syncMode,
+          ...(syncMode === "scheduled" && intervalMinutes ? { syncIntervalMinutes: intervalMinutes } : {})
+        });
+        const updated = await updateIntegrationConnectionConfig(userId, connectionId, nextConfig);
+        if (!updated) {
+          return failed(operation.tool, "That Gmail connection no longer exists.");
+        }
+
+        const effectiveInterval = effectiveGmailSyncIntervalMinutes(readGmailAutonomyPreferences(updated.config), gmailScheduledSyncRuntimeFromEnv());
+        const summary =
+          syncMode === "manual_only"
+            ? "Done — Gmail is now manual only. I'll check when you say \"sync Gmail\"."
+            : `Done — Gmail scheduled checks are now on every ${formatIntervalMinutes(effectiveInterval)}.`;
+
+        return { tool: operation.tool, status: "executed", summary, result: updated };
       }
 
       case "gmail.rule.list": {
@@ -2315,6 +2431,17 @@ function formatCanonicalGmailSyncBlock(userId: string, state: Awaited<ReturnType
   }
 
   return undefined;
+}
+
+/** How often Gmail is actually being checked, distinct from formatGmailConnectionStatusForChat's
+ * connection/rule status — a deliberately narrow answer for "when do you check Gmail?"-style
+ * questions, never listing rules unless asked (that's gmail.rule.list's own job). */
+function formatGmailAutonomyStatusForChat(state: Awaited<ReturnType<typeof buildGmailAutonomyState>>): string {
+  if (!state.gmailConnected || !state.primaryConnection) {
+    return "Gmail is not connected yet, so there's no sync schedule to show. Say 'connect Gmail' first.";
+  }
+
+  return [gmailSyncModeSentence(state), `Gmail alerts are ${state.reviewNotificationEnabled ? "on" : "off"}.`].join("\n");
 }
 
 function formatGmailConnectionStatusForChat(

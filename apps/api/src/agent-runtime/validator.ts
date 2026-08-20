@@ -238,6 +238,22 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     };
   }
 
+  // Same reasoning again: gmail.autonomy.apply_update is never planned by the LLM directly, only
+  // ever reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation. Its args (connectionId/syncMode/intervalMinutes) are set by
+  // gmail.autonomy.propose_update's pendingOperationUpdate after resolving the real connection —
+  // a direct plan would have no real connection id to put there anyway.
+  if (tool.name === "gmail.autonomy.apply_update") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending Gmail sync-schedule change",
+      rationale: operation.rationale
+    };
+  }
+
   // Same reasoning again: daily_loop.settings_apply_update is never planned by the LLM
   // directly, only ever reached via the deterministic confirm whitelist re-executing an
   // already-stored pendingOperation. Its args are the fully-resolved values (minutes, not

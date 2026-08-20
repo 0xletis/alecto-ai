@@ -327,6 +327,42 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({})
   },
   {
+    name: "gmail.autonomy.status",
+    description:
+      "Show whether Gmail checks are manual-only or on a scheduled interval, the interval if scheduled, and whether Gmail alerts (review notifications) are on. Use for 'when do you check Gmail?', 'is Gmail sync scheduled?', 'gmail sync settings', 'how often do you check my email?'. Read-only — never confuse with gmail.rule.list (which shows WHAT is tracked, not HOW OFTEN Gmail itself is checked).",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "gmail.autonomy.propose_update",
+    description:
+      "Propose changing HOW OFTEN Alecto checks Gmail in the background — manual-only (only when the user says 'sync Gmail') or scheduled on a real interval via the existing worker poll. Use for 'check Gmail every hour', 'check my email every 1h', 'review my emails every 30 minutes', 'check email sync every 1h', 'make Gmail manual only', 'stop checking Gmail automatically', 'turn off scheduled Gmail sync'. This is a GLOBAL Gmail-checking-frequency setting, never a specific named rule — do NOT use gmail.rule.propose_update for this, even though the wording ('check emails', 'review my emails') sounds similar; gmail.rule.propose_update is only for pausing/resuming/removing ONE specific, already-named tracking rule (e.g. 'pause Work action emails', 'stop tracking Endesa bills'), and the reverse is also true — never use this tool when the user names a specific rule. Opens a pending confirmation; does not mutate anything until confirmed. Never claims instant/webhook delivery — scheduled checks still run on the existing worker's periodic poll.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      syncMode: z.enum(["manual_only", "scheduled"]),
+      intervalMinutes: z
+        .number()
+        .int()
+        .positive()
+        .max(24 * 60)
+        .optional()
+        .describe("Required when syncMode is 'scheduled' — the user's real requested interval in minutes, e.g. 60 for 'every hour', 30 for 'every 30 minutes', 120 for 'every 2 hours'. Omit for manual_only.")
+    })
+  },
+  {
+    name: "gmail.autonomy.apply_update",
+    description: "Internal: applies the confirmed Gmail sync-frequency change. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      connectionId: z.string().min(1),
+      syncMode: z.enum(["manual_only", "scheduled"]),
+      intervalMinutes: z.number().int().positive().max(24 * 60).optional()
+    })
+  },
+  {
     name: "gmail.rule.list",
     description: "List the user's active Gmail tracking rules.",
     mutates: false,
@@ -364,7 +400,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.rule.propose_update",
     description:
-      "Propose pausing, resuming, or removing an existing Gmail tracking rule (built-in or custom) — resolves the target by name against the user's real rules (a fresh lookup; the user does not need to have listed rules first) and opens a pending confirmation. Use for 'turn off X', 'pause the X rule', 'resume X', 'delete/remove the X rule'. Does NOT support changing an existing rule's review/auto-log behavior — that's fixed when a rule is created and can't be changed afterward; if asked, explain that honestly instead of planning this.",
+      "Propose pausing, resuming, or removing an existing Gmail tracking rule (built-in or custom) — resolves the target by name against the user's real rules (a fresh lookup; the user does not need to have listed rules first) and opens a pending confirmation. Use ONLY when the user clearly names a specific existing rule: 'turn off X', 'pause the X rule', 'resume X', 'delete/remove the X rule', 'stop tracking Endesa bills'. Never use this for a general Gmail-checking-frequency request that doesn't name a rule ('check Gmail every hour', 'review my emails every 1h', 'check email sync every 1h') — that always means gmail.autonomy.propose_update instead, even though both mention 'emails'/'review'. Does NOT support changing an existing rule's review/auto-log behavior — that's fixed when a rule is created and can't be changed afterward; if asked, explain that honestly instead of planning this.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({

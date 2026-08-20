@@ -1,5 +1,6 @@
 import { createMemory, getMostRecentlyRemindedActionItem, rejectPendingAction, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
+import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
@@ -317,25 +318,6 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const pendingOperationBefore = context.session.pendingOperation;
   const visibleEntitiesBefore = context.session.visibleEntities;
 
-  const guardrail = await checkGoalGuardrail(message, context);
-  if (guardrail.decision !== "allow") {
-    // hard_block/soft_warn are real, detected conflicts worth a durable trace (feeds existing
-    // insight/daily-review pipelines that already read risk_pattern memories); ask_clarification
-    // is not — nothing was actually confirmed yet, so nothing is logged.
-    const executedOps: ExecutedOperation[] =
-      guardrail.decision === "hard_block" || guardrail.decision === "soft_warn" ? [await logGuardrailIncident(userId, message, guardrail)] : [];
-    applyExecutionSideEffects(context.session, executedOps);
-    return finalize(context, {
-      reply: guardrail.reply ?? "Let's pause here for a moment.",
-      operationsPlanned: [],
-      executedOps,
-      plannerUsed: "none",
-      llmPlannerAttempted: guardrail.llmAttempted,
-      toolValidationPassed: true,
-      topic: "guardrail"
-    });
-  }
-
   const pending = context.session.pendingOperation;
   const normalized = normalizeExactMessage(message);
 
@@ -420,6 +402,11 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
   }
 
+  const gmailAutonomyStatusShortcut = gmailAutonomyStatusShortcutOperation(message);
+  if (gmailAutonomyStatusShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailAutonomyStatusShortcut, "gmail_autonomy");
+  }
+
   const gmailNudgeSettingsShortcut = !pending ? gmailNudgeSettingsShortcutOperation(message) : undefined;
   if (gmailNudgeSettingsShortcut) {
     return finalizeDeterministicOperation(context, message, gmailNudgeSettingsShortcut, "proactive_settings");
@@ -441,6 +428,17 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     const actionCompletionShortcut = await actionCompletionShortcutOperation(message, context);
     if (actionCompletionShortcut) {
       return finalizeDeterministicOperation(context, message, actionCompletionShortcut, "actions");
+    }
+
+    // Checked ahead of the pure-review-only shortcuts below: only ever produces operations when
+    // the message ALSO contains a Gmail sync-frequency request ("check email sync every 1h") —
+    // a message with none returns [] immediately and falls through unchanged. Handles the
+    // reported compound transcript ("delete it nothing important, and can u check email sync
+    // every 1h?") as ONE turn: the visible review really gets rejected AND the sync-schedule
+    // proposal really opens, rather than one silently overwriting or dropping the other.
+    const gmailAutonomyCompoundShortcuts = gmailAutonomyCompoundShortcutOperations(message, context);
+    if (gmailAutonomyCompoundShortcuts.length > 0) {
+      return finalizeDeterministicOperations(context, message, gmailAutonomyCompoundShortcuts, "gmail_autonomy");
     }
 
     const gmailReviewTriageShortcuts = gmailReviewExplicitTriageShortcutOperations(message, context);
@@ -500,6 +498,39 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       llmPlannerAttempted: false,
       toolValidationPassed: true,
       topic: "goal_anchor_nudge"
+    });
+  }
+
+  // Checked here — AFTER every deterministic domain shortcut above (Gmail sync/autonomy/status/
+  // alerts/reviews, action completion/snooze/archive, reminders, proactive settings) — rather
+  // than as the very first thing in the turn. A real smoke test found "check gmail every hour"
+  // classified as "avoidance" of an unrelated active reading goal, purely because the guardrail's
+  // LLM tier ran on literally every message before anything else got a chance to recognize it as
+  // a plain operational command. Goal-avoidance is only a meaningful question for a message that
+  // ISN'T already a clear, unambiguous domain action — exactly the set of messages that reach
+  // this point without an earlier shortcut having already handled them. This never widens what
+  // the guardrail blocks, only narrows which messages are even offered to it.
+  logAgentRuntimeDiagnostics({
+    phase: "guardrail_check",
+    userId,
+    note: "no domain shortcut matched; message reaches goal-avoidance guardrail"
+  });
+  const guardrail = await checkGoalGuardrail(message, context);
+  if (guardrail.decision !== "allow") {
+    // hard_block/soft_warn are real, detected conflicts worth a durable trace (feeds existing
+    // insight/daily-review pipelines that already read risk_pattern memories); ask_clarification
+    // is not — nothing was actually confirmed yet, so nothing is logged.
+    const executedOps: ExecutedOperation[] =
+      guardrail.decision === "hard_block" || guardrail.decision === "soft_warn" ? [await logGuardrailIncident(userId, message, guardrail)] : [];
+    applyExecutionSideEffects(context.session, executedOps);
+    return finalize(context, {
+      reply: guardrail.reply ?? "Let's pause here for a moment.",
+      operationsPlanned: [],
+      executedOps,
+      plannerUsed: "none",
+      llmPlannerAttempted: guardrail.llmAttempted,
+      toolValidationPassed: true,
+      topic: "guardrail"
     });
   }
 
@@ -621,6 +652,12 @@ async function finalizeDeterministicOperation(
   plannedOperation: PlannedOperation,
   topic: string
 ): Promise<AgentMessageResponse> {
+  logAgentRuntimeDiagnostics({
+    phase: "domain_shortcut_matched",
+    userId: context.session.userId,
+    finalOps: [plannedOperation],
+    note: `domain shortcut matched: ${plannedOperation.tool}; guardrail skipped because operational command matched`
+  });
   const pendingOperationBefore = context.session.pendingOperation;
   const visibleEntitiesBefore = context.session.visibleEntities;
   const validatedOps = validateOperations([plannedOperation], context);
@@ -676,6 +713,12 @@ async function finalizeDeterministicOperations(
   plannedOperations: PlannedOperation[],
   topic: string
 ): Promise<AgentMessageResponse> {
+  logAgentRuntimeDiagnostics({
+    phase: "domain_shortcut_matched",
+    userId: context.session.userId,
+    finalOps: plannedOperations,
+    note: `domain shortcut matched: ${plannedOperations.map((op) => op.tool).join(", ")}; guardrail skipped because operational command matched`
+  });
   const pendingOperationBefore = context.session.pendingOperation;
   const visibleEntitiesBefore = context.session.visibleEntities;
   const validatedOps = validateOperations(plannedOperations, context);
@@ -1292,6 +1335,123 @@ function visibleReferenceTokens(value: string): string[] {
   ];
 }
 
+/**
+ * V3 Gmail autonomy — HOW OFTEN Gmail itself is checked (manual-only, or a real scheduled
+ * interval via the existing worker poll), distinct from gmail.rule.* (WHAT is tracked). A real
+ * Telegram smoke test found "review my emails every 1h" misrouted to gmail.rule.propose_update,
+ * pausing the user's "Work action emails" rule instead — V3 had no tool for this concept at all,
+ * so the real LLM planner reached for the closest-sounding existing one. Reuses legacy/gmail-
+ * conversation.ts's own parseGmailAutonomyPreference (already correctly scoped to NOT match a
+ * named-rule request like "pause X" — it only recognizes manual/every-N-minutes/hours/daily/
+ * notification phrasing) rather than re-implementing that parsing from scratch; this only READS
+ * that function, never touches /messages/process's own routing.
+ */
+function parseGmailAutonomyPreferenceForAgentRuntime(message: string): GmailAutonomyPreferenceRequest | undefined {
+  const text = normalizeIntentText(message);
+
+  // parseGmailAutonomyPreference's own topic guard accepts a bare "review"/"reviews" alone
+  // (Gmail review items are one of the things it configures), but that word is also used by
+  // OTHER, unrelated V3 features (the daily loop's "daily review", weekly review, action
+  // review). A real regression this caused: "turn off daily review" (the daily-loop setting)
+  // was reinterpreted as "review daily" -> Gmail scheduled-every-day, because the legacy
+  // parser's "daily" pattern matched alongside "review" satisfying its topic guard. Require an
+  // unambiguous Gmail/email word here before trusting the parser's result at all.
+  if (!/\b(gmail|email|emails|mail|mails|inbox)\b/.test(text)) {
+    return undefined;
+  }
+
+  const direct = parseGmailAutonomyPreference(message);
+  if (direct) {
+    return direct;
+  }
+
+  // parseGmailAutonomyPreference doesn't recognize bare "Nh" shorthand ("every 1h") — the exact
+  // phrasing the reported transcript used. Added here, as a V3-only supplement, rather than
+  // widening the shared legacy parser itself.
+  const hoursShorthand = text.match(/\bevery\s+(\d+)\s*h\b/);
+  if (hoursShorthand?.[1]) {
+    const hours = Number.parseInt(hoursShorthand[1], 10);
+    if (Number.isFinite(hours) && hours > 0) {
+      return { kind: "scheduled", intervalMinutes: hours * 60 };
+    }
+  }
+
+  return undefined;
+}
+
+function looksLikeGmailAutonomyStatusQuery(text: string): boolean {
+  return (
+    // "you" is spelled out here as an explicit alternative alongside the "u" texting shorthand
+    // ("when do u check email?") rather than folded into normalizeIntentText, since that
+    // normalizer is shared by every other shortcut in this file and blindly rewriting "u" ->
+    // "you" everywhere risks corrupting unrelated messages that use "u" for something else.
+    /\bwhen\b[\s\S]{0,20}\b(do|does)\b[\s\S]{0,10}\b(you|u|it|alecto)\b[\s\S]{0,20}\bcheck\b[\s\S]{0,20}\b(gmail|email|emails|mail|inbox)\b/.test(text) ||
+    /\bis\b[\s\S]{0,20}\b(gmail|email)\b[\s\S]{0,20}\bsync\b[\s\S]{0,20}\bscheduled\b/.test(text) ||
+    /\b(gmail|email)\b[\s\S]{0,20}\bsync\b[\s\S]{0,20}\b(settings|schedule)\b/.test(text) ||
+    /\bhow often\b[\s\S]{0,30}\bcheck\b[\s\S]{0,20}\b(gmail|email|emails|mail)\b/.test(text) ||
+    // "do you check my email automatically?" — no "when"/"how often" at all, so this needs its
+    // own explicit schedule-shaped qualifier to avoid swallowing an unrelated bare "do you check
+    // email" (which reads more like a sync request than a status question).
+    /\b(do|does)\b[\s\S]{0,10}\b(you|u|it|alecto)\b[\s\S]{0,20}\bcheck\b[\s\S]{0,20}\b(gmail|email|emails|mail|inbox)\b[\s\S]{0,20}\b(automatically|auto|regularly|on (a|your) schedule)\b/.test(
+      text
+    )
+  );
+}
+
+function gmailAutonomyStatusShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return undefined;
+  }
+
+  return looksLikeGmailAutonomyStatusQuery(text)
+    ? { tool: "gmail.autonomy.status", args: {}, rationale: "user asked how often Gmail is checked" }
+    : undefined;
+}
+
+/**
+ * Combines (a) an explicit Gmail sync-frequency change (manual-only or scheduled, via
+ * parseGmailAutonomyPreferenceForAgentRuntime) with (b) any Gmail review the SAME message also
+ * dismisses — either by explicit index (reusing buildExplicitGmailReviewIntentPlan) or, when
+ * exactly one review is visible, by a bare pronoun ("delete it," "ignore it," "it's nothing
+ * important" — no index at all, the exact shape the reported transcript used). Only ever fires
+ * when an autonomy preference is genuinely present; a pure review-only message (no autonomy
+ * language) returns nothing here and falls through unchanged to the existing review shortcuts.
+ */
+function gmailAutonomyCompoundShortcutOperations(message: string, context: ContextBundle): PlannedOperation[] {
+  const preference = parseGmailAutonomyPreferenceForAgentRuntime(message);
+  if (!preference || preference.kind === "review_notifications" || preference.kind === "daily_digest" || preference.kind === "work_hours") {
+    return [];
+  }
+
+  const reviewPlan = buildExplicitGmailReviewIntentPlan(message, context);
+  const reviewOps = reviewPlan ? [...reviewPlan.operations] : [];
+
+  if (reviewOps.length === 0) {
+    const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+    const text = normalizeIntentText(message);
+    const dismissesReview = /\b(delete|remove|discard|ignore|ifnore|reject|skip)\b/.test(text) || /\bnothing important\b/.test(text);
+    if (visibleReviews.length === 1 && dismissesReview) {
+      reviewOps.push({
+        tool: "gmail.review.reject",
+        args: { reviewId: visibleReviews[0]!.id },
+        rationale: "user dismissed the one visible Gmail review by pronoun, alongside a Gmail sync-frequency request"
+      });
+    }
+  }
+
+  const autonomyOp: PlannedOperation = {
+    tool: "gmail.autonomy.propose_update",
+    args:
+      preference.kind === "manual_only"
+        ? { syncMode: "manual_only" }
+        : { syncMode: "scheduled", intervalMinutes: preference.intervalMinutes },
+    rationale: "user asked to change Gmail's scheduled sync mode/interval"
+  };
+
+  return [...reviewOps, autonomyOp];
+}
+
 function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
   const text = normalizeIntentText(message);
   if (!text || /\bsync\b/.test(text)) {
@@ -1320,6 +1480,19 @@ function gmailSyncShortcutOperation(message: string): PlannedOperation | undefin
   const text = normalizeIntentText(message);
 
   if (!text || looksLikeGmailAlertSettingsRequest(text)) {
+    return undefined;
+  }
+
+  // "check Gmail every hour"/"check email sync every 1h" and "when do you check Gmail?" all
+  // otherwise satisfy the "check ... gmail" pattern below (its trailing now/new group is
+  // optional) and were being misrouted into an immediate one-off gmail.sync instead of the
+  // scheduled-sync preference or status query they're actually asking for. Both defer to
+  // gmailAutonomyStatusShortcutOperation/gmailAutonomyCompoundShortcutOperations instead.
+  if (looksLikeGmailAutonomyStatusQuery(text)) {
+    return undefined;
+  }
+  const autonomyPreference = parseGmailAutonomyPreferenceForAgentRuntime(message);
+  if (autonomyPreference && (autonomyPreference.kind === "scheduled" || autonomyPreference.kind === "manual_only")) {
     return undefined;
   }
 

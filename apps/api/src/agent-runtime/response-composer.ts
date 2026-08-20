@@ -52,16 +52,23 @@ export function composeReply(input: ComposeReplyInput): string {
   // already exists). Checked first, ahead of the general informational-tool rule below,
   // because gmail.rule.create is a mutating tool that still needs this treatment.
   const groundTruthOnly = executedSummaries(input.executedOps, (tool) => GROUND_TRUTH_ONLY_TOOLS.has(tool?.name ?? ""));
-  if (groundTruthOnly.length > 0) {
-    return groundTruthOnly.join("\n\n");
-  }
 
   // Informational (read-only) tools are the answer itself — their ground-truth summary is
   // always the reply, never blended with the LLM's framing, which risks either duplicating
   // it verbatim or omitting the substance behind a vague sentence like "I'll list them now."
-  const informationalSummaries = executedSummaries(input.executedOps, (tool) => tool?.mutates === false);
-  if (informationalSummaries.length > 0) {
-    return informationalSummaries.join("\n\n");
+  // Excludes anything already counted above so a tool that's BOTH (e.g. gmail.review.inspect)
+  // isn't shown twice. Combined WITH groundTruthOnly, not returned separately: a real compound
+  // turn (e.g. "delete it, and check email sync every 1h") executes gmail.review.reject
+  // (ground-truth-only) AND opens a gmail.autonomy.propose_update confirmation (informational,
+  // mutates:false) in the SAME turn — returning groundTruthOnly alone would silently drop the
+  // second half of the reply even though both really happened/were proposed.
+  const informationalSummaries = executedSummaries(
+    input.executedOps,
+    (tool) => tool?.mutates === false && !GROUND_TRUTH_ONLY_TOOLS.has(tool?.name ?? "")
+  );
+  const deterministicLines = [...groundTruthOnly, ...informationalSummaries];
+  if (deterministicLines.length > 0) {
+    return deterministicLines.join("\n\n");
   }
 
   const leadLines: string[] = [];
@@ -145,6 +152,7 @@ const HUMAN_ACTION: Record<string, string> = {
   "planning.next_week_apply": "create that plan",
   "weekly_review.save": "save that weekly review",
   "gmail.rule.apply_update": "update that Gmail rule",
+  "gmail.autonomy.apply_update": "update Gmail's sync schedule",
   "daily_loop.settings_apply_update": "update your daily loop settings",
   "proactive.settings_apply_update": "update your proactive message settings"
 };
