@@ -1,6 +1,7 @@
 import { getAgentConversationSession, upsertAgentConversationSession } from "@operator-agent/db";
 import type {
   AgentEntity,
+  AgentFocusedEntities,
   AgentMutationRecord,
   AgentPendingOperation,
   AgentSessionMessage,
@@ -25,6 +26,7 @@ export function emptySession(userId: string, channel: string): AgentSessionState
     topic: null,
     pendingOperation: null,
     visibleEntities: [],
+    focusedEntities: {},
     recentMutations: []
   };
 }
@@ -47,6 +49,7 @@ export async function loadPersistedSession(userId: string, channel: string): Pro
     topic: typeof row.topic === "string" ? row.topic : null,
     pendingOperation: asPendingOperation(row.pendingOperation),
     visibleEntities: asEntityArray(row.visibleEntities),
+    focusedEntities: asFocusedEntities(row.focusedEntities),
     recentMutations: asMutationArray(row.recentMutations),
     messages: asMessageArray(row.messages)
   };
@@ -56,9 +59,7 @@ export async function loadPersistedSession(userId: string, channel: string): Pro
 export async function persistSession(session: AgentSessionState): Promise<void> {
   await upsertAgentConversationSession(session.userId, session.channel, {
     topic: session.topic,
-    // Reserved for forward compatibility with the AgentConversationSession schema — the
-    // runtime does not yet distinguish a single "focused" entity from the visible set.
-    focusedEntities: null,
+    focusedEntities: session.focusedEntities,
     pendingOperation: session.pendingOperation,
     visibleEntities: session.visibleEntities,
     recentMutations: session.recentMutations,
@@ -84,6 +85,23 @@ function asEntityArray(value: unknown): AgentEntity[] {
   return value.filter(
     (item): item is AgentEntity => isRecord(item) && typeof item.id === "string" && typeof item.type === "string" && typeof item.label === "string"
   );
+}
+
+function isAgentEntity(value: unknown): value is AgentEntity {
+  return isRecord(value) && typeof value.id === "string" && typeof value.type === "string" && typeof value.label === "string";
+}
+
+function asFocusedEntities(value: unknown): AgentFocusedEntities {
+  if (!isRecord(value)) {
+    return {};
+  }
+  const result: AgentFocusedEntities = {};
+  for (const [type, entity] of Object.entries(value)) {
+    if (isAgentEntity(entity) && entity.type === type) {
+      result[entity.type] = entity;
+    }
+  }
+  return result;
 }
 
 function asMutationArray(value: unknown): AgentMutationRecord[] {

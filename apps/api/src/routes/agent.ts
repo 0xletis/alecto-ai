@@ -1,5 +1,8 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { getOrCreateNotificationSettings, hasNotificationLog } from "@operator-agent/db";
+import { proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
+import { loadContext } from "../agent-runtime/context-loader.js";
 import { handleAgentMessage } from "../agent-runtime/runtime.js";
 import type {
   AgentMessageRequest,
@@ -7,6 +10,10 @@ import type {
   PublicAgentMessageResponse,
   PublicExecutedOperation
 } from "../agent-runtime/types.js";
+import { evaluateProactiveEligibility } from "../operator/proactive-eligibility.js";
+import { decideProactiveOperatorMessage, gmailNudgeDedupeKey, EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
+import { formatMinutesOfDay } from "../operator/daily-loop-settings.js";
+import { formatDateInTimezone, parseOptionalNow } from "../utils/datetime.js";
 
 export const AgentMessageRequestSchema = z.object({
   userId: z.string().min(1),
@@ -39,6 +46,66 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
     const result = await handlers.message(parsed.data);
     return parsed.data.debugRaw ? result : toPublicResponse(result);
   });
+
+  // Preview-only: computes and returns what the V3 Proactive Operator MVP WOULD send, without
+  // sending anything or persisting a NotificationLog entry — decideProactiveOperatorMessage
+  // itself never touches the DB. This is deliberately the only integration point for this pass
+  // (per docs/10-v3-readiness-audit.md §13); wiring an actual scheduled send is a separate,
+  // later decision. Reuses the exact same loadContext() every normal chat turn already uses.
+  server.get<{ Params: { userId: string }; Querystring: { now?: string; channel?: string } }>(
+    "/users/:userId/operator/proactive/preview",
+    async (request) => {
+      const userId = request.params.userId;
+      const now = parseOptionalNow(request.query.now) ?? new Date();
+      const channel = request.query.channel ?? "telegram";
+
+      const [context, notificationSettings] = await Promise.all([loadContext(userId, channel), getOrCreateNotificationSettings(userId)]);
+
+      const sentForDate = formatDateInTimezone(now, notificationSettings.timezone);
+      const candidateDedupeKeys = [MORNING_BRIEF_DEDUPE_KEY, EVENING_CHECKIN_DEDUPE_KEY, ...context.gmailReviews.map((review) => gmailNudgeDedupeKey(review.id))];
+      const sentFlags = await Promise.all(candidateDedupeKeys.map((type) => hasNotificationLog({ userId, type, sentForDate })));
+      const alreadySentDedupeKeys = new Set(candidateDedupeKeys.filter((_, index) => sentFlags[index]));
+
+      const decision = decideProactiveOperatorMessage({
+        context,
+        notificationSettings,
+        now,
+        alreadySentDedupeKeys,
+        sentCountToday: alreadySentDedupeKeys.size
+      });
+
+      // Informational only — env flags are developer rollout controls, not the product UX (see
+      // docs/10-v3-readiness-audit.md §15/§19). apps/worker's own delivery code independently
+      // re-checks every one of these before an actual send; this route never writes the DB.
+      const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
+      const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
+      const isAllowlisted = proactiveOperatorAllowlistFromEnv()(userId);
+      const eligibility = evaluateProactiveEligibility({
+        decision,
+        deliveryEnabled,
+        isAllowlisted,
+        notificationSettings
+      });
+
+      return {
+        decision,
+        eligibility: {
+          ...eligibility,
+          deliveryEnabled,
+          allowlistActive,
+          // Only meaningful when an allowlist is actually configured — with none active, every
+          // opted-in user is eligible, so reporting a match here would be a non-answer.
+          allowlistMatched: allowlistActive ? isAllowlisted : undefined,
+          scheduledTime: decision.decision === "proposed_message" && decision.type === "morning_brief" ? formatMinutesOfDay(notificationSettings.morningTimeMinutes) : undefined,
+          optIn: {
+            morningBriefEnabled: notificationSettings.morningBriefEnabled,
+            eveningCheckinEnabled: notificationSettings.eveningCheckinEnabled,
+            gmailNudgeEnabled: notificationSettings.gmailNudgeEnabled
+          }
+        }
+      };
+    }
+  );
 }
 
 export function defaultAgentRouteHandlers(): AgentRouteHandlers {

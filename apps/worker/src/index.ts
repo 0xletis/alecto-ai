@@ -13,8 +13,11 @@ import {
   type ActionItem,
   type ActionItemReminderType
 } from "@operator-agent/db";
-import { buildDailyCheckinPrompt } from "@operator-agent/core";
+import { buildDailyCheckinPrompt, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
+import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
+import { runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
+import { runLegacyDailyLoopMorningBriefs } from "./legacy-daily-loop-morning.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -31,6 +34,7 @@ if (!telegramBotToken) {
 }
 
 console.log(`Worker started. API base URL: ${apiBaseUrl}`);
+logEffectiveProactiveDeliveryConfig();
 
 await runTick();
 setInterval(() => {
@@ -38,6 +42,20 @@ setInterval(() => {
     console.error("Worker tick failed", error);
   });
 }, tickMs);
+
+/** Logged once at startup so it's immediately visible whether the two developer rollout controls
+ * are actually live in THIS process — .env is only read at startup, so a stale env value here is
+ * the single most common source of "why isn't V3 sending" confusion. See
+ * docs/10-v3-readiness-audit.md §19. */
+function logEffectiveProactiveDeliveryConfig(): void {
+  const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
+  const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
+  const allowlistSummary = allowlistActive
+    ? `active (${process.env.PROACTIVE_OPERATOR_ALLOWLIST})`
+    : "inactive — no allowlist configured, every opted-in user is eligible";
+
+  console.log(`V3 proactive delivery config: PROACTIVE_OPERATOR_DELIVERY_ENABLED=${deliveryEnabled}, PROACTIVE_OPERATOR_ALLOWLIST=${allowlistSummary}`);
+}
 
 async function runTick() {
   const settings = await getUsersWithEnabledNotifications();
@@ -68,8 +86,17 @@ async function runTick() {
 
   }
 
-  await runDailyMorningBriefs(now, settings);
+  // Legacy daily-loop morning message and V3's proactive morning brief are mutually exclusive
+  // per user — see apps/worker/src/legacy-daily-loop-morning.ts's doc comment. Order between
+  // these two calls does not matter: the legacy call skips based on configuration
+  // (morningBriefEnabled + V3 delivery actually live for that user), not on whether V3 actually
+  // sends this tick.
+  await runLegacyDailyLoopMorningBriefs(settings, { apiGet, sendTelegramMessage });
   await runDailyEveningReviews(now, settings);
+
+  // Cautious first real-delivery path for V3's Proactive Operator MVP — morning_brief only, off
+  // by default (PROACTIVE_OPERATOR_DELIVERY_ENABLED). See apps/worker/src/v3-proactive-delivery.ts.
+  await runV3ProactiveMorningBriefs(settings, { apiGet, sendTelegramMessage });
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
@@ -118,20 +145,6 @@ export async function sendDueActionReminders(now = new Date()) {
       console.log(`Sent ${candidate.reminderType} action reminder for ${candidate.actionItem.id}.`);
     } catch (error) {
       console.error(`Action reminder failed for ${candidate.actionItem.id}`, error);
-    }
-  }
-}
-
-export async function runDailyMorningBriefs(now = new Date(), settings?: NotificationSettings[]) {
-  const notificationSettings = settings ?? (await getUsersWithEnabledNotifications());
-
-  for (const item of notificationSettings) {
-    if (!item.telegramUserId || !item.dailyLoopEnabled) {
-      continue;
-    }
-
-    if (formatMinutesOfDay(item.morningTimeMinutes) === formatLocalTime(now, item.timezone)) {
-      await maybeSendDailyLoopStart(item, now);
     }
   }
 }
@@ -237,33 +250,6 @@ async function maybeSendWeeklyInsight(item: NotificationSettings, now: Date) {
 
   if (logged) {
     console.log(`Sent weekly insight to ${item.userId} for week ${sentForDate}.`);
-  }
-}
-
-async function maybeSendDailyLoopStart(item: NotificationSettings, now: Date) {
-  if (!item.telegramUserId) {
-    return;
-  }
-
-  const sentForDate = formatLocalDate(now, item.timezone);
-  const logInput = {
-    userId: item.userId,
-    type: "daily_loop_morning",
-    sentForDate
-  };
-
-  if (await hasNotificationLog(logInput)) {
-    return;
-  }
-
-  const response = await apiGet<DailyLoopMessageResponse>(
-    `/users/${item.userId}/daily-loop/start-day?markSent=true&now=${encodeURIComponent(now.toISOString())}`
-  );
-  await sendTelegramMessage(item.telegramUserId, response.message);
-  const logged = await createNotificationLog(logInput);
-
-  if (logged) {
-    console.log(`Sent daily loop start to ${item.userId} for ${sentForDate}.`);
   }
 }
 
@@ -387,35 +373,6 @@ async function sendTelegramMessage(chatId: string, text: string) {
   }
 }
 
-function formatLocalTime(date: Date, timezone: string): string {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).formatToParts(date);
-
-  return `${getPart(parts, "hour")}:${getPart(parts, "minute")}`;
-}
-
-function formatMinutesOfDay(minutes: number | undefined): string {
-  const safeMinutes = Number.isInteger(minutes) && minutes !== undefined && minutes >= 0 && minutes <= 1439 ? minutes : 0;
-  const hour = Math.floor(safeMinutes / 60);
-  const minute = safeMinutes % 60;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-}
-
-function formatLocalDate(date: Date, timezone: string): string {
-  const parts = new Intl.DateTimeFormat("en-CA", {
-    timeZone: timezone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit"
-  }).formatToParts(date);
-
-  return `${getPart(parts, "year")}-${getPart(parts, "month")}-${getPart(parts, "day")}`;
-}
-
 function formatLocalWeekday(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-US", {
     timeZone: timezone,
@@ -440,10 +397,6 @@ function parseLocalDateParts(date: Date, timezone: string): Date {
   }).formatToParts(date);
 
   return new Date(`${getPart(parts, "year")}-${getPart(parts, "month")}-${getPart(parts, "day")}T00:00:00Z`);
-}
-
-function getPart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
-  return parts.find((part) => part.type === type)?.value ?? "";
 }
 
 function formatInsight(insight: InsightReport) {

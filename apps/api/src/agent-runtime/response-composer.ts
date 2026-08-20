@@ -16,8 +16,13 @@ export interface ComposeReplyInput {
  * AND the executed tool isn't itself the direct answer to the question.
  */
 export function composeReply(input: ComposeReplyInput): string {
+  // Never blended with replyDraft: a clarification means the turn's own attempted
+  // operation was rejected (or nothing was attempted at all), so replyDraft — written by
+  // the planner BEFORE validation/execution ran — may itself be a premature, false success
+  // claim (e.g. "I've moved it to Friday" for a move that the validator actually rejected).
+  // The clarification question is the only thing here grounded in what actually happened.
   if (input.clarificationQuestion) {
-    return input.replyDraft ? `${input.replyDraft} ${input.clarificationQuestion}`.trim() : input.clarificationQuestion;
+    return input.clarificationQuestion;
   }
 
   if (input.pendingConfirmationOps.length > 0) {
@@ -77,7 +82,31 @@ export function composeReply(input: ComposeReplyInput): string {
   return leadLines.length > 0 ? joinSentences(leadLines) : "I didn't find anything to act on.";
 }
 
-const GROUND_TRUTH_ONLY_TOOLS = new Set(["operator.recent_changes", "gmail.rule.create"]);
+const GROUND_TRUTH_ONLY_TOOLS = new Set([
+  "operator.recent_changes",
+  "gmail.rule.create",
+  "action.hygiene_apply",
+  "planning.next_week_apply",
+  "weekly_review.save",
+  "gmail.rule.apply_update",
+  "daily_loop.settings_apply_update",
+  "gmail.review.reject",
+  "gmail.review.to_action",
+  "proactive.settings_apply_update",
+  // A real-LLM eval run found the planner's pre-execution replyDraft claiming evidence "counted
+  // toward" a goal even when this call fell back to the genuinely unlinked path — its own summary
+  // is specifically written to state the truth about whether/what was linked, so that truth must
+  // always be what's shown, never the LLM's optimism. NOT goal.log_evidence too, deliberately:
+  // that tool is routinely planned in the SAME turn as action.create (e.g. "I have an interview
+  // tomorrow"), and groundTruthOnly below suppresses every OTHER op's summary in the turn, not
+  // just replyDraft — adding it here silently dropped the action.create half of that reply.
+  "event.log_custom_progress"
+]);
+
+/** Exposed only for runtime.ts's dev/test-only planning trace, to classify which composeReply branch produced a reply without duplicating its branch logic. */
+export function isGroundTruthOnlyTool(tool: string): boolean {
+  return GROUND_TRUTH_ONLY_TOOLS.has(tool);
+}
 
 /** "I couldn't <do the thing> because <reason>. Nothing was changed." — always names the failure, never implies success. */
 function correctionLine(tool: string, detail: string): string {
@@ -95,7 +124,13 @@ const HUMAN_ACTION: Record<string, string> = {
   "memory.create": "save that memory",
   "gmail.rule.create": "set up that Gmail rule",
   "gmail.review.reject": "reject that email review",
-  "gmail.review.to_action": "turn that email into a task"
+  "gmail.review.to_action": "turn that email into a task",
+  "action.hygiene_apply": "apply those action cleanup decisions",
+  "planning.next_week_apply": "create that plan",
+  "weekly_review.save": "save that weekly review",
+  "gmail.rule.apply_update": "update that Gmail rule",
+  "daily_loop.settings_apply_update": "update your daily loop settings",
+  "proactive.settings_apply_update": "update your proactive message settings"
 };
 
 function humanAction(tool: string): string {

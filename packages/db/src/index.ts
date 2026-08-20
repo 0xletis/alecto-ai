@@ -1390,6 +1390,17 @@ export async function getEmailReviewItem(userId: string, reviewId: string): Prom
   return item ? toEmailReviewItem(item) : undefined;
 }
 
+export async function getPendingEmailReviewCount(userId: string): Promise<number> {
+  await ensureUser(userId);
+
+  return prisma.emailReviewItem.count({
+    where: {
+      userId,
+      status: "pending"
+    }
+  });
+}
+
 export async function createActionItemIfNotExists(
   userId: string,
   input: CreateActionItemInput
@@ -2496,6 +2507,23 @@ export async function hasNotificationLog(input: NotificationLogInput): Promise<b
   return Boolean(log);
 }
 
+/** Same lookup as hasNotificationLog, but returns the real sentAt when it exists — needed
+ * whenever a caller has to report WHEN something actually sent, not just whether it did. */
+export async function getNotificationLog(input: NotificationLogInput): Promise<{ sentAt: Date } | undefined> {
+  const log = await prisma.notificationLog.findUnique({
+    where: {
+      userId_type_sentForDate: {
+        userId: input.userId,
+        type: input.type,
+        sentForDate: input.sentForDate
+      }
+    },
+    select: { sentAt: true }
+  });
+
+  return log ?? undefined;
+}
+
 export async function hasRecentNotificationLog(input: Pick<NotificationLogInput, "userId" | "type"> & { since: Date }): Promise<boolean> {
   const log = await prisma.notificationLog.findFirst({
     where: {
@@ -3155,6 +3183,9 @@ function toNotificationSettings(
     weeklyInsightDay: (settings.weeklyInsightDay as NotificationSettings["weeklyInsightDay"]) ?? undefined,
     weeklyInsightTime: settings.weeklyInsightTime ?? undefined,
     dailyLoopEnabled: settings.dailyLoopEnabled,
+    morningBriefEnabled: settings.morningBriefEnabled,
+    eveningCheckinEnabled: settings.eveningCheckinEnabled,
+    gmailNudgeEnabled: settings.gmailNudgeEnabled,
     timezone: settings.timezone,
     defaultActionTimeMinutes: settings.defaultActionTimeMinutes ?? 540,
     morningTimeMinutes: settings.morningTimeMinutes ?? 540,

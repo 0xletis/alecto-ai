@@ -1,0 +1,131 @@
+import { getLocalTodayRange } from "@operator-agent/core";
+
+/**
+ * Generic, dependency-free local-datetime formatter extracted from
+ * apps/api/src/server.ts, where it was defined once privately and called
+ * 17 times across actions, email reviews, and other unrelated surfaces —
+ * not specific to action hygiene, which is why it lives here rather than
+ * in apps/api/src/actions/hygiene.ts (which also needs it).
+ */
+export function formatLocalDateTime(date: Date | undefined, timezone = "Europe/Madrid"): string {
+  if (!date) {
+    return "not set";
+  }
+
+  return new Intl.DateTimeFormat("en-GB", {
+    timeZone: timezone,
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  }).format(date);
+}
+
+/**
+ * Generic pending-decision expiry helper extracted from
+ * apps/api/src/server.ts, where it was called ~21 times across pending
+ * actions of every kind (not just Gmail rules) — moved here so the legacy
+ * Gmail conversation cluster (apps/api/src/legacy/gmail-conversation.ts)
+ * can use it without importing back from server.ts.
+ */
+export function pendingDecisionExpiry(): Date {
+  return new Date(Date.now() + 60 * 60 * 1000);
+}
+
+/**
+ * Generic date-arithmetic and timezone-local-date helpers extracted from
+ * apps/api/src/server.ts, where they were used across daily brief, weekly
+ * review, and action-hygiene analysis — not specific to any one of those,
+ * which is why they live here rather than in
+ * apps/api/src/legacy/action-hygiene-conversation.ts (which also needs them).
+ */
+export function getDateTimePart(parts: Intl.DateTimeFormatPart[], type: Intl.DateTimeFormatPartTypes): string {
+  return parts.find((part) => part.type === type)?.value ?? "";
+}
+
+export function formatDateInTimezone(date: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+
+  return `${getDateTimePart(parts, "year")}-${getDateTimePart(parts, "month")}-${getDateTimePart(parts, "day")}`;
+}
+
+export function daysBetweenLocalDates(fromDate: string, toDate: string): number {
+  const [fromYear, fromMonth, fromDay] = fromDate.split("-").map(Number);
+  const [toYear, toMonth, toDay] = toDate.split("-").map(Number);
+  const from = Date.UTC(fromYear, fromMonth - 1, fromDay);
+  const to = Date.UTC(toYear, toMonth - 1, toDay);
+  return Math.max(0, Math.floor((to - from) / (24 * 60 * 60 * 1000)));
+}
+
+export function daysBetween(from: Date, to: Date): number {
+  return Math.max(0, Math.floor((to.getTime() - from.getTime()) / (24 * 60 * 60 * 1000)));
+}
+
+/**
+ * Generic local-date-string arithmetic helpers extracted from
+ * apps/api/src/server.ts, where they were used across daily brief, weekly
+ * review, and next-week planning — not specific to planning, which is why
+ * they live here rather than in
+ * apps/api/src/legacy/planning-conversation.ts (which also needs them).
+ */
+export function addDaysToLocalDateString(date: string, days: number): string {
+  const [year, month, day] = date.split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + days, 12, 0, 0, 0)).toISOString().slice(0, 10);
+}
+
+export function localDateStartUtc(localDate: string, timezone: string): Date {
+  return getLocalTodayRange(new Date(`${localDate}T12:00:00Z`), timezone).start;
+}
+
+/**
+ * Generic local-week/date-range helpers extracted from
+ * apps/api/src/server.ts, where they were used both by next-week planning's
+ * `buildNextWeekPlanContext` (stays in server.ts) and the legacy
+ * weekly-review cluster (apps/api/src/legacy/weekly-review-conversation.ts),
+ * which also needs them.
+ */
+export function startOfLocalWeek(localDate: string): string {
+  const date = new Date(`${localDate}T12:00:00Z`);
+  const day = date.getUTCDay();
+  const mondayOffset = day === 0 ? -6 : 1 - day;
+  return addDaysToLocalDateString(localDate, mondayOffset);
+}
+
+export function isDateInRange(date: Date | undefined, start: Date, end: Date): boolean {
+  return Boolean(date && date >= start && date < end);
+}
+
+/**
+ * Generic "one day from now" helper extracted from apps/api/src/server.ts,
+ * where it was called both by the legacy /messages/process pending-memory
+ * cluster (apps/api/src/legacy/messages-process.ts) and the check-in-route
+ * low-sleep/impulse pending-memory helper that stays in server.ts.
+ */
+export function tomorrow(): Date {
+  const date = new Date();
+  date.setDate(date.getDate() + 1);
+  return date;
+}
+
+/**
+ * Generic optional-date-string parser extracted from apps/api/src/server.ts,
+ * where it was defined once privately and called ~26 times across nearly
+ * every route's `now` query/body param plus the legacy pending-decision
+ * resolver (apps/api/src/legacy/messages-process.ts) — the most widely
+ * shared "now" parser in the whole cleanup series.
+ */
+export function parseOptionalNow(value: string | undefined): Date | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}

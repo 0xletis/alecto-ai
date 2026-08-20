@@ -181,6 +181,9 @@ model NotificationSettings {
   weeklyInsightDay     String?
   weeklyInsightTime    String?
   dailyLoopEnabled     Boolean  @default(false)
+  morningBriefEnabled  Boolean  @default(false)
+  eveningCheckinEnabled Boolean @default(false)
+  gmailNudgeEnabled    Boolean  @default(false)
   timezone             String   @default("Europe/Madrid")
   defaultActionTimeMinutes Int   @default(540)
   morningTimeMinutes       Int   @default(540)

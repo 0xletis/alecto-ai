@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { prisma, updateUserOperatingProfile } from "../packages/db/src/index.ts";
+import { createGoal, prisma, updateUserOperatingProfile } from "../packages/db/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
 
 interface MockPlan {
@@ -433,13 +433,20 @@ test("agent/message: generic user policy guardrail blocks before planning, no ha
     // No mocked plan: the guardrail must short-circuit before the planner is ever invoked.
     const turn1 = await send(server, userId, "I think I'm chasing losses again tonight");
     assert.match(turn1.reply, /slow down|careful/i);
-    assert.equal(turn1.operationsExecuted.length, 0);
     assert.equal(turn1.debug.plannerUsed, "none");
     assert.equal(turn1.debug.llmPlannerAttempted, false);
-    assert.equal(turn1.debug.mutationExecuted, false);
+    // The generic goal/guardrail engine (apps/api/src/agent-runtime/goal-guardrails.ts) logs a
+    // detected conflict as a risk_pattern memory — reusing the existing memory infrastructure
+    // that insights/daily-review already read — rather than silently dropping it. No action/event
+    // is ever created; only that one deterministic, non-LLM-driven memory write happens.
+    assert.equal(turn1.operationsExecuted.length, 1);
+    assert.equal(turn1.operationsExecuted[0]?.tool, "memory.create");
+    assert.equal(turn1.debug.mutationExecuted, true);
 
     const eventCount = await prisma.event.count({ where: { userId } });
     assert.equal(eventCount, 0);
+    const riskMemories = await prisma.memoryEntry.count({ where: { userId, type: "risk_pattern" } });
+    assert.equal(riskMemories, 1);
   } finally {
     clearMocks();
     await server.close();
@@ -773,6 +780,9 @@ test("agent/message: operator.today never recommends a slash command, suggests n
 
   try {
     await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    // A goal anchor, so "so what today" hits the normal operator.today flow this test is
+    // actually testing, not the new empty-user goal-anchor nudge (agent-runtime/runtime.ts).
+    await createGoal(userId, { title: "Apply to developer jobs", category: "career", priority: "medium" });
     await prisma.actionItem.createMany({
       data: [
         { userId, source: "manual", title: "Apply to jobs", status: "open", priority: "medium", evidence: "manual" },

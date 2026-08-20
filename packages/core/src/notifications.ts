@@ -12,6 +12,14 @@ export const NotificationSettingsSchema = z.object({
   weeklyInsightDay: z.enum(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]).optional(),
   weeklyInsightTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
   dailyLoopEnabled: z.boolean().default(false),
+  // Product-level opt-in for Agent Runtime v3's Proactive Operator MVP — deliberately separate
+  // from dailyLoopEnabled (a distinct, older feature: the legacy /daily-loop/start-day|end-day
+  // messages). PROACTIVE_OPERATOR_DELIVERY_ENABLED/PROACTIVE_OPERATOR_ALLOWLIST remain developer
+  // rollout controls (apps/worker/src/v3-proactive-delivery.ts); these three fields are the
+  // actual per-user, per-moment product consent — no proactive message sends without both.
+  morningBriefEnabled: z.boolean().default(false),
+  eveningCheckinEnabled: z.boolean().default(false),
+  gmailNudgeEnabled: z.boolean().default(false),
   timezone: z.string().default("Europe/Madrid"),
   defaultActionTimeMinutes: z.number().int().min(0).max(1439).default(540),
   morningTimeMinutes: z.number().int().min(0).max(1439).default(540),
@@ -32,6 +40,9 @@ export const UpdateNotificationSettingsInputSchema = z.object({
   weeklyInsightDay: z.enum(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]).optional(),
   weeklyInsightTime: z.string().regex(/^\d{2}:\d{2}$/).optional(),
   dailyLoopEnabled: z.boolean().optional(),
+  morningBriefEnabled: z.boolean().optional(),
+  eveningCheckinEnabled: z.boolean().optional(),
+  gmailNudgeEnabled: z.boolean().optional(),
   timezone: z.string().optional(),
   defaultActionTimeMinutes: z.number().int().min(0).max(1439).optional(),
   morningTimeMinutes: z.number().int().min(0).max(1439).optional(),

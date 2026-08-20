@@ -12,7 +12,7 @@
 
 import type { ActionItem, ActionItemReminderType, getActiveGoals } from "@operator-agent/db";
 import type { DailyCoachResponse, Goal, MemoryEntry, StoredEvent } from "@operator-agent/core";
-import type { buildConversationControlDebugForUser, PlanWindowKind, sanitizeActionItem } from "./server.js";
+import type { buildConversationControlDebugForUser, sanitizeActionItem } from "./server.js";
 
 export interface GithubCommit {
   sha: string;
@@ -383,6 +383,8 @@ export interface ActionHygieneReport {
   suggestedCleanupCandidates: ActionHygieneAction[];
   summary: string;
 }
+
+export type PlanWindowKind = "next_week" | "current_week";
 
 export interface NextWeekPlanContext {
   userId: string;

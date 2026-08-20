@@ -10,6 +10,14 @@ export const GoalMetricSchema = z.object({
   key: z.string().min(1),
   label: z.string().min(1),
   eventType: z.string().optional(),
+  /** Adaptive Goal Creation MVP (docs/10-v3-readiness-audit.md §21): a free-form per-goal signal
+   * discriminator (e.g. "tea_cups_drunk", "called_grandmother") for a metric that ISN'T backed by
+   * a registered EventType. When set, evidence for this metric is logged as a generic
+   * "custom.goal_progress_logged" event with `data.signalKey` set to this value — targetMetrics
+   * is stored as JSON, so this needed no schema migration, only this additive Zod field. A metric
+   * sets either `eventType` (a real registry type, e.g. career.application_sent) or `signalKey`
+   * (a custom one), never neither — see goal-evidence.ts's countEvidenceForMetric. */
+  signalKey: z.string().optional(),
   aggregation: MetricAggregationSchema,
   window: MetricWindowSchema,
   unit: z.string().optional()
@@ -18,7 +26,11 @@ export const GoalMetricSchema = z.object({
 export const GoalCheckInQuestionSchema = z.object({
   key: z.string().min(1),
   question: z.string().min(1),
-  answerType: CheckInAnswerTypeSchema
+  answerType: CheckInAnswerTypeSchema,
+  /** Free-text cadence as the plan proposed it (e.g. "weekly", "evening") — additive field, kept
+   * loose (not MetricWindowSchema) since a check-in cadence like "morning"/"evening" isn't a
+   * metric aggregation window. Optional so pre-existing stored rows without it still parse. */
+  cadence: z.string().optional()
 });
 
 export const GoalSchema = z.object({
