@@ -17,6 +17,7 @@ import { buildDailyCheckinPrompt } from "@operator-agent/core";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
 import { runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
+import { runLegacyDailyLoopMorningBriefs } from "./legacy-daily-loop-morning.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -70,7 +71,12 @@ async function runTick() {
 
   }
 
-  await runDailyMorningBriefs(now, settings);
+  // Legacy daily-loop morning message and V3's proactive morning brief are mutually exclusive
+  // per user — see apps/worker/src/legacy-daily-loop-morning.ts's doc comment. Order between
+  // these two calls does not matter: the legacy call skips based on configuration
+  // (morningBriefEnabled + V3 delivery actually live for that user), not on whether V3 actually
+  // sends this tick.
+  await runLegacyDailyLoopMorningBriefs(settings, { apiGet, sendTelegramMessage });
   await runDailyEveningReviews(now, settings);
 
   // Cautious first real-delivery path for V3's Proactive Operator MVP — morning_brief only, off
@@ -124,20 +130,6 @@ export async function sendDueActionReminders(now = new Date()) {
       console.log(`Sent ${candidate.reminderType} action reminder for ${candidate.actionItem.id}.`);
     } catch (error) {
       console.error(`Action reminder failed for ${candidate.actionItem.id}`, error);
-    }
-  }
-}
-
-export async function runDailyMorningBriefs(now = new Date(), settings?: NotificationSettings[]) {
-  const notificationSettings = settings ?? (await getUsersWithEnabledNotifications());
-
-  for (const item of notificationSettings) {
-    if (!item.telegramUserId || !item.dailyLoopEnabled) {
-      continue;
-    }
-
-    if (formatMinutesOfDay(item.morningTimeMinutes) === formatLocalTime(now, item.timezone)) {
-      await maybeSendDailyLoopStart(item, now);
     }
   }
 }
@@ -243,33 +235,6 @@ async function maybeSendWeeklyInsight(item: NotificationSettings, now: Date) {
 
   if (logged) {
     console.log(`Sent weekly insight to ${item.userId} for week ${sentForDate}.`);
-  }
-}
-
-async function maybeSendDailyLoopStart(item: NotificationSettings, now: Date) {
-  if (!item.telegramUserId) {
-    return;
-  }
-
-  const sentForDate = formatLocalDate(now, item.timezone);
-  const logInput = {
-    userId: item.userId,
-    type: "daily_loop_morning",
-    sentForDate
-  };
-
-  if (await hasNotificationLog(logInput)) {
-    return;
-  }
-
-  const response = await apiGet<DailyLoopMessageResponse>(
-    `/users/${item.userId}/daily-loop/start-day?markSent=true&now=${encodeURIComponent(now.toISOString())}`
-  );
-  await sendTelegramMessage(item.telegramUserId, response.message);
-  const logged = await createNotificationLog(logInput);
-
-  if (logged) {
-    console.log(`Sent daily loop start to ${item.userId} for ${sentForDate}.`);
   }
 }
 

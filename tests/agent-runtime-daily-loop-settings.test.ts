@@ -4,7 +4,7 @@ import test from "node:test";
 import { buildServer, clearAgentRuntimeMocks, getAgentSession, mockPlan, op, prisma, sendAgentMessage, seedUser, type MockPlan } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
- * Agent Runtime v3 daily-loop settings flow — migrating on/off + morning-brief/evening-review
+ * Agent Runtime v3 LEGACY daily-loop settings flow — migrating on/off + start-day/evening-review
  * time changes from the legacy /messages/process brain
  * (apps/api/src/legacy/daily-conversation.ts's handleNaturalDailyLoopSettings, which mutates
  * NotificationSettings immediately with no confirmation and has no "off" support at all) into
@@ -44,7 +44,7 @@ test("agent/message: 'what are my daily loop settings?' shows the real current s
 
     assert.match(reply.reply, /daily loop settings:/i);
     assert.match(reply.reply, /daily review: off/i);
-    assert.match(reply.reply, /morning brief: 09:00/i);
+    assert.match(reply.reply, /start-day message: 09:00/i);
     assert.match(reply.reply, /evening review: 19:00/i);
     assert.equal(reply.debug.mutationExecuted, false);
   } finally {
@@ -160,7 +160,7 @@ test("agent/message: 'turn daily check-ins back on' works, and re-enabling an al
   }
 });
 
-test("agent/message: 'set my daily review to mornings at 8am' proposes and applies a morning-time change", async () => {
+test("agent/message: 'set my daily loop start time to 8am' proposes and applies a start-day time change", async () => {
   const server = buildServer();
   const userId = `daily-loop-morning-time-${randomUUID()}`;
 
@@ -169,13 +169,13 @@ test("agent/message: 'set my daily review to mornings at 8am' proposes and appli
     await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true } });
 
     mockPlan(dailyLoopProposeUpdatePlan({ morningTimeText: "8am" }));
-    const proposeReply = await sendAgentMessage(server, userId, "set my morning brief to 8am");
-    assert.match(proposeReply.reply, /move the morning brief to 08:00/i);
+    const proposeReply = await sendAgentMessage(server, userId, "set my daily loop start time to 8am");
+    assert.match(proposeReply.reply, /move the daily loop's start-day message to 08:00/i);
     assert.equal(proposeReply.debug.mutationExecuted, false);
 
     const applyReply = await sendAgentMessage(server, userId, "yes");
     assert.equal(applyReply.debug.mutationExecuted, true);
-    assert.match(applyReply.reply, /done — the morning brief is now at 08:00/i);
+    assert.match(applyReply.reply, /done — the daily loop's start-day message is now at 08:00/i);
 
     const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
     assert.equal(updated?.morningTimeMinutes, 8 * 60);
@@ -224,7 +224,7 @@ test("agent/message: a request for an unsupported daily-loop setting is declined
       operations: [],
       needsClarification: false,
       clarificationQuestion: null,
-      replyDraft: "The daily loop only supports on/off plus the morning-brief and evening-review times — I can't change the delivery channel."
+      replyDraft: "The daily loop only supports on/off plus its start-day and evening-review times — I can't change the delivery channel."
     });
     const reply = await sendAgentMessage(server, userId, "send my daily review by SMS instead");
 

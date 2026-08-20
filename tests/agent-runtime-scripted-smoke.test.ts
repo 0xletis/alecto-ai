@@ -1087,11 +1087,11 @@ test("scripted smoke 15: a configured knownTrigger still intervenes even with no
 
   try {
     await seedUser(userId);
-    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["sports betting"] } });
+    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["late night online shopping"] } });
 
     // No mockGuardrail needed: a configured trigger is matched deterministically, before any
     // LLM tier would even be considered.
-    const reply = await sendAgentMessage(server, userId, "I'm opening the betting app, sports betting always relaxes me");
+    const reply = await sendAgentMessage(server, userId, "I'm browsing late night online shopping again, it always relaxes me");
     assertNoGenericErrorRaw(reply.reply);
     assert.equal(reply.debug.llmPlannerAttempted, false, "a literal trigger match never needs the LLM tier");
     assert.deepEqual(reply.operationsPlanned, []);

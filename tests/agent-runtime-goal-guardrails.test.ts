@@ -134,10 +134,10 @@ test("E. with no relevant goal or trigger, an ordinary question is never hard-bl
     // No goals seeded at all, no knownTriggers configured — checkGoalGuardrail short-circuits
     // to allow WITHOUT attempting the LLM tier (nothing to classify against), so no
     // mockGuardrail is needed or used here.
-    mockPlan({ topic: "general", intent: "answer_question", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "Leverage means borrowing to increase your position size — and the risk." });
-    const reply = await sendAgentMessage(server, userId, "what is leverage?");
+    mockPlan({ topic: "general", intent: "answer_question", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "A recruiter reply usually means your resume passed the first screen." });
+    const reply = await sendAgentMessage(server, userId, "what does a recruiter reply usually mean?");
 
-    assert.equal(reply.reply, "Leverage means borrowing to increase your position size — and the risk.");
+    assert.equal(reply.reply, "A recruiter reply usually means your resume passed the first screen.");
     assert.equal(reply.debug.llmPlannerAttempted, true, "must reach the normal tool planner, proving the guardrail did not intercept");
   } finally {
     clearAgentRuntimeMocks();
@@ -152,10 +152,10 @@ test("F. a configured knownTrigger still intervenes even with no formal goal", a
 
   try {
     await seedUser(userId);
-    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["sports betting"] } });
+    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["late night online shopping"] } });
 
     // No mockGuardrail: a literal trigger match is Tier 1, purely deterministic, no LLM call.
-    const reply = await sendAgentMessage(server, userId, "I'm opening the betting app, sports betting always relaxes me");
+    const reply = await sendAgentMessage(server, userId, "I'm browsing late night online shopping again, it always relaxes me");
 
     assert.equal(reply.debug.llmPlannerAttempted, false);
     assert.deepEqual(reply.operationsPlanned, []);
@@ -173,11 +173,11 @@ test("G. asking for help controlling an urge related to a goal is supportive, no
 
   try {
     await seedUser(userId);
-    await seedGoal(userId, "Stop gambling", "wellbeing");
+    await seedGoal(userId, "Stop smoking", "health");
 
     mockGuardrail(classification({ conflict: "none" }));
     mockPlan({ topic: "general", intent: "support", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "Good — what's making the urge strong right now?" });
-    const reply = await sendAgentMessage(server, userId, "I want to control my gambling impulses");
+    const reply = await sendAgentMessage(server, userId, "I want to control my urge to smoke");
 
     assert.equal(reply.reply, "Good — what's making the urge strong right now?");
     assert.doesNotMatch(reply.reply, /conflicts with your goal/i);
@@ -194,10 +194,10 @@ test("a hard_block never opens a pending confirmation", async () => {
 
   try {
     await seedUser(userId);
-    const goal = await seedGoal(userId, "Stop gambling", "wellbeing");
+    const goal = await seedGoal(userId, "Stop smoking", "health");
 
     mockGuardrail(classification({ conflict: "hard_block", goalId: goal.id, pattern: "active_violation" }));
-    const reply = await sendAgentMessage(server, userId, "I want to bet 1000 because it's safe");
+    const reply = await sendAgentMessage(server, userId, "I'm about to have a cigarette, it's fine just this once");
 
     assert.equal(reply.needsConfirmation, false, "a hard block is not itself a pending confirmation");
     const row = await getAgentSession(userId);
@@ -215,18 +215,18 @@ test("an ask_clarification classification asks a short goal-grounded question an
 
   try {
     await seedUser(userId);
-    const goal = await seedGoal(userId, "Stop gambling", "wellbeing");
+    const goal = await seedGoal(userId, "Avoid impulsive spending", "finance");
 
     mockGuardrail(
       classification({
         conflict: "ask_clarification",
         goalId: goal.id,
-        clarifyingQuestion: "Is this about actually placing a bet, or just asking how betting odds work?"
+        clarifyingQuestion: "Are you about to actually buy this, or just asking about the price?"
       })
     );
-    const reply = await sendAgentMessage(server, userId, "what happens if I bet on this?");
+    const reply = await sendAgentMessage(server, userId, "what happens if I buy this right now?");
 
-    assert.equal(reply.reply, "Is this about actually placing a bet, or just asking how betting odds work?");
+    assert.equal(reply.reply, "Are you about to actually buy this, or just asking about the price?");
     assert.equal(reply.debug.mutationExecuted, false, "nothing is confirmed yet, so nothing is logged");
     assert.deepEqual(reply.operationsPlanned, []);
   } finally {
@@ -242,13 +242,58 @@ test("an invented/mismatched goalId from the classifier is never trusted — fal
 
   try {
     await seedUser(userId);
-    await seedGoal(userId, "Stop gambling", "wellbeing");
+    await seedGoal(userId, "Sleep before midnight", "health");
 
     mockGuardrail(classification({ conflict: "hard_block", goalId: randomUUID(), pattern: "active_violation" }));
     mockPlan({ topic: "general", intent: "answer", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "Sure, here's some info." });
-    const reply = await sendAgentMessage(server, userId, "tell me about odds");
+    const reply = await sendAgentMessage(server, userId, "tell me about sleep cycles");
 
     assert.equal(reply.reply, "Sure, here's some info.", "a goalId the model wasn't actually given must never be trusted into a block");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("H. a user with no betting/trading goal or trigger at all is never hard-blocked for mentioning betting — there is no built-in domain block", async () => {
+  const server = buildServer();
+  const userId = `guardrail-h-no-betting-goal-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    // No goals, no knownTriggers/knownFailureModes — checkGoalGuardrail has nothing to classify
+    // against, so it short-circuits to allow without even attempting the LLM tier. Proves the
+    // product has no hardcoded "betting = block" behavior: the same literal message that is
+    // hard-blocked in test A (once the user has a "Stop gambling" goal) is normal chat here.
+    mockPlan({ topic: "general", intent: "log_intent", operations: [], needsClarification: false, clarificationQuestion: null, replyDraft: "Got it, let me know how it goes." });
+    const reply = await sendAgentMessage(server, userId, "I want to bet 1000 because it's safe");
+
+    assert.equal(reply.debug.llmPlannerAttempted, true, "must reach the normal tool planner — nothing hardcoded intercepts a betting-related message by itself");
+    assert.doesNotMatch(reply.reply, /conflicts with your goal/i);
+
+    const risk = await prisma.memoryEntry.count({ where: { userId, type: "risk_pattern" } });
+    assert.equal(risk, 0, "nothing is logged as a risk incident when there is no goal/trigger to conflict with");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("I. avoiding an 'Apply to 3 jobs/day' goal for something else gets a goal-aligned intervention", async () => {
+  const server = buildServer();
+  const userId = `guardrail-i-jobs-avoidance-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const goal = await seedGoal(userId, "Apply to 3 jobs/day", "career");
+
+    mockGuardrail(classification({ conflict: "soft_warn", goalId: goal.id, pattern: "avoidance" }));
+    const reply = await sendAgentMessage(server, userId, "I'm going to watch videos all afternoon instead of applying to jobs");
+
+    assert.match(reply.reply, /apply to 3 jobs\/day/i);
+    assert.deepEqual(reply.operationsPlanned, [], "the tool planner must never be reached once the guardrail intervenes");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

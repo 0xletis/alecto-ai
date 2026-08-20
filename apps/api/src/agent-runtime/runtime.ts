@@ -89,7 +89,7 @@ export const GOAL_ANCHOR_NUDGE_REPLY = [
   "A few examples:",
   "1. Find a new developer job",
   "2. Train 3x/week",
-  "3. Control impulsive spending/gambling/trading",
+  "3. Avoid impulsive spending",
   "4. Build a project",
   "",
   "Goal creation through chat isn't wired yet, so use /create_goal for now — or tell me the context and I'll remember it."

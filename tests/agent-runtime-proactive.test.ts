@@ -322,3 +322,57 @@ test("10. hitting the daily proactive-message cap suppresses further messages", 
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+test("11. morning brief with no risk_pattern memory never mentions betting/finance — there is no hardcoded domain default", async () => {
+  const server = buildServer();
+  const userId = `proactive-morning-no-risk-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await seedNotificationSettings(userId);
+    await createActionItem(userId, { source: "manual", title: "Apply to 3 developer jobs", priority: "high" });
+
+    const decision = await preview(server, userId, MORNING_UTC);
+
+    assert.equal(decision.decision, "proposed_message");
+    assert.match((decision as any).message, /apply to 3 developer jobs/i);
+    assert.doesNotMatch((decision as any).message, /bet|gambl|financ|trading|impuls/i, "buildMorningBrief must never mention betting/finance unless a real risk_pattern memory exists for today");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("12. morning brief surfaces a real same-day risk_pattern memory verbatim, whatever goal it came from", async () => {
+  const server = buildServer();
+  const userId = `proactive-morning-risk-watchout-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await seedNotificationSettings(userId);
+    await createActionItem(userId, { source: "manual", title: "Apply to 3 developer jobs", priority: "high" });
+    const goal = await createGoal(userId, { title: "Stop gambling", category: "wellbeing", priority: "high" });
+    // Simulates a real earlier-today incident from checkGoalGuardrail (runtime.ts's
+    // logGuardrailIncident) against the user's OWN active goal — proactive.ts's buildMorningBrief
+    // only ever reads this generic risk_pattern memory type, never a goal title or domain keyword
+    // directly, so this proves the morning brief can surface a betting-related watchout only
+    // because real data says so, not because of any built-in betting logic.
+    await prisma.memoryEntry.create({
+      data: {
+        userId,
+        type: "risk_pattern",
+        summary: `Guardrail (hard_block): "I want to bet 1000" conflicted with goal "${goal.goal.title}".`,
+        source: "system_inferred",
+        createdAt: new Date(MORNING_UTC)
+      }
+    });
+
+    const decision = await preview(server, userId, MORNING_UTC);
+
+    assert.equal(decision.decision, "proposed_message");
+    assert.match((decision as any).message, /watch out: guardrail \(hard_block\): "i want to bet 1000" conflicted with goal "stop gambling"/i);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});

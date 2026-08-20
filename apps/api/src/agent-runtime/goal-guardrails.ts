@@ -217,30 +217,54 @@ async function classifyGoalConflict(message: string, goals: Goal[]): Promise<Goa
     const client = createOpenAIClient();
     const model = process.env.AGENT_RUNTIME_GUARDRAIL_MODEL ?? process.env.OPENAI_MODEL ?? defaultModel;
 
-    const response = await client.responses.create({
-      model,
-      store: false,
-      input: [
-        { role: "developer", content: [{ type: "input_text", text: buildGuardrailSystemPrompt() }] },
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: JSON.stringify({ message, goals: goals.map((goal) => ({ id: goal.id, title: goal.title, why: goal.why ?? null })) })
-            }
-          ]
+    const response = await withGuardrailTimeout(
+      client.responses.create({
+        model,
+        store: false,
+        input: [
+          { role: "developer", content: [{ type: "input_text", text: buildGuardrailSystemPrompt() }] },
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: JSON.stringify({ message, goals: goals.map((goal) => ({ id: goal.id, title: goal.title, why: goal.why ?? null })) })
+              }
+            ]
+          }
+        ],
+        text: {
+          format: { type: "json_schema", name: "goal_conflict_classification", strict: true, schema: CLASSIFICATION_SCHEMA }
         }
-      ],
-      text: {
-        format: { type: "json_schema", name: "goal_conflict_classification", strict: true, schema: CLASSIFICATION_SCHEMA }
-      }
-    });
+      })
+    );
 
     return JSON.parse(response.output_text) as GoalConflictClassification;
   } catch {
     return null;
   }
+}
+
+const defaultGuardrailTimeoutMs = 15000;
+
+/**
+ * Bounds this Tier 2 OpenAI call so a slow/hung/misconfigured API key falls back to "no
+ * classification" (the enclosing try/catch already treats any error as null, i.e. allow) within
+ * a few seconds, instead of hanging the whole turn — this runs on EVERY message once the user has
+ * at least one active goal, before the main planner ever runs, so a hang here blocks everything
+ * downstream too. Mirrors planner.ts's withPlannerTimeout and attention.ts's
+ * withDailyCoachTimeout, both pre-existing precedent for this exact pattern.
+ */
+export async function withGuardrailTimeout<T>(promise: Promise<T>): Promise<T> {
+  const parsedTimeoutMs = Number(process.env.AGENT_RUNTIME_GUARDRAIL_TIMEOUT_MS ?? defaultGuardrailTimeoutMs);
+  const timeoutMs = Number.isFinite(parsedTimeoutMs) && parsedTimeoutMs > 0 ? parsedTimeoutMs : defaultGuardrailTimeoutMs;
+
+  return await Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error("Agent Runtime v3 guardrail LLM call timed out.")), timeoutMs);
+    })
+  ]);
 }
 
 function buildGuardrailSystemPrompt(): string {

@@ -133,7 +133,7 @@ test("agent/message: hygiene_start stores visible action-hygiene items in the v3
     await seedUser(userId);
     const overdue = await createActionItem(userId, {
       source: "manual",
-      title: "Review betting guardrail rules",
+      title: "Review overdue hygiene rules",
       priority: "medium",
       dueAt: daysAgo(4)
     });
@@ -294,7 +294,7 @@ test("agent/message: 'complete 1, snooze 2 to Friday, archive 3' applies all thr
     // getActionItems orders by dueAt ascending (most overdue first) — earlier dueAt lands at
     // the lower index in the hygiene list, not creation order.
     const toComplete = await createActionItem(userId, { source: "manual", title: "Do 2 strength sessions", priority: "medium", dueAt: daysAgo(5) });
-    const toSnooze = await createActionItem(userId, { source: "manual", title: "Review betting guardrail rules", priority: "medium", dueAt: daysAgo(4) });
+    const toSnooze = await createActionItem(userId, { source: "manual", title: "Review overdue hygiene rules", priority: "medium", dueAt: daysAgo(4) });
     const toArchive = await createActionItem(userId, { source: "manual", title: "Check cheap car listings twice", priority: "medium", dueAt: daysAgo(3) });
 
     hygieneStartPlan();

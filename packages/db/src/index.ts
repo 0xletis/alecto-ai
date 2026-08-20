@@ -2507,6 +2507,23 @@ export async function hasNotificationLog(input: NotificationLogInput): Promise<b
   return Boolean(log);
 }
 
+/** Same lookup as hasNotificationLog, but returns the real sentAt when it exists — needed
+ * whenever a caller has to report WHEN something actually sent, not just whether it did. */
+export async function getNotificationLog(input: NotificationLogInput): Promise<{ sentAt: Date } | undefined> {
+  const log = await prisma.notificationLog.findUnique({
+    where: {
+      userId_type_sentForDate: {
+        userId: input.userId,
+        type: input.type,
+        sentForDate: input.sentForDate
+      }
+    },
+    select: { sentAt: true }
+  });
+
+  return log ?? undefined;
+}
+
 export async function hasRecentNotificationLog(input: Pick<NotificationLogInput, "userId" | "type"> & { since: Date }): Promise<boolean> {
   const log = await prisma.notificationLog.findFirst({
     where: {

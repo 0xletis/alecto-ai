@@ -14,6 +14,7 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getOrCreateNotificationSettings,
+  getNotificationLog,
   hasNotificationLog,
   snoozeActionItem,
   updateEmailSignalRule,
@@ -840,7 +841,11 @@ export async function executeOperation(
         const now = new Date();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const morningKey = MORNING_BRIEF_DEDUPE_KEY;
-        const alreadySentToday = await hasNotificationLog({ userId, type: morningKey, sentForDate });
+        const [alreadySentToday, legacyDailyLoopLog] = await Promise.all([
+          hasNotificationLog({ userId, type: morningKey, sentForDate }),
+          getNotificationLog({ userId, type: "daily_loop_morning", sentForDate })
+        ]);
+        const legacyDailyLoopSentAt = legacyDailyLoopLog?.sentAt;
 
         const status = getProactiveDeliveryStatus({
           context,
@@ -849,13 +854,14 @@ export async function executeOperation(
           alreadySentDedupeKeys: alreadySentToday ? new Set([morningKey]) : new Set(),
           sentCountToday: alreadySentToday ? 1 : 0,
           deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
-          isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId)
+          isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId),
+          legacyDailyLoopSentAt
         });
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatProactiveDeliveryDiagnosis(status, settings),
+          summary: formatProactiveDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt),
           result: { status }
         };
       }
@@ -1165,7 +1171,7 @@ function formatDailyLoopSettingsSummary(settings: NotificationSettings): string 
   return [
     "Daily loop settings:",
     `- Daily review: ${settings.dailyLoopEnabled ? "on" : "off"}`,
-    `- Morning brief: ${formatMinutesOfDay(settings.morningTimeMinutes)} (${settings.timezone})`,
+    `- Start-day message: ${formatMinutesOfDay(settings.morningTimeMinutes)} (${settings.timezone})`,
     `- Evening review: ${formatMinutesOfDay(settings.eveningTimeMinutes)} (${settings.timezone})`
   ].join("\n");
 }
@@ -1201,7 +1207,7 @@ function describeDailyLoopChanges(current: NotificationSettings, request: DailyL
 
   if (request.morningTimeMinutes !== undefined && request.morningTimeMinutes !== current.morningTimeMinutes) {
     const time = formatMinutesOfDay(request.morningTimeMinutes);
-    changes.push({ proposal: `move the morning brief to ${time}`, done: `the morning brief is now at ${time}` });
+    changes.push({ proposal: `move the daily loop's start-day message to ${time}`, done: `the daily loop's start-day message is now at ${time}` });
   }
 
   if (request.eveningTimeMinutes !== undefined && request.eveningTimeMinutes !== current.eveningTimeMinutes) {

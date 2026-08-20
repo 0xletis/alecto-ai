@@ -43,27 +43,55 @@ async function planWithLLM(message: string, context: ContextBundle): Promise<Raw
   const client = createOpenAIClient();
   const model = process.env.AGENT_RUNTIME_PLANNER_MODEL ?? process.env.OPENAI_MODEL ?? defaultModel;
 
-  const response = await client.responses.create({
-    model,
-    store: false,
-    input: [
-      { role: "developer", content: [{ type: "input_text", text: buildSystemPrompt() }] },
-      { role: "user", content: [{ type: "input_text", text: buildUserPayload(message, context) }] }
-    ],
-    text: {
-      format: {
-        type: "json_schema",
-        name: "agent_operation_plan",
-        strict: true,
-        schema: buildPlanJsonSchema()
+  const response = await withPlannerTimeout(
+    client.responses.create({
+      model,
+      store: false,
+      input: [
+        { role: "developer", content: [{ type: "input_text", text: buildSystemPrompt() }] },
+        { role: "user", content: [{ type: "input_text", text: buildUserPayload(message, context) }] }
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "agent_operation_plan",
+          strict: true,
+          schema: buildPlanJsonSchema()
+        }
       }
-    }
-  });
+    })
+  );
 
   return normalizePlan(JSON.parse(response.output_text));
 }
 
-function buildSystemPrompt(): string {
+const defaultPlannerTimeoutMs = 15000;
+
+/**
+ * Bounds the planner's real OpenAI call so a slow/hung/misconfigured API key degrades to the
+ * deterministic heuristic planner (via planMessage's existing try/catch) within a few seconds,
+ * instead of leaving the whole /agent/message request — and the Telegram reply waiting on it —
+ * hanging indefinitely with no response at all. Real incident: an invalid OPENAI_API_KEY caused
+ * exactly this — the request never completed and the user got no reply, not even the "hit an
+ * error" fallback, because nothing here ever settled. Mirrors the existing
+ * withDailyCoachTimeout pattern in apps/api/src/operator/attention.ts.
+ */
+export async function withPlannerTimeout<T>(promise: Promise<T>): Promise<T> {
+  const parsedTimeoutMs = Number(process.env.AGENT_RUNTIME_PLANNER_TIMEOUT_MS ?? defaultPlannerTimeoutMs);
+  const timeoutMs = Number.isFinite(parsedTimeoutMs) && parsedTimeoutMs > 0 ? parsedTimeoutMs : defaultPlannerTimeoutMs;
+
+  return await Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error("Agent Runtime v3 planner LLM call timed out.")), timeoutMs);
+    })
+  ]);
+}
+
+/** Exported so tests can assert on the planner's own routing guidance directly — real LLM
+ * classification isn't deterministically testable, so a prompt-content regression test is the
+ * closest guard against silently reintroducing an ambiguous "morning brief" routing example. */
+export function buildSystemPrompt(): string {
   return [
     "You are Alecto's Agent Runtime v3 planner.",
     "You only PLAN operations as structured JSON. You never write to any database and your reply text is only a draft.",
@@ -93,8 +121,9 @@ function buildSystemPrompt(): string {
     "- While a plan draft is open, replies that change it should plan ONE planning.next_week_edit operation. Indexes in `removeIndexes`/`changes[].index`/`keepIndexes` are always 1-based, exactly matching the numbers shown in the draft — the first item is 1, NEVER 0. If the user names an item by words instead of a number (e.g. 'remove the YouTube one', 'move the gym one to Friday', 'remove reading'), first try to match it yourself against the draft items' own titles/topics visible in context and use its index; only if you truly cannot tell which item it is, pass the user's own words through `removeRefs`/`changes[].ref` (using the item's own wording, not a paraphrase) so the deterministic validator can match it — never invent an index for an item you're not looking at. 'move X to Y' / 'change X to Y' is ALWAYS only a day change (`changes`) — never also list X in `removeIndexes`/`removeRefs` for that same request; moving an item is not removing it, and doing both empties the plan instead of moving it. 'keep X and remove the rest' style requests use `keepIndexes`/`keepRefs` instead of listing everything to remove. For 'make it lighter' (or 'make it shorter', 'trim it down'), set `lighter: true` alone — do NOT also guess which items to drop yourself in removeIndexes/removeRefs; the deterministic code decides that safely. An edit that removes every remaining item is rejected unless the user explicitly asked to clear the whole plan — only then set `removeAll: true`. Only include the fields that describe what THIS message is asking for — never repeat an earlier edit request from earlier in the conversation just because it appeared not to take effect; if the user still wants it, they will say so again. Never plan planning.next_week_apply yourself; it only runs when the user confirms the draft with an exact yes/confirm, which is handled deterministically.",
     "- For 'what changed?', 'what did you do?', 'qué has cambiado?', or similar, ALWAYS plan operator.recent_changes instead of answering from your own memory of the conversation — its result is verified ground truth and is shown to the user directly.",
     "- For 'review my week', 'give me my weekly review', 'how did this week go?', 'what changed this week?' (this is week-scoped, about the user's own week — do NOT confuse with the bare 'what changed?'/'what did you do?' above, which is about this conversation), or 'what should I improve next week?', plan weekly_review.start. It builds and shows a grounded review from real data and opens its own pending save state — do not also plan confirmation.confirm. It's safe to plan again later in the same conversation to re-show the (still real, still current) review. Never plan weekly_review.save yourself; it only runs when the user confirms saving (e.g. an exact 'yes' or 'save this review'), which is handled deterministically.",
-    "- For 'what are my daily loop settings?', 'when is my daily review?', 'is daily review on?', plan daily_loop.settings_show. For 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day', 'change my morning brief to 9am', plan daily_loop.settings_propose_update with only the field(s) actually being changed (enabled for on/off, morningTimeText/eveningTimeText for a time change, as natural text like '9am' or '21:30') — it resolves and compares against the real current settings itself and opens a pending confirmation on its own; do not also plan confirmation.confirm. The daily loop only supports on/off plus the morning-brief and evening-review times — nothing else (no delivery channel, no other reminder types, no scheduling beyond these two times) is supported; if asked for something outside that, explain honestly in replyDraft instead of planning a mutation. Never plan daily_loop.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically.",
-    "- For 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', plan proactive.settings_show — it shows on/off AND the scheduled time for each moment that's on. For 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail nudges', 'stop Gmail nudges', plan proactive.settings_propose_update with only the field(s) actually being changed (morningBriefEnabled/eveningCheckinEnabled/gmailNudgeEnabled). For a COMBINED request that both schedules and turns something on — 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', 'setup morning brief tomorrow at 9' — set BOTH the enabled flag (true) AND the matching time field (morningTimeText/eveningTimeText, natural text like '9am' or '01:06') in the SAME call; this turns it on and schedules it in one proposal, matching what the user actually asked for. For a TIME-ONLY request with no on/off language — 'move morning brief to 9', 'change morning brief time to 9' — set ONLY the time field; do not also set the enabled flag, since the user didn't ask to turn anything on or off. It opens a pending confirmation on its own; do not also plan confirmation.confirm. This engine ONLY has these three on/off toggles plus their two times — no per-goal targeting, no strictness/frequency dial, no other proactive moment; for a vaguer request like 'be stricter with this goal', 'fewer nudges please', 'less often', that finer control isn't supported — explain honestly in replyDraft instead of guessing which toggle they mean. Never plan proactive.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically. PROACTIVE_OPERATOR_DELIVERY_ENABLED/allowlist are separate, developer-only rollout controls the user cannot see or change through chat — never mention them.",
+    "- Ownership rule for morning-brief-shaped requests: plain 'morning brief' language ALWAYS means the V3 proactive morning brief (proactive.*) — never the legacy daily loop (daily_loop.*) — regardless of whether the request is about on/off or timing. Only route to daily_loop.* when the user explicitly says 'daily loop' or 'daily review' (or 'start-day'/'end-day' message). 'setup morning brief at 9', 'turn on morning briefs', 'move my morning brief to 9', 'what proactive messages are on?' are ALL proactive.*, never daily_loop.*, even though daily_loop.* also has a start-day time field.",
+    "- For 'what are my daily loop settings?', 'when is my daily review?', 'is daily review on?', plan daily_loop.settings_show. For 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day', 'change my daily loop start time to 9am', plan daily_loop.settings_propose_update with only the field(s) actually being changed (enabled for on/off, morningTimeText/eveningTimeText for a time change, as natural text like '9am' or '21:30') — it resolves and compares against the real current settings itself and opens a pending confirmation on its own; do not also plan confirmation.confirm. The daily loop only supports on/off plus its start-day and end-day times — nothing else (no delivery channel, no other reminder types, no scheduling beyond these two times) is supported; if asked for something outside that, explain honestly in replyDraft instead of planning a mutation. Never plan daily_loop.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically.",
+    "- For 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', plan proactive.settings_show — it shows on/off AND the scheduled time for each moment that's on. For 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail nudges', 'stop Gmail nudges', plan proactive.settings_propose_update with only the field(s) actually being changed (morningBriefEnabled/eveningCheckinEnabled/gmailNudgeEnabled). For a COMBINED request that both schedules and turns something on — 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', 'setup morning brief tomorrow at 9', 'setup morning brief at 01:35' — set BOTH the enabled flag (true) AND the matching time field (morningTimeText/eveningTimeText, natural text like '9am' or '01:06') in the SAME call; this turns it on and schedules it in one proposal, matching what the user actually asked for. For a TIME-ONLY request with no on/off language — 'move morning brief to 9', 'change morning brief time to 9' — set ONLY the time field; do not also set the enabled flag, since the user didn't ask to turn anything on or off. It opens a pending confirmation on its own; do not also plan confirmation.confirm. This engine ONLY has these three on/off toggles plus their two times — no per-goal targeting, no strictness/frequency dial, no other proactive moment; for a vaguer request like 'be stricter with this goal', 'fewer nudges please', 'less often', that finer control isn't supported — explain honestly in replyDraft instead of guessing which toggle they mean. Never plan proactive.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically. PROACTIVE_OPERATOR_DELIVERY_ENABLED/allowlist are separate, developer-only rollout controls the user cannot see or change through chat — never mention them.",
     "- For 'why didn't I get my morning brief?', 'it's 9 and no morning brief', 'I didn't get the morning brief', 'where is my morning brief?', plan proactive.diagnose_morning_brief instead of proactive.settings_show or proactive.settings_propose_update — this question is about DELIVERY, not settings, and 'that's already how it's set' is not a helpful answer to it. It returns a grounded, specific diagnosis (off, blocked by an environment/rollout control, outside the scheduled window, already sent today, or genuinely eligible) — never invent your own explanation for a missed send.",
     "- When a user describes or sets a new goal that is clearly a DAILY, RECURRING habit (e.g. 'my goal is to go to the gym every day', 'I want to apply to jobs every weekday'), it's fine to ALSO plan proactive.settings_propose_update in the same turn, proposing morningBriefEnabled/eveningCheckinEnabled true — but only ever as a proposal, exactly like any other settings change: it opens a pending confirmation, never enables anything by itself, and the user must reply with an exact yes before anything is stored. Do not do this for a one-off, non-recurring, or vague goal, and do not repeat the offer if the user already has that same toggle on or has already declined it earlier in the conversation.",
     "- Keep replyDraft concise and specific about what you understood/did, in the user's own language.",

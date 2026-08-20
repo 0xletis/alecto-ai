@@ -418,7 +418,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "daily_loop.settings_show",
     description:
-      "Show the user's current daily-loop settings: whether it's on, and the morning-brief/evening-review times. Use for 'what are my daily loop settings?', 'when is my daily review?'.",
+      "Show the user's current LEGACY daily-loop settings: whether it's on, and its start-day/end-day times. This is the older daily-loop feature, distinct from the V3 proactive morning brief (proactive.settings_show) — 'morning brief' on its own means the V3 proactive moment; only use this tool for explicit daily-loop language: 'what are my daily loop settings?', 'when is my daily review?', 'is the daily loop on?'.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({})
@@ -426,13 +426,13 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "daily_loop.settings_propose_update",
     description:
-      "Propose turning the daily loop on/off and/or changing the morning-brief or evening-review time — shows what would change and opens a pending confirmation. Use for 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day'. Set only the field(s) the user is actually asking to change. Does NOT support anything beyond on/off + the two times (e.g. delivery channel, default action reminder time, weekly insight day) — those aren't supported; explain that honestly instead of planning this.",
+      "Propose turning the LEGACY daily loop on/off and/or changing its start-day or end-day time — shows what would change and opens a pending confirmation. This is the older daily-loop feature, distinct from the V3 proactive morning brief (proactive.settings_propose_update) — only use this tool for explicit daily-loop language: 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day', 'change my daily loop start time to 9am'. Plain 'morning brief' language ('set up a morning brief at 9', 'move my morning brief to 9', 'turn on morning briefs') always means the V3 proactive moment — use proactive.settings_propose_update for that instead, even if the wording resembles a time change. Set only the field(s) the user is actually asking to change. Does NOT support anything beyond on/off + the two times (e.g. delivery channel, default action reminder time, weekly insight day) — those aren't supported; explain that honestly instead of planning this.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
-      enabled: z.boolean().optional().describe("Set true to turn the daily loop on, false to turn it off."),
-      morningTimeText: z.string().optional().describe("New natural-language time for the morning brief, e.g. '9am', '09:00'."),
-      eveningTimeText: z.string().optional().describe("New natural-language time for the evening review, e.g. '9:30pm', '21:30'.")
+      enabled: z.boolean().optional().describe("Set true to turn the legacy daily loop on, false to turn it off."),
+      morningTimeText: z.string().optional().describe("New natural-language start-day time for the LEGACY daily loop, e.g. '9am', '09:00'. Do not use this for plain 'morning brief' requests — those mean the V3 proactive moment (proactive.settings_propose_update's morningTimeText) instead."),
+      eveningTimeText: z.string().optional().describe("New natural-language end-day time for the LEGACY daily loop, e.g. '9:30pm', '21:30'.")
     })
   },
   {

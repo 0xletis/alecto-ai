@@ -178,3 +178,87 @@ test("10. everything eligible but nothing arrived: diagnosis points at the worke
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+test("11. legacy daily-loop already sent today: diagnosis says so explicitly, never implying V3 sent", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-legacy-sent-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const morningTimeMinutes = currentMinutesUtc();
+    // V3 is fully configured to look eligible (opted in, delivery flag off — the common default
+    // state) but the legacy daily-loop message already went out today via the worker's own
+    // legacy sender (apps/worker/src/legacy-daily-loop-morning.ts), which only ever runs when V3
+    // does NOT own delivery for this user.
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
+
+    const sentForDate = new Date().toISOString().slice(0, 10);
+    await createNotificationLog({ userId, type: "daily_loop_morning", sentForDate });
+
+    const reply = await diagnose(server, userId);
+    assert.match(reply, /did get a morning message today/i);
+    assert.match(reply, /legacy daily-loop/i);
+    assert.doesNotMatch(reply, /settings look eligible/i, "must not answer as if V3 itself sent or is merely eligible");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("12. legacy-sent diagnosis reports the message's real send time, not the user's current scheduled time", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-legacy-sent-time-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    // Real incident: the user changed their scheduled time AFTER a legacy message already sent
+    // earlier today at the OLD time — the diagnosis must report when the message actually went
+    // out, not the now-current morningTimeMinutes, or it misstates what the user actually got.
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes: 1200, timezone: "UTC" } });
+    await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
+
+    const sentAt = new Date();
+    const sentForDate = sentAt.toISOString().slice(0, 10);
+    const realSentTime = `${String(sentAt.getUTCHours()).padStart(2, "0")}:${String(sentAt.getUTCMinutes()).padStart(2, "0")}`;
+    await prisma.notificationLog.create({ data: { userId, type: "daily_loop_morning", sentForDate, sentAt } });
+
+    const reply = await diagnose(server, userId);
+    assert.match(reply, new RegExp(`around ${realSentTime}`, "i"), `expected the real send time ${realSentTime}, got: ${reply}`);
+    assert.doesNotMatch(reply, /around 20:00/i, "must not report the current morningTimeMinutes setting (20:00) instead of the actual send time");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("13. if V3 itself already sent today, that takes priority over a stale earlier legacy send from the same day", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-v3-sent-over-legacy-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    // Real incident: legacy sent once early in the day (e.g. before the user opted into V3), the
+    // user later opted in and rescheduled V3, and V3 itself went on to actually send at the NEW
+    // time. Asking "why didn't I get my morning brief?" after that must report V3's own success —
+    // not resurface the old, no-longer-relevant legacy send from hours earlier.
+    const morningTimeMinutes = currentMinutesUtc();
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
+
+    const sentForDate = new Date().toISOString().slice(0, 10);
+    const earlierToday = new Date(Date.now() - 60 * 60 * 1000);
+    await prisma.notificationLog.create({ data: { userId, type: "daily_loop_morning", sentForDate, sentAt: earlierToday } });
+    await createNotificationLog({ userId, type: "v3_morning_brief", sentForDate });
+
+    const reply = await diagnose(server, userId);
+    assert.match(reply, /already sent today/i, "must report V3's own successful send");
+    assert.doesNotMatch(reply, /legacy daily-loop/i, "must not resurface the earlier, now-irrelevant legacy send");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});

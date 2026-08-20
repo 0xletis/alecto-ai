@@ -182,12 +182,12 @@ test("7. the goal-aligned guardrail still sees active goals after adding goal.li
 
   try {
     await seedUser(userId);
-    const goal = await seedGoal(userId, { title: "Stop gambling", category: "wellbeing", priority: "critical" });
+    const goal = await seedGoal(userId, { title: "Stop smoking", category: "health", priority: "critical" });
 
     mockGuardrail({ conflict: "hard_block", goalId: goal.id, pattern: "active_violation", clarifyingQuestion: null, reason: "test" });
-    const reply = await sendAgentMessage(server, userId, "I want to bet 1000 because it's safe");
+    const reply = await sendAgentMessage(server, userId, "I'm about to have a cigarette, it's fine just this once");
 
-    assert.match(reply.reply, /conflicts with your goal to stop gambling/i);
+    assert.match(reply.reply, /conflicts with your goal to stop smoking/i);
     assert.deepEqual(reply.operationsPlanned, [], "the guardrail must still short-circuit before the planner runs");
   } finally {
     clearAgentRuntimeMocks();

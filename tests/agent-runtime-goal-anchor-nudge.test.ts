@@ -86,7 +86,7 @@ test("4. a user with a knownTrigger but no goals does not get the nudge", async 
 
   try {
     await seedUser(userId);
-    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["sports betting"] } });
+    await prisma.userOperatingProfile.create({ data: { userId, knownTriggers: ["late night online shopping"] } });
 
     mockPlan(operatorTodayPlan());
     const reply = await sendAgentMessage(server, userId, "so what today");

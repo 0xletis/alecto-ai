@@ -80,19 +80,33 @@ export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificat
   const logger = options.logger ?? console;
 
   if (!deliveryEnabled) {
+    logger.log("V3 proactive morning brief: PROACTIVE_OPERATOR_DELIVERY_ENABLED is not \"true\" in this process — skipping for every user this tick.");
     return;
   }
 
   for (const item of settings) {
+    if (!item.telegramUserId || !item.morningBriefEnabled) {
+      continue;
+    }
+
+    // Only log from here on — this is the exact minute this user's morning brief was scheduled
+    // for, the one moment a silent skip is actually worth surfacing. Every other tick/user
+    // combination is normal and would be pure noise if logged.
+    if (formatMinutesOfDay(item.morningTimeMinutes) !== formatLocalTime(now, item.timezone)) {
+      continue;
+    }
+
     // dailyLoopEnabled is a separate, older feature (legacy daily-loop start/end-day messages).
     // morningBriefEnabled is the actual per-user product consent for THIS feature — required
     // independently, so a user can never receive a v3 morning brief without having explicitly
     // opted into it themselves (via /agent/message's proactive.settings_* tools).
-    if (!item.telegramUserId || !item.dailyLoopEnabled || !item.morningBriefEnabled || !isAllowed(item.userId)) {
+    if (!item.dailyLoopEnabled) {
+      logger.log(`V3 proactive morning brief: time matched for ${item.userId} but dailyLoopEnabled is false — skipping.`);
       continue;
     }
 
-    if (formatMinutesOfDay(item.morningTimeMinutes) !== formatLocalTime(now, item.timezone)) {
+    if (!isAllowed(item.userId)) {
+      logger.log(`V3 proactive morning brief: time matched for ${item.userId} but they are not in PROACTIVE_OPERATOR_ALLOWLIST — skipping.`);
       continue;
     }
 
@@ -121,6 +135,8 @@ async function maybeSendV3MorningBrief(
 
   const decision = response.decision;
   if (decision.decision !== "proposed_message" || decision.type !== "morning_brief") {
+    const reason = decision.decision === "no_message" ? decision.reason : `decision type was "${decision.type}", not morning_brief`;
+    logger.log(`V3 proactive morning brief: preview for ${item.userId} did not propose a morning brief this tick (${reason}) — nothing sent.`);
     return;
   }
 

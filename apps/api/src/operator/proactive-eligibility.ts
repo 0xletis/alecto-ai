@@ -92,6 +92,7 @@ function isUserOptedIn(type: ProactiveMessageType, settings: NotificationSetting
  * (user_not_allowlisted) is ever actually a blocker.
  */
 export type ProactiveDeliveryStatus =
+  | "legacy_daily_loop_sent_instead"
   | "delivery_disabled"
   | "missing_allowlist"
   | "user_not_allowlisted"
@@ -110,11 +111,31 @@ export interface ProactiveDeliveryStatusInput {
   sentCountToday: number;
   deliveryEnabled: boolean;
   isAllowlisted: boolean;
+  /** The real sentAt of today's LEGACY daily-loop morning message (NotificationLog type
+   * "daily_loop_morning"), when one exists — see docs/10-v3-readiness-audit.md §18. Checked
+   * first: apps/worker/src/legacy-daily-loop-morning.ts only ever sends when V3 does NOT own
+   * delivery for this user, so a value here means legacy — not V3 — is the actual source of
+   * today's morning message. Carrying the real timestamp (not just a boolean) matters: this can
+   * be a send from EARLIER today, before the user's current morningTimeMinutes was set to
+   * something later — reporting the user's now-current scheduled time here would misstate when
+   * the message they actually received went out. */
+  legacyDailyLoopSentAt: Date | undefined;
 }
 
 export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput): ProactiveDeliveryStatus {
   const settings = input.notificationSettings;
 
+  // V3's own success is checked FIRST, ahead of everything else including legacy: if V3 already
+  // sent today, that is the most current, most relevant truth, and must never be shadowed by a
+  // legacy send from earlier the same day (e.g. before the user opted into/rescheduled V3) — a
+  // real incident showed a stale legacy_daily_loop_sent_instead answer persisting for the rest of
+  // the day even after the user rescheduled and re-asked about a completely different window.
+  if (input.alreadySentDedupeKeys.has(MORNING_BRIEF_DEDUPE_KEY)) {
+    return "duplicate_dedupe_key";
+  }
+  if (input.legacyDailyLoopSentAt) {
+    return "legacy_daily_loop_sent_instead";
+  }
   if (!input.deliveryEnabled) {
     return "delivery_disabled";
   }
@@ -133,10 +154,6 @@ export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput):
     return "outside_morning_window";
   }
 
-  if (input.alreadySentDedupeKeys.has(MORNING_BRIEF_DEDUPE_KEY)) {
-    return "duplicate_dedupe_key";
-  }
-
   const decision = decideProactiveOperatorMessage({
     context: input.context,
     notificationSettings: settings,
@@ -153,17 +170,27 @@ export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput):
 }
 
 const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string) => string> = {
+  legacy_daily_loop_sent_instead: (time) =>
+    `You did get a morning message today around ${time} — but it came from the older legacy daily-loop system, not the V3 proactive morning brief you're asking about. Real V3 delivery is still a developer rollout control most users aren't on yet; ask "what proactive messages are on?" to check your V3 opt-in and scheduled time.`,
   delivery_disabled: (time) => `Morning brief is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
   missing_allowlist: (time) => `Morning brief is on at ${time}, but no PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment.`,
   user_not_allowlisted: (time) => `Morning brief is on at ${time}, but this user is not in PROACTIVE_OPERATOR_ALLOWLIST.`,
   user_not_opted_in: () => "Morning brief is currently off — turn it on and I'll start sending it.",
-  daily_loop_disabled: (time) => `Morning brief is on at ${time}, but the daily loop itself is off, which also blocks delivery — turn the daily loop back on too.`,
+  daily_loop_disabled: (time) => `Morning brief is on at ${time}, but the daily loop itself is off, which blocks both the V3 morning brief and the legacy daily-loop message — turn the daily loop back on too.`,
   outside_morning_window: (time) => `Morning brief is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
   duplicate_dedupe_key: (time) => `Morning brief is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
   no_candidate: (time) => `Morning brief is on at ${time}, but there isn't anything grounded to send right now (e.g. no active goals or open actions) — check back closer to ${time}.`,
   eligible: (time) => `Settings look eligible — morning brief is on at ${time}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
 };
 
-export function formatProactiveDeliveryDiagnosis(status: ProactiveDeliveryStatus, settings: NotificationSettings): string {
-  return DIAGNOSIS_MESSAGE[status](formatMinutesOfDay(settings.morningTimeMinutes));
+export function formatProactiveDeliveryDiagnosis(status: ProactiveDeliveryStatus, settings: NotificationSettings, legacyDailyLoopSentAt?: Date): string {
+  // legacy_daily_loop_sent_instead reports the message's REAL sentAt, not the user's current
+  // morningTimeMinutes — the legacy send can be from earlier today, before the scheduled time was
+  // last changed, and reusing the current setting here would misstate when it actually went out.
+  const time =
+    status === "legacy_daily_loop_sent_instead" && legacyDailyLoopSentAt
+      ? formatMinutesOfDay(minutesOfDayInTimezone(legacyDailyLoopSentAt, settings.timezone))
+      : formatMinutesOfDay(settings.morningTimeMinutes);
+
+  return DIAGNOSIS_MESSAGE[status](time);
 }
