@@ -36,6 +36,11 @@ export interface EmailSyncSummary {
   llmErrors: number;
   llmNeedsReview: number;
   llmIgnored: number;
+  aiMessagesChecked?: number;
+  aiRuleMatches?: number;
+  aiRuleMatchSkipped?: number;
+  aiRuleMatchUnavailable?: number;
+  aiRuleMatchErrors?: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsSemanticDeduped: number;

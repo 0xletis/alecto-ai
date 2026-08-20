@@ -54,9 +54,12 @@ import {
   type StoredEvent
 } from "@operator-agent/core";
 import {
+  classifyGmailMessageAgainstRules,
   classifyEmailWithLLM,
   JobSearchEmailAllowedEventTypes,
-  WorkActionEmailAllowedEventTypes
+  WorkActionEmailAllowedEventTypes,
+  type GmailRuleMatchClassification,
+  type GmailRuleMatchRule
 } from "@operator-agent/llm";
 import {
   archiveEvent,
@@ -248,10 +251,12 @@ import type {
   EmailReviewCandidateDebug,
   EmailRuleDiagnostics,
   EmailRuleSyncSummary,
+  GmailLastSyncDiagnostics,
   GithubCommit,
   GmailErrorStage,
   GmailMessage,
   GmailMessagePart,
+  GmailSyncDecisionDebug,
   GmailStoredToken,
   GmailTokenResponse,
   NextWeekPlanSuggestion,
@@ -269,7 +274,10 @@ export function buildServer() {
     logger: true
   });
 
-  configureAgentRuntimeServices({ syncGmailForUser: syncGmailForConversation });
+  configureAgentRuntimeServices({
+    syncGmailForUser: syncGmailForConversation,
+    gmailSyncDebugForUser: gmailSyncDebugForConversation
+  });
 
   server.get("/health", async () => ({
     ok: true,
@@ -2377,6 +2385,24 @@ async function syncGmailForConversation(userId: string): Promise<string> {
   return dedupeLines(replies).join("\n\n");
 }
 
+async function gmailSyncDebugForConversation(userId: string): Promise<string> {
+  const gmailConnections = (await getIntegrationConnections(userId))
+    .filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived")
+    .sort((a, b) => (b.lastSyncedAt?.getTime() ?? 0) - (a.lastSyncedAt?.getTime() ?? 0));
+  const connection = gmailConnections.find((candidate) => candidate.status === "active") ?? gmailConnections[0];
+
+  if (!connection) {
+    return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
+  }
+
+  const diagnostics = readGmailLastSyncDiagnostics(connection.config);
+  if (!diagnostics) {
+    return "I do not have a Gmail sync debug summary yet. Say \"sync Gmail\" first.";
+  }
+
+  return formatGmailLastSyncDiagnostics(diagnostics);
+}
+
 async function syncIntegrationsForConversation(userId: string): Promise<string> {
   const connections = (await getIntegrationConnections(userId)).filter(
     (connection) =>
@@ -2447,19 +2473,74 @@ function formatConversationGmailSyncResult(result: {
 }
 
 function formatGmailSyncTotalsForConversation(totals: ReturnType<typeof gmailSyncTotals>): string {
+  const messagesChecked = totals.messagesFound + totals.aiMessagesChecked;
+
   if (totals.reviewItemsCreated > 0 && totals.eventsCreated > 0) {
-    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+    return `Gmail sync: ${messagesChecked} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
   }
 
   if (totals.reviewItemsCreated > 0) {
-    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}.`;
+    return `Gmail sync: ${messagesChecked} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}.`;
   }
 
   if (totals.eventsCreated > 0) {
-    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+    return `Gmail sync: ${messagesChecked} messages checked, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
   }
 
-  return `Gmail sync: ${totals.messagesFound} messages checked, 0 new items.`;
+  return `Gmail sync: ${messagesChecked} messages checked, 0 new review items. Say "why did Gmail sync find nothing?" to see the skipped-message summary.`;
+}
+
+function readGmailLastSyncDiagnostics(config: unknown): GmailLastSyncDiagnostics | undefined {
+  if (!isRecord(config) || !isRecord(config.gmailLastSyncDiagnostics)) {
+    return undefined;
+  }
+
+  const diagnostics = config.gmailLastSyncDiagnostics;
+  if (
+    typeof diagnostics.checkedAt !== "string" ||
+    typeof diagnostics.connectionId !== "string" ||
+    (diagnostics.status !== "success" && diagnostics.status !== "error") ||
+    !isRecord(diagnostics.summary)
+  ) {
+    return undefined;
+  }
+
+  return diagnostics as unknown as GmailLastSyncDiagnostics;
+}
+
+function formatGmailLastSyncDiagnostics(diagnostics: GmailLastSyncDiagnostics): string {
+  const decisions = diagnostics.decisions.slice(0, 10).map((decision, index) => {
+    const subject = decision.subject ? truncatePlainText(decision.subject, 90) : "(no subject)";
+    const from = decision.from ? ` from ${truncatePlainText(decision.from, 70)}` : "";
+    const labels = decision.labels?.length ? ` labels: ${decision.labels.join(",")}` : "";
+    const outcome =
+      decision.decision === "skipped"
+        ? `skipped: ${decision.skipReason ?? "no active rule matched"}`
+        : `${decision.decision.replace(/_/g, " ")}${decision.matchedRuleName ? `: ${decision.matchedRuleName}` : ""}`;
+
+    return `${index + 1}. ${subject}${from} - ${outcome}${labels}`;
+  });
+
+  return [
+    "Gmail sync debug",
+    "",
+    `Last sync: ${diagnostics.checkedAt}`,
+    `Status: ${diagnostics.status}`,
+    `Messages checked: ${diagnostics.summary.messagesChecked}`,
+    `New review items: ${diagnostics.summary.reviewItemsCreated}`,
+    `Events logged: ${diagnostics.summary.eventsCreated}`,
+    `AI rule matcher: ${diagnostics.aiRuleMatcher}${diagnostics.aiRuleMatcherReason ? ` - ${diagnostics.aiRuleMatcherReason}` : ""}`,
+    diagnostics.errorStage ? `Error stage: ${diagnostics.errorStage}` : undefined,
+    diagnostics.error ? `Last error: ${safeGmailErrorMessage(diagnostics.error)}` : undefined,
+    diagnostics.rules.length
+      ? `Active rules: ${diagnostics.rules.map((rule) => rule.name).join(", ")}`
+      : "Active rules: none",
+    decisions.length ? "" : undefined,
+    decisions.length ? "Recent checked messages:" : "No recent checked-message diagnostics were stored.",
+    ...decisions
+  ]
+    .filter((line): line is string => line !== undefined)
+    .join("\n");
 }
 
 function formatConversationGithubSyncResult(result: {
@@ -2493,20 +2574,54 @@ function gmailSyncTotals(summaries: EmailRuleSyncSummary[]) {
   return summaries.reduce(
     (totals, summary) => ({
       messagesFound: totals.messagesFound + summary.messagesFound,
+      aiMessagesChecked: totals.aiMessagesChecked + summary.aiMessagesChecked,
       processed: totals.processed + summary.processed,
       ignoredUnknown: totals.ignoredUnknown + summary.ignoredUnknown,
       deduped: totals.deduped + summary.deduped,
       semanticDeduped: totals.semanticDeduped + summary.semanticDeduped,
+      needsReview: totals.needsReview + summary.needsReview,
+      llmClassified: totals.llmClassified + summary.llmClassified,
+      llmUnavailable: totals.llmUnavailable + summary.llmUnavailable,
+      llmErrors: totals.llmErrors + summary.llmErrors,
+      llmNeedsReview: totals.llmNeedsReview + summary.llmNeedsReview,
+      llmIgnored: totals.llmIgnored + summary.llmIgnored,
+      aiRuleMatches: totals.aiRuleMatches + summary.aiRuleMatches,
+      aiRuleMatchSkipped: totals.aiRuleMatchSkipped + summary.aiRuleMatchSkipped,
+      aiRuleMatchUnavailable: totals.aiRuleMatchUnavailable + summary.aiRuleMatchUnavailable,
+      aiRuleMatchErrors: totals.aiRuleMatchErrors + summary.aiRuleMatchErrors,
       reviewItemsCreated: totals.reviewItemsCreated + summary.reviewItemsCreated,
+      reviewItemsAlreadyPending: totals.reviewItemsAlreadyPending + summary.reviewItemsAlreadyPending,
+      reviewItemsRejectedDeduped: totals.reviewItemsRejectedDeduped + summary.reviewItemsRejectedDeduped,
+      reviewItemsSemanticDeduped: totals.reviewItemsSemanticDeduped + summary.reviewItemsSemanticDeduped,
+      lowConfidenceIgnored: totals.lowConfidenceIgnored + summary.lowConfidenceIgnored,
+      archivedCleanupReprocessed: totals.archivedCleanupReprocessed + summary.archivedCleanupReprocessed,
+      skippedDueMaxEventsPerSync: totals.skippedDueMaxEventsPerSync + summary.skippedDueMaxEventsPerSync,
       eventsCreated: totals.eventsCreated + summary.eventsCreated
     }),
     {
       messagesFound: 0,
+      aiMessagesChecked: 0,
       processed: 0,
       ignoredUnknown: 0,
       deduped: 0,
       semanticDeduped: 0,
+      needsReview: 0,
+      llmClassified: 0,
+      llmUnavailable: 0,
+      llmErrors: 0,
+      llmNeedsReview: 0,
+      llmIgnored: 0,
+      aiRuleMatches: 0,
+      aiRuleMatchSkipped: 0,
+      aiRuleMatchUnavailable: 0,
+      aiRuleMatchErrors: 0,
       reviewItemsCreated: 0,
+      reviewItemsAlreadyPending: 0,
+      reviewItemsRejectedDeduped: 0,
+      reviewItemsSemanticDeduped: 0,
+      lowConfidenceIgnored: 0,
+      archivedCleanupReprocessed: 0,
+      skippedDueMaxEventsPerSync: 0,
       eventsCreated: 0
     }
   );
@@ -3369,6 +3484,7 @@ async function syncGmailConnection(connection: IntegrationConnection) {
 
   let eventsCreated = 0;
   const emailSummaries: EmailRuleSyncSummary[] = [];
+  const processedMessageIds = new Set<string>();
 
   try {
     const accessToken = await getValidGmailAccessToken(connection);
@@ -3377,7 +3493,7 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       const ruleSummary = createEmailRuleSyncSummary(rule);
 
       try {
-        Object.assign(ruleSummary, await syncEmailSignalRule({ userId: connection.userId, accessToken, rule }));
+        Object.assign(ruleSummary, await syncEmailSignalRule({ userId: connection.userId, accessToken, rule, processedMessageIds }));
         eventsCreated += ruleSummary.eventsCreated;
 
         await updateEmailSignalRuleSyncState(connection.userId, rule.id, {
@@ -3404,11 +3520,24 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       }
     }
 
+    await withGmailStage("classification", () =>
+      syncGmailRecentMessagesAgainstActiveRules({
+        userId: connection.userId,
+        connectionId: connection.id,
+        accessToken,
+        rules,
+        summaries: emailSummaries,
+        processedMessageIds
+      })
+    );
+
     await updateIntegrationConnectionSyncState(connection.userId, connection.id, {
       status: "active",
       lastSyncedAt: new Date(),
       lastError: null
     });
+
+    await writeGmailLastSyncDiagnostics(connection, buildGmailLastSyncDiagnostics(connection, rules, emailSummaries, "success"));
 
     const syncLog = await createIntegrationSyncLog({
       userId: connection.userId,
@@ -3447,6 +3576,11 @@ async function syncGmailConnection(connection: IntegrationConnection) {
       status: shouldMarkConnectionError ? "error" : undefined,
       lastError: reason
     });
+
+    await writeGmailLastSyncDiagnostics(
+      connection,
+      buildGmailLastSyncDiagnostics(connection, rules, emailSummaries, "error", reason, errorStage)
+    );
 
     const syncLog = await createIntegrationSyncLog({
       userId: connection.userId,
@@ -3499,6 +3633,75 @@ async function recordGmailBackgroundSyncAttempt(input: {
       error: input.error
     })
   );
+}
+
+async function writeGmailLastSyncDiagnostics(connection: IntegrationConnection, diagnostics: GmailLastSyncDiagnostics): Promise<void> {
+  const latestConnection = await getIntegrationConnection(connection.userId, connection.id);
+  const config = isRecord(latestConnection?.config) ? { ...latestConnection.config } : isRecord(connection.config) ? { ...connection.config } : {};
+  config.gmailLastSyncDiagnostics = JSON.parse(JSON.stringify(diagnostics)) as Record<string, unknown>;
+
+  await updateIntegrationConnectionConfig(connection.userId, connection.id, config);
+}
+
+function buildGmailLastSyncDiagnostics(
+  connection: IntegrationConnection,
+  rules: EmailSignalRule[],
+  summaries: EmailRuleSyncSummary[],
+  status: "success" | "error",
+  error?: string,
+  errorStage?: GmailErrorStage
+): GmailLastSyncDiagnostics {
+  const totals = gmailSyncTotals(summaries);
+  const aiRuleMatcher = gmailLastSyncAiRuleMatcherStatus(summaries);
+  const decisions = summaries.flatMap((summary) => summary.syncDecisionDebug ?? []).slice(0, 20);
+
+  return {
+    checkedAt: new Date().toISOString(),
+    connectionId: connection.id,
+    status,
+    aiRuleMatcher: aiRuleMatcher.status,
+    aiRuleMatcherReason: aiRuleMatcher.reason,
+    rules: rules.map((rule) => ({
+      id: rule.id,
+      name: rule.name,
+      adapterId: rule.adapterId
+    })),
+    summary: {
+      messagesChecked: totals.messagesFound + totals.aiMessagesChecked,
+      processed: totals.processed,
+      reviewItemsCreated: totals.reviewItemsCreated,
+      eventsCreated: totals.eventsCreated,
+      llmClassified: totals.llmClassified,
+      llmUnavailable: totals.llmUnavailable,
+      llmErrors: totals.llmErrors
+    },
+    decisions,
+    error: error ? safeGmailErrorMessage(error) : undefined,
+    errorStage
+  };
+}
+
+function gmailLastSyncAiRuleMatcherStatus(summaries: EmailRuleSyncSummary[]): {
+  status: GmailLastSyncDiagnostics["aiRuleMatcher"];
+  reason?: string;
+} {
+  const totals = gmailSyncTotals(summaries);
+
+  if (!gmailRuleMatchClassifierAvailable()) {
+    return {
+      status: "unavailable",
+      reason: "AI rule matching unavailable; deterministic Gmail queries still ran."
+    };
+  }
+
+  if (totals.aiRuleMatchErrors > 0 && totals.aiMessagesChecked > 0) {
+    return {
+      status: totals.aiRuleMatches > 0 || totals.aiRuleMatchSkipped > 0 ? "degraded" : "error",
+      reason: "AI rule matching had errors for some checked messages."
+    };
+  }
+
+  return { status: "available" };
 }
 
 function dedupeActiveEmailRulesForSync(rules: EmailSignalRule[]): EmailSignalRule[] {
@@ -3575,6 +3778,11 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     llmErrors: 0,
     llmNeedsReview: 0,
     llmIgnored: 0,
+    aiMessagesChecked: 0,
+    aiRuleMatches: 0,
+    aiRuleMatchSkipped: 0,
+    aiRuleMatchUnavailable: 0,
+    aiRuleMatchErrors: 0,
     reviewItemsCreated: 0,
     reviewItemsAlreadyPending: 0,
     reviewItemsRejectedDeduped: 0,
@@ -3585,14 +3793,369 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     archivedCleanupReprocessed: 0,
     skippedDueMaxEventsPerSync: 0,
     eventsCreated: 0,
-    reviewCandidateDebug: []
+    reviewCandidateDebug: [],
+    syncDecisionDebug: []
   };
+}
+
+async function syncGmailRecentMessagesAgainstActiveRules(input: {
+  userId: string;
+  connectionId: string;
+  accessToken: string;
+  rules: EmailSignalRule[];
+  summaries: EmailRuleSyncSummary[];
+  processedMessageIds: Set<string>;
+}): Promise<void> {
+  if (input.rules.length === 0 || input.summaries.length === 0) {
+    return;
+  }
+
+  if (!gmailRuleMatchClassifierAvailable()) {
+    for (const summary of input.summaries) {
+      summary.aiRuleMatchUnavailable += 1;
+    }
+    return;
+  }
+
+  const maxLookbackDays = Math.min(30, Math.max(...input.rules.map((rule) => rule.lookbackDays || 7), 7));
+  const maxMessages = Math.min(
+    Number(process.env.GMAIL_RULE_MATCH_MAX_MESSAGES_PER_SYNC ?? 25) || 25,
+    Math.max(...input.rules.map((rule) => rule.maxMessagesPerSync || 25), 10),
+    25
+  );
+  const recentMessageIds = await withGmailStage("gmail_search", () =>
+    searchGmailMessages(input.accessToken, `newer_than:${maxLookbackDays}d`, maxMessages)
+  );
+  const candidateIds = recentMessageIds.filter((messageId) => !input.processedMessageIds.has(messageId)).slice(0, maxMessages);
+
+  if (candidateIds.length === 0) {
+    return;
+  }
+
+  const activeGoals = await getActiveGoals(input.userId);
+  const ruleDescriptors = buildGmailRuleMatchRules(input.rules, activeGoals);
+  const summariesByRuleId = new Map(input.summaries.map((summary) => [summary.ruleId, summary]));
+  const fallbackSummary = input.summaries[0];
+
+  for (const messageId of candidateIds) {
+    const message = await withGmailStage("gmail_message_fetch", () => getGmailMessageMetadata(input.accessToken, messageId));
+    const fields = gmailMessageRuleMatchFields(message);
+    fallbackSummary.aiMessagesChecked += 1;
+    input.processedMessageIds.add(message.id);
+
+    try {
+      const classification = await classifyGmailMessageAgainstRules({
+        source: "gmail",
+        message: fields,
+        rules: ruleDescriptors,
+        activeGoals: activeGoals.map((goal) => ({ id: goal.id, title: goal.title, category: goal.category }))
+      });
+
+      if (!classification.shouldCreateReview || !classification.matchedRuleId) {
+        fallbackSummary.aiRuleMatchSkipped += 1;
+        fallbackSummary.llmClassified += 1;
+        fallbackSummary.llmIgnored += 1;
+        fallbackSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, {
+          decision: "skipped",
+          skipReason: classification.skipReason ?? "no active rule matched",
+          confidence: classification.confidence,
+          suggestedReviewTitle: classification.suggestedReviewTitle,
+          detectedDateOrDeadline: classification.detectedDateOrDeadline
+        }));
+        continue;
+      }
+
+      const matchedRule = input.rules.find((rule) => rule.id === classification.matchedRuleId);
+      const matchedSummary = matchedRule ? summariesByRuleId.get(matchedRule.id) : undefined;
+
+      if (!matchedRule || !matchedSummary) {
+        fallbackSummary.aiRuleMatchSkipped += 1;
+        fallbackSummary.llmClassified += 1;
+        fallbackSummary.llmIgnored += 1;
+        fallbackSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, {
+          decision: "skipped",
+          skipReason: "AI matched a rule that is not active",
+          confidence: classification.confidence,
+          suggestedReviewTitle: classification.suggestedReviewTitle,
+          detectedDateOrDeadline: classification.detectedDateOrDeadline
+        }));
+        continue;
+      }
+
+      if (matchedSummary !== fallbackSummary) {
+        fallbackSummary.aiMessagesChecked = Math.max(0, fallbackSummary.aiMessagesChecked - 1);
+        matchedSummary.aiMessagesChecked += 1;
+      }
+
+      if (classification.confidence < matchedRule.minReviewConfidence) {
+        matchedSummary.aiRuleMatchSkipped += 1;
+        matchedSummary.lowConfidenceIgnored += 1;
+        matchedSummary.llmClassified += 1;
+        matchedSummary.llmIgnored += 1;
+        matchedSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, {
+          decision: "skipped",
+          matchedRuleId: matchedRule.id,
+          matchedRuleName: matchedRule.name,
+          skipReason: "matched active rule below review confidence",
+          confidence: classification.confidence,
+          suggestedReviewTitle: classification.suggestedReviewTitle,
+          detectedDateOrDeadline: classification.detectedDateOrDeadline
+        }));
+        continue;
+      }
+
+      if (isReviewItemCapReached(matchedRule, matchedSummary)) {
+        matchedSummary.aiRuleMatchSkipped += 1;
+        matchedSummary.skippedDueMaxEventsPerSync += 1;
+        matchedSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, {
+          decision: "skipped",
+          matchedRuleId: matchedRule.id,
+          matchedRuleName: matchedRule.name,
+          skipReason: "review item cap reached for rule",
+          confidence: classification.confidence,
+          suggestedReviewTitle: classification.suggestedReviewTitle,
+          detectedDateOrDeadline: classification.detectedDateOrDeadline
+        }));
+        continue;
+      }
+
+      matchedSummary.aiRuleMatches += 1;
+      matchedSummary.llmClassified += 1;
+      matchedSummary.llmNeedsReview += 1;
+      matchedSummary.needsReview += 1;
+      const reviewResult = await withGmailStage("event_creation", () =>
+        createEmailReviewItemForClassification({
+          userId: input.userId,
+          connectionId: input.connectionId,
+          rule: matchedRule,
+          message,
+          classification: gmailRuleMatchToEmailClassification(matchedRule, message, classification)
+        })
+      );
+      recordEmailReviewItemResult(matchedSummary, reviewResult);
+      matchedSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, {
+        decision: gmailSyncDecisionForReviewStatus(reviewResult.status),
+        matchedRuleId: matchedRule.id,
+        matchedRuleName: matchedRule.name,
+        skipReason: reviewResult.status === "created" ? undefined : reviewResult.status,
+        confidence: classification.confidence,
+        suggestedReviewTitle: classification.suggestedReviewTitle,
+        detectedDateOrDeadline: classification.detectedDateOrDeadline
+      }));
+    } catch (error) {
+      const safeError = safeShortErrorReason(error instanceof Error ? error.message : String(error));
+      fallbackSummary.aiRuleMatchErrors += 1;
+      fallbackSummary.llmErrors += 1;
+      fallbackSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, {
+        decision: "skipped",
+        skipReason: `AI rule matcher failed: ${safeError}`
+      }));
+    }
+  }
+}
+
+function gmailRuleMatchClassifierAvailable(): boolean {
+  return Boolean(
+    process.env.OPENAI_API_KEY ||
+      process.env.GMAIL_RULE_MATCH_LLM_MOCK_RESPONSE ||
+      process.env.GMAIL_RULE_MATCH_LLM_MOCK_THROW === "true"
+  );
+}
+
+function buildGmailRuleMatchRules(rules: EmailSignalRule[], activeGoals: Goal[]): GmailRuleMatchRule[] {
+  const goalsById = new Map(activeGoals.map((goal) => [goal.id, goal]));
+
+  return rules.map((rule) => ({
+    id: rule.id,
+    name: rule.name,
+    adapterId: rule.adapterId,
+    description: gmailRuleMatchDescription(rule),
+    query: rule.query,
+    goalTitle: rule.goalId ? goalsById.get(rule.goalId)?.title : undefined,
+    examples: gmailRuleMatchExamples(rule)
+  }));
+}
+
+function gmailRuleMatchDescription(rule: EmailSignalRule): string {
+  if (rule.adapterId === "job_search_email") {
+    return "Recruiter and job-search emails: recruiter replies, interview scheduling, job application confirmations, rejections, offers, and application follow-up.";
+  }
+
+  if (rule.adapterId === "work_action_email") {
+    return "Work/project action emails: requests, deadlines, follow-ups, feedback requests, blockers, and meeting/action scheduling that may need a user decision.";
+  }
+
+  return `Custom review-first Gmail tracking rule named "${rule.name}". Match emails relevant to the rule name, query, sender, keywords, and linked goal if present.`;
+}
+
+function gmailRuleMatchExamples(rule: EmailSignalRule): string[] {
+  if (rule.adapterId === "job_search_email") {
+    return ["Quick call about frontend role", "Interview invitation", "Unfortunately your application"];
+  }
+
+  if (rule.adapterId === "work_action_email") {
+    return ["Can you review the dashboard by Friday?", "Brainstorm meeting tomorrow", "Waiting on you for feedback"];
+  }
+
+  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""}`);
+  const examples: string[] = [];
+  if (/\bendesa\b|invoice|bill|factura|receipt|recibo/.test(normalized)) {
+    examples.push("Your Endesa bill is ready", "Factura disponible");
+  }
+  if (/security|login|account alert|unknown device|2fa|verification/.test(normalized)) {
+    examples.push("New login from unknown device", "Security alert");
+  }
+  if (/apartment|rental|rent|flat|viewing/.test(normalized)) {
+    examples.push("Viewing appointment for apartment");
+  }
+  return examples;
+}
+
+function gmailRuleMatchToEmailClassification(
+  rule: EmailSignalRule,
+  message: GmailMessage,
+  classification: GmailRuleMatchClassification
+): ReturnType<typeof classifyJobSearchEmail> {
+  const subject = getGmailHeader(message, "subject");
+  const from = getGmailHeader(message, "from");
+  const detectedDateOrDeadline = classification.detectedDateOrDeadline ?? undefined;
+  const extracted: Record<string, unknown> = {
+    aiMatchedRuleId: rule.id,
+    aiMatchedRuleName: rule.name,
+    suggestedReviewTitle: classification.suggestedReviewTitle,
+    subject,
+    from
+  };
+
+  if (detectedDateOrDeadline) {
+    extracted.detectedDateOrDeadline = detectedDateOrDeadline;
+    extracted.deadline = detectedDateOrDeadline;
+  }
+
+  if (rule.adapterId === "custom_email_review") {
+    extracted.customRuleName = rule.name;
+  }
+
+  if (rule.goalId) {
+    extracted.goalId = rule.goalId;
+  }
+
+  return {
+    decision: "needs_review",
+    eventType: gmailRuleMatchEventType(rule, message, classification),
+    confidence: classification.confidence,
+    reason: "ai_rule_match",
+    evidence: truncatePlainText(
+      [classification.suggestedReviewTitle, classification.reason, message.snippet].filter(Boolean).join(" - "),
+      500
+    ),
+    extracted,
+    metadata: {
+      classifierMode: rule.classifierMode === "llm" ? "llm" : "hybrid",
+      adapterId: rule.adapterId,
+      source: "gmail",
+      classifier: "llm"
+    }
+  };
+}
+
+function gmailRuleMatchEventType(
+  rule: EmailSignalRule,
+  message: GmailMessage,
+  classification: GmailRuleMatchClassification
+): string | undefined {
+  const text = normalizeForComparison(
+    [getGmailHeader(message, "subject"), message.snippet, classification.reason, classification.suggestedReviewTitle].join(" ")
+  );
+
+  if (rule.adapterId === "work_action_email") {
+    if (classification.detectedDateOrDeadline || /\b(deadline|due|by friday|tomorrow|meeting|scheduled|schedule)\b/.test(text)) {
+      return "work_deadline_detected";
+    }
+    if (/\bfollow up\b|waiting on you/.test(text)) {
+      return "work_follow_up_requested";
+    }
+    return "work_action_required";
+  }
+
+  if (rule.adapterId === "job_search_email") {
+    if (/\binterview|schedule|scheduled|meeting|call\b/.test(text)) {
+      return "career.interview_scheduled";
+    }
+    if (/\boffer letter|job offer|offer of employment|employment agreement\b/.test(text)) {
+      return "career.offer_received";
+    }
+    if (/\bunfortunately|reject|rejection|not selected|not moving forward\b/.test(text)) {
+      return "career.rejection_received";
+    }
+    if (/\bapplication received|thanks for applying|application confirmation\b/.test(text)) {
+      return "career.application_confirmation_received";
+    }
+    return "career.recruiter_reply_received";
+  }
+
+  return undefined;
+}
+
+function gmailMessageRuleMatchFields(message: GmailMessage) {
+  return {
+    id: message.id,
+    from: getGmailHeader(message, "from"),
+    to: getGmailHeader(message, "to"),
+    subject: getGmailHeader(message, "subject"),
+    date: getGmailHeader(message, "date"),
+    snippet: message.snippet ?? ""
+  };
+}
+
+function gmailSyncDecisionDebug(
+  message: GmailMessage,
+  decision: Omit<GmailSyncDecisionDebug, "messageId" | "subject" | "from" | "date" | "labels">
+): GmailSyncDecisionDebug {
+  return {
+    messageId: message.id,
+    subject: truncatePlainText(getGmailHeader(message, "subject"), 120),
+    from: truncatePlainText(getGmailHeader(message, "from"), 120),
+    date: truncatePlainText(getGmailHeader(message, "date"), 120),
+    labels: sanitizeGmailLabels(message.labelIds),
+    ...decision
+  };
+}
+
+function sanitizeGmailLabels(labels: string[] | undefined): string[] | undefined {
+  const safeLabels = (labels ?? [])
+    .filter((label) => /^[A-Z_]+$/.test(label))
+    .filter((label) => ["INBOX", "SENT", "UNREAD", "IMPORTANT", "CATEGORY_PERSONAL", "CATEGORY_UPDATES"].includes(label));
+
+  return safeLabels.length > 0 ? safeLabels.slice(0, 6) : undefined;
+}
+
+function gmailSyncDecisionForReviewStatus(
+  status: Awaited<ReturnType<typeof createEmailReviewItemForClassification>>["status"]
+): GmailSyncDecisionDebug["decision"] {
+  if (status === "created") {
+    return "created_review";
+  }
+  if (status === "already_pending" || status === "semantic_pending") {
+    return "already_pending";
+  }
+  if (status === "rejected_deduped" || status === "semantic_rejected") {
+    return "rejected_deduped";
+  }
+  if (status === "approved_deduped" || status === "semantic_approved" || status === "archived_deduped") {
+    return "approved_deduped";
+  }
+  if (status === "active_event_deduped") {
+    return "active_event_deduped";
+  }
+  return "skipped";
 }
 
 async function syncEmailSignalRule(input: {
   userId: string;
   accessToken: string;
   rule: EmailSignalRule;
+  processedMessageIds?: Set<string>;
 }): Promise<EmailRuleSyncSummary> {
   const summary = createEmailRuleSyncSummary(input.rule);
   const messageIds = await withGmailStage("gmail_search", () => fetchEmailMessageIds(input.accessToken, input.rule));
@@ -3605,6 +4168,7 @@ async function syncEmailSignalRule(input: {
     }
 
     const message = await withGmailStage("gmail_message_fetch", () => getGmailMessage(input.accessToken, messageId));
+    input.processedMessageIds?.add(message.id);
     const text = gmailMessageToText(message);
     const classificationResult = await withGmailStage("classification", () => classifyEmailForRule(input.rule, message, text));
     const classification = classificationResult.classification;
@@ -3662,29 +4226,7 @@ async function syncEmailSignalRule(input: {
           classification
         })
       );
-      summary.reviewCandidateDebug.push(reviewResult.debug as EmailReviewCandidateDebug);
-
-      if (reviewResult.status === "created") {
-        summary.reviewItemsCreated += 1;
-      } else if (reviewResult.status === "already_pending") {
-        summary.reviewItemsAlreadyPending += 1;
-      } else if (reviewResult.status === "rejected_deduped") {
-        summary.reviewItemsRejectedDeduped += 1;
-      } else if (reviewResult.status === "semantic_pending") {
-        summary.reviewItemsSemanticDeduped += 1;
-        summary.reviewItemsAlreadyPending += 1;
-      } else if (reviewResult.status === "semantic_rejected") {
-        summary.reviewItemsSemanticDeduped += 1;
-        summary.reviewItemsRejectedDeduped += 1;
-      } else if (
-        reviewResult.status === "semantic_approved" ||
-        reviewResult.status === "approved_deduped" ||
-        reviewResult.status === "archived_deduped"
-      ) {
-        summary.reviewItemsSemanticDeduped += 1;
-      } else if (reviewResult.status === "active_event_deduped") {
-        summary.semanticDeduped += 1;
-      }
+      recordEmailReviewItemResult(summary, reviewResult);
 
       continue;
     }
@@ -3789,6 +4331,35 @@ async function syncEmailSignalRule(input: {
   return summary;
 }
 
+function recordEmailReviewItemResult(
+  summary: EmailRuleSyncSummary,
+  reviewResult: Awaited<ReturnType<typeof createEmailReviewItemForClassification>>
+): void {
+  summary.reviewCandidateDebug.push(reviewResult.debug as EmailReviewCandidateDebug);
+
+  if (reviewResult.status === "created") {
+    summary.reviewItemsCreated += 1;
+  } else if (reviewResult.status === "already_pending") {
+    summary.reviewItemsAlreadyPending += 1;
+  } else if (reviewResult.status === "rejected_deduped") {
+    summary.reviewItemsRejectedDeduped += 1;
+  } else if (reviewResult.status === "semantic_pending") {
+    summary.reviewItemsSemanticDeduped += 1;
+    summary.reviewItemsAlreadyPending += 1;
+  } else if (reviewResult.status === "semantic_rejected") {
+    summary.reviewItemsSemanticDeduped += 1;
+    summary.reviewItemsRejectedDeduped += 1;
+  } else if (
+    reviewResult.status === "semantic_approved" ||
+    reviewResult.status === "approved_deduped" ||
+    reviewResult.status === "archived_deduped"
+  ) {
+    summary.reviewItemsSemanticDeduped += 1;
+  } else if (reviewResult.status === "active_event_deduped") {
+    summary.semanticDeduped += 1;
+  }
+}
+
 async function fetchEmailMessageIds(accessToken: string, rule: EmailSignalRule): Promise<string[]> {
   if (rule.fetchStrategy === "query") {
     return searchGmailMessagesForRule(accessToken, rule);
@@ -3806,7 +4377,7 @@ async function classifyEmailForRule(
   message: GmailMessage,
   text: string
 ): Promise<{ classification: ReturnType<typeof classifyJobSearchEmail>; llmStatus?: "classified" | "unavailable" | "error" }> {
-  const securityNoise = classifySecurityAuthEmailNoise(rule, message, text);
+  const securityNoise = ruleAllowsSecurityAuthAccountEmails(rule) ? undefined : classifySecurityAuthEmailNoise(rule, message, text);
   if (securityNoise) {
     return { classification: securityNoise };
   }
@@ -3880,7 +4451,7 @@ async function classifyEmailForRule(
       subject: getGmailHeader(message, "subject"),
       from: getGmailHeader(message, "from"),
       snippet: message.snippet,
-      bodyText: text,
+      bodyText: message.snippet ?? "",
       allowedEventTypes: rule.adapterId === "work_action_email" ? WorkActionEmailAllowedEventTypes : JobSearchEmailAllowedEventTypes,
       classifierMode: rule.classifierMode === "llm" ? "llm" : "hybrid",
       minAutoLogConfidence: rule.minAutoLogConfidence,
@@ -3907,6 +4478,11 @@ async function classifyEmailForRule(
       llmStatus: "error"
     };
   }
+}
+
+function ruleAllowsSecurityAuthAccountEmails(rule: EmailSignalRule): boolean {
+  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""}`);
+  return /\b(security|account alert|login alert|unknown device|authentication|2fa|verification|password reset)\b/.test(normalized);
 }
 
 function isHardEmailClassification(classification: ReturnType<typeof classifyJobSearchEmail>): boolean {
@@ -4769,6 +5345,25 @@ async function getGmailMessage(accessToken: string, messageId: string): Promise<
       }
     }
   );
+
+  if (!response.ok) {
+    throw gmailApiError("message fetch", response.status, await response.text());
+  }
+
+  return (await response.json()) as GmailMessage;
+}
+
+async function getGmailMessageMetadata(accessToken: string, messageId: string): Promise<GmailMessage> {
+  const params = new URLSearchParams({ format: "metadata" });
+  for (const header of ["Subject", "From", "To", "Date"]) {
+    params.append("metadataHeaders", header);
+  }
+
+  const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}?${params.toString()}`, {
+    headers: {
+      authorization: `Bearer ${accessToken}`
+    }
+  });
 
   if (!response.ok) {
     throw gmailApiError("message fetch", response.status, await response.text());

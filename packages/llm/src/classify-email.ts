@@ -61,6 +61,59 @@ export interface ClassifyEmailWithLLMOptions {
   model?: string;
 }
 
+const GmailRuleMatchClassificationSchema = z.object({
+  shouldCreateReview: z.boolean(),
+  matchedRuleId: z.string().nullable(),
+  matchedRuleName: z.string().nullable(),
+  confidence: z.number().min(0).max(1),
+  reason: z.string().min(1).max(180),
+  suggestedReviewTitle: z.string().nullable(),
+  detectedDateOrDeadline: z.string().nullable(),
+  skipReason: z.string().nullable()
+});
+
+export interface GmailRuleMatchRule {
+  id: string;
+  name: string;
+  adapterId: string;
+  description?: string;
+  query?: string;
+  goalTitle?: string;
+  examples?: string[];
+}
+
+export interface GmailRuleMatchMessage {
+  id?: string;
+  from?: string;
+  to?: string;
+  subject?: string;
+  date?: string;
+  snippet?: string;
+}
+
+export interface ClassifyGmailMessageAgainstRulesInput {
+  source: "gmail";
+  message: GmailRuleMatchMessage;
+  rules: GmailRuleMatchRule[];
+  activeGoals?: Array<{ id: string; title: string; category?: string | null }>;
+}
+
+export interface GmailRuleMatchClassification {
+  shouldCreateReview: boolean;
+  matchedRuleId: string | null;
+  matchedRuleName: string | null;
+  confidence: number;
+  reason: string;
+  suggestedReviewTitle: string;
+  detectedDateOrDeadline: string | null;
+  skipReason: string | null;
+}
+
+export interface ClassifyGmailMessageAgainstRulesOptions {
+  apiKey?: string;
+  model?: string;
+}
+
 export async function classifyEmailWithLLM(
   input: ClassifyEmailWithLLMInput,
   options: ClassifyEmailWithLLMOptions = {}
@@ -117,6 +170,198 @@ export async function classifyEmailWithLLM(
 
   const parsed = LLMEmailClassificationSchema.parse(JSON.parse(response.output_text));
   return normalizeLLMEmailClassification(parsed, input, allowedEventTypes);
+}
+
+export async function classifyGmailMessageAgainstRules(
+  input: ClassifyGmailMessageAgainstRulesInput,
+  options: ClassifyGmailMessageAgainstRulesOptions = {}
+): Promise<GmailRuleMatchClassification> {
+  const safeInput = sanitizeGmailRuleMatchInput(input);
+
+  if (process.env.GMAIL_RULE_MATCH_LLM_CAPTURE_INPUT === "true") {
+    process.env.GMAIL_RULE_MATCH_LLM_CAPTURED_INPUT = JSON.stringify(safeInput);
+  }
+
+  if (process.env.GMAIL_RULE_MATCH_LLM_MOCK_THROW === "true") {
+    delete process.env.GMAIL_RULE_MATCH_LLM_MOCK_THROW;
+    throw new Error("mock Gmail rule-match LLM failure");
+  }
+
+  const mocked = mockGmailRuleMatchResponse(safeInput);
+  if (mocked) {
+    return normalizeGmailRuleMatchClassification(mocked, safeInput);
+  }
+
+  const client = createOpenAIClient({ apiKey: options.apiKey });
+  const model = options.model ?? process.env.GMAIL_RULE_MATCH_LLM_MODEL ?? process.env.OPENAI_MODEL ?? defaultModel;
+  const response = await client.responses.create({
+    model,
+    store: false,
+    input: [
+      {
+        role: "developer",
+        content: [
+          {
+            type: "input_text",
+            text: buildGmailRuleMatchPrompt()
+          }
+        ]
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: JSON.stringify(safeInput)
+          }
+        ]
+      }
+    ],
+    text: {
+      format: {
+        type: "json_schema",
+        name: "gmail_rule_match",
+        strict: true,
+        schema: buildGmailRuleMatchJsonSchema()
+      }
+    }
+  });
+
+  return normalizeGmailRuleMatchClassification(JSON.parse(response.output_text), safeInput);
+}
+
+function sanitizeGmailRuleMatchInput(input: ClassifyGmailMessageAgainstRulesInput): ClassifyGmailMessageAgainstRulesInput {
+  return {
+    source: "gmail",
+    message: {
+      id: truncateEmailText(input.message.id ?? "", 120),
+      from: truncateEmailText(input.message.from ?? "", 220),
+      to: truncateEmailText(input.message.to ?? "", 220),
+      subject: truncateEmailText(input.message.subject ?? "", 220),
+      date: truncateEmailText(input.message.date ?? "", 120),
+      snippet: truncateEmailText(input.message.snippet ?? "", 700)
+    },
+    rules: input.rules.slice(0, 20).map((rule) => ({
+      id: truncateEmailText(rule.id, 120),
+      name: truncateEmailText(rule.name, 120),
+      adapterId: truncateEmailText(rule.adapterId, 80),
+      description: truncateEmailText(rule.description ?? "", 500),
+      query: truncateEmailText(rule.query ?? "", 300),
+      goalTitle: truncateEmailText(rule.goalTitle ?? "", 160),
+      examples: (rule.examples ?? []).slice(0, 5).map((example) => truncateEmailText(example, 180))
+    })),
+    activeGoals: (input.activeGoals ?? []).slice(0, 20).map((goal) => ({
+      id: truncateEmailText(goal.id, 120),
+      title: truncateEmailText(goal.title, 160),
+      category: goal.category ? truncateEmailText(goal.category, 80) : null
+    }))
+  };
+}
+
+function mockGmailRuleMatchResponse(input: ClassifyGmailMessageAgainstRulesInput): unknown {
+  const raw = process.env.GMAIL_RULE_MATCH_LLM_MOCK_RESPONSE;
+  if (!raw) {
+    return undefined;
+  }
+
+  const parsed = JSON.parse(raw) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return parsed;
+  }
+
+  const record = parsed as Record<string, unknown>;
+  const bySubject = record.bySubject;
+  if (bySubject && typeof bySubject === "object" && !Array.isArray(bySubject)) {
+    const subject = input.message.subject ?? "";
+    const subjectMatch = (bySubject as Record<string, unknown>)[subject];
+    if (subjectMatch) {
+      return subjectMatch;
+    }
+  }
+
+  return record.default ?? parsed;
+}
+
+function normalizeGmailRuleMatchClassification(
+  raw: unknown,
+  input: ClassifyGmailMessageAgainstRulesInput
+): GmailRuleMatchClassification {
+  const parsed = GmailRuleMatchClassificationSchema.parse(raw);
+  const rule =
+    (parsed.matchedRuleId ? input.rules.find((candidate) => candidate.id === parsed.matchedRuleId) : undefined) ??
+    (parsed.matchedRuleName
+      ? input.rules.find((candidate) => normalizeText(candidate.name) === normalizeText(parsed.matchedRuleName ?? ""))
+      : undefined);
+
+  if (!parsed.shouldCreateReview || !rule) {
+    return {
+      shouldCreateReview: false,
+      matchedRuleId: null,
+      matchedRuleName: null,
+      confidence: parsed.confidence,
+      reason: cleanOneLine(parsed.reason, 180),
+      suggestedReviewTitle: cleanOneLine(parsed.suggestedReviewTitle || "Email review", 120),
+      detectedDateOrDeadline: parsed.detectedDateOrDeadline ? cleanOneLine(parsed.detectedDateOrDeadline, 120) : null,
+      skipReason: cleanOneLine(parsed.skipReason ?? (rule ? "no review needed" : "no active rule matched"), 180)
+    };
+  }
+
+  return {
+    shouldCreateReview: true,
+    matchedRuleId: rule.id,
+    matchedRuleName: rule.name,
+    confidence: parsed.confidence,
+    reason: cleanOneLine(parsed.reason, 180),
+    suggestedReviewTitle: cleanOneLine(parsed.suggestedReviewTitle || input.message.subject || rule.name, 120),
+    detectedDateOrDeadline: parsed.detectedDateOrDeadline ? cleanOneLine(parsed.detectedDateOrDeadline, 120) : null,
+    skipReason: parsed.skipReason ? cleanOneLine(parsed.skipReason, 180) : null
+  };
+}
+
+function cleanOneLine(value: string, maxLength: number): string {
+  return truncateEmailText(value.replace(/\s+/g, " ").trim(), maxLength) || "unknown";
+}
+
+function buildGmailRuleMatchPrompt(): string {
+  return [
+    "You classify one recent Gmail message against Alecto's active Gmail tracking rules.",
+    "Return JSON only matching the schema. Choose at most one matched rule.",
+    "Use only the provided safe fields: sender, recipients, subject, date, snippet, active rules, and active goal titles.",
+    "Do not assume access to the full email body. Do not request mailbox writes. This is review-first only.",
+    "The active rules are generic. They may describe work actions, recruiter/job-search mail, invoices or bills, calendar/meeting mail, government/legal/tax admin, security/account alerts, shipping/refunds, personal/family admin, or any custom user-defined category.",
+    "If the email clearly matches one active rule, set shouldCreateReview true, return that rule id/name, a calibrated confidence, a concise reason, and a useful review title.",
+    "If no active rule matches, set shouldCreateReview false, matchedRuleId/name null, and skipReason explaining the non-match.",
+    "Do not create a review just because the email is important in general; it must match one of the provided active rules.",
+    "Do not invent rule ids, rule names, goals, facts, dates, or deadlines.",
+    "Keep suggestedReviewTitle specific and useful, for example: 'Upgrade Node.js to 24', 'Review Endesa bill', 'Reply to recruiter about frontend role', 'Check apartment viewing appointment'."
+  ].join("\n");
+}
+
+function buildGmailRuleMatchJsonSchema() {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      shouldCreateReview: { type: "boolean" },
+      matchedRuleId: { type: ["string", "null"] },
+      matchedRuleName: { type: ["string", "null"] },
+      confidence: { type: "number", minimum: 0, maximum: 1 },
+      reason: { type: "string", maxLength: 180 },
+      suggestedReviewTitle: { type: ["string", "null"], maxLength: 120 },
+      detectedDateOrDeadline: { type: ["string", "null"], maxLength: 120 },
+      skipReason: { type: ["string", "null"], maxLength: 180 }
+    },
+    required: [
+      "shouldCreateReview",
+      "matchedRuleId",
+      "matchedRuleName",
+      "confidence",
+      "reason",
+      "suggestedReviewTitle",
+      "detectedDateOrDeadline",
+      "skipReason"
+    ]
+  };
 }
 
 function normalizeLLMEmailClassification(

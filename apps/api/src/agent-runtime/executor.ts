@@ -95,7 +95,7 @@ import { formatDateInTimezone, formatLocalDateTime } from "../utils/datetime.js"
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
-import { syncGmailForAgentRuntime } from "./services.js";
+import { gmailSyncDebugForAgentRuntime, syncGmailForAgentRuntime } from "./services.js";
 
 export async function executeOperation(
   userId: string,
@@ -744,6 +744,16 @@ export async function executeOperation(
         const state = await buildGmailAutonomyState(userId);
         const syncBlock = formatCanonicalGmailSyncBlock(userId, state);
         const summary = syncBlock ?? appendGmailSyncReconnectLink(userId, await syncGmailForAgentRuntime(userId));
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary,
+          result: { message: summary }
+        };
+      }
+
+      case "gmail.sync.debug": {
+        const summary = await gmailSyncDebugForAgentRuntime(userId);
         return {
           tool: operation.tool,
           status: "executed",

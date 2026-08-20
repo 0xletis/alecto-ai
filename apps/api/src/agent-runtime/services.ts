@@ -1,5 +1,6 @@
 export interface AgentRuntimeServices {
   syncGmailForUser?: (userId: string) => Promise<string>;
+  gmailSyncDebugForUser?: (userId: string) => Promise<string>;
 }
 
 const services: AgentRuntimeServices = {};
@@ -10,6 +11,7 @@ export function configureAgentRuntimeServices(nextServices: AgentRuntimeServices
 
 export function resetAgentRuntimeServicesForTests(): void {
   delete services.syncGmailForUser;
+  delete services.gmailSyncDebugForUser;
 }
 
 export async function syncGmailForAgentRuntime(userId: string): Promise<string> {
@@ -18,4 +20,12 @@ export async function syncGmailForAgentRuntime(userId: string): Promise<string> 
   }
 
   return services.syncGmailForUser(userId);
+}
+
+export async function gmailSyncDebugForAgentRuntime(userId: string): Promise<string> {
+  if (!services.gmailSyncDebugForUser) {
+    return "Gmail sync debug is not available in this runtime.";
+  }
+
+  return services.gmailSyncDebugForUser(userId);
 }

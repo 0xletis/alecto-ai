@@ -335,6 +335,11 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     });
   }
 
+  const gmailSyncDebugShortcut = gmailSyncDebugShortcutOperation(message);
+  if (gmailSyncDebugShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailSyncDebugShortcut, "gmail_sync_debug");
+  }
+
   const gmailSyncShortcut = gmailSyncShortcutOperation(message);
   if (gmailSyncShortcut) {
     return finalizeDeterministicOperation(context, message, gmailSyncShortcut, "gmail_sync");
@@ -585,6 +590,26 @@ function gmailSyncShortcutOperation(message: string): PlannedOperation | undefin
   }
 
   return { tool: "gmail.sync", args: {}, rationale: "user explicitly asked to sync Gmail/email now" };
+}
+
+function gmailSyncDebugShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+
+  if (!text) {
+    return undefined;
+  }
+
+  const asksDebug =
+    /\bwhy\b[\s\S]{0,60}\bgmail\b[\s\S]{0,60}\b(find nothing|found nothing|no results|0 new|zero new|nothing)\b/.test(text) ||
+    /\bshow\b[\s\S]{0,30}\bgmail\b[\s\S]{0,30}\bsync\b[\s\S]{0,20}\bdebug\b/.test(text) ||
+    /\bgmail\b[\s\S]{0,30}\bsync\b[\s\S]{0,20}\bdebug\b/.test(text) ||
+    /\bsync\b[\s\S]{0,20}\bgmail\b[\s\S]{0,20}\bdebug\b/.test(text);
+
+  if (!asksDebug) {
+    return undefined;
+  }
+
+  return { tool: "gmail.sync.debug", args: {}, rationale: "user asked for the last Gmail sync diagnostic summary" };
 }
 
 function gmailBuiltInRuleEnableShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
@@ -883,6 +908,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
     if (op.tool.startsWith("gmail.rule.")) return "gmail_rule_management";
     if (op.tool.startsWith("gmail.review")) return "gmail_reviews";
     if (op.tool === "gmail.sync") return "gmail_sync";
+    if (op.tool === "gmail.sync.debug") return "gmail_sync_debug";
     if (op.tool === "gmail.status") return "gmail_status";
     if (op.tool.startsWith("memory.")) return "memory";
     if (op.tool.startsWith("event.")) return "progress_logging";

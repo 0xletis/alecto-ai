@@ -58,6 +58,8 @@ export interface GmailMessage {
   id: string;
   threadId?: string;
   snippet?: string;
+  labelIds?: string[];
+  internalDate?: string;
   payload?: GmailMessagePart;
 }
 
@@ -80,6 +82,11 @@ export interface EmailRuleSyncSummary {
   llmErrors: number;
   llmNeedsReview: number;
   llmIgnored: number;
+  aiMessagesChecked: number;
+  aiRuleMatches: number;
+  aiRuleMatchSkipped: number;
+  aiRuleMatchUnavailable: number;
+  aiRuleMatchErrors: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsRejectedDeduped: number;
@@ -93,6 +100,47 @@ export interface EmailRuleSyncSummary {
   lastError?: string;
   lastErrorStage?: GmailErrorStage;
   reviewCandidateDebug: EmailReviewCandidateDebug[];
+  syncDecisionDebug: GmailSyncDecisionDebug[];
+}
+
+export interface GmailSyncDecisionDebug {
+  messageId?: string;
+  subject?: string;
+  from?: string;
+  date?: string;
+  labels?: string[];
+  matchedRuleId?: string;
+  matchedRuleName?: string;
+  decision: "created_review" | "already_pending" | "rejected_deduped" | "approved_deduped" | "active_event_deduped" | "skipped";
+  skipReason?: string;
+  confidence?: number;
+  suggestedReviewTitle?: string;
+  detectedDateOrDeadline?: string | null;
+}
+
+export interface GmailLastSyncDiagnostics {
+  checkedAt: string;
+  connectionId: string;
+  status: "success" | "error";
+  aiRuleMatcher: "available" | "unavailable" | "degraded" | "error";
+  aiRuleMatcherReason?: string;
+  rules: Array<{
+    id: string;
+    name: string;
+    adapterId: string;
+  }>;
+  summary: {
+    messagesChecked: number;
+    processed: number;
+    reviewItemsCreated: number;
+    eventsCreated: number;
+    llmClassified: number;
+    llmUnavailable: number;
+    llmErrors: number;
+  };
+  decisions: GmailSyncDecisionDebug[];
+  error?: string;
+  errorStage?: GmailErrorStage;
 }
 
 export interface EmailReviewCandidateDebug {

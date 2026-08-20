@@ -278,6 +278,14 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({})
   },
   {
+    name: "gmail.sync.debug",
+    description:
+      "Show the last safe Gmail sync diagnostic summary without running a sync. Use for 'why did Gmail sync find nothing?', 'show Gmail sync debug', or 'sync Gmail debug'. Read-only.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
     name: "gmail.rule.list",
     description: "List the user's active Gmail tracking rules.",
     mutates: false,

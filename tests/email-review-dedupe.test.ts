@@ -864,7 +864,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: noRuleUserId, message: "sync my email" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new items/);
+    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new review items/);
 
     response = await server.inject({
       method: "POST",
@@ -892,7 +892,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: syncUserId, message: "check my Gmail now" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new items/);
+    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new review items/);
     assert.doesNotMatch(response.json().reply, /older Gmail connection|active deduped|semantic deduped/);
     assert.doesNotMatch(response.json().reply, /natural-sync-access-token|natural-sync-refresh-token|ciphertext|"iv"|"tag"/);
 
@@ -902,7 +902,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: syncUserId, message: "sync integrations" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new items/);
+    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new review items/);
 
     response = await server.inject({
       method: "POST",
@@ -2496,7 +2496,7 @@ test("Gmail security and auth emails are hard-filtered before job search and cus
     });
 
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 6 messages checked, 0 new items/);
+    assert.match(response.json().reply, /Gmail sync: 6 messages checked, 0 new review items/);
     assert.equal(await prisma.emailReviewItem.count({ where: { userId: securityUserId } }), 0);
     assert.equal(await prisma.event.count({ where: { userId: securityUserId, source: "gmail" } }), 0);
     assert.doesNotMatch(response.json().reply, /security-filter-token|ciphertext|refresh token|access token/i);

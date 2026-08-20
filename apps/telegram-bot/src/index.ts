@@ -2844,19 +2844,21 @@ function formatGmailSyncSummary(response: IntegrationSyncResponse): string {
 }
 
 function formatGmailSyncTotals(totals: ReturnType<typeof gmailSyncTotals>): string {
+  const messagesChecked = totals.messagesFound + totals.aiMessagesChecked;
+
   if (totals.reviewItemsCreated > 0 && totals.eventsCreated > 0) {
-    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+    return `Gmail sync: ${messagesChecked} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
   }
 
   if (totals.reviewItemsCreated > 0) {
-    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}.`;
+    return `Gmail sync: ${messagesChecked} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}.`;
   }
 
   if (totals.eventsCreated > 0) {
-    return `Gmail sync: ${totals.messagesFound} messages checked, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
+    return `Gmail sync: ${messagesChecked} messages checked, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
   }
 
-  return `Gmail sync: ${totals.messagesFound} messages checked, 0 new items.`;
+  return `Gmail sync: ${messagesChecked} messages checked, 0 new review items. Say "why did Gmail sync find nothing?" to see the skipped-message summary.`;
 }
 
 function noActiveEmailRulesMessage(): string {
@@ -2903,7 +2905,7 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
   const ruleLines =
     response.emailSummaries?.map(
       (summary) =>
-        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, llm classified ${summary.llmClassified}, llm unavailable ${summary.llmUnavailable}, llm errors ${summary.llmErrors}, llm needs review ${summary.llmNeedsReview}, llm ignored ${summary.llmIgnored}, review created ${summary.reviewItemsCreated}, review pending ${summary.reviewItemsAlreadyPending}, review semantic deduped ${summary.reviewItemsSemanticDeduped}, review rejected/deduped ${summary.reviewItemsRejectedDeduped}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
+        `- rule ${summary.ruleId} (${summary.adapterId}, ${summary.fetchStrategy}/${summary.classifierMode}): found ${summary.messagesFound}, ai checked ${summary.aiMessagesChecked ?? 0}, processed ${summary.processed}, events ${summary.eventsCreated}, active deduped ${summary.deduped}, semantic deduped ${summary.semanticDeduped}, cleanup reprocessed ${summary.archivedCleanupReprocessed}, needs review ${summary.needsReview}, llm classified ${summary.llmClassified}, llm unavailable ${summary.llmUnavailable}, llm errors ${summary.llmErrors}, llm needs review ${summary.llmNeedsReview}, llm ignored ${summary.llmIgnored}, ai matches ${summary.aiRuleMatches ?? 0}, ai skipped ${summary.aiRuleMatchSkipped ?? 0}, ai unavailable ${summary.aiRuleMatchUnavailable ?? 0}, ai errors ${summary.aiRuleMatchErrors ?? 0}, review created ${summary.reviewItemsCreated}, review pending ${summary.reviewItemsAlreadyPending}, review semantic deduped ${summary.reviewItemsSemanticDeduped}, review rejected/deduped ${summary.reviewItemsRejectedDeduped}, filtered marketing ${summary.filteredMarketing}, low confidence ${summary.lowConfidenceIgnored}, ignored unknown ${summary.ignoredUnknown}, skipped cap ${summary.skippedDueMaxEventsPerSync}${summary.lastErrorStage ? `, lastErrorStage: ${summary.lastErrorStage}` : ""}${summary.lastError ? `, lastError: ${safeGmailIntegrationMessageFromText(summary.lastError)}` : ""}`
     ) ?? [];
   const candidateLines =
     response.emailSummaries?.flatMap((summary) =>
@@ -2928,6 +2930,7 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
     response.emailSummaries?.[0] ? `maxMessagesPerSync: ${response.emailSummaries[0].maxMessagesPerSync}` : undefined,
     response.emailSummaries?.[0] ? `maxEventsPerSync: ${response.emailSummaries[0].maxEventsPerSync}` : undefined,
     `messages found: ${totals.messagesFound}`,
+    `ai messages checked: ${totals.aiMessagesChecked}`,
     `processed: ${totals.processed}`,
     `events created: ${totals.eventsCreated}`,
     `active deduped: ${totals.deduped}`,
@@ -2939,6 +2942,10 @@ function formatGmailSyncDebug(connection: IntegrationConnection, response: Integ
     `llm errors: ${totals.llmErrors}`,
     `llm needs review: ${totals.llmNeedsReview}`,
     `llm ignored: ${totals.llmIgnored}`,
+    `ai rule matches: ${totals.aiRuleMatches}`,
+    `ai rule skipped: ${totals.aiRuleMatchSkipped}`,
+    `ai rule unavailable: ${totals.aiRuleMatchUnavailable}`,
+    `ai rule errors: ${totals.aiRuleMatchErrors}`,
     `review items created: ${totals.reviewItemsCreated}`,
     `review items already pending: ${totals.reviewItemsAlreadyPending}`,
     `review semantic deduped: ${totals.reviewItemsSemanticDeduped}`,
@@ -2983,6 +2990,7 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
   return summaries.reduce(
     (totals, summary) => ({
       messagesFound: totals.messagesFound + summary.messagesFound,
+      aiMessagesChecked: totals.aiMessagesChecked + (summary.aiMessagesChecked ?? 0),
       processed: totals.processed + summary.processed,
       ignoredUnknown: totals.ignoredUnknown + summary.ignoredUnknown,
       filteredMarketing: totals.filteredMarketing + summary.filteredMarketing,
@@ -2992,6 +3000,10 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       llmErrors: totals.llmErrors + summary.llmErrors,
       llmNeedsReview: totals.llmNeedsReview + summary.llmNeedsReview,
       llmIgnored: totals.llmIgnored + summary.llmIgnored,
+      aiRuleMatches: totals.aiRuleMatches + (summary.aiRuleMatches ?? 0),
+      aiRuleMatchSkipped: totals.aiRuleMatchSkipped + (summary.aiRuleMatchSkipped ?? 0),
+      aiRuleMatchUnavailable: totals.aiRuleMatchUnavailable + (summary.aiRuleMatchUnavailable ?? 0),
+      aiRuleMatchErrors: totals.aiRuleMatchErrors + (summary.aiRuleMatchErrors ?? 0),
       reviewItemsCreated: totals.reviewItemsCreated + summary.reviewItemsCreated,
       reviewItemsAlreadyPending: totals.reviewItemsAlreadyPending + summary.reviewItemsAlreadyPending,
       reviewItemsSemanticDeduped: totals.reviewItemsSemanticDeduped + summary.reviewItemsSemanticDeduped,
@@ -3005,6 +3017,7 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
     }),
     {
       messagesFound: 0,
+      aiMessagesChecked: 0,
       processed: 0,
       ignoredUnknown: 0,
       filteredMarketing: 0,
@@ -3014,6 +3027,10 @@ function gmailSyncTotals(summaries: EmailSyncSummary[]) {
       llmErrors: 0,
       llmNeedsReview: 0,
       llmIgnored: 0,
+      aiRuleMatches: 0,
+      aiRuleMatchSkipped: 0,
+      aiRuleMatchUnavailable: 0,
+      aiRuleMatchErrors: 0,
       reviewItemsCreated: 0,
       reviewItemsAlreadyPending: 0,
       reviewItemsSemanticDeduped: 0,
@@ -4818,6 +4835,11 @@ interface EmailSyncSummary {
   llmErrors: number;
   llmNeedsReview: number;
   llmIgnored: number;
+  aiMessagesChecked?: number;
+  aiRuleMatches?: number;
+  aiRuleMatchSkipped?: number;
+  aiRuleMatchUnavailable?: number;
+  aiRuleMatchErrors?: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsSemanticDeduped: number;
