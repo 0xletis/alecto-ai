@@ -984,6 +984,19 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
       candidates.push({ index, intent, position, order: order++ });
     }
   };
+  // "keep them there for now", "keep both in review", "delete both" — a plural/all quantifier
+  // with no explicit number at all means every currently visible review, not one specific,
+  // ambiguous item. A real Telegram smoke test found "keep both in review for now" (with exactly
+  // two visible reviews) sent to the LLM planner, which echoed one review's own subject text back
+  // as a `ref` that then failed to resolve, producing a confusing "which one did you mean?" for a
+  // message that was never actually ambiguous. This only ever fires when visibleReviews is
+  // non-empty (buildExplicitGmailReviewIntentPlan's own early return), so it's already scoped to
+  // an active Gmail-review-triage conversation.
+  const addAllVisibleEntries = (intent: ExplicitGmailReviewIntent, position: number) => {
+    for (const index of visibleIndexSet) {
+      candidates.push({ index, intent, position, order: order++ });
+    }
+  };
 
   // Alecto never mutates the actual Gmail mailbox — "delete"/"remove"/"discard" a review is the
   // same real action as "ignore"/"reject" it (both just decide the EmailReviewItem, never the
@@ -1025,6 +1038,57 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
     }
   }
 
+  // Plural/all quantifier, no explicit number — English "keep them"/"leave both"/"keep all of
+  // them" (deliberately no trailing "review/pending" requirement here, unlike the numbered
+  // pattern above: the reported transcript's exact phrase, "keep them there for now", has no
+  // domain word at all, and this whole extraction only ever runs with real visible reviews). The
+  // negative lookbehind excludes "them"/"these"/"those" immediately after a number ("4 and 6
+  // keep them in review") — that's the INDEX-FIRST keep pattern below's own pass-through pronoun
+  // referring back to the numbers just named, not a request to keep every visible review; without
+  // this guard, a real mixed-triage message ("...4 and 6 keep them in review for later") had this
+  // plural match incorrectly override the correctly-extracted numbered task/keep decisions for
+  // OTHER, unrelated indexes elsewhere in the same message.
+  {
+    const match = text.match(/(?<!\d\s)\b(?:keep|leave)\s+(?:them|these|those|both|all(?:\s+of\s+them)?)\b/);
+    if (match) {
+      addAllVisibleEntries("keep", match.index ?? 0);
+    }
+  }
+  // Spanish: "deja los dos para luego", "mantén ambos en revisión" (accents already stripped by
+  // normalizeIntentText, so "mantén" arrives as "manten" and "revisión" as "revision").
+  {
+    const match = text.match(
+      /\b(?:deja|dejalo|dejalos|dejalas|manten|mantenlo|mantenlos|mantenlas|guarda|guardalo|guardalos|guardalas)\b[\s\S]{0,20}\b(?:los\s+dos|las\s+dos|ambos|ambas|todos|todas)\b/
+    );
+    if (match) {
+      addAllVisibleEntries("keep", match.index ?? 0);
+    }
+  }
+  // Catalan: "deixa'ls per després" — the pronoun is fused onto the verb ("-ls" = "them"), so
+  // this alone already means "leave them," no separate quantifier word needed.
+  {
+    const match = text.match(/\bdeixa'?ls\b/);
+    if (match) {
+      addAllVisibleEntries("keep", match.index ?? 0);
+    }
+  }
+
+  // Plural/all quantifier for ignore/task intents too, English only for now — mirrors the keep
+  // case above so "ignore them"/"delete both"/"turn both into tasks" don't hit the same
+  // ambiguous-ref bug the keep phrasing did.
+  {
+    const match = text.match(/(?<!\d\s)\b(?:ignore|ifnore|reject|skip|delete|remove|discard)\s+(?:them|these|those|both|all(?:\s+of\s+them)?)\b/);
+    if (match) {
+      addAllVisibleEntries("ignore", match.index ?? 0);
+    }
+  }
+  {
+    const match = text.match(/(?<!\d\s)\b(?:turn|convert|make|create|add)\s+(?:them|these|those|both|all(?:\s+of\s+them)?)\s+(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/);
+    if (match) {
+      addAllVisibleEntries("task", match.index ?? 0);
+    }
+  }
+
   const byIndex = new Map<number, ExplicitGmailReviewIntentEntry>();
   for (const candidate of candidates) {
     const current = byIndex.get(candidate.index);
@@ -1058,7 +1122,10 @@ function extractGmailReviewReminderLeadMinutes(text: string): number | undefined
 
 const EMAIL_REVIEW_REFERENCE_PATTERN = /\b(email|emails|gmail|inbox|mail|mails|review|reviews)\b/;
 const ACTION_COMPLETION_PATTERN = /\b(complete(d)?|finish(ed)?|mark(ed)? (?:it |that )?(?:as )?(?:done|complete))\b/;
-const ACTION_DONE_PATTERN = /^(done|finished)\b/;
+// "hecho" (Spanish "done") and Catalan "fet"/"ja està fet" ("done"/"it's already done" — the
+// clitic phrasing doesn't start with "fet", so it needs its own unanchored alternative alongside
+// the simple leading-word case).
+const ACTION_DONE_PATTERN = /^(done|finished|hecho|terminado|listo|fet|llest)\b|\bja\s+(esta|ho he)\s+fet\b/;
 const ACTION_ARCHIVE_PATTERN = /\b(archive|dismiss)\b/;
 const ACTION_SNOOZE_PATTERN = /\bsnooze\b/;
 /** Generic pronoun/bare-acknowledgement reference only — a message that names something by its
@@ -1355,14 +1422,44 @@ function parseGmailAutonomyPreferenceForAgentRuntime(message: string): GmailAuto
   // review). A real regression this caused: "turn off daily review" (the daily-loop setting)
   // was reinterpreted as "review daily" -> Gmail scheduled-every-day, because the legacy
   // parser's "daily" pattern matched alongside "review" satisfying its topic guard. Require an
-  // unambiguous Gmail/email word here before trusting the parser's result at all.
-  if (!/\b(gmail|email|emails|mail|mails|inbox)\b/.test(text)) {
+  // unambiguous Gmail/email word here before trusting the parser's result at all. Spanish/
+  // Catalan "correo(s)"/"correu(s)" are checked separately below, not folded into this same
+  // English-only gate, since the legacy parser's OWN internal topic guard is English-only too
+  // (gmail|email|...|review) and would reject a Spanish-only message before ever reaching its
+  // "cada hora" pattern — calling it for those messages would be pointless.
+  const hasEnglishMailWord = /\b(gmail|email|emails|mail|mails|inbox)\b/.test(text);
+  const hasSpanishOrCatalanMailWord = /\b(correo|correos|correu|correus)\b/.test(text);
+  if (!hasEnglishMailWord && !hasSpanishOrCatalanMailWord) {
     return undefined;
   }
 
-  const direct = parseGmailAutonomyPreference(message);
-  if (direct) {
-    return direct;
+  if (hasEnglishMailWord) {
+    const direct = parseGmailAutonomyPreference(message);
+    if (direct) {
+      return direct;
+    }
+  }
+
+  // Spanish "cada hora"/"cada N minutos"/"cada N horas" for a message that only uses
+  // "correo(s)"/"correu(s)" — never reaches parseGmailAutonomyPreference above at all, since
+  // that shared legacy parser's own topic guard requires an English mail word. Added here as a
+  // V3-only supplement rather than widening the shared legacy parser itself.
+  const everyMinutesEs = text.match(/\bcada\s+(\d+)\s+minutos?\b/);
+  if (everyMinutesEs?.[1]) {
+    const minutes = Number.parseInt(everyMinutesEs[1], 10);
+    if (Number.isFinite(minutes) && minutes > 0) {
+      return { kind: "scheduled", intervalMinutes: minutes };
+    }
+  }
+  const everyHoursEs = text.match(/\bcada\s+(\d+)\s+horas?\b/);
+  if (everyHoursEs?.[1]) {
+    const hours = Number.parseInt(everyHoursEs[1], 10);
+    if (Number.isFinite(hours) && hours > 0) {
+      return { kind: "scheduled", intervalMinutes: hours * 60 };
+    }
+  }
+  if (/\bcada\s+hora\b/.test(text)) {
+    return { kind: "scheduled", intervalMinutes: 60 };
   }
 
   // parseGmailAutonomyPreference doesn't recognize bare "Nh" shorthand ("every 1h") — the exact
@@ -1393,6 +1490,12 @@ function looksLikeGmailAutonomyStatusQuery(text: string): boolean {
     // own explicit schedule-shaped qualifier to avoid swallowing an unrelated bare "do you check
     // email" (which reads more like a sync request than a status question).
     /\b(do|does)\b[\s\S]{0,10}\b(you|u|it|alecto)\b[\s\S]{0,20}\bcheck\b[\s\S]{0,20}\b(gmail|email|emails|mail|inbox)\b[\s\S]{0,20}\b(automatically|auto|regularly|on (a|your) schedule)\b/.test(
+      text
+    ) ||
+    // Spanish "cada cuánto miras mi email?" / Catalan "cada quant mires el meu email?" — "cada
+    // cuánto"/"cada quant" ("how often") is the direct equivalent of the English "how often"
+    // branch above; accents are already stripped by normalizeIntentText ("cuánto" -> "cuanto").
+    /\bcada\s+(cuanto|quant)\b[\s\S]{0,30}\b(miras|mira|revisas|revisa|checas|checa|chequeas|chequea|mires|revises)\b[\s\S]{0,20}\b(email|correo|correos|correu|correus|gmail|mail)\b/.test(
       text
     )
   );

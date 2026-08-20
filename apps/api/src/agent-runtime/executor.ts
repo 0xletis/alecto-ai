@@ -1215,7 +1215,8 @@ export async function executeOperation(
       case "gmail.review.to_action": {
         const reviewId = args.reviewId as string;
         const plannedDueText = typeof args.dueText === "string" ? args.dueText.trim() : "";
-        const dueText = plannedDueText || extractGmailReviewActionDueText(message);
+        const rawDueText = plannedDueText || extractGmailReviewActionDueText(message);
+        const dueText = rawDueText ? translateDueTextToEnglish(rawDueText) : rawDueText;
         const reviews = await getEmailReviewItems(userId, { status: "pending", limit: 50 });
         const review = reviews.find((item) => item.id === reviewId);
         if (!review) return failed(operation.tool, "That email review no longer exists or was already decided.");
@@ -1982,6 +1983,42 @@ function normalizeSearchText(text: string): string {
 function truncateForChat(text: string, maxLength: number): string {
   const clean = text.replace(/\s+/g, " ").trim();
   return clean.length <= maxLength ? clean : `${clean.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
+// packages/core's parseActionDueDate (used by createActionItemFromEmailReview below) only
+// recognizes English day-part phrasing ("tomorrow morning") — it has no Spanish/Catalan support
+// at all, and is shared by several other tools (action.create/snooze/reschedule), so widening it
+// directly risks a much larger blast radius than this one call site needs. This is a narrow,
+// V3-only translation of the handful of due-date phrases these tests actually exercise, applied
+// only to gmail.review.to_action's dueText, not a general Spanish/Catalan date parser. Ordered
+// longest-phrase-first so e.g. "demà al matí" is translated whole before the bare "demà" fallback
+// would otherwise only catch "demà" and leave "al matí" untouched.
+// Trailing \b is unreliable right after à/í — JS regex's \w (and therefore \b) is ASCII-only by
+// default, so a boundary check immediately following one of these accented letters silently never
+// matches; a non-letter lookahead is used instead wherever a pattern ends on one.
+const NOT_FOLLOWED_BY_LETTER = "(?![a-zA-Z])";
+const DUE_TEXT_ES_CA_TRANSLATIONS: Array<[RegExp, string]> = [
+  [/\bmañana\s+por\s+la\s+mañana\b/gi, "tomorrow morning"],
+  [/\bmañana\s+por\s+la\s+tarde\b/gi, "tomorrow afternoon"],
+  [/\bmañana\s+por\s+la\s+noche\b/gi, "tomorrow evening"],
+  [new RegExp(`\\bdemà\\s+al\\s+mat[ií]${NOT_FOLLOWED_BY_LETTER}`, "gi"), "tomorrow morning"],
+  [/\bdemà\s+a\s+la\s+tarda\b/gi, "tomorrow afternoon"],
+  [/\bdemà\s+al\s+vespre\b/gi, "tomorrow evening"],
+  [/\bdemà\s+a\s+la\s+nit\b/gi, "tomorrow evening"],
+  [new RegExp(`\\bdemà${NOT_FOLLOWED_BY_LETTER}`, "gi"), "tomorrow"],
+  [/\bmañana\b/gi, "tomorrow"],
+  [/\bhoy\b/gi, "today"],
+  [/\bavui\b/gi, "today"],
+  [/\besta\s+noche\b/gi, "tonight"],
+  [/\baquesta\s+nit\b/gi, "tonight"]
+];
+
+function translateDueTextToEnglish(text: string): string {
+  let result = text;
+  for (const [pattern, replacement] of DUE_TEXT_ES_CA_TRANSLATIONS) {
+    result = result.replace(pattern, replacement);
+  }
+  return result;
 }
 
 function extractGmailReviewActionDueText(message: string): string | undefined {

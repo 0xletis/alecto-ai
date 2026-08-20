@@ -61,7 +61,8 @@ export const toolCatalog: ToolDefinition[] = [
   },
   {
     name: "action.complete",
-    description: "Mark an action item as completed.",
+    description:
+      "Mark an action item as completed. Use for 'complete it', 'done', 'finished', 'mark it done' (English), 'hecho', 'terminado', 'listo', 'ya lo hice' (Spanish), or 'fet', 'ja està fet', 'ja ho he fet' (Catalan). A bare acknowledgement like this refers to whichever task is currently in view or was just mentioned — omit actionId and let the validator resolve it.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({ actionId: actionIdField })
@@ -101,7 +102,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.reminder_list",
     description:
-      "List only active reminder action items, not every task. Use for 'do I have any reminders on?', 'what reminders are set?', or 'show my reminders'. Read-only.",
+      "List only active reminder action items, not every task. Use for 'do I have any reminders on?', 'what reminders are set?', 'show my reminders' (English), '¿qué recordatorios tengo?', 'muéstrame mis recordatorios' (Spanish), or 'quins recordatoris tinc?' (Catalan). Read-only.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({})
@@ -329,7 +330,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.autonomy.status",
     description:
-      "Show whether Gmail checks are manual-only or on a scheduled interval, the interval if scheduled, and whether Gmail alerts (review notifications) are on. Use for 'when do you check Gmail?', 'is Gmail sync scheduled?', 'gmail sync settings', 'how often do you check my email?'. Read-only — never confuse with gmail.rule.list (which shows WHAT is tracked, not HOW OFTEN Gmail itself is checked).",
+      "Show whether Gmail checks are manual-only or on a scheduled interval, the interval if scheduled, and whether Gmail alerts (review notifications) are on. Use for 'when do you check Gmail?', 'is Gmail sync scheduled?', 'gmail sync settings', 'how often do you check my email?' (English); '¿cada cuánto miras mi email?', '¿cada cuánto revisas el correo?', 'configuración de sincronización de gmail' (Spanish); '¿cada quant mires el meu email?' (Catalan). This is always a read-only question, never a request to sync now — do NOT plan gmail.sync for it. Never confuse with gmail.rule.list (which shows WHAT is tracked, not HOW OFTEN Gmail itself is checked).",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({})
@@ -337,7 +338,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.autonomy.propose_update",
     description:
-      "Propose changing HOW OFTEN Alecto checks Gmail in the background — manual-only (only when the user says 'sync Gmail') or scheduled on a real interval via the existing worker poll. Use for 'check Gmail every hour', 'check my email every 1h', 'review my emails every 30 minutes', 'check email sync every 1h', 'make Gmail manual only', 'stop checking Gmail automatically', 'turn off scheduled Gmail sync'. This is a GLOBAL Gmail-checking-frequency setting, never a specific named rule — do NOT use gmail.rule.propose_update for this, even though the wording ('check emails', 'review my emails') sounds similar; gmail.rule.propose_update is only for pausing/resuming/removing ONE specific, already-named tracking rule (e.g. 'pause Work action emails', 'stop tracking Endesa bills'), and the reverse is also true — never use this tool when the user names a specific rule. Opens a pending confirmation; does not mutate anything until confirmed. Never claims instant/webhook delivery — scheduled checks still run on the existing worker's periodic poll.",
+      "Propose changing HOW OFTEN Alecto checks Gmail in the background — manual-only (only when the user says 'sync Gmail') or scheduled on a real interval via the existing worker poll. Use for 'check Gmail every hour', 'check my email every 1h', 'review my emails every 30 minutes', 'check email sync every 1h', 'make Gmail manual only', 'stop checking Gmail automatically', 'turn off scheduled Gmail sync' (English); 'revisa mi correo cada hora', 'revisa mi email cada 30 minutos', 'pon el correo en manual' (Spanish). This is a GLOBAL Gmail-checking-frequency setting, never a specific named rule — do NOT use gmail.rule.propose_update for this, even though the wording ('check emails', 'review my emails', 'revisa mi correo') sounds similar; gmail.rule.propose_update is only for pausing/resuming/removing ONE specific, already-named tracking rule (e.g. 'pause Work action emails', 'stop tracking Endesa bills'), and the reverse is also true — never use this tool when the user names a specific rule. Opens a pending confirmation; does not mutate anything until confirmed. Never claims instant/webhook delivery — scheduled checks still run on the existing worker's periodic poll.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -434,7 +435,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.reject",
     description:
-      "Reject (ignore) a pending Gmail email review item from the most recently shown list — only affects Alecto's own tracking, never the actual mailbox (no email is sent, replied to, archived, or labeled). Use for 'reject the Endesa one', 'ignore the first one', 'ignore that email review'. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording, e.g. 'Endesa', 'the recruiter one') when they described it in words — never invent a reviewId yourself.",
+      "Reject (ignore) a pending Gmail email review item from the most recently shown list — only affects Alecto's own tracking, never the actual mailbox (no email is sent, replied to, archived, or labeled). Use for 'reject the Endesa one', 'ignore the first one', 'ignore that email review', 'ignore 3', 'delete the newsletter' (English); 'borra el 3', 'descarta este correo', 'ignora el de Endesa' (Spanish); 'descarta el 3', 'ignora el de la newsletter' (Catalan). For 'ignore them', 'delete both', 'reject all of them' with no number given, plan ONE gmail.review.reject per currently visible review — never a single call with a vague ref like 'both' or 'them', which cannot resolve to one specific item. Reference each item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording, e.g. 'Endesa', 'the recruiter one') when they described ONE item in words — never invent a reviewId yourself.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -446,7 +447,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.inspect",
     description:
-      "Answer a question about one pending Gmail review item from the most recently shown list, using only the stored subject/sender/snippet/evidence. Use for questions like 'does the jobs newsletter one mention frontend developer jobs?' or 'what does the second email say?'. If only snippet/evidence is stored, say that limitation instead of inventing details.",
+      "Answer a question about one pending Gmail review item from the most recently shown list, using only the stored subject/sender/snippet/evidence. Use for questions like 'does the jobs newsletter one mention frontend developer jobs?', 'what does the second email say?' (English); '¿de qué trata el correo 2?', '¿qué dice el de Endesa?' (Spanish); 'de què va el correu 2?' (Catalan). If only snippet/evidence is stored, say that limitation instead of inventing details.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -459,7 +460,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.to_action",
     description:
-      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X'. If the user asks for a due time, pass their exact timing phrase as dueText (e.g. '5 minutes from now', 'tomorrow morning', 'next Monday'); if they say 'at the time it says in the email', omit dueText and the executor will parse the stored email snippet/evidence. If they ask for a reminder before it, set reminderLeadMinutes. If they ask to be reminded 'at that time' or 'at the same time' as the due time, set reminderLeadMinutes: 0. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
+      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X', 'convert 2 into a task for tomorrow' (English); 'convierte el 2 en tarea para mañana', 'haz una tarea del correo de Endesa' (Spanish); \"fes-ne una tasca per demà al matí\", 'fes una tasca del 2 per demà al matí' (Catalan). If the user asks for a due time, pass their exact timing phrase as dueText (e.g. '5 minutes from now', 'tomorrow morning', 'para mañana', 'per demà al matí'); if they say 'at the time it says in the email', omit dueText and the executor will parse the stored email snippet/evidence. If they ask for a reminder before it, set reminderLeadMinutes. If they ask to be reminded 'at that time' or 'at the same time' as the due time, set reminderLeadMinutes: 0. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -473,7 +474,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.keep",
     description:
-      "Keep a pending Gmail email review item in review for later. This is a deliberate no-op decision for phrases like 'keep 4 in review for later' or 'leave that one for later'; it must not create an action, event, memory, or Gmail mailbox change.",
+      "Keep a pending Gmail email review item in review for later. This is a deliberate no-op decision for phrases like 'keep 4 in review for later', 'leave that one for later', 'keep both in review', 'keep them there for now', 'keep all of them pending' (English); 'deja los dos para luego', 'mantén ambos en revisión', 'déjalo para después' (Spanish); \"deixa'ls per després\" (Catalan). For a PLURAL reference ('them', 'both', 'all', 'los dos', 'ambos') with no specific number, plan ONE gmail.review.keep per currently visible review — never a single call with a vague ref like 'both', which cannot resolve to one specific item and would wrongly ask for clarification when the user's intent was already unambiguous. It must not create an action, event, memory, or Gmail mailbox change.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
