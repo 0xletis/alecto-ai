@@ -140,6 +140,22 @@ function buildMorningBrief(
     lines.push(`Skip "${deferCandidate.title}" today — low priority.`);
   }
 
+  // Goal Evidence Loop MVP (docs/10-v3-readiness-audit.md §20) — generic across every goal
+  // category, not job-search-specific: a pending Gmail review counts here only when its OWN rule
+  // is linked (EmailSignalRule.goalId) to one of the user's real active goals, exactly the same
+  // linkage goal.status uses. A recruiter email waiting on a job-search goal and an Endesa
+  // invoice waiting on a bills goal are surfaced by the identical code path.
+  const goalLinkedRuleIds = new Set(
+    context.gmailRules.filter((rule) => rule.goalId && context.activeGoals.some((goal) => goal.id === rule.goalId)).map((rule) => rule.id)
+  );
+  const goalLinkedReviews = context.gmailReviews.filter((review) => goalLinkedRuleIds.has(review.ruleId));
+  if (goalLinkedReviews.length > 0) {
+    const label = gmailReviewChatLabel(goalLinkedReviews[0], context.gmailRules);
+    lines.push(
+      `You also have ${goalLinkedReviews.length} email review${goalLinkedReviews.length === 1 ? "" : "s"} waiting on a goal you're tracking — "${label}" — handle that before other things.`
+    );
+  }
+
   const todayLocalDate = formatDateInTimezone(now, settings.timezone);
   const riskToday = context.memories.find((memory) => memory.type === "risk_pattern" && formatDateInTimezone(memory.createdAt, settings.timezone) === todayLocalDate);
   if (riskToday) {

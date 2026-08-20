@@ -10,6 +10,7 @@ export * from "./event-registry.js";
 export * from "./events.js";
 export * from "./goal-templates.js";
 export * from "./goal-linking.js";
+export * from "./goal-evidence.js";
 export * from "./goal-guardrails.js";
 export * from "./goals.js";
 export * from "./gmail-autonomy.js";

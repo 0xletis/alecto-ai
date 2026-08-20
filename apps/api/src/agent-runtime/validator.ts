@@ -7,7 +7,7 @@ import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
 const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
-const GMAIL_REVIEW_REFERENCE_TOOLS = new Set(["gmail.review.reject", "gmail.review.to_action"]);
+const GMAIL_REVIEW_REFERENCE_TOOLS = new Set(["gmail.review.reject", "gmail.review.to_action", "gmail.review.approve"]);
 
 export function validateOperations(operations: PlannedOperation[], context: ContextBundle): ValidatedOperation[] {
   return operations.map((operation) => validateOperation(operation, context));

@@ -350,12 +350,52 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "gmail.review.approve",
+    description:
+      "Approve a pending Gmail email review item the way its OWN classification already recommends — creates an action if it was classified as a work action, logs a real event (e.g. a recruiter reply, an interview, a rejection) if it was classified as a specific already-known event type, or just marks it reviewed if neither applies. Grounded entirely in that review's own pre-existing classification — never invents an event or action type itself. Use for 'approve the recruiter one', 'log that reply', 'track that email', 'approve 2', or any 'handle this the right way' request that is NOT explicitly asking to force it into a task (use gmail.review.to_action for that instead). Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number.")
+    })
+  },
+  {
     name: "goal.list",
     description:
       "List the user's real active goals with title/category/priority/why. Use for 'what are my goals?', 'show my active goals', 'what am I working on?', 'which goals are active?', 'why did I set the X goal?'. Read-only — never creates, updates, or deletes a goal, and never invents or guesses a goal's details.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({})
+  },
+  {
+    name: "goal.log_evidence",
+    description:
+      "Log a real, grounded event that counts as evidence toward whichever active goal declares that event type (a goal's own targetMetrics — set when the goal was created — decide the link; this never guesses). Works for any goal category, not just career/job-search. Use event.log_job_applications instead for 'sent N CVs/applications' and event.log_workout for training sessions — this tool is for the other concrete signals: a recruiter reply, an interview being scheduled or completed, a rejection, or a job offer. Examples: 'got 2 recruiter replies' (eventType recruiter_reply_received, count 2), 'I have an interview tomorrow' (eventType interview_scheduled — also consider planning action.create for the interview itself if a date was given), 'got rejected by Acme' (eventType rejection_received, notes 'Acme'). Never invent a signal the user didn't actually describe.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      eventType: z.enum([
+        "career.recruiter_reply_received",
+        "career.interview_scheduled",
+        "career.interview_completed",
+        "career.rejection_received",
+        "career.offer_received"
+      ]),
+      count: z.number().int().positive().max(20).optional().describe("Defaults to 1. Set higher only when the user gave an explicit count, e.g. 'got 2 recruiter replies'."),
+      notes: z.string().optional().describe("Free-text detail actually stated by the user, e.g. a company name — never invented.")
+    })
+  },
+  {
+    name: "goal.status",
+    description:
+      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence events counted toward it, and real pending Gmail reviews linked to it. Never invents counts or progress. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', 'how many CVs did I send today?', or the equivalent for any other active goal (e.g. 'how's training going?').",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it (e.g. 'job search', 'training', 'Endesa bills') — matched against real active goal titles/categories, never an invented id. Omit if the user didn't name a specific goal.")
+    })
   },
   {
     name: "proactive.settings_show",

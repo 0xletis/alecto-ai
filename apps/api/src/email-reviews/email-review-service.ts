@@ -538,6 +538,7 @@ export function humanEmailReviewEventLabel(eventType: string): string {
     "career.application_confirmation_received": "application confirmation",
     "career.recruiter_reply_received": "recruiter reply",
     "career.interview_scheduled": "interview event",
+    "career.interview_completed": "completed interview",
     "career.rejection_received": "rejection",
     "career.offer_received": "job offer"
   };

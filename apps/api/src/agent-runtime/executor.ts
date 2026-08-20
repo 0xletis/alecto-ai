@@ -13,6 +13,7 @@ import {
   getActiveMemories,
   getEmailReviewItems,
   getEmailSignalRules,
+  getEventsSince,
   getOrCreateNotificationSettings,
   getNotificationLog,
   hasNotificationLog,
@@ -23,7 +24,19 @@ import {
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
-import { parseActionDueDate, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv, type Goal, type NotificationSettings } from "@operator-agent/core";
+import {
+  describeGoalEvidenceMatch,
+  findGoalsForEventType,
+  inferGoalLinkForAction,
+  parseActionDueDate,
+  proactiveOperatorAllowlistActiveFromEnv,
+  proactiveOperatorAllowlistFromEnv,
+  proactiveOperatorDeliveryEnabledFromEnv,
+  type Goal,
+  type NotificationSettings,
+  type StoredEvent
+} from "@operator-agent/core";
+import { inferActionGoalLink } from "../utils/action-goal-link.js";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
@@ -36,7 +49,13 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
-import { createActionItemFromEmailReview, formatGmailReviewListForChat, gmailReviewChatLabel, rejectEmailReviewForUser } from "../email-reviews/email-review-service.js";
+import {
+  approveEmailReviewForUser,
+  createActionItemFromEmailReview,
+  formatGmailReviewListForChat,
+  gmailReviewChatLabel,
+  rejectEmailReviewForUser
+} from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
 import { formatProactiveDeliveryDiagnosis, getProactiveDeliveryStatus } from "../operator/proactive-eligibility.js";
 import { MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
@@ -90,17 +109,29 @@ export async function executeOperation(
       case "action.create": {
         const dueText = args.dueText as string | undefined;
         const parsedDate = dueText ? parseActionDueDate(dueText) : undefined;
+        const title = args.title as string;
+        const description = args.notes as string | undefined;
+        // Generic goal linkage (Goal Evidence Loop MVP, docs/10-v3-readiness-audit.md §20) —
+        // the exact same keyword/confidence-scored matcher gmail.review.to_action already uses
+        // for email-derived actions, now also applied to manually created ones, so "need to
+        // follow up with recruiter tomorrow" links to an active job-search goal exactly the same
+        // way a bill-paying action would link to an active bills goal. Never invents a link below
+        // the matcher's own confidence threshold.
+        const goalLink = await inferActionGoalLink(userId, title, description);
         const created = await createActionItem(userId, {
           source: "manual",
-          title: args.title as string,
-          description: args.notes as string | undefined,
+          title,
+          description,
           priority: (args.priority as ActionItem["priority"] | undefined) ?? "medium",
-          dueAt: parsedDate?.dueAt ?? undefined
+          dueAt: parsedDate?.dueAt ?? undefined,
+          goalId: goalLink.goalId ?? undefined,
+          goalSlug: goalLink.goalSlug ?? undefined,
+          goalTitleSnapshot: goalLink.matchedGoalTitle
         });
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Created task "${created.title}"${created.dueAt ? ` due ${created.dueAt.toDateString()}` : ""}.`,
+          summary: `Created task "${created.title}"${created.dueAt ? ` due ${created.dueAt.toDateString()}` : ""}.${goalLink.matchedGoalTitle ? ` Linked to your "${goalLink.matchedGoalTitle}" goal.` : ""}`,
           result: created,
           entities: [actionToEntity(created)]
         };
@@ -424,10 +455,39 @@ export async function executeOperation(
             evidence: [args.notes as string | undefined, message].filter(Boolean) as string[]
           }))
         );
+        const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged ${created.length} job application${created.length === 1 ? "" : "s"} sent.`,
+          summary: `Logged ${created.length} job application${created.length === 1 ? "" : "s"} sent.${goalNote ? ` ${goalNote}` : ""}`,
+          result: created
+        };
+      }
+
+      case "goal.log_evidence": {
+        const eventType = args.eventType as
+          | "career.recruiter_reply_received"
+          | "career.interview_scheduled"
+          | "career.interview_completed"
+          | "career.rejection_received"
+          | "career.offer_received";
+        const count = (args.count as number | undefined) ?? 1;
+        const notes = args.notes as string | undefined;
+        const created = await createEvents(
+          userId,
+          Array.from({ length: count }, () => ({
+            type: eventType,
+            source: "manual" as const,
+            confidence: 1,
+            data: notes ? { notes } : undefined,
+            evidence: [notes, message].filter(Boolean) as string[]
+          }))
+        );
+        const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, eventType));
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Logged ${describeEventCount(eventType, created.length)}${notes ? ` (${notes})` : ""}.${goalNote ? ` ${goalNote}` : ""}`,
           result: created
         };
       }
@@ -714,12 +774,71 @@ export async function executeOperation(
         };
       }
 
+      case "gmail.review.approve": {
+        const reviewId = args.reviewId as string;
+        const result = await approveEmailReviewForUser(userId, reviewId);
+
+        if (result.status === "not_found") {
+          return failed(operation.tool, "That email review no longer exists or was already decided.");
+        }
+        if (result.status === "not_pending") {
+          return failed(operation.tool, `That email review is already ${result.review.status}.`);
+        }
+
+        // Same reasoning as gmail.review.reject/to_action above: keep the other still-pending
+        // reviews visible alongside whatever this approval produced (action, event, or neither).
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const entities = [
+          ...(result.actionItem ? [actionToEntity(result.actionItem)] : []),
+          ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+        ];
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: result.message,
+          result: { emailReview: result.emailReview, event: result.event, actionItem: result.actionItem },
+          entities
+        };
+      }
+
       case "goal.list": {
         return {
           tool: operation.tool,
           status: "executed",
           summary: formatGoalListForChat(context.activeGoals),
           result: context.activeGoals
+        };
+      }
+
+      case "goal.status": {
+        const goalRef = args.goalRef as string | undefined;
+        const targetGoals = resolveGoalStatusTargets(goalRef, context.activeGoals);
+
+        // resolveGoalStatusTargets falls back to ALL active goals whenever goalRef doesn't
+        // confidently match one of them, so an empty result here only ever means there are no
+        // active goals at all — never "couldn't find a match."
+        if (targetGoals.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "You don't have any active goals yet. Use /create_goal to set one.",
+            result: []
+          };
+        }
+
+        const timezone = await getUserTimezone(userId);
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const recentEvents = await getEventsSince(userId, sevenDaysAgo);
+        const todayLocalDate = formatDateInTimezone(new Date(), timezone);
+
+        const summaries = targetGoals.map((goal) => formatGoalStatusForChat(goal, { openActions: context.openActions, gmailReviews: context.gmailReviews, gmailRules: context.gmailRules, recentEvents, timezone, todayLocalDate }));
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: summaries.join("\n\n"),
+          result: targetGoals
         };
       }
 
@@ -1073,6 +1192,96 @@ function formatGoalListForChat(goals: Goal[]): string {
     }
   });
   lines.push("", "Goal editing through chat is not wired yet. Use /create_goal or tell me if you want me to remember context.");
+
+  return lines.join("\n");
+}
+
+/** Grammatically correct singular/plural for the event types goal.log_evidence and goal.status
+ * both count — separate from email-review-service.ts's humanEmailReviewEventLabel, whose
+ * "log X"/outcome phrasing is never pluralized by a count, unlike here. Falls back to the raw
+ * type with a bare "s" for any event type not in this small, career-scoped list (the only domain
+ * with a curated goal.log_evidence enum today; extending this to other domains later is additive). */
+const EVENT_COUNT_LABELS: Record<string, [singular: string, plural: string]> = {
+  "career.application_sent": ["application sent", "applications sent"],
+  "career.recruiter_reply_received": ["recruiter reply", "recruiter replies"],
+  "career.interview_scheduled": ["interview scheduled", "interviews scheduled"],
+  "career.interview_completed": ["interview completed", "interviews completed"],
+  "career.rejection_received": ["rejection", "rejections"],
+  "career.offer_received": ["job offer", "job offers"]
+};
+
+function describeEventCount(eventType: string, count: number): string {
+  const labels = EVENT_COUNT_LABELS[eventType];
+  if (!labels) {
+    return `${count} ${eventType} event${count === 1 ? "" : "s"}`;
+  }
+
+  return `${count} ${count === 1 ? labels[0] : labels[1]}`;
+}
+
+/**
+ * Which active goal(s) "goal.status" reports on — reuses goal-linking.ts's inferGoalLinkForAction
+ * (the exact same keyword/confidence matcher gmail.review.to_action and action.create already
+ * use), treating goalRef as if it were an action title being matched against goal keywords. Not
+ * job-search-specific: "training", "Endesa bills", "job search" all resolve the same way. No
+ * confident match (or no goalRef given) means "no single goal was clearly named" — report on
+ * every active goal instead of guessing which one.
+ */
+function resolveGoalStatusTargets(goalRef: string | undefined, activeGoals: Goal[]): Goal[] {
+  if (!goalRef) {
+    return activeGoals;
+  }
+
+  const link = inferGoalLinkForAction({ actionTitle: goalRef, activeGoals });
+  const matched = link.goalId ? activeGoals.find((goal) => goal.id === link.goalId) : undefined;
+
+  return matched ? [matched] : activeGoals;
+}
+
+/**
+ * Grounded per-goal status line: real linked open actions, real evidence events counted this
+ * week/today via the goal's own declared targetMetrics (goal-evidence.ts's
+ * findGoalsForEventType, applied in reverse — which of THIS goal's metrics match each event),
+ * and real pending Gmail reviews linked via the rule that created them. Never invents a count.
+ */
+function formatGoalStatusForChat(
+  goal: Goal,
+  input: { openActions: ActionItem[]; gmailReviews: EmailReviewItem[]; gmailRules: EmailSignalRule[]; recentEvents: StoredEvent[]; timezone: string; todayLocalDate: string }
+): string {
+  const trackedEventTypes = new Set((goal.targetMetrics ?? []).map((metric) => metric.eventType).filter(Boolean) as string[]);
+  const goalEvents = trackedEventTypes.size > 0 ? input.recentEvents.filter((event) => trackedEventTypes.has(event.type)) : [];
+  const todayEvents = goalEvents.filter((event) => formatDateInTimezone(event.timestamp, input.timezone) === input.todayLocalDate);
+  const linkedActions = input.openActions.filter((action) => action.goalId === goal.id);
+  const linkedRuleIds = new Set(input.gmailRules.filter((rule) => rule.goalId === goal.id).map((rule) => rule.id));
+  const linkedReviews = input.gmailReviews.filter((review) => linkedRuleIds.has(review.ruleId));
+
+  const eventCountsByType = new Map<string, number>();
+  for (const event of goalEvents) {
+    eventCountsByType.set(event.type, (eventCountsByType.get(event.type) ?? 0) + 1);
+  }
+  const todayCountsByType = new Map<string, number>();
+  for (const event of todayEvents) {
+    todayCountsByType.set(event.type, (todayCountsByType.get(event.type) ?? 0) + 1);
+  }
+
+  const lines = [`"${goal.title}" (${goal.category}):`];
+
+  if (eventCountsByType.size > 0) {
+    lines.push(`This week: ${[...eventCountsByType.entries()].map(([type, count]) => describeEventCount(type, count)).join(", ")}.`);
+    if (todayCountsByType.size > 0) {
+      lines.push(`Today: ${[...todayCountsByType.entries()].map(([type, count]) => describeEventCount(type, count)).join(", ")}.`);
+    }
+  } else {
+    lines.push("No logged progress in the last 7 days.");
+  }
+
+  if (linkedActions.length > 0) {
+    lines.push(`Open actions: ${linkedActions.map((action) => `"${action.title}"`).join(", ")}.`);
+  }
+
+  if (linkedReviews.length > 0) {
+    lines.push(`${linkedReviews.length} pending Gmail review${linkedReviews.length === 1 ? "" : "s"} linked to this goal.`);
+  }
 
   return lines.join("\n");
 }
