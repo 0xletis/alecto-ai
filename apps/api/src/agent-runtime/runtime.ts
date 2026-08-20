@@ -1,4 +1,4 @@
-import { createMemory, rejectPendingAction, type PendingAction } from "@operator-agent/db";
+import { createMemory, getMostRecentlyRemindedActionItem, rejectPendingAction, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation } from "./executor.js";
@@ -141,6 +141,51 @@ function isPlanningTraceEnabled(): boolean {
 
 function isPlanningTool(tool: string | undefined | null): boolean {
   return Boolean(tool && tool.startsWith("planning."));
+}
+
+function logAgentRuntimeDiagnostics(input: {
+  phase: string;
+  userId: string;
+  plannerOps?: PlannedOperation[];
+  explicitReviewIntentMap?: ExplicitGmailReviewIntentEntry[];
+  finalOps?: PlannedOperation[];
+  validatedOps?: ValidatedOperation[];
+  mutationTools?: string[];
+  /** Free-form context for a phase that isn't well captured by the structured fields above — e.g.
+   * for "complete it"/"done", whether it resolved to a real ActionItem (and via which source:
+   * the worker's own recent notification log, or a plain visible session entity) or fell through
+   * to the normal planner entirely (meaning it could still end up targeting a Gmail review). */
+  note?: string;
+}): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: input.phase,
+      userId: input.userId,
+      runtimeSelected: "agent_v3",
+      plannerOps: input.plannerOps?.map(safeDiagnosticOperation) ?? [],
+      explicitReviewIntentMap:
+        input.explicitReviewIntentMap?.map((entry) => ({ index: entry.index, intent: entry.intent, position: entry.position })) ?? [],
+      finalOps: input.finalOps?.map(safeDiagnosticOperation) ?? [],
+      validatedOps: input.validatedOps?.map((op) => ({ tool: op.tool, status: op.status })) ?? [],
+      mutationTools: input.mutationTools ?? [],
+      ...(input.note ? { note: input.note } : {})
+    })
+  );
+}
+
+function safeDiagnosticOperation(op: PlannedOperation): { tool: string; args: Record<string, unknown> } {
+  const safeArgs: Record<string, unknown> = {};
+  for (const key of ["index", "ref", "dueText", "reminderLeadMinutes", "leadMinutes", "status", "limit"]) {
+    if (op.args[key] !== undefined) {
+      safeArgs[key] = op.args[key];
+    }
+  }
+  return { tool: op.tool, args: safeArgs };
 }
 
 interface PlanningTraceInputs {
@@ -350,6 +395,26 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, gmailBuiltInRuleShortcut, "gmail_rule_management");
   }
 
+  const gmailReviewListShortcut = gmailReviewListShortcutOperation(message, context);
+  if (gmailReviewListShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailReviewListShortcut, "gmail_reviews");
+  }
+
+  const gmailReviewInspectShortcut = gmailReviewInspectShortcutOperation(message, context);
+  if (gmailReviewInspectShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailReviewInspectShortcut, "gmail_reviews");
+  }
+
+  const reminderListShortcut = actionReminderListShortcutOperation(message);
+  if (reminderListShortcut) {
+    return finalizeDeterministicOperation(context, message, reminderListShortcut, "actions");
+  }
+
+  const meetingListShortcut = actionMeetingListShortcutOperation(message);
+  if (meetingListShortcut) {
+    return finalizeDeterministicOperation(context, message, meetingListShortcut, "actions");
+  }
+
   const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
   if (gmailConnectionShortcut) {
     return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
@@ -358,6 +423,45 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const gmailNudgeSettingsShortcut = !pending ? gmailNudgeSettingsShortcutOperation(message) : undefined;
   if (gmailNudgeSettingsShortcut) {
     return finalizeDeterministicOperation(context, message, gmailNudgeSettingsShortcut, "proactive_settings");
+  }
+
+  if (!pending) {
+    // Checked FIRST, ahead of every Gmail-review shortcut: a bare "complete it"/"done"/"archive
+    // it"/"snooze it tomorrow" right after the worker sends a due-action notification is a real,
+    // reported failure mode otherwise — the real LLM planner has nothing but session.visibleEntities
+    // to go on, and that can be stuck pointing at an already-decided Gmail review (rejecting a
+    // review with an empty "remaining" list never clears it — see applyExecutionSideEffects — so
+    // the LAST thing shown stays "visible" even after the user acted on it), producing exactly the
+    // observed bug: "complete it" tried to re-decide an already-rejected email review instead of
+    // completing the task the worker had just reminded them about. This resolves deterministically
+    // BEFORE the planner ever sees the message, so that stale context can never cause a wrong tool
+    // choice for this specific, unambiguous, high-value pattern. Only ever targets a real
+    // ActionItem — see actionCompletionShortcutOperation's own explicit "no email/review wording"
+    // guard for why a Gmail review is never in scope here at all.
+    const actionCompletionShortcut = await actionCompletionShortcutOperation(message, context);
+    if (actionCompletionShortcut) {
+      return finalizeDeterministicOperation(context, message, actionCompletionShortcut, "actions");
+    }
+
+    const gmailReviewTriageShortcuts = gmailReviewExplicitTriageShortcutOperations(message, context);
+    if (gmailReviewTriageShortcuts.length > 0) {
+      return finalizeDeterministicOperations(context, message, gmailReviewTriageShortcuts, "gmail_reviews");
+    }
+
+    const gmailReviewToActionShortcuts = gmailReviewToActionShortcutOperations(message, context);
+    if (gmailReviewToActionShortcuts.length > 0) {
+      return finalizeDeterministicOperations(context, message, gmailReviewToActionShortcuts, "gmail_reviews");
+    }
+
+    const actionTimeCorrectionShortcut = actionTimeCorrectionShortcutOperation(message, context);
+    if (actionTimeCorrectionShortcut) {
+      return finalizeDeterministicOperation(context, message, actionTimeCorrectionShortcut, "actions");
+    }
+
+    const preDueReminderShortcut = preDueReminderShortcutOperation(message, context);
+    if (preDueReminderShortcut) {
+      return finalizeDeterministicOperation(context, message, preDueReminderShortcut, "actions");
+    }
   }
 
   // A legacy PendingAction (from a slash-command flow like /action_hygiene or a Gmail rule
@@ -400,9 +504,20 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   }
 
   const { plan, plannerUsed } = await planMessage(message, context);
+  const reconciledOperations = reconcileExplicitGmailReviewIntentOperations(message, context, plan.operations);
 
-  const validatedOps = validateOperations(plan.operations, context);
+  const validatedOps = validateOperations(reconciledOperations, context);
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
+  const explicitReviewIntentPlan = buildExplicitGmailReviewIntentPlan(message, context);
+  logAgentRuntimeDiagnostics({
+    phase: "validated_operations",
+    userId,
+    plannerOps: plan.operations,
+    explicitReviewIntentMap: explicitReviewIntentPlan?.entries,
+    finalOps: reconciledOperations,
+    validatedOps,
+    mutationTools: validatedOps.filter((op) => op.status === "valid" && getToolDefinition(op.tool)?.mutates).map((op) => op.tool)
+  });
 
   // Pending-operation firewall: while a mutation is awaiting confirmation, no OTHER mutation
   // may run — not even a fresh, unrelated one, and not even a re-ask of the same one. This is
@@ -411,7 +526,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   if (pending && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
     return finalize(context, {
       reply: `You still have a pending confirmation for ${pending.summary}. Confirm, cancel, or tell me a new request.`,
-      operationsPlanned: plan.operations,
+      operationsPlanned: reconciledOperations,
       executedOps: [],
       plannerUsed,
       llmPlannerAttempted: true,
@@ -426,7 +541,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
   const executableOps = validatedOps.filter((op) => op.status === "valid" && !META_TOOLS.has(op.tool));
 
-  const topic = resolveTopic(plan.operations, plan.topic, context.session.topic);
+  const topic = resolveTopic(reconciledOperations, plan.topic, context.session.topic);
 
   let executedOps: ExecutedOperation[] = [];
   let clarificationQuestion: string | undefined;
@@ -442,6 +557,13 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   } else {
     executedOps = await Promise.all(executableOps.map((op) => executeOperation(userId, op, context, message)));
     applyExecutionSideEffects(context.session, executedOps);
+    logAgentRuntimeDiagnostics({
+      phase: "executed_operations",
+      userId,
+      finalOps: reconciledOperations,
+      validatedOps,
+      mutationTools: executedOps.filter((op) => op.status === "executed" && getToolDefinition(op.tool)?.mutates).map((op) => op.tool)
+    });
 
     // pendingConfirmationOps can only be non-empty here when `pending` was null (the firewall
     // above already returned for any mutation attempt while a pending operation exists).
@@ -463,7 +585,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     problemOps
   });
 
-  const plannedPlanningOp = plan.operations.find((op) => isPlanningTool(op.tool));
+  const plannedPlanningOp = reconciledOperations.find((op) => isPlanningTool(op.tool));
   const planningTrace = recordPlanningTrace(
     {
       message,
@@ -479,7 +601,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
 
   return finalize(context, {
     reply,
-    operationsPlanned: plan.operations,
+    operationsPlanned: reconciledOperations,
     executedOps,
     plannerUsed,
     llmPlannerAttempted: true,
@@ -546,6 +668,628 @@ async function finalizeDeterministicOperation(
     topic,
     planningTrace
   });
+}
+
+async function finalizeDeterministicOperations(
+  context: ContextBundle,
+  message: string,
+  plannedOperations: PlannedOperation[],
+  topic: string
+): Promise<AgentMessageResponse> {
+  const pendingOperationBefore = context.session.pendingOperation;
+  const visibleEntitiesBefore = context.session.visibleEntities;
+  const validatedOps = validateOperations(plannedOperations, context);
+  const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
+  const pendingConfirmationOps = validatedOps.filter((op) => op.status === "needs_confirmation");
+  const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
+  const executableOps = validatedOps.filter((op) => op.status === "valid" && !META_TOOLS.has(op.tool));
+  const executedOps: ExecutedOperation[] = [];
+
+  for (const op of executableOps) {
+    executedOps.push(await executeOperation(context.session.userId, op, context, message));
+  }
+  applyExecutionSideEffects(context.session, executedOps);
+  logAgentRuntimeDiagnostics({
+    phase: "deterministic_operations_executed",
+    userId: context.session.userId,
+    finalOps: plannedOperations,
+    validatedOps,
+    mutationTools: executedOps.filter((op) => op.status === "executed" && getToolDefinition(op.tool)?.mutates).map((op) => op.tool)
+  });
+
+  if (pendingConfirmationOps.length > 0) {
+    const summary = summarizePendingOperations(pendingConfirmationOps);
+    setPendingOperation(context.session, createPendingOperationRecord(topic, summary, pendingConfirmationOps));
+  }
+
+  const clarification = validatedOps.find((op) => op.status === "needs_clarification")?.clarificationQuestion;
+  const reply = composeReply({
+    replyDraft: "",
+    clarificationQuestion: clarification,
+    pendingConfirmationOps,
+    executedOps,
+    problemOps
+  });
+
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: plannedOperations[0],
+      validatedOp: validatedOps[0],
+      executedOp: executedOps.find((op) => isPlanningTool(op.tool)),
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: inferComposerSource({ clarificationQuestion: clarification, pendingConfirmationOps, executedOps, problemOps, replyDraft: "" })
+    },
+    context.session
+  );
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: plannedOperations,
+    executedOps,
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed,
+    topic,
+    planningTrace
+  });
+}
+
+function gmailReviewListShortcutOperation(message: string, context?: ContextBundle): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return undefined;
+  }
+
+  const asksReviewList =
+    /\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b[\s\S]{0,50}\b(email reviews?|gmail reviews?|emails? to review|items? to review)\b/.test(text) ||
+    /\b(email reviews?|gmail reviews?|emails? to review|items? to review)\b[\s\S]{0,50}\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b/.test(text) ||
+    /^email reviews?$/.test(text) ||
+    /\bwhat emails? need (my )?attention\b/.test(text) ||
+    (/^show me (?:the )?reviews?$/.test(text) && Boolean(context && (context.gmailReviews.length > 0 || hasRecentGmailContext(context)))) ||
+    // "any emails left to review?", "anything left to review?" — a natural follow-up after
+    // triaging some of a list, only trusted once the conversation has actually touched Gmail
+    // reviews recently (same contextual gate as "show me the reviews" above), since "anything
+    // left" alone is too generic a phrase to trust unconditionally.
+    (/\b(any|anything)\b[\s\S]{0,30}\bleft\b[\s\S]{0,20}\b(review|reviews|emails?)\b|\b(emails?|reviews?)\b[\s\S]{0,20}\bleft\b[\s\S]{0,20}\breview\b/.test(text) &&
+      Boolean(context && (context.gmailReviews.length > 0 || hasRecentGmailContext(context))));
+
+  if (!asksReviewList) {
+    return undefined;
+  }
+
+  return { tool: "gmail.review.list", args: { status: "pending" }, rationale: "user asked to see pending Gmail reviews" };
+}
+
+function gmailReviewInspectShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+  if (visibleReviews.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  if (
+    !text ||
+    /\b(turn|convert|make|create|add|reject|ignore|approve|task|action|remind|reminder)\b/.test(text) ||
+    gmailReviewListShortcutOperation(message, context)
+  ) {
+    return undefined;
+  }
+
+  const asksQuestion = /\b(does|do|is|are|has|have|hay|tiene|mentions?|contains?|info|what|which|tell me about)\b/.test(text) || text.endsWith("?");
+  const selected = selectVisibleEntityMention(text, visibleReviews);
+  if (!asksQuestion || !selected) {
+    return undefined;
+  }
+
+  return {
+    tool: "gmail.review.inspect",
+    args: { reviewId: selected.id, question: message.trim() },
+    rationale: "user asked about one visible Gmail review"
+  };
+}
+
+type ExplicitGmailReviewIntent = "ignore" | "task" | "keep";
+
+interface ExplicitGmailReviewIntentEntry {
+  index: number;
+  intent: ExplicitGmailReviewIntent;
+  position: number;
+  order: number;
+}
+
+interface ExplicitGmailReviewIntentPlan {
+  operations: PlannedOperation[];
+  entries: ExplicitGmailReviewIntentEntry[];
+  dueText?: string;
+  reminderLeadMinutes?: number;
+}
+
+function gmailReviewExplicitTriageShortcutOperations(message: string, context: ContextBundle): PlannedOperation[] {
+  const plan = buildExplicitGmailReviewIntentPlan(message, context);
+  if (!plan) {
+    return [];
+  }
+  logAgentRuntimeDiagnostics({
+    phase: "deterministic_gmail_review_triage",
+    userId: context.session.userId,
+    plannerOps: [],
+    explicitReviewIntentMap: plan.entries,
+    finalOps: plan.operations,
+    mutationTools: plan.operations.filter((op) => getToolDefinition(op.tool)?.mutates).map((op) => op.tool)
+  });
+  return plan.operations;
+}
+
+function gmailReviewToActionShortcutOperations(message: string, context: ContextBundle): PlannedOperation[] {
+  const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+  if (visibleReviews.length === 0) {
+    return [];
+  }
+
+  const text = normalizeIntentText(message);
+  if (!/\b(turn|convert|make|create|add)\b/.test(text) || !/\b(tasks?|actions?|reminders?)\b/.test(text)) {
+    return [];
+  }
+
+  const indexes = extractVisibleIndexesFromReviewActionMessage(text, visibleReviews);
+  const targetRefs: Array<{ index?: number; reviewId?: string }> = indexes.map((index) => ({ index }));
+
+  if (targetRefs.length === 0) {
+    const selected = selectVisibleEntityMention(text, visibleReviews);
+    if (selected) {
+      targetRefs.push(visibleEntityToGmailReviewRef(selected));
+    } else if (visibleReviews.length === 1 && isGenericSingleVisibleReviewTaskReference(text)) {
+      targetRefs.push(visibleEntityToGmailReviewRef(visibleReviews[0]!));
+    } else {
+      return [];
+    }
+  }
+
+  const reminderLeadMinutes = extractPreDueReminderLeadMinutes(text);
+  const dueText = /\b(time (?:they|it|each|the email|mail) (?:say|says)|time in (?:each )?(?:email|mail)|at the time)\b/.test(text)
+    ? undefined
+    : extractNaturalDueTextFromMessage(text);
+
+  return targetRefs.map((targetRef) => ({
+    tool: "gmail.review.to_action",
+    args: {
+      ...targetRef,
+      ...(dueText ? { dueText } : {}),
+      ...(reminderLeadMinutes !== undefined ? { reminderLeadMinutes } : {})
+    },
+    rationale: "user asked to turn visible Gmail reviews into tasks"
+  }));
+}
+
+function reconcileExplicitGmailReviewIntentOperations(
+  message: string,
+  context: ContextBundle,
+  operations: PlannedOperation[]
+): PlannedOperation[] {
+  const plan = buildExplicitGmailReviewIntentPlan(message, context);
+  if (!plan) {
+    return operations;
+  }
+
+  const reviewTools = new Set(["gmail.review.reject", "gmail.review.to_action", "gmail.review.keep", "gmail.review.approve"]);
+  const nonReviewOps = operations.filter((op) => !reviewTools.has(op.tool));
+  const finalOps = [...plan.operations, ...nonReviewOps];
+  logAgentRuntimeDiagnostics({
+    phase: "reconciled_gmail_review_triage",
+    userId: context.session.userId,
+    plannerOps: operations,
+    explicitReviewIntentMap: plan.entries,
+    finalOps,
+    mutationTools: finalOps.filter((op) => getToolDefinition(op.tool)?.mutates).map((op) => op.tool)
+  });
+  return finalOps;
+}
+
+function buildExplicitGmailReviewIntentPlan(message: string, context: ContextBundle): ExplicitGmailReviewIntentPlan | undefined {
+  const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+  if (visibleReviews.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index).filter((index): index is number => typeof index === "number"));
+  const entries = extractExplicitGmailReviewIntentEntries(text, visibleIndexSet);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  const dueText = extractNaturalDueTextFromMessage(text);
+  const reminderLeadMinutes = extractGmailReviewReminderLeadMinutes(text);
+  const operations = entries.map<PlannedOperation>((entry) => {
+    if (entry.intent === "ignore") {
+      return {
+        tool: "gmail.review.reject",
+        args: { index: entry.index },
+        rationale: "user explicitly asked to ignore a visible Gmail review"
+      };
+    }
+
+    if (entry.intent === "keep") {
+      return {
+        tool: "gmail.review.keep",
+        args: { index: entry.index },
+        rationale: "user explicitly asked to keep a visible Gmail review pending"
+      };
+    }
+
+    return {
+      tool: "gmail.review.to_action",
+      args: {
+        index: entry.index,
+        ...(dueText ? { dueText } : {}),
+        ...(reminderLeadMinutes !== undefined ? { reminderLeadMinutes } : {})
+      },
+      rationale: "user explicitly asked to turn a visible Gmail review into a task"
+    };
+  });
+
+  return { operations, entries, dueText, reminderLeadMinutes };
+}
+
+function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: Set<number>): ExplicitGmailReviewIntentEntry[] {
+  const candidates: ExplicitGmailReviewIntentEntry[] = [];
+  let order = 0;
+  const addEntries = (intent: ExplicitGmailReviewIntent, position: number, rawIndexes: string) => {
+    for (const index of extractIndexesFromText(rawIndexes, visibleIndexSet)) {
+      candidates.push({ index, intent, position, order: order++ });
+    }
+  };
+
+  // Alecto never mutates the actual Gmail mailbox — "delete"/"remove"/"discard" a review is the
+  // same real action as "ignore"/"reject" it (both just decide the EmailReviewItem, never the
+  // email itself), so all of these verbs map to the identical "ignore" intent/gmail.review.reject
+  // tool. A real Telegram smoke test's "u can delete 3 its nothing important" was silently missed
+  // entirely because "delete" wasn't recognized as one of the ignore-intent verbs at all.
+  for (const match of text.matchAll(/\b(?:ignore|ifnore|reject|skip|delete|remove|discard)\s+(?:number\s+)?((?:#?\d+\s*(?:,|\band\b|\by\b|&)?\s*)+)/g)) {
+    if (match[1]) {
+      addEntries("ignore", match.index ?? 0, match[1]);
+    }
+  }
+
+  // The reversed phrasing — the index named first, then a dismissive judgment about it ("3 is
+  // nothing important", "3 isn't relevant", "4 is junk/spam") — same intent, index-before-verb
+  // word order instead of verb-before-index.
+  for (const match of text.matchAll(
+    /\b((?:#?\d+\s*(?:,|\band\b|\by\b|&)?\s*)+)\s+(?:is|are|isn't|is not|aren't|are not)\s+(?:nothing important|not important|not relevant|irrelevant|junk|spam)\b/g
+  )) {
+    if (match[1]) {
+      addEntries("ignore", match.index ?? 0, match[1]);
+    }
+  }
+
+  for (const match of text.matchAll(/\b(?:turn|convert|make|create|add)\s+((?:#?\d+\s*(?:,|\band\b|\by\b|&)?\s*)+)\s+(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/g)) {
+    if (match[1]) {
+      addEntries("task", match.index ?? 0, match[1]);
+    }
+  }
+
+  for (const match of text.matchAll(/\b(?:keep|leave)\s+((?:#?\d+\s*(?:,|\band\b|\by\b|&)?\s*)+)\s+(?:in\s+)?(?:review|reviews?|pending|for later)\b/g)) {
+    if (match[1]) {
+      addEntries("keep", match.index ?? 0, match[1]);
+    }
+  }
+
+  for (const match of text.matchAll(/\b((?:#?\d+\s*(?:,|\band\b|\by\b|&)?\s*)+)\s+(?:keep|leave)\s+(?:them\s+|these\s+|those\s+)?(?:in\s+)?(?:review|reviews?|pending|for later)\b/g)) {
+    if (match[1]) {
+      addEntries("keep", match.index ?? 0, match[1]);
+    }
+  }
+
+  const byIndex = new Map<number, ExplicitGmailReviewIntentEntry>();
+  for (const candidate of candidates) {
+    const current = byIndex.get(candidate.index);
+    if (!current || gmailReviewIntentPriority(candidate.intent) > gmailReviewIntentPriority(current.intent)) {
+      byIndex.set(candidate.index, candidate);
+    }
+  }
+
+  return [...byIndex.values()].sort((left, right) => left.position - right.position || left.order - right.order || left.index - right.index);
+}
+
+function extractIndexesFromText(text: string, visibleIndexSet: Set<number>): number[] {
+  const indexes = [...text.matchAll(/\b\d+\b/g)]
+    .map((match) => Number(match[0]))
+    .filter((index) => visibleIndexSet.has(index));
+  return [...new Set(indexes)];
+}
+
+function gmailReviewIntentPriority(intent: ExplicitGmailReviewIntent): number {
+  if (intent === "ignore") return 3;
+  if (intent === "keep") return 2;
+  return 1;
+}
+
+function extractGmailReviewReminderLeadMinutes(text: string): number | undefined {
+  if (/\bremind\b[\s\S]{0,80}\b(?:at that time|at the same time|same time|then)\b/.test(text)) {
+    return 0;
+  }
+  return extractPreDueReminderLeadMinutes(text);
+}
+
+const EMAIL_REVIEW_REFERENCE_PATTERN = /\b(email|emails|gmail|inbox|mail|mails|review|reviews)\b/;
+const ACTION_COMPLETION_PATTERN = /\b(complete(d)?|finish(ed)?|mark(ed)? (?:it |that )?(?:as )?(?:done|complete))\b/;
+const ACTION_DONE_PATTERN = /^(done|finished)\b/;
+const ACTION_ARCHIVE_PATTERN = /\b(archive|dismiss)\b/;
+const ACTION_SNOOZE_PATTERN = /\bsnooze\b/;
+/** Generic pronoun/bare-acknowledgement reference only — a message that names something by its
+ * own specific words ("complete the Nietzsche book goal") should still go through the normal
+ * planner/validator resolution path, not this shortcut, which exists only for the truly ambiguous
+ * "it"/"that"/bare-word case a worker notification leaves the user replying to. */
+const GENERIC_ACTION_REFERENCE_PATTERN = /\b(it|that one|that|this one|this)\b/;
+
+/**
+ * Deterministic resolution for a generic "complete it"/"done"/"archive it"/"snooze it tomorrow"
+ * reply — see the call site in processAgentMessageInner for why this exists and runs before the
+ * planner. Never fires when the message itself references an email/Gmail review (requirement:
+ * Alecto must only ever act on a Gmail review when the user explicitly says so), and only fires
+ * for a generic pronoun-shaped reference, never a message that names something specific in its own
+ * words (that's left to the normal planner + validator's resolveActionRef).
+ */
+async function actionCompletionShortcutOperation(message: string, context: ContextBundle): Promise<PlannedOperation | undefined> {
+  const text = normalizeIntentText(message);
+  // Any digit means the user named something by number ("complete 1, snooze 2, archive 3") —
+  // that's an explicit numbered reference (or a multi-item batch) the normal planner + validator's
+  // own numbered-list resolution already handles correctly; this shortcut exists only for the
+  // genuinely ambiguous bare-pronoun case a worker notification leaves the user replying to.
+  if (!text || EMAIL_REVIEW_REFERENCE_PATTERN.test(text) || /\d/.test(text)) {
+    return undefined;
+  }
+
+  let tool: "action.complete" | "action.archive" | "action.snooze" | undefined;
+  let untilText: string | undefined;
+
+  if (ACTION_SNOOZE_PATTERN.test(text)) {
+    untilText = extractNaturalDueTextFromMessage(text);
+    // action.snooze's untilText is required — without one to extract, fall through rather than
+    // plan an operation the validator can only reject.
+    if (!untilText) {
+      return undefined;
+    }
+    tool = "action.snooze";
+  } else if (ACTION_ARCHIVE_PATTERN.test(text)) {
+    tool = "action.archive";
+  } else if (ACTION_COMPLETION_PATTERN.test(text) || ACTION_DONE_PATTERN.test(text)) {
+    tool = "action.complete";
+  } else {
+    return undefined;
+  }
+
+  if (tool !== "action.snooze" && !GENERIC_ACTION_REFERENCE_PATTERN.test(text) && !ACTION_DONE_PATTERN.test(text)) {
+    return undefined;
+  }
+
+  const resolved = await resolveMostRecentlyNotifiedOrVisibleActionId(context);
+  logAgentRuntimeDiagnostics({
+    phase: "action_completion_shortcut",
+    userId: context.session.userId,
+    note: resolved ? `resolved to ActionItem ${resolved.actionId} via ${resolved.source}, tool=${tool}` : "no ActionItem resolved — falling through to normal planner"
+  });
+  if (!resolved) {
+    return undefined;
+  }
+
+  return {
+    tool,
+    args: { actionId: resolved.actionId, ...(untilText ? { untilText } : {}) },
+    rationale: "user replied generically about the most recently notified/visible task, not a Gmail review"
+  };
+}
+
+/**
+ * Ground truth for "which task is 'it'" when the message itself gives no better clue: prefers
+ * whichever real ActionItem the worker most recently actually notified the user about (via
+ * sendDueActionReminders' own ActionItemReminderLog — see getMostRecentlyRemindedActionItem's doc
+ * comment for why this exists at all: the worker has no way to update this chat session's own
+ * visibleEntities, so relying on session state alone left "it" resolving to whatever was visible
+ * from an unrelated EARLIER turn, e.g. a Gmail review the user had already rejected). Only trusts
+ * a notification from the last 24 hours — an old, possibly-stale reminder from days ago is not a
+ * safe silent target. Falls back to a plain visible "action" entity in session when no recent
+ * notification exists at all (e.g. right after creating a task in the very same conversation,
+ * before the worker has had any chance to notify about anything).
+ */
+async function resolveMostRecentlyNotifiedOrVisibleActionId(
+  context: ContextBundle
+): Promise<{ actionId: string; source: "reminded_by_worker" | "visible_session_entity" } | undefined> {
+  const remindedAction = await getMostRecentlyRemindedActionItem(context.session.userId, {
+    since: new Date(Date.now() - 24 * 60 * 60 * 1000)
+  });
+  if (remindedAction) {
+    return { actionId: remindedAction.id, source: "reminded_by_worker" };
+  }
+
+  const visibleAction = context.session.visibleEntities.find((entity) => entity.type === "action");
+  return visibleAction ? { actionId: visibleAction.id, source: "visible_session_entity" } : undefined;
+}
+
+function actionTimeCorrectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  if (visibleActions.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  const times = [...text.matchAll(/\b\d{1,2}(?::\d{2})?\s*(?:am|pm)\b/g)].map((match) => match[0]);
+  if (times.length === 0 || !/\b(means|should be|not|change|correct)\b/.test(text)) {
+    return undefined;
+  }
+
+  const timeText = times[times.length - 1];
+  const rawRef = text.split(/\b(?:means|should be|change|correct)\b/)[0]?.trim() ?? "";
+  const ref = rawRef.replace(/\b(the|that|this|task|action)\b/g, " ").replace(/\s+/g, " ").trim();
+
+  return {
+    tool: "action.reschedule",
+    args: { ...(ref ? { ref } : {}), timeText },
+    rationale: "user corrected the time for a visible scheduled task"
+  };
+}
+
+function preDueReminderShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  if (visibleActions.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  const leadMinutes = extractPreDueReminderLeadMinutes(text);
+  if (!leadMinutes || !/\b(remind|reminder|recorda|recuerdame|avisame)\b/.test(text) || !/\bbefore\b/.test(text)) {
+    return undefined;
+  }
+
+  return {
+    tool: "action.create_pre_due_reminders",
+    args: { leadMinutes, ref: text },
+    rationale: "user asked for reminders before visible scheduled tasks"
+  };
+}
+
+function actionReminderListShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return undefined;
+  }
+
+  const asksReminderList =
+    /\b(do i have|have i got|any|what|which|show|list|see)\b[\s\S]{0,40}\breminders?\b/.test(text) ||
+    /\breminders?\b[\s\S]{0,40}\b(on|set|scheduled|active|pending)\b/.test(text);
+
+  return asksReminderList ? { tool: "action.reminder_list", args: {}, rationale: "user asked to see scheduled reminders" } : undefined;
+}
+
+function actionMeetingListShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!/\b(when|what time|show|list|see)\b[\s\S]{0,40}\b(meetings?|calls?|appointments?)\b/.test(text)) {
+    return undefined;
+  }
+  return { tool: "action.meeting_list", args: {}, rationale: "user asked for scheduled meetings" };
+}
+
+function extractVisibleIndexesFromReviewActionMessage(text: string, visibleReviews: AgentEntity[]): number[] {
+  const beforeTask = text.split(/\b(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/)[0] ?? text;
+  const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index).filter((index): index is number => typeof index === "number"));
+  const indexes = [...beforeTask.matchAll(/\b\d+\b/g)]
+    .map((match) => Number(match[0]))
+    .filter((index) => visibleIndexSet.has(index));
+
+  const ordinalIndexes = [
+    ["first", 1],
+    ["second", 2],
+    ["third", 3],
+    ["fourth", 4],
+    ["fifth", 5]
+  ] as const;
+  for (const [word, index] of ordinalIndexes) {
+    if (beforeTask.includes(word) && visibleIndexSet.has(index)) {
+      indexes.push(index);
+    }
+  }
+
+  return [...new Set(indexes)];
+}
+
+function extractPreDueReminderLeadMinutes(text: string): number | undefined {
+  const match = text.match(/\b(\d{1,3})\s*(?:minutes?|mins?|min)\s+before\b/);
+  if (match?.[1]) {
+    const minutes = Number(match[1]);
+    return Number.isInteger(minutes) && minutes > 0 ? minutes : undefined;
+  }
+  return /\bremind\b[\s\S]{0,30}\bbefore\b/.test(text) ? 30 : undefined;
+}
+
+function extractNaturalDueTextFromMessage(text: string): string | undefined {
+  const minuteRelative = text.match(/\b(?:in\s+\d{1,4}\s+(?:minutes?|mins?)|\d{1,4}\s+(?:minutes?|mins?)\s+from\s+now)\b/);
+  if (minuteRelative?.[0]) {
+    return minuteRelative[0].trim();
+  }
+
+  const relative = text.match(/\b((?:today|tomorrow|tonight|now)(?:\s+(?:morning|afternoon|evening|tonight))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)\b/);
+  if (relative?.[1]) {
+    return relative[1].trim();
+  }
+
+  const weekday = text.match(
+    /\b((?:next\s+)?(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+(?:morning|afternoon|evening|tonight))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)\b/
+  );
+  return weekday?.[1]?.trim();
+}
+
+function messageReferencesVisibleEntity(text: string, entities: AgentEntity[]): boolean {
+  return Boolean(selectVisibleEntityMention(text, entities));
+}
+
+function selectVisibleEntityMention(text: string, entities: AgentEntity[]): AgentEntity | undefined {
+  const textTokens = visibleReferenceTokens(text);
+  if (textTokens.length === 0) {
+    return undefined;
+  }
+
+  const scored = entities
+    .map((entity) => {
+      const labelTokens = new Set(visibleReferenceTokens(entity.label));
+      const overlap = textTokens.filter((token) => labelTokens.has(token));
+      return { entity, overlap, score: overlap.length };
+    })
+    .filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  if (scored.length === 0) {
+    return undefined;
+  }
+
+  const [first, second] = scored;
+  if (!first) {
+    return undefined;
+  }
+
+  if (first.score >= 2 && first.score > (second?.score ?? 0)) {
+    return first.entity;
+  }
+
+  if (first.score === 1 && !second) {
+    const token = first.overlap[0] ?? "";
+    if (token.length >= 5) {
+      return first.entity;
+    }
+  }
+
+  return undefined;
+}
+
+function visibleEntityToGmailReviewRef(entity: AgentEntity): { index?: number; reviewId?: string } {
+  return typeof entity.index === "number" ? { index: entity.index } : { reviewId: entity.id };
+}
+
+function isGenericSingleVisibleReviewTaskReference(text: string): boolean {
+  const beforeTask = text.split(/\b(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/)[0] ?? text;
+  const specificWords = visibleReferenceTokens(beforeTask).filter(
+    (token) => !/^(turn|convert|make|create|add|can|could|would|please|pls|email|gmail|mail|review|item|one|it|this|that)$/.test(token)
+  );
+  return specificWords.length === 0;
+}
+
+function visibleReferenceTokens(value: string): string[] {
+  return [
+    ...new Set(
+      normalizeIntentText(value)
+        .replace(/[^\p{L}\p{N}\s]/gu, " ")
+        .split(/\s+/)
+        .map((token) => token.trim())
+        .filter(
+          (token) =>
+            token.length >= 3 &&
+            !/^(the|and|for|with|from|into|onto|does|have|has|any|info|about|what|which|tell|says|say|task|tasks|action|actions|reminder|reminders|email|emails|gmail|mail|mails|review|reviews|item|items|one|this|that|it|they|them|each|turn|convert|make|create|add|please|could|would|can|you|me|my|your|hay|tiene|sobre|para|con|una|uno|las|los|del)$/.test(
+              token
+            )
+        )
+    )
+  ];
 }
 
 function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {

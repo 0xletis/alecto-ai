@@ -222,6 +222,12 @@ export function parseActionDueDate(
   const hour = Math.floor(minutes / 60);
   const minute = minutes % 60;
 
+  const inMinutes = lower.match(/\bin\s+(\d+)\s+(?:minutes?|mins?)\b|\b(\d+)\s+(?:minutes?|mins?)\s+from\s+now\b/);
+  if (inMinutes) {
+    const amount = Number(inMinutes[1] ?? inMinutes[2]);
+    return parsedDateResult(new Date(now.getTime() + amount * 60_000), inMinutes[0], inMinutes[0], preferences, false);
+  }
+
   const nowMatch = lower.match(/\b(?:at\s+)?now\b/);
   if (nowMatch) {
     return parsedDateResult(new Date(now), nowMatch[0], nowMatch[0], preferences, false);

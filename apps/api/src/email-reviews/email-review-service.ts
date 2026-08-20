@@ -329,6 +329,12 @@ export async function parseEmailReviewActionDueAt(userId: string, dueText: strin
 
 function detectedDeadlineTextFromEmailReview(review: EmailReviewItem, now: Date): string | undefined {
   const text = cleanEmailFragment([review.subject, review.snippet, review.evidence].filter(Boolean).join(" "));
+  const relativeDateTime = relativeDateTimeTextFromEmailReviewText(text);
+
+  if (relativeDateTime) {
+    return relativeDateTime;
+  }
+
   const match = text.match(
     /\b(?:by|before|after|on)?\s*(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b/i
   );
@@ -346,6 +352,30 @@ function detectedDeadlineTextFromEmailReview(review: EmailReviewItem, now: Date)
 
   const year = match[3] ? Number(match[3]) : now.getFullYear();
   return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function relativeDateTimeTextFromEmailReviewText(text: string): string | undefined {
+  const time = "\\d{1,2}(?::\\d{2})?\\s*(?:a\\.?m\\.?|p\\.?m\\.?)";
+  const relative = "(?:today|tomorrow|tonight)";
+  const weekday = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)";
+  const day = `(?:${relative}|(?:next\\s+)?${weekday})`;
+
+  const dayThenTime = text.match(new RegExp(`\\b(${day})(?:\\s+(?:morning|afternoon|evening))?\\s+(?:at\\s+)?(${time})\\b`, "i"));
+  if (dayThenTime?.[1] && dayThenTime[2]) {
+    return `${dayThenTime[1]} at ${normalizeEmailReviewTimeText(dayThenTime[2])}`;
+  }
+
+  const timeThenDay = text.match(new RegExp(`\\b(?:at\\s+)?(${time})\\s+(?:on\\s+)?(${day})\\b`, "i"));
+  if (timeThenDay?.[1] && timeThenDay[2]) {
+    return `${timeThenDay[2]} at ${normalizeEmailReviewTimeText(timeThenDay[1])}`;
+  }
+
+  const dayPart = text.match(new RegExp(`\\b(${day}\\s+(?:morning|afternoon|evening|tonight))\\b`, "i"));
+  return dayPart?.[1]?.trim();
+}
+
+function normalizeEmailReviewTimeText(text: string): string {
+  return text.replace(/\s+/g, "").replace(/\./g, "").toLowerCase();
 }
 
 function monthNumber(month: string): number | undefined {
@@ -640,8 +670,18 @@ export function actionItemInputFromEmailReview(review: EmailReviewItem): CreateA
 export function buildActionTitle(review: EmailReviewItem, project?: string): string {
   const subject = cleanEmailFragment(review.subject ?? "");
   const bodyText = cleanEmailFragment(extractBodyLikeText(review.evidence) || review.snippet || "");
+  const securityAlertAction = securityAlertActionTitle(subject, bodyText, `${review.subject ?? ""} ${review.snippet ?? ""} ${review.evidence ?? ""} ${review.from ?? ""}`);
+  const securityAdvisoryAction = securityAdvisoryActionTitle(subject, bodyText);
   const subjectAction = actionTitleFromText(subject);
   const bodyAction = actionTitleFromText(bodyText);
+
+  if (securityAlertAction) {
+    return securityAlertAction;
+  }
+
+  if (securityAdvisoryAction) {
+    return securityAdvisoryAction;
+  }
 
   if (subjectAction && !/^follow up on\b/i.test(subjectAction)) {
     return subjectAction;
@@ -666,6 +706,67 @@ export function buildActionTitle(review: EmailReviewItem, project?: string): str
   }
 
   return cleanActionPhrase(review.subject ?? "Review work action");
+}
+
+/**
+ * Google/provider account "security alert" notifications (new sign-in, suspicious activity —
+ * "Alerta de seguridad para X", "Security alert for your account") are a different email shape
+ * from a GitHub-style "security advisory" (a code vulnerability, handled separately below): there
+ * is no upgrade/review-object sentence to extract an action phrase from, only a subject naming the
+ * account and a snippet/evidence description of the alert. Falling through to the generic
+ * actionTitleFromText/contextualActionTitleFromReview path on this shape produced a real, reported
+ * bug: a raw, truncated classifier description ended up glued into the title verbatim. The fix is
+ * the same pattern as securityAdvisoryActionTitle below — detect the shape early and build a
+ * clean, generic title naming the actual account, never a specific provider's exact wording.
+ */
+function securityAlertActionTitle(subject: string, bodyText: string, rawText: string): string | undefined {
+  const combined = `${subject} ${bodyText}`;
+  if (!/\b(security alert|alerta de seguridad|security notification|new sign-?in|suspicious sign-?in|inicio de sesion)\b/i.test(combined)) {
+    return undefined;
+  }
+
+  // The account address must come from the RAW subject/snippet/evidence/from — cleanEmailFragment
+  // (used to build the already-cleaned `subject`/`bodyText` above) deliberately strips every email
+  // address it finds, so by the time this runs the one address that actually matters (the account
+  // the alert is ABOUT, e.g. "Alerta de seguridad para X@gmail.com") is already gone from those.
+  const account = extractEmailAddressFromText(rawText);
+  return account ? `Review security alert for ${account}` : "Review Gmail security alert";
+}
+
+function extractEmailAddressFromText(text: string): string | undefined {
+  return text.match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i)?.[0];
+}
+
+function securityAdvisoryActionTitle(subject: string, bodyText: string): string | undefined {
+  const combined = `${subject} ${bodyText}`;
+  if (!/\bsecurity advisory\b|\bvulnerabilit(?:y|ies)\b/i.test(combined)) {
+    return undefined;
+  }
+
+  const vulnerability = combined.match(/\b(ssrf|denial of service|dos|cross-site scripting|xss|remote code execution|rce)\b/i)?.[1];
+  const packageName = combined.match(/\b(?:security advisory on|affects)\s+([a-z0-9.+#/-]+)\b/i)?.[1];
+  const vulnerabilityLabel = vulnerability ? normalizeVulnerabilityLabel(vulnerability) : undefined;
+  const packageLabel = packageName ? cleanActionObject(packageName) : undefined;
+
+  if (vulnerabilityLabel && packageLabel) {
+    return `Review ${vulnerabilityLabel} security advisory for ${packageLabel}`;
+  }
+  if (vulnerabilityLabel) {
+    return `Review ${vulnerabilityLabel} security advisory`;
+  }
+  if (packageLabel) {
+    return `Review security advisory for ${packageLabel}`;
+  }
+  return "Review security advisory";
+}
+
+function normalizeVulnerabilityLabel(value: string): string {
+  const lower = value.toLowerCase();
+  if (lower === "dos") return "denial of service";
+  if (lower === "xss") return "XSS";
+  if (lower === "rce") return "RCE";
+  if (lower === "ssrf") return "SSRF";
+  return lower;
 }
 
 export function buildActionDescription(review: EmailReviewItem): string | undefined {

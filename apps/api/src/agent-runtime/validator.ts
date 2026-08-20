@@ -7,7 +7,13 @@ import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
 const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
-const GMAIL_REVIEW_REFERENCE_TOOLS = new Set(["gmail.review.reject", "gmail.review.to_action", "gmail.review.approve"]);
+const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
+  "gmail.review.reject",
+  "gmail.review.inspect",
+  "gmail.review.to_action",
+  "gmail.review.keep",
+  "gmail.review.approve"
+]);
 
 export function validateOperations(operations: PlannedOperation[], context: ContextBundle): ValidatedOperation[] {
   return operations.map((operation) => validateOperation(operation, context));
@@ -94,6 +100,34 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     }
 
     args.selections = resolution.selections;
+  }
+
+  if (tool.name === "action.reschedule" && !args.actionId) {
+    const resolution = resolveActionRef(args as { ref?: string }, context);
+
+    if (resolution.status === "needs_clarification") {
+      return {
+        tool: tool.name,
+        args,
+        status: "needs_clarification",
+        requiresConfirmation: false,
+        clarificationQuestion: resolution.question,
+        rationale: operation.rationale
+      };
+    }
+
+    args.actionId = resolution.actionId;
+  }
+
+  if (tool.name === "action.reschedule" && !args.dueText && !args.timeText) {
+    return {
+      tool: tool.name,
+      args,
+      status: "needs_clarification",
+      requiresConfirmation: false,
+      clarificationQuestion: "What new time should I move that task to?",
+      rationale: operation.rationale
+    };
   }
 
   if (GMAIL_REVIEW_REFERENCE_TOOLS.has(tool.name) && !args.reviewId) {
@@ -302,6 +336,37 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     requiresConfirmation: tool.requiresConfirmation,
     rationale: operation.rationale
   };
+}
+
+type ActionRefResolution =
+  | { status: "resolved"; actionId: string }
+  | { status: "needs_clarification"; question: string };
+
+function resolveActionRef(args: { ref?: string }, context: ContextBundle): ActionRefResolution {
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+
+  if (args.ref?.trim()) {
+    const candidates: EmailRuleSelectionCandidate[] = [
+      ...visibleActions.map((entity) => ({ id: entity.id, name: entity.label, status: "open" })),
+      ...context.openActions
+        .filter((action) => !visibleActions.some((entity) => entity.id === action.id))
+        .map((action) => ({ id: action.id, name: action.title, status: action.status }))
+    ];
+    const selected = selectEmailRuleCandidate(args.ref, candidates);
+    if (selected) {
+      return { status: "resolved", actionId: selected.id };
+    }
+    return { status: "needs_clarification", question: `I couldn't tell which task "${args.ref}" refers to — which one did you mean?` };
+  }
+
+  const resolution = resolveSingleVisibleEntity(visibleActions, "action");
+  if (resolution.status === "resolved") {
+    return { status: "resolved", actionId: resolution.entity.id };
+  }
+  if (resolution.status === "none") {
+    return { status: "needs_clarification", question: "Which task do you mean? I don't have one in view right now." };
+  }
+  return { status: "needs_clarification", question: "I see more than one task that could match — which one did you mean?" };
 }
 
 /** Same matching rule the gmail.rule.create executor uses to detect a duplicate. */

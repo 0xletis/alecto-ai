@@ -35,6 +35,7 @@ async function seedReview(
     providerMessageId: string;
     extracted?: Record<string, unknown>;
     proposedEventType?: string;
+    updatedAt?: Date;
   }
 ) {
   return prisma.emailReviewItem.create({
@@ -54,7 +55,8 @@ async function seedReview(
       confidence: 0.8,
       reason: "custom_rule_match",
       extracted: overrides.extracted ?? {},
-      status: "pending"
+      status: "pending",
+      updatedAt: overrides.updatedAt
     }
   });
 }
@@ -394,6 +396,308 @@ test("Gmail review-to-task transcript creates a clean Nest.js task, honors user 
     const tasksReply = await sendAgentMessage(server, userId, "show all tasks");
     assert.equal((tasksReply.reply.match(/Found \d+ action item\(s\)/g) ?? []).length, 1);
     assert.match(tasksReply.reply, /upgrade nest\.js to 24/i);
+  } finally {
+    mock.timers.reset();
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("Gmail review meeting transcript supports list, QA, multi-task conversion, reminders, correction, and meeting query", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-08-20T10:00:00.000Z") });
+  const server = buildServer();
+  const userId = `gmail-review-meeting-transcript-${randomUUID()}`;
+  const timezone = "Europe/Madrid";
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone, morningTimeMinutes: 540 } });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Work action emails",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "Branding direction meeting",
+      from: "Client <client@example.com>",
+      snippet: "Hey Letis, scheduled a branding direction meeting tomorrow at 9 AM. Bring 3 ideas.",
+      proposedEventType: "work_deadline_detected",
+      providerMessageId: "branding-meeting",
+      updatedAt: new Date("2026-08-20T09:00:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "Brainstorm meeting",
+      from: "Client <client@example.com>",
+      snippet: "Hey Letis, scheduled a braistorm meeting tomorrow at 12am see u there!",
+      proposedEventType: "work_deadline_detected",
+      providerMessageId: "brainstorm-meeting",
+      updatedAt: new Date("2026-08-20T09:01:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "Jobs Newsletter #461",
+      from: "Jobs <jobs@example.com>",
+      snippet: "Top jobs this week include Frontend Developer at Example Labs and Product Engineer roles.",
+      providerMessageId: "jobs-newsletter",
+      updatedAt: new Date("2026-08-20T09:02:00.000Z")
+    });
+
+    const list = await sendAgentMessage(server, userId, "show me the email reviews");
+    assert.deepEqual(list.operationsPlanned.map((operation) => operation.tool), ["gmail.review.list"]);
+    assert.match(list.reply, /Pending Gmail reviews/i);
+    assert.match(list.reply, /^1\. Jobs Newsletter #461/im);
+    assert.match(list.reply, /^2\. Brainstorm meeting/im);
+    assert.match(list.reply, /^3\. Branding direction meeting/im);
+
+    const qa = await sendAgentMessage(server, userId, "the jobs newsletter one does it have any info on frontend developer jobs?");
+    assert.deepEqual(qa.operationsPlanned.map((operation) => operation.tool), ["gmail.review.inspect"]);
+    assert.match(qa.reply, /Jobs Newsletter #461/i);
+    assert.match(qa.reply, /yes/i);
+    assert.match(qa.reply, /Frontend Developer/i);
+    assert.match(qa.reply, /only have the stored subject, snippet, and evidence/i);
+    assert.doesNotMatch(qa.reply, /Pending Gmail reviews:/i);
+
+    const created = await sendAgentMessage(server, userId, "turn 2 and 3 into tasks at the time they say in each mail and remind me 30 minutes before each");
+    assert.deepEqual(created.operationsPlanned.map((operation) => operation.tool), ["gmail.review.to_action", "gmail.review.to_action"]);
+    assert.equal(created.debug.mutationExecuted, true);
+    assert.match(created.reply, /Created task: "Brainstorm meeting" for 21\/08\/2026, 00:00/i);
+    assert.match(created.reply, /Reminder: 20\/08\/2026, 23:30/i);
+    assert.match(created.reply, /Created task: "Branding direction meeting" for 21\/08\/2026, 09:00/i);
+    assert.match(created.reply, /Reminder: 21\/08\/2026, 08:30/i);
+
+    const meetingTasks = await prisma.actionItem.findMany({
+      where: { userId, actionType: { not: "reminder" }, status: "open" },
+      orderBy: { title: "asc" }
+    });
+    assert.deepEqual(meetingTasks.map((action) => action.title), ["Brainstorm meeting", "Branding direction meeting"]);
+    const brainstorm = meetingTasks.find((action) => action.title === "Brainstorm meeting");
+    const branding = meetingTasks.find((action) => action.title === "Branding direction meeting");
+    assert.ok(brainstorm?.dueAt);
+    assert.ok(branding?.dueAt);
+    assert.match(formatLocalDateTime(brainstorm!.dueAt!, timezone), /21\/08\/2026, 00:00/);
+    assert.match(formatLocalDateTime(branding!.dueAt!, timezone), /21\/08\/2026, 09:00/);
+
+    let reminders = await prisma.actionItem.findMany({
+      where: { userId, actionType: "reminder", status: "open" },
+      orderBy: { dueAt: "asc" }
+    });
+    assert.equal(reminders.length, 2);
+    assert.ok(reminders.every((action) => action.source === "system"));
+    assert.match(reminders.map((action) => formatLocalDateTime(action.dueAt!, timezone)).join("\n"), /20\/08\/2026, 23:30/);
+    assert.match(reminders.map((action) => formatLocalDateTime(action.dueAt!, timezone)).join("\n"), /21\/08\/2026, 08:30/);
+
+    const correction = await sendAgentMessage(server, userId, "brainstorm meeting means 12pm i guess not am change it");
+    assert.deepEqual(correction.operationsPlanned.map((operation) => operation.tool), ["action.reschedule"]);
+    assert.match(correction.reply, /Action rescheduled: Brainstorm meeting/i);
+    assert.match(correction.reply, /21\/08\/2026, 12:00/);
+    assert.match(correction.reply, /Reminder updated: 21\/08\/2026, 11:30/);
+    assert.doesNotMatch(correction.reply, /Completed/i);
+
+    const afterCorrectionMeetings = await prisma.actionItem.findMany({
+      where: { userId, title: "Brainstorm meeting", status: "open" }
+    });
+    assert.equal(afterCorrectionMeetings.length, 1);
+    assert.match(formatLocalDateTime(afterCorrectionMeetings[0]!.dueAt!, timezone), /21\/08\/2026, 12:00/);
+
+    const reminderReply = await sendAgentMessage(server, userId, "also will u remind me 30 min before of each meeting?");
+    assert.deepEqual(reminderReply.operationsPlanned.map((operation) => operation.tool), ["action.create_pre_due_reminders"]);
+    assert.match(reminderReply.reply, /Reminders set 30 minutes before/i);
+    assert.match(reminderReply.reply, /Brainstorm meeting: 21\/08\/2026, 11:30/i);
+    assert.match(reminderReply.reply, /Branding direction meeting: 21\/08\/2026, 08:30/i);
+
+    reminders = await prisma.actionItem.findMany({
+      where: { userId, actionType: "reminder", status: "open" },
+      orderBy: { dueAt: "asc" }
+    });
+    assert.equal(reminders.length, 2, "re-asking for reminders must not duplicate reminder tasks");
+
+    const meetings = await sendAgentMessage(server, userId, "when are my meetings");
+    assert.deepEqual(meetings.operationsPlanned.map((operation) => operation.tool), ["action.meeting_list"]);
+    assert.match(meetings.reply, /Your meetings:/i);
+    assert.match(meetings.reply, /Branding direction meeting.*21\/08\/2026, 09:00.*Reminder: 21\/08\/2026, 08:30/i);
+    assert.match(meetings.reply, /Brainstorm meeting.*21\/08\/2026, 12:00.*Reminder: 21\/08\/2026, 11:30/i);
+    assert.doesNotMatch(meetings.reply, /Jobs Newsletter/i);
+    assert.equal((meetings.reply.match(/Found \d+ action item\(s\)/g) ?? []).length, 0);
+  } finally {
+    mock.timers.reset();
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("mixed Gmail review triage honors explicit ignore/task/keep refs, relative time, and reminder query", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-08-20T21:07:00.000Z") });
+  const server = buildServer();
+  const userId = `gmail-review-mixed-triage-${randomUUID()}`;
+  const timezone = "Europe/Madrid";
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone, morningTimeMinutes: 540 } });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Gmail reviews",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "Jobs Newsletter #461",
+      from: "Jobs <jobs@example.com>",
+      snippet: "Top jobs this week include Frontend Developer at Example Labs.",
+      providerMessageId: "jobs-newsletter-mixed",
+      updatedAt: new Date("2026-08-20T20:00:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "Alerta de seguridad para letisyt@gmail.com",
+      from: "Google <no-reply@accounts.google.com>",
+      snippet: "Nuevo inicio de sesion detectado.",
+      providerMessageId: "gmail-security-alert-mixed",
+      updatedAt: new Date("2026-08-20T20:01:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "RE: duda",
+      from: "Friend <friend@example.com>",
+      snippet: "Te respondo sobre la duda de antes.",
+      providerMessageId: "duda-mixed",
+      updatedAt: new Date("2026-08-20T20:02:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "[0xletis] A security advisory on next affects at least one of your repositories",
+      from: "GitHub <noreply@github.com>",
+      snippet: "Security advisory: denial of service vulnerability affects next. Review and upgrade the affected repository.",
+      providerMessageId: "github-dos-mixed",
+      updatedAt: new Date("2026-08-20T20:03:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "[0xletis] A security advisory on next affects at least one of your repositories",
+      from: "GitHub <noreply@github.com>",
+      snippet: "Security advisory: SSRF vulnerability affects next. Review and upgrade the affected repository.",
+      providerMessageId: "github-ssrf-mixed",
+      updatedAt: new Date("2026-08-20T20:04:00.000Z")
+    });
+    await seedReview(userId, connectionId, rule.id, {
+      subject: "we need to seriously talk about getcracked",
+      from: "Someone <person@example.com>",
+      snippet: "We need to seriously talk about getcracked later.",
+      providerMessageId: "getcracked-mixed",
+      updatedAt: new Date("2026-08-20T20:05:00.000Z")
+    });
+
+    const list = await sendAgentMessage(server, userId, "show me the reviews");
+    assert.match(list.reply, /^1\. we need to seriously talk about getcracked/im);
+    assert.match(list.reply, /^2\. \[0xletis\] A security advisory/im);
+    assert.match(list.reply, /^3\. \[0xletis\] A security advisory/im);
+    assert.match(list.reply, /^4\. RE: duda/im);
+    assert.match(list.reply, /^5\. Alerta de seguridad/im);
+    assert.match(list.reply, /^6\. Jobs Newsletter #461/im);
+
+    const triage = await sendAgentMessage(
+      server,
+      userId,
+      "ignore 1, turn 2 and 3 into tasks 5 minutes from now and remind me of them at that time, ifnore 5 too, and 4 and 6 keep them in review for later"
+    );
+
+    assert.equal(triage.debug.mutationExecuted, true);
+    assert.match(triage.reply, /ignored review 1/i);
+    assert.match(triage.reply, /ignored review 5/i);
+    assert.match(triage.reply, /created task/i);
+    assert.match(triage.reply, /kept review 4/i);
+    assert.match(triage.reply, /kept review 6/i);
+    assert.match(triage.reply, /23:12/i);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId, status: "open" }, orderBy: { title: "asc" } });
+    const taskActions = actions.filter((action) => action.actionType !== "reminder");
+    const reminderActions = actions.filter((action) => action.actionType === "reminder");
+    assert.equal(taskActions.length, 2, "only reviews 2 and 3 should become tasks");
+    // "remind me of them at that time" means AT the task's own due moment — a separate companion
+    // reminder ActionItem due at that exact same instant would just make the worker send a second,
+    // duplicate notification for the same moment, so none should be created; the task's own due
+    // notification already covers it.
+    assert.equal(reminderActions.length, 0, "a reminder due at the exact same time as the task itself must not create a duplicate notification");
+    assert.ok(taskActions.every((action) => /security advisory|github|next/i.test(action.title)), "created tasks must be the two GitHub security advisory reviews");
+    assert.ok(taskActions.every((action) => !/getcracked|newsletter|duda|alerta/i.test(action.title)), "ignored/kept reviews must not become tasks");
+    for (const action of taskActions) {
+      assert.ok(action.dueAt);
+      assert.equal(formatLocalDateTime(action.dueAt!, timezone), "20/08/2026, 23:12");
+    }
+
+    const reviews = await prisma.emailReviewItem.findMany({ where: { userId }, orderBy: { updatedAt: "desc" } });
+    const byProviderMessageId = new Map(reviews.map((review) => [review.providerMessageId, review]));
+    assert.equal(byProviderMessageId.get("getcracked-mixed")?.status, "rejected");
+    assert.equal(byProviderMessageId.get("github-ssrf-mixed")?.status, "approved");
+    assert.equal(byProviderMessageId.get("github-dos-mixed")?.status, "approved");
+    assert.equal(byProviderMessageId.get("duda-mixed")?.status, "pending");
+    assert.equal(byProviderMessageId.get("gmail-security-alert-mixed")?.status, "rejected");
+    assert.equal(byProviderMessageId.get("jobs-newsletter-mixed")?.status, "pending");
+
+    const reminders = await sendAgentMessage(server, userId, "do i have any reminders on");
+    assert.deepEqual(reminders.operationsPlanned.map((operation) => operation.tool), ["action.reminder_list"]);
+    // No separate reminder ActionItems exist (see above) — the two tasks' own due notifications
+    // are the only thing that will fire, so the reminder list is honestly empty.
+    assert.match(reminders.reply, /no reminders are currently scheduled/i);
+    assert.doesNotMatch(reminders.reply, /Found \d+ action item\(s\)/i);
+    assert.doesNotMatch(reminders.reply, /getcracked|Jobs Newsletter|RE: duda/i);
+  } finally {
+    mock.timers.reset();
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("an explicitly ignored Gmail review cannot become a task even if a bad planner plan is queued", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-08-20T21:07:00.000Z") });
+  const server = buildServer();
+  const userId = `gmail-review-ignore-blocks-task-${randomUUID()}`;
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid" } });
+    const rule = await prisma.emailSignalRule.create({
+      data: {
+        userId,
+        connectionId,
+        adapterId: "custom_email_review",
+        name: "Gmail reviews",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user"
+      }
+    });
+    const review = await seedReview(userId, connectionId, rule.id, {
+      subject: "we need to seriously talk about getcracked",
+      from: "Someone <person@example.com>",
+      snippet: "We need to seriously talk about getcracked later.",
+      providerMessageId: "getcracked-ignore-blocks-task"
+    });
+
+    await sendAgentMessage(server, userId, "show me the reviews");
+
+    mockPlan(gmailReviewToActionPlan({ index: 1, dueText: "5 minutes from now" }));
+    const reply = await sendAgentMessage(server, userId, "ignore 1");
+
+    assert.deepEqual(reply.operationsPlanned.map((operation) => operation.tool), ["gmail.review.reject"]);
+    assert.doesNotMatch(reply.reply, /created task/i);
+    assert.equal(reply.debug.mutationExecuted, true);
+
+    const actions = await prisma.actionItem.findMany({ where: { userId } });
+    assert.equal(actions.length, 0);
+    const updatedReview = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(updatedReview?.status, "rejected");
   } finally {
     mock.timers.reset();
     clearAgentRuntimeMocks();

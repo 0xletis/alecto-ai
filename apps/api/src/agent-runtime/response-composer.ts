@@ -84,6 +84,9 @@ export function composeReply(input: ComposeReplyInput): string {
 
 const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "operator.recent_changes",
+  "action.reschedule",
+  "action.create_pre_due_reminders",
+  "action.reminder_list",
   "gmail.sync",
   "gmail.sync.debug",
   "gmail.rule.create",
@@ -92,9 +95,11 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "planning.next_week_apply",
   "weekly_review.save",
   "gmail.rule.apply_update",
+  "gmail.review.inspect",
   "daily_loop.settings_apply_update",
   "gmail.review.reject",
   "gmail.review.to_action",
+  "gmail.review.keep",
   "proactive.settings_apply_update",
   // A real-LLM eval run found the planner's pre-execution replyDraft claiming evidence "counted
   // toward" a goal even when this call fell back to the genuinely unlinked path — its own summary
@@ -121,6 +126,9 @@ const HUMAN_ACTION: Record<string, string> = {
   "action.snooze": "snooze that task",
   "action.complete": "complete that task",
   "action.archive": "archive that task",
+  "action.reschedule": "reschedule that task",
+  "action.create_pre_due_reminders": "set those reminders",
+  "action.reminder_list": "show your reminders",
   "event.log_job_applications": "log those job applications",
   "event.log_workout": "log that workout",
   "event.log_custom_progress": "log that progress",
@@ -130,7 +138,9 @@ const HUMAN_ACTION: Record<string, string> = {
   "gmail.rule.create": "set up that Gmail rule",
   "gmail.rule.enable_builtin": "enable that Gmail rule",
   "gmail.review.reject": "reject that email review",
+  "gmail.review.inspect": "inspect that email review",
   "gmail.review.to_action": "turn that email into a task",
+  "gmail.review.keep": "keep that email review",
   "action.hygiene_apply": "apply those action cleanup decisions",
   "planning.next_week_apply": "create that plan",
   "weekly_review.save": "save that weekly review",

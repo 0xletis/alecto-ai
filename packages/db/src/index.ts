@@ -1802,6 +1802,37 @@ export async function createActionItemReminderLog(input: {
   });
 }
 
+/**
+ * The ActionItem behind the most recent real due/overdue/snoozed-reopen notification actually
+ * sent to this user (sendDueActionReminders' own ActionItemReminderLog rows — the ground truth of
+ * what the worker told them about, independent of whatever the chat session's own visibleEntities
+ * happen to still be pointing at). Used as a deterministic fallback for a bare "complete it"/
+ * "done" right after a notification, since the worker has no way to update the agent-runtime
+ * session's visibleEntities itself. Never returns an item that's since been completed/archived —
+ * a stale notification about a task the user already finished some other way must not resurface.
+ */
+export async function getMostRecentlyRemindedActionItem(userId: string, options: { since?: Date } = {}): Promise<ActionItem | undefined> {
+  const log = await prisma.actionItemReminderLog.findFirst({
+    where: {
+      userId,
+      ...(options.since ? { sentAt: { gte: options.since } } : {})
+    },
+    orderBy: { sentAt: "desc" }
+  });
+
+  if (!log) {
+    return undefined;
+  }
+
+  const actionItem = await prisma.actionItem.findUnique({ where: { id: log.actionItemId } });
+
+  if (!actionItem || actionItem.userId !== userId || actionItem.status === "archived" || actionItem.status === "completed") {
+    return undefined;
+  }
+
+  return toActionItem(actionItem);
+}
+
 export async function reopenSnoozedActionItem(userId: string, actionItemId: string): Promise<ActionItem | undefined> {
   const existing = await getActionItem(userId, actionItemId);
 

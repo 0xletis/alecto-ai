@@ -74,6 +74,47 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({ actionId: actionIdField })
   },
   {
+    name: "action.reschedule",
+    description:
+      "Change an existing action item's due date/time without completing it and without creating a duplicate. Use for corrections like 'brainstorm meeting means 12pm not 12am, change it' or 'move the YouTube task to tomorrow afternoon'. Prefer actionId from visible context; otherwise pass ref using the task's visible wording.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      actionId: actionIdField,
+      ref: z.string().min(1).optional().describe("The task's visible wording if actionId is not known, e.g. 'brainstorm meeting'."),
+      dueText: z.string().min(1).optional().describe("A full natural-language due date/time, e.g. 'tomorrow afternoon'."),
+      timeText: z.string().min(1).optional().describe("A time-only correction, e.g. '12pm'. Uses the action's existing local date.")
+    })
+  },
+  {
+    name: "action.create_pre_due_reminders",
+    description:
+      "Create real reminder action items due before already-scheduled action items. Use when the user asks 'remind me 30 minutes before each meeting'. This creates Alecto ActionItems that the existing reminder worker can deliver; it does not create calendar events.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      actionIds: z.array(z.string().min(1)).optional().describe("Action ids to remind about. Omit to use the currently visible meeting-like actions."),
+      leadMinutes: z.number().int().nonnegative().max(1440).optional(),
+      ref: z.string().min(1).optional().describe("Optional visible wording such as 'meetings' or 'brainstorm'.")
+    })
+  },
+  {
+    name: "action.reminder_list",
+    description:
+      "List only active reminder action items, not every task. Use for 'do I have any reminders on?', 'what reminders are set?', or 'show my reminders'. Read-only.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "action.meeting_list",
+    description:
+      "List only scheduled meeting-like action items/reminder tasks, with their due times and reminder times if present. Use for 'when are my meetings?' instead of dumping all actions.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
     name: "action.hygiene_start",
     description:
       "Show the user's action-cleanup candidates (stale/overdue action items worth completing, snoozing, or archiving). Use this for 'clean up my actions', 'help me clean up my tasks', 'what actions should I complete, snooze, or archive?', and similar requests.",
@@ -367,16 +408,42 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "gmail.review.inspect",
+    description:
+      "Answer a question about one pending Gmail review item from the most recently shown list, using only the stored subject/sender/snippet/evidence. Use for questions like 'does the jobs newsletter one mention frontend developer jobs?' or 'what does the second email say?'. If only snippet/evidence is stored, say that limitation instead of inventing details.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's visible wording, e.g. 'jobs newsletter'."),
+      question: z.string().min(1).optional().describe("The user's exact question about the review.")
+    })
+  },
+  {
     name: "gmail.review.to_action",
     description:
-      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X'. If the user asks for a due time, pass their exact timing phrase as dueText (e.g. 'tomorrow morning', 'next Monday'). Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
+      "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X'. If the user asks for a due time, pass their exact timing phrase as dueText (e.g. '5 minutes from now', 'tomorrow morning', 'next Monday'); if they say 'at the time it says in the email', omit dueText and the executor will parse the stored email snippet/evidence. If they ask for a reminder before it, set reminderLeadMinutes. If they ask to be reminded 'at that time' or 'at the same time' as the due time, set reminderLeadMinutes: 0. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
       reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
       index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
       ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number."),
-      dueText: z.string().min(1).optional().describe("Natural-language due time requested by the user, e.g. 'tomorrow morning', 'tomorrow afternoon', 'next Monday'.")
+      dueText: z.string().min(1).optional().describe("Natural-language due time requested by the user, e.g. '5 minutes from now', 'tomorrow morning', 'tomorrow afternoon', 'next Monday'."),
+      reminderLeadMinutes: z.number().int().nonnegative().max(1440).optional().describe("Lead time for a real reminder ActionItem, e.g. 30 for 'remind me 30 minutes before', or 0 for 'remind me at that time'.")
+    })
+  },
+  {
+    name: "gmail.review.keep",
+    description:
+      "Keep a pending Gmail email review item in review for later. This is a deliberate no-op decision for phrases like 'keep 4 in review for later' or 'leave that one for later'; it must not create an action, event, memory, or Gmail mailbox change.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number.")
     })
   },
   {

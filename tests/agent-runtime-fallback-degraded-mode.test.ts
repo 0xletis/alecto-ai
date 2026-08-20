@@ -37,7 +37,7 @@ test("1. a Gmail-shaped message during an LLM outage gets a clean degraded reply
     await seedUser(userId);
     process.env.AGENT_RUNTIME_PLANNER_MOCK_THROW = "true";
 
-    const reply = await sendAgentMessage(server, userId, "what emails need attention?");
+    const reply = await sendAgentMessage(server, userId, "can you make sense of this email situation?");
 
     assertNoDevWording(reply.reply, "Gmail-shaped fallback");
     assert.match(reply.reply, /email/i, "should offer a Gmail-shaped example next step, not a bare generic message");

@@ -10,6 +10,7 @@ import {
   createEvents,
   createGoal,
   createMemory,
+  getActionItem,
   getActionItems,
   getActiveMemories,
   getEmailReviewItems,
@@ -18,6 +19,7 @@ import {
   getOrCreateNotificationSettings,
   getNotificationLog,
   hasNotificationLog,
+  rescheduleActionItem,
   snoozeActionItem,
   updateEmailSignalRule,
   updateNotificationSettings,
@@ -67,6 +69,7 @@ import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../g
 import {
   approveEmailReviewForUser,
   createActionItemFromEmailReview,
+  formatEmailReviewDetailsForContext,
   formatGmailReviewListForChat,
   gmailReviewChatLabel,
   rejectEmailReviewForUser
@@ -119,6 +122,19 @@ export async function executeOperation(
               : `Found ${items.length} action item(s): ${items.map((item) => `"${item.title}"`).join(", ")}.`,
           result: items,
           entities: items.map(actionToEntity)
+        };
+      }
+
+      case "action.reminder_list": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const items = await getActionItems(userId, { status: "all", limit: 100 });
+        const reminders = activeReminderActionsFromActionList(items);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatReminderActionsForChat(reminders, settings.timezone),
+          result: reminders,
+          entities: reminders.map(actionToEntity)
         };
       }
 
@@ -182,6 +198,84 @@ export async function executeOperation(
         const updated = await archiveActionItem(userId, args.actionId as string);
         if (!updated) return failed(operation.tool, "That task no longer exists.");
         return { tool: operation.tool, status: "executed", summary: `Archived "${updated.title}".`, result: updated };
+      }
+
+      case "action.reschedule": {
+        const actionId = args.actionId as string;
+        const action = await getActionItem(userId, actionId);
+        if (!action || action.status === "archived") {
+          return failed(operation.tool, "That task no longer exists or is archived.");
+        }
+
+        const settings = await getOrCreateNotificationSettings(userId);
+        const dueText = typeof args.dueText === "string" ? args.dueText.trim() : "";
+        const timeText = typeof args.timeText === "string" ? args.timeText.trim() : "";
+        const parsedDate = parseActionRescheduleDate(action, { dueText, timeText, timezone: settings.timezone });
+
+        if (!parsedDate) {
+          return failed(operation.tool, "I couldn't understand the new due time.");
+        }
+
+        const updated = await rescheduleActionItem(userId, action.id, parsedDate);
+        if (!updated) {
+          return failed(operation.tool, "That task no longer exists or is archived.");
+        }
+
+        const reminderUpdates = await updatePreDueReminderActions(userId, updated, settings.timezone);
+        const reminderLine =
+          reminderUpdates.length > 0
+            ? `\nReminder updated: ${reminderUpdates.map((item) => formatLocalDateTime(item.dueAt, settings.timezone)).join(", ")}.`
+            : "";
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Action rescheduled: ${updated.title}\ndue: ${formatLocalDateTime(updated.dueAt, settings.timezone)}.${reminderLine}`,
+          result: updated,
+          entities: [actionToEntity(updated), ...reminderUpdates.map(actionToEntity)]
+        };
+      }
+
+      case "action.create_pre_due_reminders": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const leadMinutes = (args.leadMinutes as number | undefined) ?? 30;
+        const actionIds = Array.isArray(args.actionIds) ? (args.actionIds as string[]) : [];
+        const actions = await resolveReminderTargetActions(userId, context, actionIds, args.ref as string | undefined);
+
+        if (actions.length === 0) {
+          return failed(operation.tool, "I couldn't find scheduled meeting tasks to remind you about.");
+        }
+
+        const reminders = await createOrUpdatePreDueReminderActions(userId, actions, leadMinutes, settings.timezone);
+        if (reminders.length === 0) {
+          return failed(operation.tool, "Those tasks do not have scheduled times, so I couldn't create before-time reminders.");
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: [
+            `Reminders set ${leadMinutes} minutes before:`,
+            ...reminders.map((item) => `- ${item.target.title}: ${formatLocalDateTime(item.reminder.dueAt, settings.timezone)}`)
+          ].join("\n"),
+          result: reminders,
+          entities: [...actions.map(actionToEntity), ...reminders.map((item) => actionToEntity(item.reminder))]
+        };
+      }
+
+      case "action.meeting_list": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const actions = await getActionItems(userId, { status: "all", limit: 100 });
+        const meetings = meetingActionsFromActionList(actions);
+        const reminders = preDueReminderActionsFromActionList(actions);
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatMeetingActionsForChat(meetings, reminders, settings.timezone),
+          result: { meetings, reminders },
+          entities: meetings.map(actionToEntity)
+        };
       }
 
       case "action.hygiene_start": {
@@ -955,12 +1049,50 @@ export async function executeOperation(
         // visibleEntities would silently drop them, breaking a very next "reject the other one"
         // that never re-lists in between.
         const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const reviewNumber = typeof args.index === "number" ? ` ${args.index}` : "";
+        const reviewLabel = result.review ? `: ${gmailReviewChatLabel(result.review, context.gmailRules)}` : "";
         return {
           tool: operation.tool,
           status: "executed",
-          summary: result.message,
+          summary: `Ignored review${reviewNumber} (rejected)${reviewLabel}.`,
           result: result.review,
           entities: remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+        };
+      }
+
+      case "gmail.review.keep": {
+        const reviewId = args.reviewId as string;
+        const review = await getEmailReviewItems(userId, { status: "pending", limit: 50 }).then((items) =>
+          items.find((item) => item.id === reviewId)
+        );
+        if (!review) {
+          return failed(operation.tool, "That email review no longer exists or was already decided.");
+        }
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const reviewNumber = typeof args.index === "number" ? ` ${args.index}` : "";
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Kept review${reviewNumber}: ${gmailReviewChatLabel(review, context.gmailRules)} in review for later.`,
+          result: review,
+          entities: remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+        };
+      }
+
+      case "gmail.review.inspect": {
+        const reviewId = args.reviewId as string;
+        const review = await getEmailReviewItems(userId, { status: "pending", limit: 50 }).then((items) =>
+          items.find((item) => item.id === reviewId)
+        );
+        if (!review) {
+          return failed(operation.tool, "That email review no longer exists or was already decided.");
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatGmailReviewQuestionAnswer(review, args.question as string | undefined),
+          result: { details: await formatEmailReviewDetailsForContext(userId, review.id) }
         };
       }
 
@@ -978,17 +1110,38 @@ export async function executeOperation(
         // visible alongside the newly created action, not just the action alone.
         const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
         const settings = await getOrCreateNotificationSettings(userId);
+        const reminderLeadMinutes = typeof args.reminderLeadMinutes === "number" ? args.reminderLeadMinutes : undefined;
+        // reminderLeadMinutes: 0 means "remind me AT the due time" (see tool-catalog.ts) — that
+        // moment is already covered by the task's own due notification (sendDueActionReminders),
+        // so creating a second, separate reminder ActionItem due at the exact same instant would
+        // just make the worker send two notifications for one moment. Only a genuine BEFORE-time
+        // request (a positive lead) warrants a real companion reminder.
+        const wantsSeparateReminder = typeof reminderLeadMinutes === "number" && reminderLeadMinutes > 0;
+        const reminders =
+          wantsSeparateReminder && actionItem.dueAt
+            ? await createOrUpdatePreDueReminderActions(userId, [actionItem], reminderLeadMinutes, settings.timezone)
+            : [];
         const dueLabel = actionItem.dueAt
           ? dueText?.trim()
             ? ` for ${dueText.trim()} (${formatLocalDateTime(actionItem.dueAt, settings.timezone)})`
             : ` for ${formatLocalDateTime(actionItem.dueAt, settings.timezone)}`
           : "";
+        const reminderLabel =
+          reminders.length > 0
+            ? ` Reminder: ${formatLocalDateTime(reminders[0]!.reminder.dueAt, settings.timezone)}.`
+            : wantsSeparateReminder
+              ? " I couldn't set a before-time reminder because the task has no scheduled time."
+              : "";
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${created ? "Created task" : "Task already exists"}: "${actionItem.title}"${dueLabel}.`,
-          result: actionItem,
-          entities: [actionToEntity(actionItem), ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))]
+          summary: `${created ? "Created task" : "Task already exists"}: "${actionItem.title}"${dueLabel}.${reminderLabel}`,
+          result: { actionItem, reminders },
+          entities: [
+            actionToEntity(actionItem),
+            ...reminders.map((item) => actionToEntity(item.reminder)),
+            ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+          ]
         };
       }
 
@@ -1455,10 +1608,275 @@ export async function executeOperation(
   }
 }
 
+function formatGmailReviewQuestionAnswer(review: EmailReviewItem, question?: string): string {
+  const subject = review.subject ?? "Gmail review";
+  const sourceText = [review.subject, review.snippet, review.evidence]
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const preview = sourceText ? truncateForChat(sourceText, 320) : "";
+  const limitation = "I only have the stored subject, snippet, and evidence here, not the full Gmail body.";
+
+  if (!sourceText) {
+    return `${subject}: I do not have enough stored preview text to answer that safely. ${limitation}`;
+  }
+
+  const asked = normalizeSearchText(question ?? "");
+  const source = normalizeSearchText(sourceText);
+  const contentTerms = meaningfulQuestionTerms(asked);
+  const matchedTerms = contentTerms.filter((term) => source.includes(term));
+
+  if (contentTerms.length > 0) {
+    if (matchedTerms.length > 0) {
+      return `${subject}: yes, the stored preview mentions ${matchedTerms.slice(0, 4).join(", ")}.\nPreview: ${preview}\n${limitation}`;
+    }
+    return `${subject}: I do not see that in the stored preview.\nPreview: ${preview}\n${limitation}`;
+  }
+
+  return `${subject}:\nPreview: ${preview}\n${limitation}`;
+}
+
+function meaningfulQuestionTerms(text: string): string[] {
+  const stopWords = new Set([
+    "the",
+    "one",
+    "does",
+    "have",
+    "any",
+    "info",
+    "about",
+    "with",
+    "from",
+    "that",
+    "this",
+    "email",
+    "review",
+    "mail",
+    "mails",
+    "emails",
+    "job",
+    "jobs",
+    "newsletter"
+  ]);
+  return [...new Set(text.split(/\s+/).filter((term) => term.length >= 4 && !stopWords.has(term)))];
+}
+
+function parseActionRescheduleDate(
+  action: ActionItem,
+  input: { dueText?: string; timeText?: string; timezone: string }
+): Date | undefined {
+  if (input.dueText?.trim()) {
+    const parsed = parseActionDueDate(input.dueText, { timezone: input.timezone });
+    return parsed.invalidReason ? undefined : parsed.dueAt ?? undefined;
+  }
+
+  if (input.timeText?.trim() && action.dueAt) {
+    const localDate = formatDateInTimezone(action.dueAt, input.timezone);
+    const parsed = parseActionDueDate(`${localDate} ${input.timeText}`, { timezone: input.timezone });
+    return parsed.invalidReason ? undefined : parsed.dueAt ?? undefined;
+  }
+
+  return undefined;
+}
+
+async function resolveReminderTargetActions(
+  userId: string,
+  context: ContextBundle,
+  actionIds: string[],
+  ref?: string
+): Promise<ActionItem[]> {
+  const broadMeetingRef = !ref?.trim() || /\b(each|all|meeting|meetings|them|these|those)\b/i.test(ref);
+  if (actionIds.length === 0 && broadMeetingRef) {
+    return meetingActionsFromActionList(await getActionItems(userId, { status: "all", limit: 100 }));
+  }
+
+  const candidateIds =
+    actionIds.length > 0
+      ? actionIds
+      : context.session.visibleEntities.filter((entity) => entity.type === "action").map((entity) => entity.id);
+  const uniqueIds = [...new Set(candidateIds)];
+  const actions = (
+    await Promise.all(uniqueIds.map((actionId) => getActionItem(userId, actionId)))
+  ).filter((action): action is ActionItem => Boolean(action && action.status !== "archived" && action.status !== "completed"));
+
+  const meetingActions = meetingActionsFromActionList(actions);
+  if (broadMeetingRef) {
+    return meetingActions;
+  }
+
+  const normalizedRef = normalizeSearchText(ref ?? "");
+  return meetingActions.filter((action) => normalizeSearchText(action.title).includes(normalizedRef));
+}
+
+async function createOrUpdatePreDueReminderActions(
+  userId: string,
+  actions: ActionItem[],
+  leadMinutes: number,
+  timezone: string
+): Promise<Array<{ target: ActionItem; reminder: ActionItem; created: boolean }>> {
+  const results: Array<{ target: ActionItem; reminder: ActionItem; created: boolean }> = [];
+
+  for (const action of actions) {
+    // leadMinutes <= 0 would create a companion reminder due AT (or after) the main task's own
+    // due time — the task's own due notification already covers that moment, so a separate
+    // reminder here would just be a duplicate notification for the same instant. Callers that
+    // mean "remind me at the due time" should rely on the task's own reminder, not this one.
+    if (!action.dueAt || action.actionType === "reminder" || leadMinutes <= 0) {
+      continue;
+    }
+
+    const dueAt = new Date(action.dueAt.getTime() - leadMinutes * 60_000);
+    const existing = await findPreDueReminderAction(userId, action.id, leadMinutes);
+
+    if (existing && existing.status !== "archived") {
+      const updated =
+        existing.dueAt?.getTime() === dueAt.getTime()
+          ? existing
+          : (await rescheduleActionItem(userId, existing.id, dueAt)) ?? existing;
+      results.push({ target: action, reminder: updated, created: false });
+      continue;
+    }
+
+    const created = await createActionItemIfNotExists(userId, {
+      source: "system",
+      sourceId: preDueReminderSourceId(action.id, leadMinutes),
+      title: `Reminder: ${action.title}`,
+      description: leadMinutes === 0 ? `Reminder when ${action.title} is due.` : `Reminder ${leadMinutes} minutes before ${action.title}.`,
+      priority: action.priority,
+      dueAt,
+      project: action.project,
+      actionType: "reminder",
+      evidence: `Reminder for action ${action.id} at ${formatLocalDateTime(action.dueAt, timezone)}.`
+    });
+    results.push({ target: action, reminder: created.actionItem, created: created.created });
+  }
+
+  return results;
+}
+
+async function updatePreDueReminderActions(userId: string, action: ActionItem, timezone: string): Promise<ActionItem[]> {
+  if (!action.dueAt) {
+    return [];
+  }
+
+  const actions = await getActionItems(userId, { status: "all", limit: 100 });
+  const reminders = actions.filter((item) => item.source === "system" && item.sourceId?.startsWith(`pre_due_reminder:${action.id}:`));
+  const updated: ActionItem[] = [];
+
+  for (const reminder of reminders) {
+    const leadMinutes = reminder.sourceId ? preDueReminderLeadMinutes(reminder.sourceId) : undefined;
+    if (leadMinutes === undefined || reminder.status === "archived") {
+      continue;
+    }
+    const dueAt = new Date(action.dueAt.getTime() - leadMinutes * 60_000);
+    updated.push((await rescheduleActionItem(userId, reminder.id, dueAt)) ?? reminder);
+  }
+
+  return updated.sort((left, right) => (left.dueAt?.getTime() ?? 0) - (right.dueAt?.getTime() ?? 0));
+}
+
+async function findPreDueReminderAction(userId: string, actionId: string, leadMinutes: number): Promise<ActionItem | undefined> {
+  const actions = await getActionItems(userId, { status: "all", limit: 100 });
+  return actions.find((item) => item.source === "system" && item.sourceId === preDueReminderSourceId(actionId, leadMinutes));
+}
+
+function preDueReminderSourceId(actionId: string, leadMinutes: number): string {
+  return `pre_due_reminder:${actionId}:${leadMinutes}`;
+}
+
+function preDueReminderLeadMinutes(sourceId: string): number | undefined {
+  const match = sourceId.match(/^pre_due_reminder:[^:]+:(\d+)$/);
+  const minutes = match?.[1] ? Number(match[1]) : undefined;
+  return minutes !== undefined && Number.isInteger(minutes) && minutes >= 0 ? minutes : undefined;
+}
+
+function activeReminderActionsFromActionList(actions: ActionItem[]): ActionItem[] {
+  return actions
+    .filter((action) => action.status !== "archived" && action.status !== "completed")
+    .filter((action) => action.actionType === "reminder")
+    .filter((action) => Boolean(action.dueAt))
+    .sort((left, right) => (left.dueAt?.getTime() ?? Number.POSITIVE_INFINITY) - (right.dueAt?.getTime() ?? Number.POSITIVE_INFINITY));
+}
+
+function meetingActionsFromActionList(actions: ActionItem[]): ActionItem[] {
+  return actions
+    .filter((action) => action.status !== "archived" && action.status !== "completed")
+    .filter((action) => action.actionType !== "reminder")
+    .filter((action) => Boolean(action.dueAt))
+    .filter(isMeetingLikeAction)
+    .sort((left, right) => (left.dueAt?.getTime() ?? Number.POSITIVE_INFINITY) - (right.dueAt?.getTime() ?? Number.POSITIVE_INFINITY));
+}
+
+function preDueReminderActionsFromActionList(actions: ActionItem[]): ActionItem[] {
+  return actions.filter(
+    (action) =>
+      action.status !== "archived" &&
+      action.status !== "completed" &&
+      action.actionType === "reminder" &&
+      action.source === "system" &&
+      Boolean(action.sourceId?.startsWith("pre_due_reminder:"))
+  );
+}
+
+function isMeetingLikeAction(action: ActionItem): boolean {
+  const text = normalizeSearchText([action.title, action.description, action.evidence].filter(Boolean).join(" "));
+  return /\b(meeting|call|interview|appointment|brainstorm|sync|standup|stand up|review session)\b/.test(text);
+}
+
+function formatMeetingActionsForChat(meetings: ActionItem[], reminders: ActionItem[], timezone: string): string {
+  if (meetings.length === 0) {
+    return "I don't see any scheduled meeting tasks right now.";
+  }
+
+  const lines = ["Your meetings:"];
+  meetings.forEach((meeting) => {
+    const reminder = reminders.find((item) => item.sourceId?.startsWith(`pre_due_reminder:${meeting.id}:`));
+    lines.push(
+      `- ${meeting.title} — ${formatLocalDateTime(meeting.dueAt, timezone)}${reminder?.dueAt ? `. Reminder: ${formatLocalDateTime(reminder.dueAt, timezone)}` : ""}.`
+    );
+  });
+  return lines.join("\n");
+}
+
+function formatReminderActionsForChat(reminders: ActionItem[], timezone: string): string {
+  if (reminders.length === 0) {
+    return "No reminders are currently scheduled.";
+  }
+
+  return [
+    "Your reminders:",
+    ...reminders.map((reminder) => `- ${reminderTitleForChat(reminder.title)} — ${formatLocalDateTime(reminder.dueAt, timezone)}`)
+  ].join("\n");
+}
+
+function reminderTitleForChat(title: string): string {
+  return title.replace(/^reminder:\s*/i, "").trim() || title;
+}
+
+function normalizeSearchText(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9.+#/-]+/g, " ")
+    .trim();
+}
+
+function truncateForChat(text: string, maxLength: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  return clean.length <= maxLength ? clean : `${clean.slice(0, maxLength - 3).trimEnd()}...`;
+}
+
 function extractGmailReviewActionDueText(message: string): string | undefined {
   const text = message.replace(/\s+/g, " ").trim();
   if (!text) {
     return undefined;
+  }
+
+  const minuteRelative = text.match(/\b(?:in\s+\d{1,4}\s+(?:minutes?|mins?)|\d{1,4}\s+(?:minutes?|mins?)\s+from\s+now)\b/i);
+  if (minuteRelative?.[0]) {
+    return minuteRelative[0].trim();
   }
 
   const relativeDayMatch = text.match(
