@@ -61,6 +61,7 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
+import { buildGmailAutonomyState } from "../conversation/gmail-autonomy.js";
 import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   approveEmailReviewForUser,
@@ -93,6 +94,7 @@ import { formatDateInTimezone } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
+import { syncGmailForAgentRuntime } from "./services.js";
 
 export async function executeOperation(
   userId: string,
@@ -719,18 +721,36 @@ export async function executeOperation(
       }
 
       case "gmail.status": {
-        const connection = context.gmailConnection;
+        const state = await buildGmailAutonomyState(userId);
+        const connection = state.primaryConnection;
         const settings = await getOrCreateNotificationSettings(userId);
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatGmailConnectionStatusForChat(userId, connection, context.gmailRules, settings.timezone, args.includeLink === true),
+          summary: formatGmailConnectionStatusForChat(
+            userId,
+            connection,
+            state.activeRules,
+            settings.timezone,
+            args.includeLink === true,
+            state.lastSyncedAt
+          ),
           result: connection
         };
       }
 
+      case "gmail.sync": {
+        const summary = appendGmailSyncReconnectLink(userId, await syncGmailForAgentRuntime(userId));
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary,
+          result: { message: summary }
+        };
+      }
+
       case "gmail.rule.list": {
-        const rules = (await getEmailSignalRules(userId)).filter((rule) => rule.status === "active");
+        const rules = (await buildGmailAutonomyState(userId)).activeRules;
         const summary =
           rules.length === 0
             ? "No active Gmail rules."
@@ -1780,10 +1800,11 @@ function formatGmailConnectionStatusForChat(
   connection: IntegrationConnection | undefined,
   rules: EmailSignalRule[],
   timezone: string,
-  includeLink: boolean
+  includeLink: boolean,
+  lastSyncedAt?: Date
 ): string {
   const oauthUrl = gmailOAuthUrlForUser(userId);
-  const activeRules = rules.filter((rule) => rule.status === "active" && (!connection || rule.connectionId === connection.id));
+  const activeRules = rules.filter((rule) => rule.status === "active");
   const ruleLines = activeRules.length > 0
     ? ["", "Active rules:", ...activeRules.map((rule, index) => `${index + 1}. ${rule.name} — review-first tracking`)]
     : [];
@@ -1801,13 +1822,14 @@ function formatGmailConnectionStatusForChat(
   const email = typeof connection.config.email === "string" && connection.config.email.trim()
     ? ` as ${connection.config.email.trim()}`
     : "";
-  const lastSynced = connection.lastSyncedAt ? formatDateInTimezone(connection.lastSyncedAt, timezone) : "never";
+  const lastSynced = lastSyncedAt ?? connection.lastSyncedAt;
+  const lastSyncedLabel = lastSynced ? formatDateInTimezone(lastSynced, timezone) : "never";
 
   if (connection.status === "error") {
     return [
       gmailConnectionProblemLine(connection),
       oauthUrl ? `Reconnect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
-      `Last synced: ${lastSynced}.`,
+      `Last synced: ${lastSyncedLabel}.`,
       ...ruleLines
     ].join("\n");
   }
@@ -1816,7 +1838,7 @@ function formatGmailConnectionStatusForChat(
     return [
       `Gmail is paused${email}.`,
       oauthUrl && includeLink ? `Reconnect Gmail here if you want to refresh access:\n${oauthUrl}` : undefined,
-      `Last synced: ${lastSynced}.`,
+      `Last synced: ${lastSyncedLabel}.`,
       "Gmail sync will not run while the connection is paused.",
       ...ruleLines
     ].filter(Boolean).join("\n");
@@ -1826,13 +1848,35 @@ function formatGmailConnectionStatusForChat(
     `Gmail is connected${email}.`,
     "Access: readonly. Alecto cannot send emails or change labels.",
     oauthUrl && includeLink ? `Reconnect Gmail here if you need to refresh access:\n${oauthUrl}` : undefined,
-    `Last synced: ${lastSynced}.`,
+    `Last synced: ${lastSyncedLabel}.`,
     activeRules.length === 0
       ? "No email tracking rules are active yet. You can say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\"."
       : undefined,
     ...ruleLines,
     "Sync only runs when you say \"sync Gmail\" or when scheduled Gmail checks are enabled."
   ].filter(Boolean).join("\n");
+}
+
+function appendGmailSyncReconnectLink(userId: string, summary: string): string {
+  const lower = summary.toLowerCase();
+  const needsLink =
+    lower.includes("reconnect gmail") ||
+    lower.includes("connect gmail") ||
+    lower.includes("authorization expired") ||
+    lower.includes("token could not") ||
+    lower.includes("encryption key is missing");
+
+  if (!needsLink || summary.includes("accounts.google.com/o/oauth2")) {
+    return summary;
+  }
+
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+  if (!oauthUrl) {
+    return summary;
+  }
+
+  const label = lower.includes("not connected") ? "Connect Gmail here" : "Reconnect Gmail here";
+  return `${summary}\n\n${label}:\n${oauthUrl}`;
 }
 
 function gmailOAuthUrlForUser(userId: string): string | undefined {

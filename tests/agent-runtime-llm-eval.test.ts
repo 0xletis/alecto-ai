@@ -482,6 +482,13 @@ test(
       });
 
       await trace.guard(async () => {
+        const sync = trace.record("sync Gmail", await sendAgentMessage(server, userId, "sync Gmail"));
+        assert.deepEqual(sync.operationsPlanned.map((operation) => operation.tool), ["gmail.sync"]);
+        assert.match(sync.reply, /Gmail authorization expired\. Reconnect Gmail\./);
+        assert.match(sync.reply, /https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+        assert.doesNotMatch(sync.reply, /Last synced:/i);
+        assert.doesNotMatch(sync.reply, /\bnudges?\b/i);
+
         const proposal = trace.record("tell me when important emails arrive", await sendAgentMessage(server, userId, "tell me when important emails arrive"));
         trace.checkpoint("proposal needs confirmation", proposal.needsConfirmation, String(proposal.needsConfirmation));
         assert.equal(proposal.needsConfirmation, true);

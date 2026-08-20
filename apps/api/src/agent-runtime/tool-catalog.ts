@@ -270,6 +270,14 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "gmail.sync",
+    description:
+      "Run the existing safe manual Gmail sync now, using only active Gmail tracking rules. Use for explicit sync requests like 'sync Gmail', 'sync email', 'check Gmail now', 'check my email now', 'refresh Gmail', or 'look for new emails now'. Never use for Gmail status/setup, Gmail alerts, or rule-list questions.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
     name: "gmail.rule.list",
     description: "List the user's active Gmail tracking rules.",
     mutates: false,

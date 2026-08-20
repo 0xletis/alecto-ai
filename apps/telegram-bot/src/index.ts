@@ -3077,9 +3077,29 @@ async function updateEmailRuleStatusCommand(ctx: Context, status: "active" | "pa
 
 function formatIntegrationSyncFailure(connection: IntegrationConnection, error: unknown): string {
   const reason =
-    connection.integrationId === "gmail" ? safeGmailIntegrationErrorMessage(error) : safeIntegrationErrorMessage(error);
+    connection.integrationId === "gmail" ? safeGmailIntegrationErrorMessage(error, connection.lastError) : safeIntegrationErrorMessage(error);
+
+  if (connection.integrationId === "gmail") {
+    return formatGmailSyncFailureReason(reason);
+  }
 
   return `Integration sync failed for ${connection.integrationId} ${connection.id}: ${reason}`;
+}
+
+function formatGmailSyncFailureReason(reason: string): string {
+  if (
+    reason.startsWith("Gmail authorization") ||
+    reason.startsWith("Gmail token") ||
+    reason.startsWith("Gmail API") ||
+    reason.startsWith("Gmail permission") ||
+    reason.startsWith("Gmail rate") ||
+    reason.startsWith("Gmail search") ||
+    reason.startsWith("Gmail connection")
+  ) {
+    return reason;
+  }
+
+  return reason.startsWith("Gmail sync failed:") ? reason : `Gmail sync failed: ${reason}`;
 }
 
 function safeIntegrationErrorMessage(error: unknown): string {
@@ -3127,18 +3147,20 @@ function safeIntegrationErrorMessage(error: unknown): string {
   return message;
 }
 
-function safeGmailIntegrationErrorMessage(error: unknown): string {
+function safeGmailIntegrationErrorMessage(error: unknown, connectionLastError?: string): string {
   if (!error || typeof error !== "object") {
-    return "Gmail sync failed.";
+    return connectionLastError ? safeGmailIntegrationMessageFromText(connectionLastError) : "Gmail sync failed.";
   }
 
   const err = error as Record<string, unknown>;
   const message =
-    typeof err.message === "string"
+    typeof err.error === "string"
+      ? err.error
+      : typeof err.message === "string"
       ? err.message
       : typeof err.description === "string"
         ? err.description
-        : "";
+        : connectionLastError ?? "";
 
   return safeGmailIntegrationMessageFromText(message);
 }
@@ -3147,7 +3169,11 @@ function safeGmailIntegrationMessageFromText(message: string): string {
   const lower = message.toLowerCase();
 
   if (lower.startsWith("gmail sync failed:")) {
-    return truncateText(message, 220);
+    return safeGmailIntegrationMessageFromText(message.replace(/^gmail sync failed:\s*/i, ""));
+  }
+
+  if (lower.includes("connection is in error status")) {
+    return "Gmail connection is in error status. Reconnect Gmail.";
   }
 
   if (lower.includes("gmail api has not been used") || lower.includes("disabled")) {
@@ -3156,6 +3182,14 @@ function safeGmailIntegrationMessageFromText(message: string): string {
 
   if (lower.includes("authorization") || lower.includes("refresh") || lower.includes("invalid_grant")) {
     return "Gmail authorization expired. Reconnect Gmail.";
+  }
+
+  if (lower.includes("token encryption key") || lower.includes("alecto_secret_encryption_key")) {
+    return "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.";
+  }
+
+  if (lower.includes("token could not be read") || lower.includes("decrypt")) {
+    return "Gmail token could not be read/decrypted. Reconnect Gmail.";
   }
 
   if (lower.includes("permission") || lower.includes("scope") || lower.includes("insufficient")) {
@@ -3317,7 +3351,11 @@ function isFetchError(error: unknown) {
 async function errorFromResponse(response: Response, fallbackMessage: string): Promise<Error> {
   try {
     const body = (await response.json()) as { error?: unknown };
-    return new Error(typeof body.error === "string" && body.error.trim() ? body.error : fallbackMessage);
+    const error = new Error(typeof body.error === "string" && body.error.trim() ? body.error : fallbackMessage);
+    if (body && typeof body === "object") {
+      Object.assign(error, body);
+    }
+    return error;
   } catch {
     return new Error(fallbackMessage);
   }

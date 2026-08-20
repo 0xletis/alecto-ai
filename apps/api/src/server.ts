@@ -153,6 +153,7 @@ import { buildOnboardingState, composeOnboardingReply } from "./legacy/daily-con
 import { registerMessageRoutes } from "./routes/messages.js";
 import { createMessagesProcessHandler } from "./legacy/messages-process.js";
 import { registerAgentRoutes, defaultAgentRouteHandlers } from "./routes/agent.js";
+import { configureAgentRuntimeServices } from "./agent-runtime/services.js";
 import { registerMemoryRoutes } from "./routes/memory.js";
 import { registerNotificationSettingsRoutes } from "./routes/notification-settings.js";
 import { registerCheckinsIngestRoutes } from "./routes/checkins-ingest.js";
@@ -266,6 +267,8 @@ export function buildServer() {
   const server = Fastify({
     logger: true
   });
+
+  configureAgentRuntimeServices({ syncGmailForUser: syncGmailForConversation });
 
   server.get("/health", async () => ({
     ok: true,
@@ -1583,6 +1586,17 @@ export function buildServer() {
       }
 
       if (connection.status === "error") {
+        if (connection.integrationId === "gmail") {
+          return reply.status(400).send({
+            error: safeGmailErrorMessage(connection.lastError ?? "Gmail authorization expired. Reconnect Gmail."),
+            connectionId: connection.id,
+            integrationId: connection.integrationId,
+            eventsCreated: 0,
+            emailSummaries: [],
+            errorStage: "token_refresh"
+          });
+        }
+
         return reply.status(400).send({
           error: "Integration connection is in error status. Resume it before syncing again."
         });
@@ -2313,11 +2327,17 @@ function isOperatorReflectionType(value: string): value is OperatorReflectionTyp
 }
 
 async function syncGmailForConversation(userId: string): Promise<string> {
-  const gmailConnections = (await getIntegrationConnections(userId)).filter(
-    (connection) => connection.integrationId === "gmail" && connection.status === "active"
+  const allGmailConnections = (await getIntegrationConnections(userId)).filter(
+    (connection) => connection.integrationId === "gmail" && connection.status !== "archived"
   );
+  const gmailConnections = allGmailConnections.filter((connection) => connection.status === "active");
 
   if (gmailConnections.length === 0) {
+    const erroredConnection = allGmailConnections.find((connection) => connection.status === "error");
+    if (erroredConnection) {
+      return safeGmailErrorMessage(erroredConnection.lastError ?? "Gmail authorization expired. Reconnect Gmail.");
+    }
+
     return "Gmail is not connected yet. Say 'connect Gmail' or use /connect_gmail.";
   }
 
@@ -2389,7 +2409,12 @@ function formatConversationGmailSyncResult(result: {
 }): string {
   if (result.status === "error") {
     const safeError = safeGmailErrorMessage(result.error);
-    if (safeError.includes("Gmail token encryption key is missing") || safeError.startsWith("Gmail sync failed:")) {
+    if (
+      safeError.includes("Gmail token encryption key is missing") ||
+      safeError.includes("Gmail authorization expired") ||
+      safeError.includes("Gmail token could not be read/decrypted") ||
+      safeError.startsWith("Gmail sync failed:")
+    ) {
       return safeError;
     }
 
@@ -4548,7 +4573,11 @@ async function readGmailToken(connection: IntegrationConnection): Promise<GmailS
         );
       }
 
-      throw new GmailSyncError("GMAIL_AUTH_EXPIRED", "Gmail authorization expired. Reconnect Gmail.", "token_refresh");
+      throw new GmailSyncError(
+        "GMAIL_AUTH_EXPIRED",
+        "Gmail token could not be read/decrypted. Reconnect Gmail.",
+        "token_refresh"
+      );
     }
   }
 
@@ -4746,6 +4775,10 @@ function safeGmailErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const lower = message.toLowerCase();
 
+  if (lower.startsWith("gmail sync failed:")) {
+    return safeGmailErrorMessage(message.replace(/^gmail sync failed:\s*/i, ""));
+  }
+
   if (lower.includes("gmail api has not been used") || lower.includes("disabled")) {
     return "Gmail API is disabled in Google Cloud project. Enable Gmail API and retry.";
   }
@@ -4754,7 +4787,17 @@ function safeGmailErrorMessage(error: unknown): string {
     return "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.";
   }
 
-  if (lower.includes("refresh token") || lower.includes("invalid_grant") || lower.includes("unauthorized")) {
+  if (lower.includes("token could not be read") || lower.includes("decrypt")) {
+    return "Gmail token could not be read/decrypted. Reconnect Gmail.";
+  }
+
+  if (
+    lower.includes("refresh token") ||
+    lower.includes("invalid_grant") ||
+    lower.includes("unauthorized") ||
+    lower.includes("authorization expired") ||
+    lower.includes("invalid credentials")
+  ) {
     return "Gmail authorization expired. Reconnect Gmail.";
   }
 

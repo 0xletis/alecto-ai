@@ -84,6 +84,7 @@ export function composeReply(input: ComposeReplyInput): string {
 
 const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "operator.recent_changes",
+  "gmail.sync",
   "gmail.rule.create",
   "action.hygiene_apply",
   "planning.next_week_apply",
@@ -122,6 +123,7 @@ const HUMAN_ACTION: Record<string, string> = {
   "event.log_workout": "log that workout",
   "event.log_custom_progress": "log that progress",
   "memory.create": "save that memory",
+  "gmail.sync": "sync Gmail",
   "gmail.rule.create": "set up that Gmail rule",
   "gmail.review.reject": "reject that email review",
   "gmail.review.to_action": "turn that email into a task",

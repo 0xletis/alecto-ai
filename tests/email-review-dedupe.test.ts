@@ -882,7 +882,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: expiredAuthUserId, message: "sync Gmail" }
     });
     assert.equal(response.statusCode, 200);
-    assert.equal(response.json().reply, "Gmail sync failed: Gmail authorization expired. Reconnect Gmail.");
+    assert.equal(response.json().reply, "Gmail authorization expired. Reconnect Gmail.");
     assert.doesNotMatch(response.json().reply, /Gmail sync failed: Gmail sync failed/);
     assert.doesNotMatch(response.json().reply, /expired-auth-access-token|expired-auth-refresh-token|ciphertext|"iv"|"tag"/);
 

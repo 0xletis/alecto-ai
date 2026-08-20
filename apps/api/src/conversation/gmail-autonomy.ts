@@ -79,11 +79,15 @@ export async function buildGmailAutonomyState(
   ]);
   const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived");
   const activeGmailConnections = gmailConnections.filter((connection) => connection.status === "active");
-  const primaryConnection = activeGmailConnections[0] ?? gmailConnections[0];
-  const activeConnectionIds = new Set(activeGmailConnections.map((connection) => connection.id));
+  const activeRuleConnectionIds = new Set(rules.filter((rule) => rule.status === "active").map((rule) => rule.connectionId));
+  const primaryConnection =
+    activeGmailConnections.find((connection) => activeRuleConnectionIds.has(connection.id)) ??
+    gmailConnections.find((connection) => activeRuleConnectionIds.has(connection.id)) ??
+    activeGmailConnections[0] ??
+    gmailConnections[0];
   const visibleConnectionIds = new Set(gmailConnections.map((connection) => connection.id));
   const visibleRules = rules.filter((rule) => rule.status !== "archived" && visibleConnectionIds.has(rule.connectionId));
-  const activeRules = visibleRules.filter((rule) => rule.status === "active" && activeConnectionIds.has(rule.connectionId));
+  const activeRules = visibleRules.filter((rule) => rule.status === "active");
   const pausedRules = visibleRules.filter((rule) => rule.status !== "active");
   const preferences = readGmailAutonomyPreferences(primaryConnection?.config);
   const syncMode = primaryConnection ? effectiveGmailSyncMode(preferences, runtime) : "unknown";

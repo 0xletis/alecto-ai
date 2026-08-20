@@ -335,6 +335,11 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     });
   }
 
+  const gmailSyncShortcut = gmailSyncShortcutOperation(message);
+  if (gmailSyncShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailSyncShortcut, "gmail_sync");
+  }
+
   const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
   if (gmailConnectionShortcut) {
     return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
@@ -545,14 +550,36 @@ function gmailConnectionShortcutOperation(message: string, context: ContextBundl
   const mentionsGmailOrEmail = /\b(gmail|email|emails|mail|mails)\b/.test(text);
   const asksConnectionAction = /\b(connect|reconnect|integrate|setup|set up|authorize|reauthorize|fix)\b/.test(text);
   const asksForLink = /\blink\b|\boauth\b|\bauth url\b|\bauthori[sz]ation url\b/.test(text);
+  const asksStatus = /\b(status|state|connected|connection|configured|setup)\b/.test(text);
   const mentionsAuthProblem = /\bgmail\b[\s\S]{0,50}\b(expired|unauthori[sz]ed|permission|scope|auth|authorization)\b|\b(expired|unauthori[sz]ed|permission|scope|auth|authorization)\b[\s\S]{0,50}\bgmail\b/.test(text);
   const contextualReconnectLink = asksForLink && /\b(connect|reconnect|authorize|reauthorize|fix|it)\b/.test(text) && hasRecentGmailContext(context);
 
-  if ((mentionsGmailOrEmail && (asksConnectionAction || asksForLink)) || mentionsAuthProblem || contextualReconnectLink) {
-    return { tool: "gmail.status", args: { includeLink: true }, rationale: "user asked for Gmail connection or reconnect help" };
+  if ((mentionsGmailOrEmail && (asksConnectionAction || asksForLink || asksStatus)) || mentionsAuthProblem || contextualReconnectLink) {
+    const includeLink = asksConnectionAction || asksForLink || mentionsAuthProblem || contextualReconnectLink;
+    return { tool: "gmail.status", args: { includeLink }, rationale: "user asked for Gmail connection or reconnect help" };
   }
 
   return undefined;
+}
+
+function gmailSyncShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+
+  if (!text || looksLikeGmailAlertSettingsRequest(text)) {
+    return undefined;
+  }
+
+  const explicitSync =
+    /\b(sync|refresh|update)\b[\s\S]{0,30}\b(gmail|email|emails|correo|correos|mail|mails)\b/.test(text) ||
+    /\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,30}\b(sync|refresh|update)\b/.test(text) ||
+    /\b(check|look for|buscar|busca|revisar|revisa)\b[\s\S]{0,35}\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,25}\b(now|new|nuevos?|ahora)?\b/.test(text) ||
+    /\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,35}\b(now|new|nuevos?|ahora)\b/.test(text);
+
+  if (!explicitSync) {
+    return undefined;
+  }
+
+  return { tool: "gmail.sync", args: {}, rationale: "user explicitly asked to sync Gmail/email now" };
 }
 
 function gmailNudgeSettingsShortcutOperation(message: string): PlannedOperation | undefined {
@@ -819,6 +846,7 @@ function inferTopicFromOperations(operations: PlannedOperation[]): string | null
     if (op.tool === "gmail.rule.list" || op.tool === "gmail.rule.explain") return "gmail_rules";
     if (op.tool.startsWith("gmail.rule.")) return "gmail_rule_management";
     if (op.tool.startsWith("gmail.review")) return "gmail_reviews";
+    if (op.tool === "gmail.sync") return "gmail_sync";
     if (op.tool === "gmail.status") return "gmail_status";
     if (op.tool.startsWith("memory.")) return "memory";
     if (op.tool.startsWith("event.")) return "progress_logging";

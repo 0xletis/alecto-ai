@@ -46,7 +46,19 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
     getLatestPendingAction(userId)
   ]);
 
-  const gmailConnection = integrationConnections.find((connection) => connection.integrationId === "gmail");
+  const activeGmailRuleConnectionIds = new Set(
+    gmailRules.filter((rule) => rule.status === "active").map((rule) => rule.connectionId)
+  );
+  const gmailConnection =
+    integrationConnections.find(
+      (connection) =>
+        connection.integrationId === "gmail" &&
+        connection.status === "active" &&
+        activeGmailRuleConnectionIds.has(connection.id)
+    ) ??
+    integrationConnections.find((connection) => connection.integrationId === "gmail" && connection.status === "active") ??
+    integrationConnections.find((connection) => connection.integrationId === "gmail" && connection.status !== "archived") ??
+    integrationConnections.find((connection) => connection.integrationId === "gmail");
 
   return {
     user,

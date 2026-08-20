@@ -558,3 +558,19 @@ Real Telegram smoke after §25 found two V3 routing bugs: "turn on Gmail nudges"
 **Tests:** `tests/agent-runtime-gmail-reconnect.test.ts` covers Gmail-alert proposal with expired auth and no sync tool, normal-user English/Spanish alert phrases, confirmation enabling `gmailNudgeEnabled`, reconnect/setup/link phrases returning the OAuth URL, `integrate email` returning reconnect action rather than passive error status, no token/ciphertext leakage, stale legacy pending state not blocking explicit Gmail-alert setup, pending proactive settings not hijacking reconnect-link requests, and exact yes/cancel still resolving pending settings. Existing Gmail sync tests remain in the legacy `/messages/process` suite. Optional LLM eval scenario 9b covers `tell me when important emails arrive` -> confirm -> reconnect link through the same `/agent/message` path, but remains skipped in normal `pnpm test`.
 
 **Still unchanged:** manual `sync Gmail`, scheduled Gmail polling, Gmail review creation/classification/dedupe, legacy slash commands, `/messages/process`, legacy bundled review notifications, V3 Gmail alert delivery, and `evening_checkin` preview-only status.
+
+## 27. V3 Gmail manual sync routing/status consistency polish (implemented)
+
+Real Telegram smoke after §26 found a sharper split: normal-chat `sync Gmail` and `sync email` returned passive Gmail status instead of syncing, while slash `/sync_gmail` did call the sync route but returned opaque `Integration sync failed for gmail <uuid>: Gmail sync failed.` lines for expired/error connections. The same smoke also showed `gmail status` saying no active rules while a rule-list question showed active rules.
+
+**V3 sync ownership:** new V3 tool `gmail.sync` handles explicit sync phrases (`sync Gmail`, `sync email`, `check Gmail now`, `check my email now`, `refresh Gmail`, `look for new emails now`). It delegates to the existing server-provided `syncGmailForConversation` service through `apps/api/src/agent-runtime/services.ts`, preserving the same Gmail OAuth/search/classification/dedupe/manual-sync path used by `/sync_gmail`. It does not enable rules, scan all mail, mutate Gmail, schedule background polling, or implement webhooks.
+
+**Routing split:** `gmail.status` stays read-only for status/connect/reconnect/setup/link questions and does not sync. Gmail alert preference phrases continue to route to `proactive.settings_propose_update`, not sync. The planner prompt and deterministic shortcut layer both name the split explicitly so `sync Gmail` cannot be swallowed by status again.
+
+**Consistency:** the V3 context loader and shared Gmail autonomy state now prefer an active Gmail connection with active rules when duplicate/stale Gmail connections exist. `gmail.status` and `gmail.rule.list` read from the same active-rule source.
+
+**Safe errors:** Gmail error formatting now strips nested `Gmail sync failed:` prefixes and maps expired authorization, token read/decrypt failure, missing encryption key, disabled Gmail API, permission/scope, rate limit, and invalid query to safe user-facing reasons. Error-status Gmail sync route responses include the safe reason in JSON so Telegram slash formatting can avoid per-UUID spam. No token, ciphertext, IV, auth tag, raw provider JSON, or provider stack trace is returned.
+
+**Tests:** `tests/agent-runtime-gmail-sync.test.ts` covers explicit sync phrases, expired auth/token failure reconnect output, no-active-rule messaging, status/rule-list consistency with multiple Gmail connections, alert/status routing not syncing, and the integration sync route's safe error JSON. Optional LLM eval scenario 9b now asserts `sync Gmail` plans `gmail.sync` and shows a reconnect action on auth failure.
+
+**Still unchanged:** Gmail webhooks/PubSub, all-inbox monitoring, scheduled polling cadence, Gmail review creation/classification/dedupe, V3 Gmail alert delivery, legacy bundled notifications, `/messages/process`, and slash command ownership.
