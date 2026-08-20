@@ -383,7 +383,15 @@ export const toolCatalog: ToolDefinition[] = [
         .describe("A real registered event type (e.g. 'career.recruiter_reply_received', 'learning.reading_session_completed') that some active goal already declares as one of its own targetMetrics — never invented, never guessed."),
       signalKey: z.string().min(1).optional().describe("A CUSTOM signal key an active goal already declared for itself — never invented, never a fixed eventType's own name."),
       goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it, when it matters for disambiguation (e.g. more than one active goal could own this signal). Matched against real active goal titles/categories, never an invented id. Omit if only one goal could plausibly own this signal."),
-      count: z.number().int().positive().max(20).optional().describe("Defaults to 1. Set higher only when the user gave an explicit count, e.g. 'got 2 recruiter replies', 'had 2 teas'."),
+      count: z
+        .number()
+        .int()
+        .positive()
+        .max(1000)
+        .optional()
+        .describe(
+          "Defaults to 1. Set to the user's own explicit count, e.g. 'got 2 recruiter replies' -> 2, 'had 2 teas' -> 2, 'read 30 minutes' -> 30 — this is a plain count of whatever unit the signal is in (replies, cups, minutes, pages, ...), not capped to a handful."
+        ),
       notes: z.string().optional().describe("Free-text detail actually stated by the user, e.g. a company name — never invented.")
     })
   },

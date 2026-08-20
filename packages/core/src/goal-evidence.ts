@@ -93,3 +93,122 @@ export function countEvidenceForMetric(metric: Pick<GoalMetric, "eventType" | "s
 
   return 0;
 }
+
+/**
+ * Goal Reference Fix pass, round 2 (a real Telegram smoke test): a goal proposed/created with
+ * only a completion-style signal ("Meditations finished") gives the user nothing to log or see
+ * until the very end, and — worse — if the user later reports real partial progress ("I read 30
+ * minutes today"), there is no compatible declared signal to log it against at all, so either the
+ * evidence is silently dropped or a confident-sounding reply overclaims. These two generic,
+ * text-shape heuristics (never a specific book/goal title) classify a signal's key+label as
+ * "progress-shaped" (an ongoing, repeatable unit — minutes, pages, sessions, reps, calls, ...) or
+ * "completion-shaped" (a one-time done/finished marker) — used both when PROPOSING a new
+ * book/reading goal (ensureBookGoalProgressSignal below) and when LOGGING evidence against an
+ * EXISTING goal that turns out to only have a completion signal (see executor.ts's
+ * goal.log_evidence). Deliberately permissive/best-effort, matching this module's existing
+ * "never invents evidence, but a missed classification degrades to asking rather than a false
+ * block" philosophy — these decide what to OFFER or PROPOSE, never what to write to the DB; every
+ * actual mutation still goes through the existing find*For* verification above.
+ */
+// Deliberately does NOT include "reading" on its own — it appears just as often in a
+// COMPLETION-shaped label ("finished reading the book") as a progress one, so it isn't a reliable
+// signal either way; the actually-quantitative units below (minutes, pages, sessions, ...) are.
+const PROGRESS_SIGNAL_TEXT_PATTERN = /\b(minutes?|mins?|hours?|pages?|chapters?|sessions?|reps?|sets?|cups?|calls?|steps?|miles?|applications?)\b/i;
+const COMPLETION_SIGNAL_TEXT_PATTERN = /\b(finish(ed)?|complete(d)?|done)\b/i;
+
+/** snake_case/kebab-case keys ("reading_minutes," "book-finished") have no real \b word boundary
+ * at an underscore/hyphen — both are \w characters as far as regex is concerned — so a bare key
+ * checked on its own (not paired with a human label that already has real spaces) needs those
+ * separators normalized to spaces first, or "reading_minutes" would match neither pattern at all. */
+function normalizeSignalText(text: string): string {
+  return text.replace(/[_-]+/g, " ");
+}
+
+export function isProgressShapedSignalText(text: string): boolean {
+  const normalized = normalizeSignalText(text);
+  return PROGRESS_SIGNAL_TEXT_PATTERN.test(normalized) && !COMPLETION_SIGNAL_TEXT_PATTERN.test(normalized);
+}
+
+export function isCompletionShapedSignalText(text: string): boolean {
+  return COMPLETION_SIGNAL_TEXT_PATTERN.test(normalizeSignalText(text));
+}
+
+/** Generic "does this goal look like a book/reading goal" check — title or category only, never a
+ * specific book title. Used only to decide whether to apply the book-goal signal defaults below;
+ * a goal that happens to also mention "book"/"reading" for an unrelated reason gets, at worst, an
+ * unused extra signal offered — never a wrong mutation, since nothing here writes to the DB. */
+export function looksLikeBookOrReadingGoal(goal: Pick<Goal, "title" | "category">): boolean {
+  return /\b(book|books|reading|read|novel|chapter|chapters)\b/i.test(`${goal.title} ${goal.category}`);
+}
+
+interface ProposedSignal {
+  key: string;
+  label: string;
+  unit?: string;
+  cadence?: "daily" | "weekly";
+}
+
+/**
+ * If a proposed book/reading goal's signals are completion-only (no progress-shaped signal at
+ * all), prepends a generic "reading minutes" progress signal — deterministic, not left to the
+ * LLM's own discretion, since prompt guidance alone did not reliably produce one in practice.
+ * A no-op for any goal that isn't book/reading-shaped, already has a progress signal, or has no
+ * signals yet at all (goal.create_propose's own "at least one signal" check handles that case).
+ */
+export function ensureBookGoalProgressSignal<T extends Pick<Goal, "title" | "category"> & { signals: ProposedSignal[] }>(
+  input: T
+): ProposedSignal[] {
+  if (!looksLikeBookOrReadingGoal(input) || input.signals.length === 0) {
+    return input.signals;
+  }
+
+  // Classified off the LABEL alone, never the key — a key derived from the goal's own title (as
+  // the one this function injects below is) will often legitimately contain a completion word
+  // like "finish" (from "Finish reading X"), which must not make the signal look completion-
+  // shaped when its actual label ("reading minutes") plainly says otherwise.
+  const hasProgressSignal = input.signals.some((signal) => isProgressShapedSignalText(signal.label));
+  if (hasProgressSignal) {
+    return input.signals;
+  }
+
+  const isCompletionOnly = input.signals.every((signal) => isCompletionShapedSignalText(signal.label));
+  if (!isCompletionOnly) {
+    return input.signals;
+  }
+
+  // The key is derived from the goal's own title, not a fixed "reading_minutes" constant — a
+  // shared literal key across different book goals (e.g. two separate "finish book X"/"finish
+  // book Y" goals) would make findGoalsForSignalKey's exact-key lookup match the WRONG goal
+  // whenever a user's message doesn't specify one, exactly the kind of cross-goal mixup this
+  // whole pass exists to prevent. Always ends in "_reading_minutes" so callers/tests can still
+  // recognize it generically without needing the exact per-goal prefix.
+  return [{ key: `${slugifyForSignalKey(input.title)}_reading_minutes`, label: "reading minutes", unit: "minutes", cadence: "daily" }, ...input.signals];
+}
+
+function slugifyForSignalKey(text: string): string {
+  const slug = text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 24);
+  return slug || "book";
+}
+
+/** The first declared metric on a goal that looks progress-shaped (by its own LABEL — never the
+ * key, which may be a title-derived slug that legitimately contains an unrelated completion word,
+ * e.g. "finish_reading_x_reading_minutes" for a goal titled "Finish reading X") — used to remap a
+ * signalKey the LLM guessed to the goal's REAL declared key when they don't literally match but
+ * both plainly mean "ongoing progress," e.g. a guessed "reading_minutes" against a goal that
+ * actually declared "pages_read_daily" / "pages read." Never crosses goals: only ever looks at the
+ * ONE goal already resolved (by goalRef or conversation focus) for this log attempt. */
+export function findCompatibleProgressMetric<T extends Pick<Goal, "targetMetrics">>(goal: T): GoalMetric | undefined {
+  return (goal.targetMetrics ?? []).find((metric) => isProgressShapedSignalText(metric.label));
+}
+
+/** True only when a goal has at least one declared signal and EVERY one of them is
+ * completion-shaped by its own LABEL — i.e. there is genuinely no progress signal to log partial
+ * evidence against. */
+export function goalHasOnlyCompletionSignals<T extends Pick<Goal, "targetMetrics">>(goal: T): boolean {
+  const metrics = goal.targetMetrics ?? [];
+  return metrics.length > 0 && metrics.every((metric) => isCompletionShapedSignalText(metric.label));
+}

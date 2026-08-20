@@ -66,6 +66,23 @@ export async function checkGoalGuardrail(message: string, context: ContextBundle
     return ALLOW;
   }
 
+  // A real Telegram smoke test found the LLM classification tier below misreading ordinary
+  // progress reports — "i didnt finish it but i read 30min today," "log it," "I only did 5
+  // minutes," "I missed gym but walked 30min," "I sent 1 CV, not 3" — as "lapse_admission"/
+  // "avoidance" against a goal, purely because they mention a shortfall word ("didn't
+  // finish"/"missed"/"only") alongside real activity. Reporting partial progress toward an
+  // ongoing tracked goal is not sabotage of it; it's exactly the kind of evidence goal.log_evidence
+  // exists to capture. This is a deterministic, generic shape check — any quantified activity
+  // ("<number> <unit>") or an explicit logging phrase ("log it," "logged that") — not a per-domain
+  // classifier, so it applies the same way to reading, gym, job applications, or anything else the
+  // user tracks. It only ever widens what reaches normal planning; an explicit user-configured
+  // trigger above still always hard-stops regardless of shape, and the LLM tier below still runs
+  // for genuinely ambiguous or avoidance-shaped messages (a message with no quantity/log phrase at
+  // all, e.g. "I'd rather watch TV than read tonight," still reaches classification as before).
+  if (looksLikeProgressReport(message)) {
+    return { ...ALLOW, reason: "progress_report_shape" };
+  }
+
   const classification = await classifyGoalConflict(message, context.activeGoals);
   if (!classification) {
     return { ...ALLOW, llmAttempted: true };
@@ -132,6 +149,20 @@ function findGoalRelatedToTrigger(trigger: string, goals: Goal[]): Goal | undefi
     const goalWords = new Set(significantWords(`${goal.title} ${goal.why ?? ""}`));
     return triggerWords.some((word) => goalWords.has(word));
   });
+}
+
+/** A quantified unit ("30 minutes," "5 pages," "2 CVs," "1 rep") or an explicit intent to record
+ * something ("log it," "logged that") — generic activity-report shapes, not tied to any one
+ * domain's vocabulary. Deliberately permissive (a few false exemptions fail open to normal
+ * planning, matching this module's existing "a missed intervention degrades to ordinary chat,
+ * never a false block" philosophy) rather than trying to also rule out every message that merely
+ * mentions a number for some other reason. */
+const QUANTIFIED_ACTIVITY_PATTERN =
+  /\b\d+(\.\d+)?\s*(min(ute)?s?|hrs?|hours?|pages?|chapters?|sessions?|reps?|sets?|cups?|calls?|cvs?|applications?|miles?|km|steps?|times?)\b/i;
+const LOG_INTENT_PATTERN = /\blog(ged|ging)\b|\blog\s+(it|that|this)\b/i;
+
+function looksLikeProgressReport(message: string): boolean {
+  return QUANTIFIED_ACTIVITY_PATTERN.test(message) || LOG_INTENT_PATTERN.test(message);
 }
 
 function significantWords(text: string): string[] {

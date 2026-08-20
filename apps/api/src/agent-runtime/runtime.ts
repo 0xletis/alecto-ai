@@ -743,7 +743,24 @@ function applyExecutionSideEffects(session: AgentSessionState, executedOps: Exec
 
   if (entities.length > 0) {
     setVisibleEntities(session, dedupeEntities(entities));
+    updateFocusedEntities(session, entities);
   }
+}
+
+/**
+ * Merges this turn's entities into session.focusedEntities, one slot per entity type, last one
+ * this turn wins. Deliberately separate from setVisibleEntities above: visibleEntities is
+ * replaced wholesale every turn that returns any entity (right for a numbered list, which really
+ * is gone once a new one is shown), but a "current goal" (or any other focused entity) must stay
+ * put across turns whose own operations don't touch that type at all — see
+ * types.ts's AgentFocusedEntities doc comment for why this fixed a real multi-turn goal bug.
+ */
+function updateFocusedEntities(session: AgentSessionState, entities: AgentEntity[]): void {
+  const next = { ...session.focusedEntities };
+  for (const entity of entities) {
+    next[entity.type] = entity;
+  }
+  session.focusedEntities = next;
 }
 
 function dedupeEntities(entities: AgentEntity[]): AgentEntity[] {

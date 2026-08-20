@@ -4,3 +4,7 @@ apps/*/dist/
 packages/*/dist/
 
 .env
+
+# Trace dumps from the optional real-LLM eval harness (tests/agent-runtime-llm-eval.test.ts) —
+# written only on a failing scenario, for local debugging, never checked in.
+tests/.llm-eval-traces/

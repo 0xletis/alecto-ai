@@ -167,6 +167,19 @@ export interface AgentSessionMessage {
   at: string;
 }
 
+/**
+ * At most one "current" entity per type — e.g. `focusedEntities.goal` is whichever goal was most
+ * recently shown/resolved/created/logged against, distinct from `visibleEntities` (a general,
+ * whole-list-replaced-per-turn set used for numbered-list references like "complete 1"). Unlike
+ * visibleEntities, a focused entity is STICKY: it survives turns whose own operations don't
+ * mention that entity type at all (see runtime.ts's applyExecutionSideEffects), which is exactly
+ * what a follow-up pronoun ("it", "that goal", "how's it going") needs — the most recently
+ * created goal is not necessarily the one the conversation is currently about. Backed by the
+ * AgentConversationSession.focusedEntities column, reserved for this since the schema's initial
+ * design (see session-store.ts's prior "reserved for forward compatibility" comment).
+ */
+export type AgentFocusedEntities = Partial<Record<AgentEntity["type"], AgentEntity>>;
+
 export interface AgentSessionState {
   userId: string;
   channel: string;
@@ -174,6 +187,7 @@ export interface AgentSessionState {
   topic: string | null;
   pendingOperation: AgentPendingOperation | null;
   visibleEntities: AgentEntity[];
+  focusedEntities: AgentFocusedEntities;
   recentMutations: AgentMutationRecord[];
 }
 

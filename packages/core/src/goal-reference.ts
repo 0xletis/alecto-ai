@@ -123,15 +123,23 @@ export interface ActiveGoalReferenceResolution<T extends Goal = Goal> {
 }
 
 /**
- * Resolves free text (as the user phrased it) against a list of active goals. `mostRecent`,
- * when given, is used whenever `goalRef` is absent/empty/a bare pronoun — Goal rows are already
- * fetched newest-first (packages/db's getActiveGoals), so passing `activeGoals[0]` there is
- * normally all a caller needs for "show tracking for it" right after creating a goal.
+ * Resolves free text (as the user phrased it) against a list of active goals.
+ *
+ * `currentFocus`, when given, is the goal the CONVERSATION is currently about — most recently
+ * shown/resolved/created/logged against, tracked by the caller across turns (see
+ * apps/api/src/agent-runtime/types.ts's AgentFocusedEntities) — not merely the newest goal that
+ * exists. It is preferred over `mostRecent` (the newest-created goal, from `activeGoals[0]` given
+ * DB rows are fetched newest-first) both for an empty/pronoun reference ("it," "that goal") and as
+ * a tiebreaker when it's one of several genuinely tied candidates: a real multi-turn bug had a
+ * user create a goal, ask about and get shown a DIFFERENT, older goal by name, then use a bare
+ * pronoun — the newest-created goal (mostRecent) was wrong; the one just shown (currentFocus) was
+ * right. `mostRecent` remains the fallback when no focus is set (e.g. a session's very first
+ * pronoun reference, right after creating one goal).
  */
 export function resolveActiveGoalReference<T extends Goal = Goal>(
   goalRef: string | undefined,
   activeGoals: T[],
-  options: { mostRecent?: T } = {}
+  options: { mostRecent?: T; currentFocus?: T } = {}
 ): ActiveGoalReferenceResolution<T> {
   const goals = activeGoals.filter((goal) => goal.status === "active");
 
@@ -139,8 +147,9 @@ export function resolveActiveGoalReference<T extends Goal = Goal>(
     return { status: "no_match" };
   }
 
+  const fallback = options.currentFocus ?? options.mostRecent;
   if (!goalRef || !goalRef.trim() || isPronounGoalReference(goalRef)) {
-    return options.mostRecent ? { status: "matched", goal: options.mostRecent } : { status: "no_match" };
+    return fallback ? { status: "matched", goal: fallback } : { status: "no_match" };
   }
 
   const normalizedRef = normalizeGoalText(goalRef);
@@ -183,7 +192,9 @@ export function resolveActiveGoalReference<T extends Goal = Goal>(
         reason = "category match";
       }
 
-      if (options.mostRecent?.id === goal.id) {
+      if (options.currentFocus?.id === goal.id) {
+        score += 2;
+      } else if (options.mostRecent?.id === goal.id) {
         score += 1;
       }
 
@@ -201,6 +212,14 @@ export function resolveActiveGoalReference<T extends Goal = Goal>(
   const withinMargin = scored.filter((entry) => entry.score >= top.score - AMBIGUITY_MARGIN);
 
   if (withinMargin.length > 1) {
+    // A genuine tie among several plausible goals is exactly when "the one we were just talking
+    // about" should decide it, rather than asking the user to repeat themselves — but only when
+    // the focused goal is actually one of the tied candidates; it must never override a reference
+    // that clearly and specifically named a different goal (that goal already won on score alone).
+    const focusedCandidate = options.currentFocus && withinMargin.find((entry) => entry.goal.id === options.currentFocus!.id);
+    if (focusedCandidate) {
+      return { status: "matched", goal: focusedCandidate.goal };
+    }
     return { status: "ambiguous", candidates: withinMargin.map((entry) => entry.goal) };
   }
 

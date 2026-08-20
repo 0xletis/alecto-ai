@@ -29,9 +29,13 @@ import {
   countEvidenceForMetric,
   CUSTOM_SIGNAL_EVENT_TYPE,
   describeGoalEvidenceMatch,
+  ensureBookGoalProgressSignal,
   EventTypeSchema,
+  findCompatibleProgressMetric,
   findGoalsForEventType,
   findGoalsForSignalKey,
+  goalHasOnlyCompletionSignals,
+  isProgressShapedSignalText,
   parseActionDueDate,
   proactiveOperatorAllowlistActiveFromEnv,
   proactiveOperatorAllowlistFromEnv,
@@ -472,8 +476,8 @@ export async function executeOperation(
       }
 
       case "goal.log_evidence": {
+        let signalKey = args.signalKey as string | undefined;
         const eventType = args.eventType as string | undefined;
-        const signalKey = args.signalKey as string | undefined;
         const goalRef = args.goalRef as string | undefined;
         const count = (args.count as number | undefined) ?? 1;
         const notes = args.notes as string | undefined;
@@ -500,18 +504,50 @@ export async function executeOperation(
         }
         const verifiedEventType: EventTypeId | undefined = parsedEventType?.success ? parsedEventType.data : undefined;
 
+        const currentFocusGoal = resolveCurrentFocusGoal(context);
+
         if (signalKey && findGoalsForSignalKey(context.activeGoals, signalKey).length === 0) {
-          return failed(operation.tool, `I don't have a "${signalKey}" signal set up for any of your active goals. Say "what am I tracking for X?" to see the real signals.`);
+          // No active goal declares this EXACT key. Only even attempt a fallback when the
+          // REQUESTED key itself is progress-shaped ("reading_minutes," "pages_read") — this is
+          // strictly for a naming mismatch against the one goal this evidence is actually about
+          // (named via goalRef, else the conversation's current focus), never a reason to guess a
+          // link for an unrelated key like "called_grandmother" just because some goal happens to
+          // be in focus. A real Telegram smoke test hit the mismatch case: a book goal created with
+          // only a completion signal had no compatible key for "I read 30 minutes today" at all.
+          const referenced = goalRef ? resolveGoalReferenceTargets(goalRef, context.activeGoals, currentFocusGoal) : undefined;
+          const targetGoal = referenced?.status === "matched" ? referenced.goals[0] : currentFocusGoal;
+
+          if (targetGoal && isProgressShapedSignalText(signalKey)) {
+            const compatibleMetric = findCompatibleProgressMetric(targetGoal);
+            if (compatibleMetric?.signalKey) {
+              // The goal DOES track ongoing progress, just under a different key than guessed
+              // (e.g. guessed "reading_minutes" against a goal that declared "pages_read_daily")
+              // — remap to the goal's own real key rather than failing over a naming mismatch.
+              signalKey = compatibleMetric.signalKey;
+            } else if (goalHasOnlyCompletionSignals(targetGoal)) {
+              return failed(
+                operation.tool,
+                `"${targetGoal.title}" only tracks completion right now, not partial progress like this. Want me to add a progress signal (e.g. reading minutes) so I can log it?`
+              );
+            } else {
+              return failed(operation.tool, `I don't have a "${signalKey}" signal set up for any of your active goals. Say "what am I tracking for X?" to see the real signals.`);
+            }
+          } else {
+            return failed(operation.tool, `I don't have a "${signalKey}" signal set up for any of your active goals. Say "what am I tracking for X?" to see the real signals.`);
+          }
         }
 
         let matchedGoals = verifiedEventType ? findGoalsForEventType(context.activeGoals, verifiedEventType) : findGoalsForSignalKey(context.activeGoals, signalKey!);
 
-        // goalRef only ever NARROWS which of the already-verified matchedGoals this evidence is
-        // attributed to (for the reply's own honesty) — it can never make an otherwise-invalid
-        // signal valid, so an unresolved/ambiguous goalRef still logs the (already-verified) event
-        // rather than blocking it; only the display note becomes "your goal" instead of naming one.
-        if (goalRef && matchedGoals.length > 1) {
-          const resolution = resolveActiveGoalReference(goalRef, matchedGoals, { mostRecent: matchedGoals[0] });
+        // Narrows which of the already-verified matchedGoals this evidence is attributed to (for
+        // the reply's own honesty) — never makes an otherwise-invalid signal valid, so an
+        // unresolved/ambiguous reference still logs the (already-verified) event rather than
+        // blocking it; only the display note becomes "your goal" instead of naming one. Prefers an
+        // explicit goalRef, then the conversation's current focus (resolveActiveGoalReference's
+        // own pronoun/empty-reference fallback), then just the first match.
+        if (matchedGoals.length > 1) {
+          const focusAmongMatched = matchedGoals.find((goal) => goal.id === currentFocusGoal?.id);
+          const resolution = resolveActiveGoalReference(goalRef, matchedGoals, { mostRecent: matchedGoals[0], currentFocus: focusAmongMatched });
           if (resolution.status === "matched" && resolution.goal) {
             matchedGoals = [resolution.goal, ...matchedGoals.filter((goal) => goal.id !== resolution.goal!.id)];
           }
@@ -533,7 +569,8 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: `Logged ${signalLabel}${notes ? ` (${notes})` : ""}.${goalNote ? ` ${goalNote}` : ""}`,
-          result: created
+          result: created,
+          entities: matchedGoals[0] ? [goalToEntity(matchedGoals[0])] : undefined
         };
       }
 
@@ -858,7 +895,7 @@ export async function executeOperation(
 
       case "goal.status": {
         const goalRef = args.goalRef as string | undefined;
-        const outcome = resolveGoalReferenceTargets(goalRef, context.activeGoals);
+        const outcome = resolveGoalReferenceTargets(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
 
         if (outcome.status === "no_match") {
           if (context.activeGoals.length === 0) {
@@ -893,7 +930,11 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: summaries.join("\n\n"),
-          result: targetGoals
+          result: targetGoals,
+          // Only for a single specifically-resolved goal ("matched"), never "all" — asking about
+          // every goal at once must not narrow the conversation's focus to whichever happened to
+          // be last in that list.
+          entities: outcome.status === "matched" ? [goalToEntity(targetGoals[0])] : undefined
         };
       }
 
@@ -902,14 +943,20 @@ export async function executeOperation(
         const category = args.category as string;
         const why = args.why as string | undefined;
         const successCriteria = args.successCriteria as string | undefined;
-        const signals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
+        const rawSignals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
         const checkIn = args.checkIn as GoalPlanCheckIn | undefined;
         const integrationHint = args.integrationHint as string | undefined;
         const firstActions = (args.firstActions as string[] | undefined) ?? [];
 
-        if (signals.length === 0) {
+        if (rawSignals.length === 0) {
           return failed(operation.tool, "I need at least one trackable signal to propose a plan for this goal.");
         }
+
+        // Deterministic, not left to the LLM's own discretion: a "finish/read a book"-shaped goal
+        // proposed with only a completion signal ("book finished") gives the user nothing to log
+        // until the very end — a real Telegram smoke test found prompt guidance alone didn't
+        // reliably prevent this. Generic for any book/reading-shaped goal, never a specific title.
+        const signals = ensureBookGoalProgressSignal({ title, category, signals: rawSignals });
 
         return {
           tool: operation.tool,
@@ -934,9 +981,14 @@ export async function executeOperation(
         const title = args.title as string;
         const category = args.category as string;
         const why = args.why as string | undefined;
-        const signals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
+        const rawSignals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
         const checkIn = args.checkIn as GoalPlanCheckIn | undefined;
         const firstActions = (args.firstActions as string[] | undefined) ?? [];
+
+        // Defensive/idempotent — goal.create_apply is normally only reached with signals already
+        // augmented by goal.create_propose above (the confirm whitelist re-executes the exact
+        // pendingOperation args), but this keeps the guarantee even if that ever changes.
+        const signals = ensureBookGoalProgressSignal({ title, category, signals: rawSignals });
 
         const targetMetrics: GoalMetric[] = signals.map((signal) => ({
           key: signal.key,
@@ -989,7 +1041,7 @@ export async function executeOperation(
 
       case "goal.tracking_show": {
         const goalRef = args.goalRef as string | undefined;
-        const outcome = resolveGoalReferenceTargets(goalRef, context.activeGoals);
+        const outcome = resolveGoalReferenceTargets(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
 
         if (outcome.status === "no_match") {
           if (context.activeGoals.length === 0) {
@@ -1011,7 +1063,8 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: outcome.goals.map((goal) => formatGoalTrackingForChat(goal)).join("\n\n"),
-          result: outcome.goals
+          result: outcome.goals,
+          entities: outcome.status === "matched" ? [goalToEntity(outcome.goals[0])] : undefined
         };
       }
 
@@ -1439,12 +1492,15 @@ export interface GoalReferenceOutcome {
  *
  * No goalRef at all means "report on every active goal" (unchanged prior behavior — e.g. "how are
  * my goals doing?"). A goalRef that resolves to exactly one goal (including a bare "it"/"that
- * goal" right after creating one, via mostRecent — activeGoals is already newest-first) is
- * "matched". Two or more goals landing within the resolver's ambiguity margin is "ambiguous" —
- * never silently guessed. A goalRef naming nothing real is "no_match" — also never silently
- * widened back to every goal, unlike the old inferGoalLinkForAction-based fallback here.
+ * goal" right after creating, showing, or logging against one — see `currentFocus` below, and
+ * `mostRecent`, tried only when there's no focus yet) is "matched". Two or more goals landing
+ * within the resolver's ambiguity margin is "ambiguous" — never silently guessed, UNLESS the
+ * conversation's current focus is one of the tied candidates, in which case that's what "the one
+ * we were just talking about" means and it wins without asking. A goalRef naming nothing real is
+ * "no_match" — also never silently widened back to every goal, unlike the old
+ * inferGoalLinkForAction-based fallback here.
  */
-function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: Goal[]): GoalReferenceOutcome {
+function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: Goal[], currentFocus?: Goal): GoalReferenceOutcome {
   if (activeGoals.length === 0) {
     return { status: "no_match", goals: [] };
   }
@@ -1453,7 +1509,7 @@ function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: G
     return { status: "all", goals: activeGoals };
   }
 
-  const resolution = resolveActiveGoalReference(goalRef, activeGoals, { mostRecent: activeGoals[0] });
+  const resolution = resolveActiveGoalReference(goalRef, activeGoals, { mostRecent: activeGoals[0], currentFocus });
 
   if (resolution.status === "matched" && resolution.goal) {
     return { status: "matched", goals: [resolution.goal] };
@@ -1464,6 +1520,17 @@ function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: G
   }
 
   return { status: "no_match", goals: [] };
+}
+
+/**
+ * Whichever goal the CONVERSATION is currently about — see types.ts's AgentFocusedEntities —
+ * re-verified against real, currently-active goals (never trusted as-is: the session only caches
+ * an id+label, e.g. the goal could have been archived since). Undefined when nothing is focused
+ * yet (a session's first goal-related turn) or the focused goal is no longer active.
+ */
+function resolveCurrentFocusGoal(context: ContextBundle): Goal | undefined {
+  const focusedGoalEntity = context.session.focusedEntities?.goal;
+  return focusedGoalEntity ? context.activeGoals.find((goal) => goal.id === focusedGoalEntity.id) : undefined;
 }
 
 function describeAmbiguousGoalChoice(candidates: Goal[]): string {
