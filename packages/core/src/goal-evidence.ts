@@ -1,4 +1,4 @@
-import type { Goal } from "./goals.js";
+import type { Goal, GoalMetric } from "./goals.js";
 
 /**
  * Generic Goal Evidence Loop MVP — the goal↔evidence linking primitive, extracted out of the
@@ -51,4 +51,45 @@ export function describeGoalEvidenceMatch(matchedGoals: Pick<Goal, "title">[]): 
   }
 
   return `This counts toward your "${matchedGoals[0].title}" goal.`;
+}
+
+/**
+ * Adaptive Goal Creation MVP (docs/10-v3-readiness-audit.md §21): the event type ANY custom,
+ * per-goal signal is stored under — deliberately the SAME generic catch-all
+ * event.log_custom_progress already wrote to, never a new EventType. The real per-signal
+ * discriminator lives in `data.signalKey`, not `type`, since many different custom goals (tea,
+ * calling family, screen time, ...) all share this one type.
+ */
+export const CUSTOM_SIGNAL_EVENT_TYPE = "custom.goal_progress_logged";
+
+/** Active goals that declare `signalKey` as one of their own targetMetrics — the custom-signal
+ * counterpart to findGoalsForEventType above, for goals with no registered EventType behind them
+ * at all (e.g. "tea_cups_drunk" for a "drink more tea" goal). Same shape, same guarantee: only
+ * ever matches a signal the goal itself declared at creation time, never inferred here. */
+export function findGoalsForSignalKey<T extends Pick<Goal, "status" | "targetMetrics">>(goals: T[], signalKey: string): T[] {
+  return goals.filter((goal) => goal.status === "active" && (goal.targetMetrics ?? []).some((metric) => metric.signalKey === signalKey));
+}
+
+interface EvidenceEventLike {
+  type: string;
+  data?: Record<string, unknown>;
+}
+
+/**
+ * How many of the given events count as evidence for ONE metric — registry-backed
+ * (metric.eventType) or custom (metric.signalKey), whichever the metric actually declares. A
+ * metric with neither never matches anything (never guesses). This is the one place that needs
+ * to know both metric shapes exist; every caller (goal.status, morning brief, future callers)
+ * just asks "how much evidence for this metric" without caring which kind it is.
+ */
+export function countEvidenceForMetric(metric: Pick<GoalMetric, "eventType" | "signalKey">, events: EvidenceEventLike[]): number {
+  if (metric.eventType) {
+    return events.filter((event) => event.type === metric.eventType).length;
+  }
+
+  if (metric.signalKey) {
+    return events.filter((event) => event.type === CUSTOM_SIGNAL_EVENT_TYPE && event.data?.signalKey === metric.signalKey).length;
+  }
+
+  return 0;
 }

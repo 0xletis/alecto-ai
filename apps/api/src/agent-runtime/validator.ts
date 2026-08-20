@@ -244,6 +244,22 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     };
   }
 
+  // Same reasoning again: goal.create_apply is never planned by the LLM directly, only ever
+  // reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by goal.create_propose. This is the one place an LLM-proposed goal
+  // operating plan actually becomes a real Goal row — it must never happen without an exact
+  // user confirmation of the plan goal.create_propose already showed them.
+  if (tool.name === "goal.create_apply") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending goal creation proposal",
+      rationale: operation.rationale
+    };
+  }
+
   if (
     tool.name === "proactive.settings_propose_update" &&
     args.morningBriefEnabled === undefined &&

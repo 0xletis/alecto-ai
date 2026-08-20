@@ -81,7 +81,7 @@ test("3. no active goals returns an honest empty state, not a false count", asyn
     const reply = await sendAgentMessage(server, userId, "what am I working on?");
 
     assert.match(reply.reply, /don't have active goals set yet/i);
-    assert.match(reply.reply, /\/create_goal/);
+    assert.match(reply.reply, /propose a plan to track it/i);
     assert.equal(reply.debug.mutationExecuted, false);
   } finally {
     clearAgentRuntimeMocks();
@@ -90,31 +90,45 @@ test("3. no active goals returns an honest empty state, not a false count", asyn
   }
 });
 
-test("4. 'create a goal to run a marathon' does not silently create a memory pretending to be a goal", async () => {
+test("4. 'create a goal to run a marathon' proposes a real operating plan and creates nothing until confirmed", async () => {
   const server = buildServer();
-  const userId = `goal-create-decline-${randomUUID()}`;
+  const userId = `goal-create-propose-${randomUUID()}`;
 
   try {
     await seedUser(userId);
 
     mockPlan({
       topic: "goals",
-      intent: "decline_goal_creation",
-      operations: [],
+      intent: "propose_goal_creation",
+      operations: [
+        op("goal.create_propose", {
+          title: "Run a marathon",
+          category: "health",
+          signals: [{ key: "training_run_completed", label: "training runs completed", cadence: "weekly" }]
+        })
+      ],
       needsClarification: false,
       clarificationQuestion: null,
-      replyDraft: "Goal creation through chat isn't wired yet — use /create_goal to add \"run a marathon\" as a real goal."
+      replyDraft: ""
     });
-    const reply = await sendAgentMessage(server, userId, "create a goal to run a marathon");
+    const proposeReply = await sendAgentMessage(server, userId, "create a goal to run a marathon");
 
-    assert.match(reply.reply, /not wired yet|isn't wired yet/i);
-    assert.match(reply.reply, /\/create_goal/);
-    assert.equal(reply.debug.mutationExecuted, false);
+    assert.match(proposeReply.reply, /run a marathon/i);
+    assert.match(proposeReply.reply, /want me to create this goal/i);
+    assert.equal(proposeReply.debug.mutationExecuted, false);
 
-    const goals = await prisma.goal.count({ where: { userId } });
-    assert.equal(goals, 0, "no real goal was created");
-    const memories = await prisma.memoryEntry.count({ where: { userId } });
-    assert.equal(memories, 0, "no memory was silently created to stand in for the declined goal either");
+    const goalsBeforeConfirm = await prisma.goal.count({ where: { userId } });
+    assert.equal(goalsBeforeConfirm, 0, "nothing is created before an exact confirmation");
+    const memoriesBeforeConfirm = await prisma.memoryEntry.count({ where: { userId } });
+    assert.equal(memoriesBeforeConfirm, 0, "no memory was silently created to stand in for the goal either");
+
+    const applyReply = await sendAgentMessage(server, userId, "yes");
+    assert.equal(applyReply.debug.mutationExecuted, true);
+    assert.match(applyReply.reply, /done.*run a marathon/i);
+
+    const goalsAfterConfirm = await prisma.goal.findMany({ where: { userId } });
+    assert.equal(goalsAfterConfirm.length, 1, "confirming the proposal must create exactly one real goal");
+    assert.equal(goalsAfterConfirm[0].title, "Run a marathon");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -122,31 +136,32 @@ test("4. 'create a goal to run a marathon' does not silently create a memory pre
   }
 });
 
-test("5. 'I want to find a developer job' never lets the reply claim a real goal now exists", async () => {
+test("5. a genuinely vague statement of intent is remembered as context, never claimed as a real tracked goal", async () => {
   const server = buildServer();
   const userId = `goal-ambiguous-intent-${randomUUID()}`;
 
   try {
     await seedUser(userId);
 
-    // The ambiguous-intent path this task sanctions: memory.create(type: "goal_context") is
-    // allowed, but only paired with a replyDraft that's explicit this is NOT a tracked goal.
+    // Still-valid fallback for a statement too vague to propose a concrete plan for (per this
+    // pass's own rule: if it's too vague, ask or remember it as context — never fabricate a
+    // goal plan out of nothing). memory.create(type: "goal_context") is allowed here, but only
+    // paired with a replyDraft that's explicit this is NOT a tracked goal.
     mockPlan({
       topic: "memory",
       intent: "remember_goal_context",
-      operations: [op("memory.create", { summary: "Wants to find a developer job", type: "goal_context" })],
+      operations: [op("memory.create", { summary: "Has been thinking about maybe getting healthier at some point", type: "goal_context" })],
       needsClarification: false,
       clarificationQuestion: null,
-      replyDraft: "I can remember that, but goal creation through V3 chat is not wired yet. Use /create_goal for now."
+      replyDraft: "I'll remember that, but it's too vague for me to propose a real tracked goal yet — tell me more if you want me to set one up."
     });
-    const reply = await sendAgentMessage(server, userId, "I want to find a developer job");
+    const reply = await sendAgentMessage(server, userId, "I've been thinking I should probably get healthier at some point");
 
-    assert.match(reply.reply, /not wired yet/i);
-    assert.match(reply.reply, /\/create_goal/);
+    assert.match(reply.reply, /too vague/i);
     assert.doesNotMatch(reply.reply, /goal (created|added|set|is now tracked)/i, "must never claim a real goal now exists");
 
     const goals = await prisma.goal.count({ where: { userId } });
-    assert.equal(goals, 0, "an ambiguous statement of intent must never silently create a real Goal row");
+    assert.equal(goals, 0, "a genuinely vague statement of intent must never silently create a real Goal row");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

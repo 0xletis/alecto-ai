@@ -372,29 +372,88 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "goal.log_evidence",
     description:
-      "Log a real, grounded event that counts as evidence toward whichever active goal declares that event type (a goal's own targetMetrics — set when the goal was created — decide the link; this never guesses). Works for any goal category, not just career/job-search. Use event.log_job_applications instead for 'sent N CVs/applications' and event.log_workout for training sessions — this tool is for the other concrete signals: a recruiter reply, an interview being scheduled or completed, a rejection, or a job offer. Examples: 'got 2 recruiter replies' (eventType recruiter_reply_received, count 2), 'I have an interview tomorrow' (eventType interview_scheduled — also consider planning action.create for the interview itself if a date was given), 'got rejected by Acme' (eventType rejection_received, notes 'Acme'). Never invent a signal the user didn't actually describe.",
+      "Log a real, grounded event that counts as evidence toward whichever active goal declares it (a goal's own targetMetrics — set when the goal was created — decide the link; this never guesses). Works for any goal category, not just career/job-search. Use event.log_job_applications instead for 'sent N CVs/applications' and event.log_workout for training sessions. Set EITHER eventType (one of the fixed career signals below) OR signalKey (a CUSTOM per-goal signal key, e.g. 'tea_cups_drunk', 'called_grandmother' — only use a signalKey that is one of the user's OWN active goals' declared custom signals, visible from goal.tracking_show or the goal's own creation; never invent one). Examples: 'got 2 recruiter replies' (eventType recruiter_reply_received, count 2), 'I have an interview tomorrow' (eventType interview_scheduled — also consider planning action.create for the interview itself if a date was given), 'got rejected by Acme' (eventType rejection_received, notes 'Acme'), 'had 2 teas today' for a goal that declared a 'tea_cups_drunk' signal (signalKey 'tea_cups_drunk', count 2). Never invent a signal the user didn't actually describe.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
-      eventType: z.enum([
-        "career.recruiter_reply_received",
-        "career.interview_scheduled",
-        "career.interview_completed",
-        "career.rejection_received",
-        "career.offer_received"
-      ]),
-      count: z.number().int().positive().max(20).optional().describe("Defaults to 1. Set higher only when the user gave an explicit count, e.g. 'got 2 recruiter replies'."),
+      eventType: z
+        .enum([
+          "career.recruiter_reply_received",
+          "career.interview_scheduled",
+          "career.interview_completed",
+          "career.rejection_received",
+          "career.offer_received"
+        ])
+        .optional(),
+      signalKey: z.string().min(1).optional().describe("A CUSTOM signal key an active goal already declared for itself — never invented, never a fixed eventType's own name."),
+      count: z.number().int().positive().max(20).optional().describe("Defaults to 1. Set higher only when the user gave an explicit count, e.g. 'got 2 recruiter replies', 'had 2 teas'."),
       notes: z.string().optional().describe("Free-text detail actually stated by the user, e.g. a company name — never invented.")
     })
   },
   {
     name: "goal.status",
     description:
-      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence events counted toward it, and real pending Gmail reviews linked to it. Never invents counts or progress. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', 'how many CVs did I send today?', or the equivalent for any other active goal (e.g. 'how's training going?').",
+      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence counted toward EACH of its declared signals (fixed or custom), and real pending Gmail reviews linked to it. Never invents counts or progress. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', 'how many CVs did I send today?', or the equivalent for any other active goal (e.g. 'how's training going?', 'how's the tea goal going?').",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
-      goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it (e.g. 'job search', 'training', 'Endesa bills') — matched against real active goal titles/categories, never an invented id. Omit if the user didn't name a specific goal.")
+      goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it (e.g. 'job search', 'training', 'Endesa bills', 'tea') — matched against real active goal titles/categories, never an invented id. Omit if the user didn't name a specific goal.")
+    })
+  },
+  {
+    name: "goal.create_propose",
+    description:
+      "Propose a full custom operating plan for a NEW goal the user just expressed — never applies anything until the user confirms. Works for ANY goal, not from a fixed list: 'I want to drink more tea', 'I want to call my grandmother every Sunday', 'I want to stop scrolling in bed', 'I want to keep up with Endesa/admin emails', 'I want to build Alecto every day' are all equally valid. You (the planner) choose: a short title, a category (free text, e.g. 'health', 'family', 'admin', 'habit', 'career' — never limited to a fixed enum), why if the user said one, optional successCriteria in the user's own terms (e.g. '2 cups/day, 5 days/week'), 1-3 trackable signals (each a short stable snake_case key like 'tea_cups_drunk' plus a human label — invent a REASONABLE key/label from the goal, never leave this empty), an optional single check-in suggestion, an optional integration hint (e.g. 'Gmail: Endesa emails' — only when genuinely relevant, e.g. an admin/bills goal), and 0-3 first actions genuinely implied by the goal. If the goal is too vague to propose anything concrete (e.g. just 'I want to be better'), do NOT call this — use clarification.ask instead to find out what they actually mean. Never create the goal directly; this only proposes, and only proactive.settings_propose_update-style confirmation (an exact 'yes') can turn it into a real goal via the internal goal.create_apply.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      title: z.string().min(1),
+      category: z.string().min(1),
+      why: z.string().optional().describe("Only if the user actually said why — never invented."),
+      successCriteria: z.string().optional().describe("Concrete target in the user's own terms, e.g. '2 cups/day, 5 days/week'. Omit if genuinely unclear."),
+      signals: z
+        .array(
+          z.object({
+            key: z.string().min(1).describe("Short, stable snake_case identifier, e.g. 'tea_cups_drunk'. Must be unique to this goal."),
+            label: z.string().min(1).describe("Human label, e.g. 'cups of tea drunk'."),
+            unit: z.string().optional(),
+            cadence: z.enum(["daily", "weekly"]).optional()
+          })
+        )
+        .min(1)
+        .max(5),
+      checkIn: z
+        .object({
+          cadence: z.string().min(1).describe("e.g. 'evening', 'morning', 'weekly'."),
+          question: z.string().min(1)
+        })
+        .optional(),
+      integrationHint: z.string().optional().describe("Only when a real, existing integration is genuinely relevant, e.g. 'Gmail: track Endesa emails' — never claim automatic monitoring that isn't wired up."),
+      firstActions: z.array(z.string().min(1)).max(3).optional().describe("Only actions genuinely implied by the goal itself, e.g. 'Buy tea' for a tea goal — never generic filler.")
+    })
+  },
+  {
+    name: "goal.create_apply",
+    description: "Internal: creates the confirmed goal and its tracking config exactly as proposed. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      title: z.string().min(1),
+      category: z.string().min(1),
+      why: z.string().optional(),
+      signals: z.array(z.object({ key: z.string().min(1), label: z.string().min(1), unit: z.string().optional(), cadence: z.enum(["daily", "weekly"]).optional() })),
+      checkIn: z.object({ cadence: z.string().min(1), question: z.string().min(1) }).optional(),
+      firstActions: z.array(z.string().min(1)).optional()
+    })
+  },
+  {
+    name: "goal.tracking_show",
+    description:
+      "Show what is actually configured for one active goal — its declared signals (with their real keys, so goal.log_evidence can be used correctly), check-in, and why — never its progress (use goal.status for that). Use for 'what am I tracking for the tea goal?', 'what signals does my job search goal have?', 'show my goal setup for X'.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalRef: z.string().min(1).optional().describe("The goal's own wording — matched the same way goal.status matches it. Omit if the user didn't name a specific goal.")
     })
   },
   {

@@ -8,6 +8,7 @@ import {
   createEmailSignalRule,
   createEvent,
   createEvents,
+  createGoal,
   createMemory,
   getActionItems,
   getActiveMemories,
@@ -25,14 +26,18 @@ import {
   type EmailSignalRule
 } from "@operator-agent/db";
 import {
+  countEvidenceForMetric,
+  CUSTOM_SIGNAL_EVENT_TYPE,
   describeGoalEvidenceMatch,
   findGoalsForEventType,
+  findGoalsForSignalKey,
   inferGoalLinkForAction,
   parseActionDueDate,
   proactiveOperatorAllowlistActiveFromEnv,
   proactiveOperatorAllowlistFromEnv,
   proactiveOperatorDeliveryEnabledFromEnv,
   type Goal,
+  type GoalMetric,
   type NotificationSettings,
   type StoredEvent
 } from "@operator-agent/core";
@@ -470,24 +475,41 @@ export async function executeOperation(
           | "career.interview_scheduled"
           | "career.interview_completed"
           | "career.rejection_received"
-          | "career.offer_received";
+          | "career.offer_received"
+          | undefined;
+        const signalKey = args.signalKey as string | undefined;
         const count = (args.count as number | undefined) ?? 1;
         const notes = args.notes as string | undefined;
+
+        if (!eventType && !signalKey) {
+          return failed(operation.tool, "I need either a known signal type or a custom signal key to log this — try describing it again.");
+        }
+
+        // Adaptive Goal Creation MVP (docs/10-v3-readiness-audit.md §21): a signalKey is only
+        // ever trusted when an active goal ALREADY declared it as one of its own targetMetrics —
+        // the LLM can propose a signalKey it believes matches, but this is the deterministic
+        // check that actually decides, exactly like resolveGoalStatusTargets does for goalRef.
+        if (signalKey && findGoalsForSignalKey(context.activeGoals, signalKey).length === 0) {
+          return failed(operation.tool, `I don't have a "${signalKey}" signal set up for any of your active goals. Say "what am I tracking for X?" to see the real signals.`);
+        }
+
         const created = await createEvents(
           userId,
           Array.from({ length: count }, () => ({
-            type: eventType,
+            type: eventType ?? CUSTOM_SIGNAL_EVENT_TYPE,
             source: "manual" as const,
             confidence: 1,
-            data: notes ? { notes } : undefined,
+            data: signalKey ? { signalKey, notes } : notes ? { notes } : undefined,
             evidence: [notes, message].filter(Boolean) as string[]
           }))
         );
-        const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, eventType));
+        const matchedGoals = eventType ? findGoalsForEventType(context.activeGoals, eventType) : findGoalsForSignalKey(context.activeGoals, signalKey!);
+        const goalNote = describeGoalEvidenceMatch(matchedGoals);
+        const signalLabel = eventType ? describeEventCount(eventType, created.length) : describeCustomSignalCount(matchedGoals[0], signalKey!, created.length);
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged ${describeEventCount(eventType, created.length)}${notes ? ` (${notes})` : ""}.${goalNote ? ` ${goalNote}` : ""}`,
+          summary: `Logged ${signalLabel}${notes ? ` (${notes})` : ""}.${goalNote ? ` ${goalNote}` : ""}`,
           result: created
         };
       }
@@ -822,7 +844,7 @@ export async function executeOperation(
           return {
             tool: operation.tool,
             status: "executed",
-            summary: "You don't have any active goals yet. Use /create_goal to set one.",
+            summary: "You don't have any active goals yet. Tell me what you want to work on and I can propose a plan to track it.",
             result: []
           };
         }
@@ -838,6 +860,109 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: summaries.join("\n\n"),
+          result: targetGoals
+        };
+      }
+
+      case "goal.create_propose": {
+        const title = args.title as string;
+        const category = args.category as string;
+        const why = args.why as string | undefined;
+        const successCriteria = args.successCriteria as string | undefined;
+        const signals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
+        const checkIn = args.checkIn as GoalPlanCheckIn | undefined;
+        const integrationHint = args.integrationHint as string | undefined;
+        const firstActions = (args.firstActions as string[] | undefined) ?? [];
+
+        if (signals.length === 0) {
+          return failed(operation.tool, "I need at least one trackable signal to propose a plan for this goal.");
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatGoalPlanProposal({ title, successCriteria, signals, checkIn, integrationHint, firstActions }),
+          pendingOperationUpdate: {
+            topic: "goal_creation",
+            summary: `create the "${title}" goal`,
+            operations: [
+              {
+                tool: "goal.create_apply",
+                args: { title, category, why, signals, checkIn, firstActions },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "goal.create_apply": {
+        const title = args.title as string;
+        const category = args.category as string;
+        const why = args.why as string | undefined;
+        const signals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
+        const checkIn = args.checkIn as GoalPlanCheckIn | undefined;
+        const firstActions = (args.firstActions as string[] | undefined) ?? [];
+
+        const targetMetrics: GoalMetric[] = signals.map((signal) => ({
+          key: signal.key,
+          label: signal.label,
+          signalKey: signal.key,
+          aggregation: "count",
+          window: signal.cadence ?? "daily",
+          unit: signal.unit
+        }));
+        const checkInConfig = checkIn ? [{ key: "custom_checkin", question: checkIn.question, answerType: "text" as const }] : undefined;
+
+        const result = await createGoal(userId, { title, category, why, targetMetrics, checkInConfig });
+
+        if (result.duplicate) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `You already have an active goal called "${result.existingGoal.title}" — nothing new was created.`,
+            result: result.existingGoal
+          };
+        }
+
+        const createdActions: ActionItem[] = [];
+        for (const actionTitle of firstActions) {
+          const created = await createActionItem(userId, {
+            source: "manual",
+            title: actionTitle,
+            priority: "medium",
+            goalId: result.goal.id,
+            goalTitleSnapshot: result.goal.title
+          });
+          createdActions.push(created);
+        }
+
+        const signalNames = signals.map((signal) => signal.label).join(", ");
+        const checkInNote = checkIn ? ` and ${checkIn.cadence} check-ins` : "";
+        const actionsNote = createdActions.length > 0 ? ` Created ${createdActions.length} first action${createdActions.length === 1 ? "" : "s"}.` : "";
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Done — I'll track "${result.goal.title}" with ${signalNames}${checkInNote}.${actionsNote}`,
+          result: result.goal,
+          entities: createdActions.map(actionToEntity)
+        };
+      }
+
+      case "goal.tracking_show": {
+        const goalRef = args.goalRef as string | undefined;
+        const targetGoals = resolveGoalStatusTargets(goalRef, context.activeGoals);
+
+        if (targetGoals.length === 0) {
+          return { tool: operation.tool, status: "executed", summary: "You don't have any active goals yet.", result: [] };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: targetGoals.map((goal) => formatGoalTrackingForChat(goal)).join("\n\n"),
           result: targetGoals
         };
       }
@@ -1177,11 +1302,12 @@ function formatThinWeeklyReviewSummary(context: WeeklyReviewContext): string {
 /**
  * Grounded in real Goal rows only — title/category/priority/why, never an invented progress
  * figure (targetMetrics/checkInConfig would need real event aggregation this tool doesn't do).
- * Always ends with the same honest boundary: goal editing isn't wired through chat yet.
+ * Always ends with an honest boundary: EDITING an existing goal isn't wired through chat yet —
+ * creating a NEW one is (goal.create_propose, docs/10-v3-readiness-audit.md §21).
  */
 function formatGoalListForChat(goals: Goal[]): string {
   if (goals.length === 0) {
-    return "You don't have active goals set yet. Use /create_goal for now, or tell me what you want to work on and I can remember the context.";
+    return "You don't have active goals set yet. Tell me what you want to work on and I can propose a plan to track it.";
   }
 
   const lines = ["Your active goals:"];
@@ -1191,7 +1317,7 @@ function formatGoalListForChat(goals: Goal[]): string {
       lines.push(`   Why: ${goal.why}`);
     }
   });
-  lines.push("", "Goal editing through chat is not wired yet. Use /create_goal or tell me if you want me to remember context.");
+  lines.push("", "Editing or deleting an existing goal through chat isn't wired yet. Use /create_goal, or tell me about a new goal and I can propose a plan for it.");
 
   return lines.join("\n");
 }
@@ -1217,6 +1343,14 @@ function describeEventCount(eventType: string, count: number): string {
   }
 
   return `${count} ${count === 1 ? labels[0] : labels[1]}`;
+}
+
+/** Custom-signal counterpart to describeEventCount above — reuses the matched goal's OWN
+ * declared metric label (set when the goal was created, from goal.create_propose's signals[])
+ * rather than any hardcoded English, since a custom signal's label is never known in advance. */
+function describeCustomSignalCount(goal: Goal | undefined, signalKey: string, count: number): string {
+  const metric = goal?.targetMetrics?.find((item) => item.signalKey === signalKey);
+  return `${count} ${metric?.label ?? signalKey}`;
 }
 
 /**
@@ -1248,28 +1382,25 @@ function formatGoalStatusForChat(
   goal: Goal,
   input: { openActions: ActionItem[]; gmailReviews: EmailReviewItem[]; gmailRules: EmailSignalRule[]; recentEvents: StoredEvent[]; timezone: string; todayLocalDate: string }
 ): string {
-  const trackedEventTypes = new Set((goal.targetMetrics ?? []).map((metric) => metric.eventType).filter(Boolean) as string[]);
-  const goalEvents = trackedEventTypes.size > 0 ? input.recentEvents.filter((event) => trackedEventTypes.has(event.type)) : [];
-  const todayEvents = goalEvents.filter((event) => formatDateInTimezone(event.timestamp, input.timezone) === input.todayLocalDate);
+  const metrics = goal.targetMetrics ?? [];
+  const todayEvents = input.recentEvents.filter((event) => formatDateInTimezone(event.timestamp, input.timezone) === input.todayLocalDate);
   const linkedActions = input.openActions.filter((action) => action.goalId === goal.id);
   const linkedRuleIds = new Set(input.gmailRules.filter((rule) => rule.goalId === goal.id).map((rule) => rule.id));
   const linkedReviews = input.gmailReviews.filter((review) => linkedRuleIds.has(review.ruleId));
 
-  const eventCountsByType = new Map<string, number>();
-  for (const event of goalEvents) {
-    eventCountsByType.set(event.type, (eventCountsByType.get(event.type) ?? 0) + 1);
-  }
-  const todayCountsByType = new Map<string, number>();
-  for (const event of todayEvents) {
-    todayCountsByType.set(event.type, (todayCountsByType.get(event.type) ?? 0) + 1);
-  }
+  // Iterates the goal's OWN declared metrics (goal-evidence.ts's countEvidenceForMetric),
+  // uniformly handling registry-backed (eventType) and custom (signalKey) signals — no
+  // special-casing needed here for either kind, and the metric's own `label` (set at goal
+  // creation, from a template or an adaptive goal.create_propose plan) is always what's shown.
+  const weekCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, input.recentEvents) })).filter((entry) => entry.count > 0);
+  const todayCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, todayEvents) })).filter((entry) => entry.count > 0);
 
   const lines = [`"${goal.title}" (${goal.category}):`];
 
-  if (eventCountsByType.size > 0) {
-    lines.push(`This week: ${[...eventCountsByType.entries()].map(([type, count]) => describeEventCount(type, count)).join(", ")}.`);
-    if (todayCountsByType.size > 0) {
-      lines.push(`Today: ${[...todayCountsByType.entries()].map(([type, count]) => describeEventCount(type, count)).join(", ")}.`);
+  if (weekCounts.length > 0) {
+    lines.push(`This week: ${weekCounts.map((entry) => `${entry.count} ${entry.metric.label}`).join(", ")}.`);
+    if (todayCounts.length > 0) {
+      lines.push(`Today: ${todayCounts.map((entry) => `${entry.count} ${entry.metric.label}`).join(", ")}.`);
     }
   } else {
     lines.push("No logged progress in the last 7 days.");
@@ -1281,6 +1412,85 @@ function formatGoalStatusForChat(
 
   if (linkedReviews.length > 0) {
     lines.push(`${linkedReviews.length} pending Gmail review${linkedReviews.length === 1 ? "" : "s"} linked to this goal.`);
+  }
+
+  return lines.join("\n");
+}
+
+interface GoalPlanSignal {
+  key: string;
+  label: string;
+  unit?: string;
+  cadence?: "daily" | "weekly";
+}
+
+interface GoalPlanCheckIn {
+  cadence: string;
+  question: string;
+}
+
+/** Deterministic formatting of an LLM-PROPOSED goal plan — args are structured (never raw prose),
+ * so this is the one place that turns them into the exact "Goal: ... / Signals: ... / Want me to
+ * create this goal?" shape, matching the product's desired UX precisely regardless of how the
+ * planner phrased its own reasoning. */
+function formatGoalPlanProposal(input: {
+  title: string;
+  successCriteria?: string;
+  signals: GoalPlanSignal[];
+  checkIn?: GoalPlanCheckIn;
+  integrationHint?: string;
+  firstActions: string[];
+}): string {
+  const lines = [`Good — I can track "${input.title}" like this:`, "", `Goal: ${input.title}`];
+
+  if (input.successCriteria) {
+    lines.push(`Target: ${input.successCriteria}`);
+  }
+
+  lines.push("Signals:", ...input.signals.map((signal) => `- ${signal.label}`));
+
+  if (input.checkIn) {
+    lines.push("Check-in:", `- ${input.checkIn.cadence}: "${input.checkIn.question}"`);
+  }
+
+  if (input.integrationHint) {
+    lines.push("Integration:", `- ${input.integrationHint}`);
+  }
+
+  if (input.firstActions.length > 0) {
+    lines.push("First actions:", ...input.firstActions.map((action) => `- ${action}`));
+  }
+
+  lines.push("", "Want me to create this goal?");
+
+  return lines.join("\n");
+}
+
+/** What's actually CONFIGURED for a goal (its own declared signals/check-in), never its progress
+ * — the config-vs-progress split matches goal.list (details) vs goal.status (progress). Shows
+ * each metric's real signalKey when it has one, so a follow-up "had 2 teas" can be answered
+ * correctly by goal.log_evidence rather than the user needing to know the exact key already. */
+function formatGoalTrackingForChat(goal: Goal): string {
+  const metrics = goal.targetMetrics ?? [];
+  const lines = [`"${goal.title}" (${goal.category}):`];
+
+  if (goal.why) {
+    lines.push(`Why: ${goal.why}`);
+  }
+
+  if (metrics.length > 0) {
+    lines.push("Signals:");
+    for (const metric of metrics) {
+      const keyNote = metric.signalKey ? ` [signal: ${metric.signalKey}]` : "";
+      lines.push(`- ${metric.label}${keyNote}`);
+    }
+  } else {
+    lines.push("No tracked signals configured.");
+  }
+
+  const checkIn = (goal.checkInConfig ?? [])[0];
+  if (checkIn) {
+    lines.push(`Check-in: "${checkIn.question}"`);
   }
 
   return lines.join("\n");

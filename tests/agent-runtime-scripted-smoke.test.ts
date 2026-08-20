@@ -754,21 +754,38 @@ test("scripted smoke 10: what are my goals? -> I sent 3 CVs today -> create a go
           }
         },
         {
+          // Adaptive Goal Creation MVP (docs/10-v3-readiness-audit.md §21) — an explicit
+          // new-goal request now proposes a real operating plan instead of declining, but still
+          // must never create anything before an exact confirmation.
           message: "create a goal to run a marathon",
           plan: {
             topic: "goals",
-            intent: "decline_goal_creation",
-            operations: [],
+            intent: "propose_goal_creation",
+            operations: [
+              op("goal.create_propose", {
+                title: "Run a marathon",
+                category: "health",
+                signals: [{ key: "training_run_completed", label: "training runs completed", cadence: "weekly" }]
+              })
+            ],
             needsClarification: false,
             clarificationQuestion: null,
-            replyDraft: "Goal creation through chat isn't wired yet — use /create_goal to add \"run a marathon\" as a real goal."
+            replyDraft: ""
           },
           assert: (turn) => {
             assertNoGenericError(turn);
             assertNoFalseSuccessClaim(turn, [/goal (created|added|is now tracked)/i]);
-            assert.match(turn.reply, /not wired yet|isn't wired yet/i);
-            assert.match(turn.reply, /\/create_goal/);
+            assert.match(turn.reply, /run a marathon/i);
+            assert.match(turn.reply, /want me to create this goal/i);
             assertNoMutationYet(turn);
+          }
+        },
+        {
+          message: "yes",
+          assert: (turn) => {
+            assertNoGenericError(turn);
+            assert.match(turn.reply, /done.*run a marathon/i);
+            assert.equal(turn.mutationExecuted, true);
           }
         }
       ]
@@ -779,9 +796,7 @@ test("scripted smoke 10: what are my goals? -> I sent 3 CVs today -> create a go
     const loggedEvents = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
     assert.equal(loggedEvents, 3, "each logged CV must be its own event, grounded in real DB state");
     const goalCount = await prisma.goal.count({ where: { userId } });
-    assert.equal(goalCount, 2, "the declined 'run a marathon' request must not have created a third goal");
-    const memoryCount = await prisma.memoryEntry.count({ where: { userId } });
-    assert.equal(memoryCount, 0, "an explicit, declined goal-creation request must not fall back to a silent memory instead");
+    assert.equal(goalCount, 3, "the confirmed 'run a marathon' proposal must have created a real third goal");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
