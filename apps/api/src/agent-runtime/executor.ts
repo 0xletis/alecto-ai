@@ -35,6 +35,7 @@ import {
   findCompatibleProgressMetric,
   findGoalsForEventType,
   findGoalsForSignalKey,
+  getEmailAdapterDefinition,
   goalHasOnlyCompletionSignals,
   isProgressShapedSignalText,
   parseActionDueDate,
@@ -62,7 +63,7 @@ import {
 } from "../gmail/gmail-rule-management.js";
 import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
 import { buildGmailAutonomyState } from "../conversation/gmail-autonomy.js";
-import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
+import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   approveEmailReviewForUser,
   createActionItemFromEmailReview,
@@ -740,7 +741,9 @@ export async function executeOperation(
       }
 
       case "gmail.sync": {
-        const summary = appendGmailSyncReconnectLink(userId, await syncGmailForAgentRuntime(userId));
+        const state = await buildGmailAutonomyState(userId);
+        const syncBlock = formatCanonicalGmailSyncBlock(userId, state);
+        const summary = syncBlock ?? appendGmailSyncReconnectLink(userId, await syncGmailForAgentRuntime(userId));
         return {
           tool: operation.tool,
           status: "executed",
@@ -812,6 +815,16 @@ export async function executeOperation(
           status: "executed",
           summary: `${rule.name} tracking is on. New matches go to email review before anything is logged — never instant, never auto-logged.`,
           result: rule
+        };
+      }
+
+      case "gmail.rule.enable_builtin": {
+        const result = await enableBuiltInGmailRuleForAgent(userId, args.kind as BuiltInGmailRuleKind);
+        return {
+          tool: operation.tool,
+          status: result.changed ? "executed" : "skipped",
+          summary: result.summary,
+          result: result.rule
         };
       }
 
@@ -1795,6 +1808,46 @@ function formatProactiveSettingsSummary(settings: NotificationSettings): string 
   ].join("\n");
 }
 
+type BuiltInGmailRuleKind = "job_search" | "work_action";
+
+function formatCanonicalGmailSyncBlock(userId: string, state: Awaited<ReturnType<typeof buildGmailAutonomyState>>): string | undefined {
+  const connection = state.primaryConnection;
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+
+  if (!connection || state.authState === "disconnected") {
+    return [
+      "Gmail is not connected yet.",
+      oauthUrl ? `Connect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      "After connecting, enable an email rule before any Gmail scan can run."
+    ].join("\n");
+  }
+
+  if (state.authState === "expired" || state.authState === "error") {
+    return [
+      gmailConnectionProblemLine(connection),
+      oauthUrl ? `Reconnect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      state.activeRules.length > 0
+        ? `You have ${state.activeRules.length} active Gmail rule${state.activeRules.length === 1 ? "" : "s"}, but sync cannot run until Gmail is reconnected.`
+        : "Sync cannot run until Gmail is reconnected.",
+      ...formatActiveGmailRuleLines(state.activeRules)
+    ].join("\n");
+  }
+
+  if (state.authState === "paused") {
+    return [
+      "Gmail is paused.",
+      "Sync cannot run while the Gmail connection is paused.",
+      ...formatActiveGmailRuleLines(state.activeRules)
+    ].join("\n");
+  }
+
+  if (state.activeRules.length === 0) {
+    return noActiveGmailRulesForAgent();
+  }
+
+  return undefined;
+}
+
 function formatGmailConnectionStatusForChat(
   userId: string,
   connection: IntegrationConnection | undefined,
@@ -1855,6 +1908,154 @@ function formatGmailConnectionStatusForChat(
     ...ruleLines,
     "Sync only runs when you say \"sync Gmail\" or when scheduled Gmail checks are enabled."
   ].filter(Boolean).join("\n");
+}
+
+function noActiveGmailRulesForAgent(): string {
+  return "Gmail is connected, but no email tracking rules are active. Say 'enable job search rule for Gmail', 'enable work action rule for Gmail', or 'track Endesa bills from Gmail'.";
+}
+
+function formatActiveGmailRuleLines(rules: EmailSignalRule[]): string[] {
+  return rules.length > 0
+    ? ["", "Active rules:", ...rules.map((rule, index) => `${index + 1}. ${rule.name} — review-first tracking`)]
+    : [];
+}
+
+async function enableBuiltInGmailRuleForAgent(
+  userId: string,
+  kind: BuiltInGmailRuleKind
+): Promise<{ changed: boolean; summary: string; rule?: EmailSignalRule }> {
+  const adapterId = kind === "work_action" ? "work_action_email" : "job_search_email";
+  const adapter = getEmailAdapterDefinition(adapterId);
+
+  if (!adapter || adapter.status !== "available") {
+    return { changed: false, summary: "That Gmail tracking rule is not available yet." };
+  }
+
+  const state = await buildGmailAutonomyState(userId);
+  const connection = state.primaryConnection;
+
+  if (!connection || state.authState === "disconnected") {
+    return { changed: false, summary: "Gmail is not connected yet. Say 'connect Gmail' first." };
+  }
+
+  const title = builtInGmailRuleHumanTitle(kind);
+  const existingActive = state.visibleRules.find((rule) => rule.adapterId === adapterId && rule.status === "active");
+  if (existingActive) {
+    return {
+      changed: false,
+      summary: [`${title} is already on.`, "", formatBuiltInGmailRuleEnabled(existingActive), gmailRuleEnableReconnectNote(userId, connection)]
+        .filter(Boolean)
+        .join("\n"),
+      rule: existingActive
+    };
+  }
+
+  if (kind === "job_search") {
+    await archiveStaleJobSearchEmailRules(userId, connection.id);
+  }
+
+  const reusable = state.visibleRules
+    .filter((rule) => rule.adapterId === adapterId)
+    .sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime())[0];
+
+  if (reusable) {
+    const updated = await updateEmailSignalRule(userId, reusable.id, { status: "active" });
+    if (!updated) {
+      return { changed: false, summary: `I could not turn ${title} on. Nothing was changed.` };
+    }
+
+    return {
+      changed: true,
+      summary: [`${title} is back on.`, "", formatBuiltInGmailRuleEnabled(updated), gmailRuleEnableReconnectNote(userId, connection)]
+        .filter(Boolean)
+        .join("\n"),
+      rule: updated
+    };
+  }
+
+  const defaults = builtInGmailRuleDefaults(kind);
+  const rule = await createEmailSignalRule(userId, {
+    connectionId: connection.id,
+    adapterId,
+    name: defaults.name,
+    query: adapter.defaultQuery ?? "",
+    fetchStrategy: defaults.fetchStrategy,
+    lookbackDays: defaults.lookbackDays,
+    maxMessagesPerSync: defaults.maxMessagesPerSync,
+    maxEventsPerSync: defaults.maxEventsPerSync,
+    classifierMode: defaults.classifierMode,
+    minAutoLogConfidence: defaults.minAutoLogConfidence,
+    minReviewConfidence: defaults.minReviewConfidence,
+    reviewBeforeLogging: defaults.reviewBeforeLogging,
+    createdBy: "user"
+  });
+
+  return {
+    changed: true,
+    summary: [`${title} is on.`, "", formatBuiltInGmailRuleEnabled(rule), gmailRuleEnableReconnectNote(userId, connection)].filter(Boolean).join("\n"),
+    rule
+  };
+}
+
+function builtInGmailRuleHumanTitle(kind: BuiltInGmailRuleKind): string {
+  return kind === "work_action" ? "Work-action email tracking" : "Job-search email tracking";
+}
+
+function builtInGmailRuleDefaults(kind: BuiltInGmailRuleKind) {
+  if (kind === "work_action") {
+    return {
+      name: "Work action emails",
+      reviewBeforeLogging: true,
+      fetchStrategy: "query" as const,
+      classifierMode: "hybrid" as const,
+      lookbackDays: 7,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 5,
+      minAutoLogConfidence: 0.95,
+      minReviewConfidence: 0.7
+    };
+  }
+
+  return {
+    name: "Job search emails",
+    reviewBeforeLogging: false,
+    fetchStrategy: "query" as const,
+    classifierMode: "rules" as const,
+    lookbackDays: 30,
+    maxMessagesPerSync: 25,
+    maxEventsPerSync: 10,
+    minAutoLogConfidence: 0.9,
+    minReviewConfidence: 0.65
+  };
+}
+
+function formatBuiltInGmailRuleEnabled(rule: EmailSignalRule): string {
+  const isWorkAction = rule.adapterId === "work_action_email";
+  const watchItems = isWorkAction
+    ? ["work requests", "deadlines", "follow-ups", "feedback requests", "blockers"]
+    : ["recruiter replies", "interview scheduling", "rejections", "offers", "application confirmations"];
+
+  return [
+    "What I will watch for:",
+    ...watchItems.map((item) => `- ${item}`),
+    "",
+    isWorkAction
+      ? "Work-action emails go to review before becoming action items."
+      : "Clear job-search emails can become career events. Uncertain emails go to review.",
+    "I only scan Gmail while this rule is active.",
+    "Sync now: say 'sync Gmail'."
+  ].join("\n");
+}
+
+function gmailRuleEnableReconnectNote(userId: string, connection: IntegrationConnection): string | undefined {
+  if (connection.status !== "error") {
+    return undefined;
+  }
+
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+  return oauthUrl
+    ? `${gmailConnectionProblemLine(connection)} Reconnect Gmail before sync can run:\n${oauthUrl}`
+    : `${gmailConnectionProblemLine(connection)} Reconnect Gmail before sync can run. ${gmailOAuthMissingConfigMessage()}`;
 }
 
 function appendGmailSyncReconnectLink(userId: string, summary: string): string {

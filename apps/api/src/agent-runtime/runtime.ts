@@ -340,6 +340,11 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, gmailSyncShortcut, "gmail_sync");
   }
 
+  const gmailBuiltInRuleShortcut = gmailBuiltInRuleEnableShortcutOperation(message, context);
+  if (gmailBuiltInRuleShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailBuiltInRuleShortcut, "gmail_rule_management");
+  }
+
   const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
   if (gmailConnectionShortcut) {
     return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
@@ -580,6 +585,37 @@ function gmailSyncShortcutOperation(message: string): PlannedOperation | undefin
   }
 
   return { tool: "gmail.sync", args: {}, rationale: "user explicitly asked to sync Gmail/email now" };
+}
+
+function gmailBuiltInRuleEnableShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return undefined;
+  }
+
+  const asksToEnable = /\b(enable|turn on|activate|start|set up|setup|create|activa|activar|enciende|encender|pon|poner)\b/.test(text);
+  if (!asksToEnable) {
+    return undefined;
+  }
+
+  const mentionsRuleSurface =
+    /\b(gmail|email|emails|correo|correos|mail|mails|rule|rules|tracking|check|one)\b/.test(text) || hasRecentGmailContext(context);
+  if (!mentionsRuleSurface) {
+    return undefined;
+  }
+
+  const mentionsJobSearch = /\b(job search|job-search|recruiter|recruiters|application|applications|cv|cvs|resume|resumes)\b/.test(text);
+  const mentionsWorkAction = /\b(work action|work actions|work-action|work email|work emails|work requests?|deadlines?|follow-ups?|feedback requests?|blockers?)\b/.test(text);
+
+  if (mentionsJobSearch && !mentionsWorkAction) {
+    return { tool: "gmail.rule.enable_builtin", args: { kind: "job_search" }, rationale: "user asked to enable job-search Gmail tracking" };
+  }
+
+  if (mentionsWorkAction && !mentionsJobSearch) {
+    return { tool: "gmail.rule.enable_builtin", args: { kind: "work_action" }, rationale: "user asked to enable work-action Gmail tracking" };
+  }
+
+  return undefined;
 }
 
 function gmailNudgeSettingsShortcutOperation(message: string): PlannedOperation | undefined {

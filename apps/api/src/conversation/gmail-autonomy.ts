@@ -21,6 +21,13 @@ import {
 } from "@operator-agent/db";
 
 export type GmailRuleKind = "job_search" | "work_action" | "custom" | "other";
+export type GmailAuthState = "connected" | "expired" | "error" | "paused" | "disconnected";
+export type GmailPrimaryConnectionReason =
+  | "active_connection_with_active_rules"
+  | "connection_with_active_rules"
+  | "active_connection"
+  | "latest_connection"
+  | "none";
 
 export interface GmailRuleRecommendation {
   kind: GmailRuleKind;
@@ -32,10 +39,13 @@ export interface GmailRuleRecommendation {
 export interface GmailAutonomyState {
   gmailConnected: boolean;
   gmailAccount?: string;
+  authState: GmailAuthState;
   primaryConnection?: IntegrationConnection;
+  primaryConnectionReason: GmailPrimaryConnectionReason;
   activeRules: EmailSignalRule[];
   pausedRules: EmailSignalRule[];
   visibleRules: EmailSignalRule[];
+  archivedRuleCount: number;
   ruleKinds: GmailRuleKind[];
   pendingEmailReviewCount: number;
   lastSyncedAt?: Date;
@@ -80,15 +90,13 @@ export async function buildGmailAutonomyState(
   const gmailConnections = connections.filter((connection) => connection.integrationId === "gmail" && connection.status !== "archived");
   const activeGmailConnections = gmailConnections.filter((connection) => connection.status === "active");
   const activeRuleConnectionIds = new Set(rules.filter((rule) => rule.status === "active").map((rule) => rule.connectionId));
-  const primaryConnection =
-    activeGmailConnections.find((connection) => activeRuleConnectionIds.has(connection.id)) ??
-    gmailConnections.find((connection) => activeRuleConnectionIds.has(connection.id)) ??
-    activeGmailConnections[0] ??
-    gmailConnections[0];
+  const selected = selectPrimaryGmailConnection(gmailConnections, activeGmailConnections, activeRuleConnectionIds);
+  const primaryConnection = selected.connection;
   const visibleConnectionIds = new Set(gmailConnections.map((connection) => connection.id));
   const visibleRules = rules.filter((rule) => rule.status !== "archived" && visibleConnectionIds.has(rule.connectionId));
   const activeRules = visibleRules.filter((rule) => rule.status === "active");
   const pausedRules = visibleRules.filter((rule) => rule.status !== "active");
+  const archivedRuleCount = rules.filter((rule) => rule.status === "archived" && visibleConnectionIds.has(rule.connectionId)).length;
   const preferences = readGmailAutonomyPreferences(primaryConnection?.config);
   const syncMode = primaryConnection ? effectiveGmailSyncMode(preferences, runtime) : "unknown";
   const syncIntervalMinutes = effectiveGmailSyncIntervalMinutes(preferences, runtime);
@@ -102,18 +110,24 @@ export async function buildGmailAutonomyState(
     : undefined;
   const recommendedRules = gmailRuleRecommendationsFromGoals(activeGoals, activeRules);
   const activeGoalsRelevantToGmail = relevantGmailGoals(activeGoals, activeRules);
-  const lastSyncedAt = activeGmailConnections
-    .map((connection) => connection.lastSyncedAt)
+  const lastSyncedAt = [
+    primaryConnection?.lastSyncedAt,
+    ...activeGmailConnections.map((connection) => connection.lastSyncedAt),
+    ...gmailConnections.map((connection) => connection.lastSyncedAt)
+  ]
     .filter((value): value is Date => Boolean(value))
     .sort((left, right) => right.getTime() - left.getTime())[0];
 
   return {
     gmailConnected: activeGmailConnections.length > 0,
     gmailAccount: gmailAccountFromConnection(primaryConnection),
+    authState: gmailAuthStateForConnection(primaryConnection),
     primaryConnection,
+    primaryConnectionReason: selected.reason,
     activeRules,
     pausedRules,
     visibleRules,
+    archivedRuleCount,
     ruleKinds: [...new Set(activeRules.map(gmailRuleKind))],
     pendingEmailReviewCount,
     lastSyncedAt,
@@ -145,6 +159,61 @@ export async function buildGmailAutonomyState(
     }),
     runtime
   };
+}
+
+function selectPrimaryGmailConnection(
+  gmailConnections: IntegrationConnection[],
+  activeGmailConnections: IntegrationConnection[],
+  activeRuleConnectionIds: Set<string>
+): { connection?: IntegrationConnection; reason: GmailPrimaryConnectionReason } {
+  const activeWithRules = activeGmailConnections.find((connection) => activeRuleConnectionIds.has(connection.id));
+  if (activeWithRules) {
+    return { connection: activeWithRules, reason: "active_connection_with_active_rules" };
+  }
+
+  const anyWithRules = gmailConnections.find((connection) => activeRuleConnectionIds.has(connection.id));
+  if (anyWithRules) {
+    return { connection: anyWithRules, reason: "connection_with_active_rules" };
+  }
+
+  const active = activeGmailConnections[0];
+  if (active) {
+    return { connection: active, reason: "active_connection" };
+  }
+
+  const latest = [...gmailConnections].sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime())[0];
+  if (latest) {
+    return { connection: latest, reason: "latest_connection" };
+  }
+
+  return { reason: "none" };
+}
+
+function gmailAuthStateForConnection(connection?: IntegrationConnection): GmailAuthState {
+  if (!connection || connection.status === "archived") {
+    return "disconnected";
+  }
+
+  if (connection.status === "active") {
+    return "connected";
+  }
+
+  if (connection.status === "paused") {
+    return "paused";
+  }
+
+  if (connection.status === "error") {
+    const lower = (connection.lastError ?? "").toLowerCase();
+    return lower.includes("authorization expired") ||
+      lower.includes("invalid_grant") ||
+      lower.includes("invalid credentials") ||
+      lower.includes("unauthorized") ||
+      lower.includes("expired")
+      ? "expired"
+      : "error";
+  }
+
+  return "error";
 }
 
 export function gmailRuleKind(rule: Pick<EmailSignalRule, "adapterId">): GmailRuleKind {

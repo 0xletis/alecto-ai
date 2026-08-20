@@ -296,6 +296,16 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "gmail.rule.enable_builtin",
+    description:
+      "Enable one of Alecto's built-in Gmail tracking rules. Use only for explicit built-in rule requests like 'enable job search rule' or 'enable work action rule'. Never confuse job search with work action.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      kind: z.enum(["job_search", "work_action"])
+    })
+  },
+  {
     name: "gmail.rule.explain",
     description: "Explain whether a named Gmail rule exists and what it does.",
     mutates: false,

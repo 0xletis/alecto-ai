@@ -31,6 +31,179 @@ function installGmailOAuthEnv(): () => void {
   };
 }
 
+async function seedExpiredDuplicateGmailState(userId: string): Promise<void> {
+  const olderConnection = await prisma.integrationConnection.create({
+    data: {
+      userId,
+      integrationId: "gmail",
+      status: "error",
+      config: { email: "letiskate@gmail.com" },
+      lastError: "Gmail authorization expired. Reconnect Gmail.",
+      lastSyncedAt: new Date("2026-07-16T09:00:00.000Z"),
+      createdAt: new Date("2026-07-16T09:00:00.000Z")
+    }
+  });
+  const middleConnection = await prisma.integrationConnection.create({
+    data: {
+      userId,
+      integrationId: "gmail",
+      status: "error",
+      config: { email: "letiskate@gmail.com" },
+      lastError: "Gmail authorization expired. Reconnect Gmail.",
+      lastSyncedAt: new Date("2026-07-29T09:00:00.000Z"),
+      createdAt: new Date("2026-07-29T09:00:00.000Z")
+    }
+  });
+  const newestRuleConnection = await prisma.integrationConnection.create({
+    data: {
+      userId,
+      integrationId: "gmail",
+      status: "error",
+      config: { email: "letiskate@gmail.com" },
+      lastError: "Gmail authorization expired. Reconnect Gmail.",
+      lastSyncedAt: new Date("2026-08-13T09:00:00.000Z"),
+      createdAt: new Date("2026-08-13T09:00:00.000Z")
+    }
+  });
+
+  await prisma.emailSignalRule.createMany({
+    data: [
+      {
+        userId,
+        connectionId: olderConnection.id,
+        adapterId: "job_search_email",
+        name: "Job search emails",
+        query: "interview recruiter application",
+        status: "archived",
+        createdBy: "user",
+        createdAt: new Date("2026-07-16T09:05:00.000Z")
+      },
+      {
+        userId,
+        connectionId: middleConnection.id,
+        adapterId: "custom_email_review",
+        name: "Old Endesa bills",
+        query: "Endesa factura",
+        status: "archived",
+        reviewBeforeLogging: true,
+        createdBy: "user",
+        createdAt: new Date("2026-07-29T09:05:00.000Z")
+      },
+      {
+        userId,
+        connectionId: middleConnection.id,
+        adapterId: "work_action_email",
+        name: "Old work action emails",
+        query: "please review",
+        status: "archived",
+        reviewBeforeLogging: true,
+        createdBy: "user",
+        createdAt: new Date("2026-07-29T09:06:00.000Z")
+      },
+      {
+        userId,
+        connectionId: middleConnection.id,
+        adapterId: "job_search_email",
+        name: "Old job search emails",
+        query: "interview recruiter application",
+        status: "archived",
+        createdBy: "user",
+        createdAt: new Date("2026-07-29T09:07:00.000Z")
+      },
+      {
+        userId,
+        connectionId: newestRuleConnection.id,
+        adapterId: "custom_email_review",
+        name: "Naturgy invoices",
+        query: "Naturgy factura",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user",
+        createdAt: new Date("2026-08-13T09:05:00.000Z")
+      },
+      {
+        userId,
+        connectionId: newestRuleConnection.id,
+        adapterId: "custom_email_review",
+        name: "Aigues de Barcelona invoices",
+        query: "Aigues de Barcelona factura",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user",
+        createdAt: new Date("2026-08-13T09:06:00.000Z")
+      },
+      {
+        userId,
+        connectionId: newestRuleConnection.id,
+        adapterId: "custom_email_review",
+        name: "Endesa bills",
+        query: "Endesa factura",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user",
+        createdAt: new Date("2026-08-13T09:07:00.000Z")
+      },
+      {
+        userId,
+        connectionId: newestRuleConnection.id,
+        adapterId: "work_action_email",
+        name: "Work action emails",
+        query: "please review OR deadline",
+        status: "active",
+        reviewBeforeLogging: true,
+        createdBy: "user",
+        createdAt: new Date("2026-08-13T09:08:00.000Z")
+      },
+      {
+        userId,
+        connectionId: newestRuleConnection.id,
+        adapterId: "job_search_email",
+        name: "Archived job search emails",
+        query: "interview recruiter application",
+        status: "archived",
+        createdBy: "user",
+        createdAt: new Date("2026-08-13T09:09:00.000Z")
+      }
+    ]
+  });
+}
+
+async function seedActiveGmailConnectionWithRule(userId: string): Promise<void> {
+  const connection = await prisma.integrationConnection.create({
+    data: {
+      userId,
+      integrationId: "gmail",
+      status: "active",
+      config: { email: "rules@example.com" }
+    }
+  });
+
+  await prisma.emailSignalRule.create({
+    data: {
+      userId,
+      connectionId: connection.id,
+      adapterId: "custom_email_review",
+      name: "Endesa bills",
+      query: "Endesa",
+      status: "active",
+      reviewBeforeLogging: true,
+      createdBy: "user"
+    }
+  });
+}
+
+async function runAgentTranscript(
+  server: ReturnType<typeof buildServer>,
+  userId: string,
+  messages: string[]
+): Promise<Array<Awaited<ReturnType<typeof sendAgentMessage>>>> {
+  const replies: Array<Awaited<ReturnType<typeof sendAgentMessage>>> = [];
+  for (const message of messages) {
+    replies.push(await sendAgentMessage(server, userId, message));
+  }
+  return replies;
+}
+
 function restoreEnv(key: "GOOGLE_CLIENT_ID" | "GOOGLE_CLIENT_SECRET" | "GMAIL_REDIRECT_URI", value: string | undefined): void {
   if (value === undefined) {
     delete process.env[key];
@@ -47,6 +220,7 @@ test("V3 explicit Gmail sync phrases run gmail.sync, not passive status", async 
 
   try {
     await seedUser(userId);
+    await seedActiveGmailConnectionWithRule(userId);
     configureAgentRuntimeServices({
       syncGmailForUser: async (calledUserId) => {
         calls.push(calledUserId);
@@ -82,6 +256,7 @@ test("V3 Gmail sync auth and token failures return safe reconnect action", async
 
   try {
     await seedUser(userId);
+    await seedActiveGmailConnectionWithRule(userId);
     configureAgentRuntimeServices({
       syncGmailForUser: async () => "Gmail authorization expired. Reconnect Gmail."
     });
@@ -118,6 +293,14 @@ test("V3 Gmail sync reports no active rules honestly", async () => {
 
   try {
     await seedUser(userId);
+    await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: { email: "rules@example.com" }
+      }
+    });
     configureAgentRuntimeServices({
       syncGmailForUser: async () =>
         "Gmail is connected, but no email tracking rules are active. Say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\"."
@@ -214,6 +397,151 @@ test("V3 Gmail status and rule list use the same active-rule source", async () =
     assert.match(list.reply, /Endesa bills/);
     assert.match(list.reply, /Work action emails/);
     assert.doesNotMatch(list.reply, /Paused stale invoices/);
+  } finally {
+    clearAgentRuntimeMocks();
+    resetAgentRuntimeServicesForTests();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("V3 Gmail status, sync, and built-in rule enablement share canonical expired duplicate state", async () => {
+  const restore = installGmailOAuthEnv();
+  const server = buildServer();
+  const userId = `gmail-canonical-transcript-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedExpiredDuplicateGmailState(userId);
+
+    const [status, sync, enableJobSearch, secondSync] = await runAgentTranscript(server, userId, [
+      "gmail status",
+      "sync Gmail",
+      "enable job search one",
+      "sync gmail"
+    ]);
+
+    assertNoGenericAgentError(status);
+    assert.deepEqual(plannedTools(status), ["gmail.status"]);
+    assert.match(status.reply, /Gmail authorization is expired/i);
+    assert.match(status.reply, /Reconnect Gmail here:\nhttps:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(status.reply, /Last synced: 2026-08-13\./);
+    assert.match(status.reply, /Naturgy invoices/);
+    assert.match(status.reply, /Aigues de Barcelona invoices/);
+    assert.match(status.reply, /Endesa bills/);
+    assert.match(status.reply, /Work action emails/);
+
+    assertNoGenericAgentError(sync);
+    assert.deepEqual(plannedTools(sync), ["gmail.sync"]);
+    assert.match(sync.reply, /Gmail authorization is expired/i);
+    assert.match(sync.reply, /Reconnect Gmail here:\nhttps:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+    assert.match(sync.reply, /You have 4 active Gmail rules, but sync cannot run until Gmail is reconnected\./);
+    assert.match(sync.reply, /Naturgy invoices/);
+    assert.match(sync.reply, /Aigues de Barcelona invoices/);
+    assert.match(sync.reply, /Endesa bills/);
+    assert.match(sync.reply, /Work action emails/);
+    assert.doesNotMatch(sync.reply, /Gmail is connected/i);
+    assert.doesNotMatch(sync.reply, /no email tracking rules are active/i);
+
+    assertNoGenericAgentError(enableJobSearch);
+    assert.deepEqual(plannedTools(enableJobSearch), ["gmail.rule.enable_builtin"]);
+    assert.match(enableJobSearch.reply, /Job-search email tracking/i);
+    assert.doesNotMatch(enableJobSearch.reply, /Work-action email tracking is already on|Work action emails is already active/i);
+
+    assertNoGenericAgentError(secondSync);
+    assert.deepEqual(plannedTools(secondSync), ["gmail.sync"]);
+    assert.match(secondSync.reply, /Gmail authorization is expired/i);
+    assert.match(secondSync.reply, /sync cannot run until Gmail is reconnected/i);
+    assert.doesNotMatch(secondSync.reply, /Gmail is connected/i);
+    assert.doesNotMatch(secondSync.reply, /no email tracking rules are active/i);
+  } finally {
+    clearAgentRuntimeMocks();
+    resetAgentRuntimeServicesForTests();
+    restore();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("V3 built-in Gmail rule enablement keeps job-search and work-action references separate", async () => {
+  const restore = installGmailOAuthEnv();
+  const server = buildServer();
+  const userId = `gmail-builtin-enable-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: { email: "rules@example.com" }
+      }
+    });
+
+    for (const phrase of ["enable job search one", "enable job search rule"]) {
+      const reply = await sendAgentMessage(server, userId, phrase);
+      assertNoGenericAgentError(reply);
+      assert.deepEqual(plannedTools(reply), ["gmail.rule.enable_builtin"], phrase);
+      assert.equal(reply.operationsPlanned[0]?.args.kind, "job_search", phrase);
+      assert.match(reply.reply, /Job-search email tracking/i, phrase);
+      assert.doesNotMatch(reply.reply, /Work-action email tracking is already on|Work action emails is already active/i, phrase);
+    }
+
+    const work = await sendAgentMessage(server, userId, "enable work action rule");
+    assertNoGenericAgentError(work);
+    assert.deepEqual(plannedTools(work), ["gmail.rule.enable_builtin"]);
+    assert.equal(work.operationsPlanned[0]?.args.kind, "work_action");
+    assert.match(work.reply, /Work-action email tracking/i);
+    assert.doesNotMatch(work.reply, /Job-search email tracking is already on|Job search emails is already active/i);
+
+    const activeRules = await prisma.emailSignalRule.findMany({
+      where: { userId, status: "active" },
+      orderBy: { name: "asc" }
+    });
+    assert.deepEqual(
+      activeRules.map((rule) => rule.adapterId).sort(),
+      ["job_search_email", "work_action_email"]
+    );
+  } finally {
+    clearAgentRuntimeMocks();
+    resetAgentRuntimeServicesForTests();
+    restore();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("V3 custom Gmail tracking like Endesa still goes through review-first rule creation confirmation", async () => {
+  const server = buildServer();
+  const userId = `gmail-custom-track-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await prisma.integrationConnection.create({
+      data: {
+        userId,
+        integrationId: "gmail",
+        status: "active",
+        config: { email: "rules@example.com" }
+      }
+    });
+    process.env.AGENT_RUNTIME_PLANNER_MOCK_RESPONSE = JSON.stringify({
+      topic: "gmail_rules",
+      intent: "create_custom_gmail_rule",
+      operations: [{ tool: "gmail.rule.create", args: { label: "Endesa bills" }, rationale: "user wants Endesa bill tracking" }],
+      needsClarification: false,
+      clarificationQuestion: null,
+      replyDraft: ""
+    });
+
+    const reply = await sendAgentMessage(server, userId, "track Endesa bills");
+    assertNoGenericAgentError(reply);
+    assert.deepEqual(plannedTools(reply), ["gmail.rule.create"]);
+    assert.equal(reply.needsConfirmation, true);
+    assert.match(reply.reply, /Endesa bills/i);
+    assert.match(reply.reply, /review-first|email reviews/i);
+    assert.match(reply.reply, /not instant/i);
   } finally {
     clearAgentRuntimeMocks();
     resetAgentRuntimeServicesForTests();
