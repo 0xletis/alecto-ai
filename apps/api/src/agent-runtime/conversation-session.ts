@@ -50,12 +50,34 @@ export function createPendingOperationRecord(
     id: `agent-pending-${now}-${Math.round(Math.random() * 1_000_000)}`,
     topic,
     summary,
-    operations,
+    operations: stripUndefinedValues(operations) as AgentPendingOperation["operations"],
     createdAt: new Date(now).toISOString(),
     // Informational only — actual expiry is enforced at the session level (see
     // session-store.ts's 24h sliding TTL), not by this per-pending-operation field.
     expiresAt: new Date(now).toISOString()
   };
+}
+
+function stripUndefinedValues(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(stripUndefinedValues);
+  }
+
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+
+  if (value && typeof value === "object") {
+    const result: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (entry !== undefined) {
+        result[key] = stripUndefinedValues(entry);
+      }
+    }
+    return result;
+  }
+
+  return value;
 }
 
 export function setVisibleEntities(session: AgentSessionState, entities: AgentEntity[]): void {

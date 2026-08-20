@@ -1768,10 +1768,10 @@ function formatProactiveSettingsSummary(settings: NotificationSettings): string 
   const morning = settings.morningBriefEnabled ? `on, around ${formatMinutesOfDay(settings.morningTimeMinutes)}` : "off";
   const evening = settings.eveningCheckinEnabled ? `on, around ${formatMinutesOfDay(settings.eveningTimeMinutes)}` : "off";
   return [
-    "Proactive messages:",
+    "Automatic messages:",
     `- Morning brief: ${morning}`,
     `- Evening check-in: ${evening}`,
-    `- Gmail nudge: ${settings.gmailNudgeEnabled ? "on" : "off"}`
+    `- Gmail alerts: ${settings.gmailNudgeEnabled ? "on" : "off"}`
   ].join("\n");
 }
 
@@ -1866,8 +1866,8 @@ function gmailReconnectNoteForNudge(userId: string, connection: IntegrationConne
   const oauthUrl = gmailOAuthUrlForUser(userId);
   const problem = gmailNudgeConnectionProblem(connection);
   return oauthUrl
-    ? `${problem}, so nudges won't work until you connect or reconnect Gmail: ${oauthUrl}.`
-    : `${problem}, so nudges won't work until Gmail OAuth is configured. ${gmailOAuthMissingConfigMessage()}`;
+    ? `${problem}, so Gmail alerts won't work until you connect or reconnect Gmail: ${oauthUrl}.`
+    : `${problem}, so Gmail alerts won't work until Gmail OAuth is configured. ${gmailOAuthMissingConfigMessage()}`;
 }
 
 function gmailReconnectNoteAfterNudgeEnabled(userId: string, connection: IntegrationConnection | undefined): string | undefined {
@@ -1878,8 +1878,8 @@ function gmailReconnectNoteAfterNudgeEnabled(userId: string, connection: Integra
   const oauthUrl = gmailOAuthUrlForUser(userId);
   const problem = gmailNudgeConnectionProblem(connection);
   return oauthUrl
-    ? `${problem}. Gmail needs connecting or reconnecting before nudges can work:\n${oauthUrl}`
-    : `${problem}. Gmail needs connecting or reconnecting before nudges can work. ${gmailOAuthMissingConfigMessage()}`;
+    ? `${problem}. Gmail needs connecting or reconnecting before alerts can work:\n${oauthUrl}`
+    : `${problem}. Gmail needs connecting or reconnecting before alerts can work. ${gmailOAuthMissingConfigMessage()}`;
 }
 
 function gmailConnectionNeedsReconnect(connection: IntegrationConnection | undefined): boolean {
@@ -1927,8 +1927,8 @@ function describeProactiveSettingsChanges(current: NotificationSettings, request
   if (request.gmailNudgeEnabled !== undefined && request.gmailNudgeEnabled !== current.gmailNudgeEnabled) {
     changes.push(
       request.gmailNudgeEnabled
-        ? { proposal: "turn on the Gmail nudge", done: "the Gmail nudge is now on" }
-        : { proposal: "turn off the Gmail nudge", done: "the Gmail nudge is now off" }
+        ? { proposal: "turn on Gmail alerts", done: "Gmail alerts are now on" }
+        : { proposal: "turn off Gmail alerts", done: "Gmail alerts are now off" }
     );
   }
 

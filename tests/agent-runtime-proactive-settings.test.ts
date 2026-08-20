@@ -113,7 +113,7 @@ test("8. 'stop morning briefs' proposes turning it off, and 'yes' turns it off",
   }
 });
 
-test("8b. 'stop evening check-ins' and 'turn on Gmail nudges' each toggle only their own field", async () => {
+test("8b. 'stop evening check-ins' and 'turn on Gmail alerts' each toggle only their own field", async () => {
   const server = buildServer();
   const userId = `proactive-settings-independent-${randomUUID()}`;
 
@@ -126,7 +126,7 @@ test("8b. 'stop evening check-ins' and 'turn on Gmail nudges' each toggle only t
     await sendAgentMessage(server, userId, "yes");
 
     mockPlan(proactiveProposeUpdatePlan({ gmailNudgeEnabled: true }));
-    await sendAgentMessage(server, userId, "turn on Gmail nudges");
+    await sendAgentMessage(server, userId, "turn on Gmail alerts");
     await sendAgentMessage(server, userId, "yes");
 
     const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
@@ -153,7 +153,7 @@ test("9. 'what proactive messages are on?' shows the real current settings", asy
 
     assert.match(reply.reply, /morning brief: on/i);
     assert.match(reply.reply, /evening check-in: off/i);
-    assert.match(reply.reply, /gmail nudge: on/i);
+    assert.match(reply.reply, /gmail alerts: on/i);
     assert.equal(reply.debug.mutationExecuted, false);
   } finally {
     clearAgentRuntimeMocks();

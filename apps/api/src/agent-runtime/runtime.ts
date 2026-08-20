@@ -321,18 +321,6 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeNoPendingReply(context, "confirmation.cancel");
   }
 
-  // A legacy PendingAction (from a slash-command flow like /action_hygiene or a Gmail rule
-  // proposal) still lives entirely in server.ts's legacy resolver — v3 has no tool that can
-  // safely execute it (applyPendingAction is entangled with Gmail-rule/action-hygiene helpers
-  // that aren't safely importable here). v3's own pendingOperation always takes precedence
-  // (handled above); only once that's empty do we check for a legacy one. Anything other than
-  // an exact confirm/cancel gets deflected here, before the planner ever runs, so a random
-  // natural message can never accidentally execute or silently drop a pending slash-command
-  // action — see docs/09-architecture-inventory.md's "PendingAction / Agent Runtime v3 interop".
-  if (!pending && context.legacyPendingAction) {
-    return finalizeLegacyPendingActionAmbiguous(context, context.legacyPendingAction);
-  }
-
   if (UNSUPPORTED_GMAIL_ACTION_RE.test(message.trim())) {
     // Deliberately does not touch pendingOperation: an unrelated, unsupported
     // request must not silently cancel or continue an unrelated pending flow.
@@ -355,6 +343,17 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const gmailNudgeSettingsShortcut = !pending ? gmailNudgeSettingsShortcutOperation(message) : undefined;
   if (gmailNudgeSettingsShortcut) {
     return finalizeDeterministicOperation(context, message, gmailNudgeSettingsShortcut, "proactive_settings");
+  }
+
+  // A legacy PendingAction (from a slash-command flow like /action_hygiene or a Gmail rule
+  // proposal) still lives entirely in server.ts's legacy resolver — v3 has no tool that can
+  // safely execute it (applyPendingAction is entangled with Gmail-rule/action-hygiene helpers
+  // that aren't safely importable here). v3's own pendingOperation always takes precedence
+  // (handled above); only once that's empty do we check for a legacy one. Explicit Gmail
+  // connect/reconnect/alert requests above are safe read-only/proposal flows and must not be
+  // swallowed by stale legacy pending state; everything else deflects before the planner.
+  if (!pending && context.legacyPendingAction) {
+    return finalizeLegacyPendingActionAmbiguous(context, context.legacyPendingAction);
   }
 
   if (pending) {
@@ -535,11 +534,11 @@ async function finalizeDeterministicOperation(
 }
 
 function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
-  const text = message.trim().toLowerCase();
+  const text = normalizeIntentText(message);
   if (!text || /\bsync\b/.test(text)) {
     return undefined;
   }
-  if (looksLikeGmailNudgeSettingsRequest(text)) {
+  if (looksLikeGmailAlertSettingsRequest(text)) {
     return undefined;
   }
 
@@ -557,27 +556,34 @@ function gmailConnectionShortcutOperation(message: string, context: ContextBundl
 }
 
 function gmailNudgeSettingsShortcutOperation(message: string): PlannedOperation | undefined {
-  const text = message.trim().toLowerCase();
-  if (!looksLikeGmailNudgeSettingsRequest(text)) {
+  const text = normalizeIntentText(message);
+  if (!looksLikeGmailAlertSettingsRequest(text)) {
     return undefined;
   }
 
-  if (/\b(turn|switch|shut)\s+off\b|\b(stop|disable)\b|\b(no more|don't|do not|dont)\b/.test(text)) {
-    return { tool: "proactive.settings_propose_update", args: { gmailNudgeEnabled: false }, rationale: "user asked to turn off Gmail nudges" };
+  if (/\b(turn|switch|shut)\s+off\b|\b(stop|disable|desactiva|desactivar|para|deja)\b|\b(no more|don't|do not|dont|no me avises|no m avises)\b/.test(text)) {
+    return { tool: "proactive.settings_propose_update", args: { gmailNudgeEnabled: false }, rationale: "user asked to turn off Gmail alerts" };
   }
 
-  if (/\b(turn|switch|enable|activate|start)\s+(on\s+)?\b|\bnotify me\b|\blet me know\b|\bsend me\b/.test(text)) {
-    return { tool: "proactive.settings_propose_update", args: { gmailNudgeEnabled: true }, rationale: "user asked to turn on Gmail nudges" };
+  if (
+    /\b(turn|switch|enable|activate|start)\s+(on\s+)?\b/.test(text) ||
+    /\b(activa|activar|enciende|avisame|avisa me|notificame|notifica me)\b/.test(text) ||
+    /\b(notify me|let me know|tell me|send me)\b/.test(text)
+  ) {
+    return { tool: "proactive.settings_propose_update", args: { gmailNudgeEnabled: true }, rationale: "user asked to turn on Gmail alerts" };
   }
 
   return undefined;
 }
 
-function looksLikeGmailNudgeSettingsRequest(text: string): boolean {
+function looksLikeGmailAlertSettingsRequest(text: string): boolean {
   return (
-    /\bgmail\b[\s\S]{0,40}\b(nudge|nudges|notification|notifications|notify)\b/.test(text) ||
-    /\b(nudge|nudges|notification|notifications|notify)\b[\s\S]{0,40}\bgmail\b/.test(text) ||
-    /\bgmail review\b[\s\S]{0,40}\b(notification|notifications|nudge|nudges)\b/.test(text)
+    /\bgmail\b[\s\S]{0,50}\b(nudge|nudges|alert|alerts|notification|notifications|notify|avisos?|notificaciones?|avisa|avises|avisame|notifica)\b/.test(text) ||
+    /\b(nudge|nudges|alert|alerts|notification|notifications|notify|avisos?|notificaciones?|avisa|avises|avisame|notifica)\b[\s\S]{0,50}\bgmail\b/.test(text) ||
+    /\b(email|emails|correo|correos|mail|mails)\b[\s\S]{0,50}\b(alert|alerts|notification|notifications|notify|avisos?|notificaciones?|avisa|avises|avisame|notifica|important|importantes)\b/.test(text) ||
+    /\b(alert|alerts|notification|notifications|notify|avisos?|notificaciones?|avisa|avises|avisame|notifica|important|importantes)\b[\s\S]{0,50}\b(email|emails|correo|correos|mail|mails)\b/.test(text) ||
+    /\b(tell me|let me know|notify me|avisame|avisa me|no me avises|notificame|notifica me)\b[\s\S]{0,50}\b(email|emails|correo|correos|gmail)\b/.test(text) ||
+    /\bgmail review\b[\s\S]{0,40}\b(notification|notifications|alert|alerts|nudge|nudges|aviso|avisos)\b/.test(text)
   );
 }
 
@@ -589,6 +595,14 @@ function hasRecentGmailContext(context: ContextBundle): boolean {
     return true;
   }
   return context.session.messages.slice(-8).some((entry) => /\bgmail\b|\bemail rules?\b|\bemail reviews?\b/.test(entry.text.toLowerCase()));
+}
+
+function normalizeIntentText(message: string): string {
+  return message
+    .trim()
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
 }
 
 async function finalizeNoPendingReply(context: ContextBundle, tool: string): Promise<AgentMessageResponse> {

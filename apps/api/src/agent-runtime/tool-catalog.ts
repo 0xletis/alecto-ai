@@ -467,7 +467,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "proactive.settings_show",
     description:
-      "Show which proactive nudges (morning brief, evening check-in, Gmail nudge) are currently on/off for the user, including their scheduled time when on. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?'.",
+      "Show which automatic messages (morning brief, evening check-in, Gmail alerts) are currently on/off for the user, including their scheduled time when on. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', 'are Gmail alerts on?'.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({})
@@ -475,13 +475,13 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "proactive.settings_propose_update",
     description:
-      "Propose turning the morning brief / evening check-in / Gmail nudge on or off, and/or changing the morning-brief or evening-check-in time — shows what would change and opens a pending confirmation. Use for 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail nudges', 'stop Gmail nudges'. For a combined request like 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', set BOTH morningBriefEnabled: true AND morningTimeText — this turns it on AND sets the time in one proposal. For a time-only request like 'move morning brief to 9', 'change morning brief time to 9', set ONLY morningTimeText — do not also set morningBriefEnabled unless the user is actually asking to turn it on/off. Set only the field(s) actually being changed. Never enables anything by itself — the user must still confirm.",
+      "Propose turning the morning brief / evening check-in / Gmail alerts on or off, and/or changing the morning-brief or evening-check-in time — shows what would change and opens a pending confirmation. Use for 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail alerts', 'stop Gmail alerts', 'tell me when important emails arrive', 'avísame de correos importantes'. For a combined request like 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', set BOTH morningBriefEnabled: true AND morningTimeText — this turns it on AND sets the time in one proposal. For a time-only request like 'move morning brief to 9', 'change morning brief time to 9', set ONLY morningTimeText — do not also set morningBriefEnabled unless the user is actually asking to turn it on/off. Set only the field(s) actually being changed. Never enables anything by itself — the user must still confirm.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       morningBriefEnabled: z.boolean().optional().describe("Set true to turn the proactive morning brief on, false to turn it off."),
       eveningCheckinEnabled: z.boolean().optional().describe("Set true to turn the proactive evening check-in on, false to turn it off."),
-      gmailNudgeEnabled: z.boolean().optional().describe("Set true to turn the proactive Gmail review nudge on, false to turn it off."),
+      gmailNudgeEnabled: z.boolean().optional().describe("Internal field: set true to turn proactive Gmail/email alerts on, false to turn them off."),
       morningTimeText: z.string().optional().describe("New natural-language time for the morning brief, e.g. '9am', '01:06'. Setting this alone does NOT turn the morning brief on — also set morningBriefEnabled: true if the user wants it turned on."),
       eveningTimeText: z.string().optional().describe("New natural-language time for the evening check-in, e.g. '9:30pm', '21:30'. Setting this alone does NOT turn the evening check-in on.")
     })

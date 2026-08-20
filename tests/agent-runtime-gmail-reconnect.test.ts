@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildServer, clearAgentRuntimeMocks, prisma, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+import { createPendingAction } from "../packages/db/src/index.ts";
+import { buildServer, clearAgentRuntimeMocks, getAgentSession, prisma, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
 
 type OAuthEnvSnapshot = {
   GOOGLE_CLIENT_ID: string | undefined;
@@ -103,7 +104,16 @@ function plannedTools(reply: Awaited<ReturnType<typeof sendAgentMessage>>): stri
   return reply.operationsPlanned.map((operation) => operation.tool);
 }
 
-test("V3 'turn on Gmail nudges' proposes proactive settings and does not sync Gmail", async () => {
+function assertNoGenericAgentError(reply: Awaited<ReturnType<typeof sendAgentMessage>>): void {
+  assert.notEqual(reply.reply, "I hit an unexpected problem there — please try again.");
+  assert.doesNotMatch(reply.reply, /unexpected problem/i);
+}
+
+function assertNoUserFacingNudge(reply: Awaited<ReturnType<typeof sendAgentMessage>>): void {
+  assert.doesNotMatch(reply.reply, /\bnudges?\b/i);
+}
+
+test("V3 'turn on Gmail nudges' proposes Gmail alerts and does not crash or sync Gmail", async () => {
   const restore = installGmailOAuthEnv();
   const server = buildServer();
   const userId = `gmail-nudge-reconnect-${randomUUID()}`;
@@ -115,31 +125,141 @@ test("V3 'turn on Gmail nudges' proposes proactive settings and does not sync Gm
 
     const proposal = await sendAgentMessage(server, userId, "turn on Gmail nudges");
 
+    assertNoGenericAgentError(proposal);
     assert.deepEqual(plannedTools(proposal), ["proactive.settings_propose_update"]);
     assert.equal(proposal.operationsPlanned[0]?.args.gmailNudgeEnabled, true);
     assert.equal(proposal.debug.mutationExecuted, false);
     assert.equal(proposal.needsConfirmation, true);
-    assert.match(proposal.reply, /about to turn on the Gmail nudge/i);
+    assert.match(proposal.reply, /about to turn on Gmail alerts/i);
     assert.match(proposal.reply, /Gmail authorization is expired/i);
+    assert.match(proposal.reply, /Gmail alerts won't work/i);
     assert.match(proposal.reply, /connect or reconnect Gmail/i);
     assertContainsOAuthLink(proposal.reply);
     assertNoGmailSecrets(proposal);
+    assertNoUserFacingNudge(proposal);
     assert.ok(!plannedTools(proposal).some((tool) => tool.toLowerCase().includes("sync")), "nudge setting must not run Gmail sync");
 
     const unchanged = await prisma.notificationSettings.findUnique({ where: { userId } });
     assert.equal(unchanged?.gmailNudgeEnabled, false);
+    const pendingSession = await getAgentSession(userId);
+    assert.equal(pendingSession?.pendingOperation !== null, true);
+    assert.doesNotMatch(JSON.stringify(pendingSession?.pendingOperation), /\bundefined\b/);
 
     const confirm = await sendAgentMessage(server, userId, "yes");
+    assertNoGenericAgentError(confirm);
     assert.deepEqual(plannedTools(confirm), ["proactive.settings_apply_update"]);
     assert.equal(confirm.operationsExecuted[0]?.tool, "proactive.settings_apply_update");
     assert.equal(confirm.debug.mutationExecuted, true);
-    assert.match(confirm.reply, /Done — the Gmail nudge is now on/i);
-    assert.match(confirm.reply, /Gmail needs connecting or reconnecting before nudges can work/i);
+    assert.match(confirm.reply, /Done — Gmail alerts are now on/i);
+    assert.match(confirm.reply, /Gmail needs connecting or reconnecting before alerts can work/i);
     assertContainsOAuthLink(confirm.reply);
     assertNoGmailSecrets(confirm);
+    assertNoUserFacingNudge(confirm);
 
     const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
     assert.equal(updated?.gmailNudgeEnabled, true);
+  } finally {
+    clearAgentRuntimeMocks();
+    restore();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("V3 normal-user Gmail alert phrases route to proactive settings without generic fallback", async () => {
+  const restore = installGmailOAuthEnv();
+  const server = buildServer();
+  const phrases = [
+    "tell me when important emails arrive",
+    "notify me about important Gmail",
+    "avísame de correos importantes",
+    "turn on Gmail alerts",
+    "turn on email alerts",
+    "send me alerts for Gmail"
+  ];
+  const userIds: string[] = [];
+
+  try {
+    for (const phrase of phrases) {
+      const userId = `gmail-alert-phrase-${randomUUID()}`;
+      userIds.push(userId);
+      await seedUser(userId);
+      await seedNotificationSettings(userId, false);
+      await seedExpiredGmailConnection(userId);
+
+      const reply = await sendAgentMessage(server, userId, phrase);
+      assertNoGenericAgentError(reply);
+      assert.deepEqual(plannedTools(reply), ["proactive.settings_propose_update"], phrase);
+      assert.equal(reply.operationsPlanned[0]?.args.gmailNudgeEnabled, true);
+      assert.equal(reply.debug.mutationExecuted, false);
+      assert.equal(reply.needsConfirmation, true);
+      assert.match(reply.reply, /Gmail alerts/i, phrase);
+      assertContainsOAuthLink(reply.reply);
+      assertNoUserFacingNudge(reply);
+      assertNoGmailSecrets(reply);
+      assert.ok(!plannedTools(reply).some((tool) => tool.toLowerCase().includes("sync")), `${phrase} must not run Gmail sync`);
+    }
+  } finally {
+    clearAgentRuntimeMocks();
+    restore();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+  }
+});
+
+test("V3 normal-user Gmail alert disable phrases route to proactive settings", async () => {
+  const server = buildServer();
+  const phrases = ["stop email alerts", "no me avises de correos", "turn off Gmail notifications"];
+  const userIds: string[] = [];
+
+  try {
+    for (const phrase of phrases) {
+      const userId = `gmail-alert-disable-${randomUUID()}`;
+      userIds.push(userId);
+      await seedUser(userId);
+      await seedNotificationSettings(userId, true);
+
+      const reply = await sendAgentMessage(server, userId, phrase);
+      assertNoGenericAgentError(reply);
+      assert.deepEqual(plannedTools(reply), ["proactive.settings_propose_update"], phrase);
+      assert.equal(reply.operationsPlanned[0]?.args.gmailNudgeEnabled, false);
+      assert.equal(reply.debug.mutationExecuted, false);
+      assert.equal(reply.needsConfirmation, true);
+      assert.match(reply.reply, /turn off Gmail alerts/i, phrase);
+      assertNoUserFacingNudge(reply);
+    }
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+  }
+});
+
+test("explicit Gmail alert setup bypasses stale legacy pending action state safely", async () => {
+  const restore = installGmailOAuthEnv();
+  const server = buildServer();
+  const userId = `gmail-alert-legacy-pending-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    await seedNotificationSettings(userId, false);
+    await seedExpiredGmailConnection(userId);
+    await createPendingAction(userId, {
+      type: "action_archive",
+      summary: "archive stale task",
+      payload: { actionId: "stale-action-id" },
+      expiresAt: new Date(Date.now() + 60_000)
+    });
+
+    const reply = await sendAgentMessage(server, userId, "turn on Gmail alerts");
+    assertNoGenericAgentError(reply);
+    assert.deepEqual(plannedTools(reply), ["proactive.settings_propose_update"]);
+    assert.equal(reply.operationsPlanned[0]?.args.gmailNudgeEnabled, true);
+    assert.match(reply.reply, /Gmail alerts/i);
+    assert.doesNotMatch(reply.reply, /pending action from the previous flow/i);
+
+    const legacyPending = await prisma.pendingAction.findFirst({ where: { userId, status: "pending" } });
+    assert.equal(legacyPending?.type, "action_archive", "Gmail alert setup must not execute or clear the legacy pending action");
   } finally {
     clearAgentRuntimeMocks();
     restore();
@@ -163,6 +283,7 @@ test("V3 reconnect and setup phrases return the real Gmail OAuth URL", async () 
     await seedUser(newUserId);
 
     const reconnect = await sendAgentMessage(server, expiredUserId, "send me link to reconnect Gmail");
+    assertNoGenericAgentError(reconnect);
     assert.deepEqual(plannedTools(reconnect), ["gmail.status"]);
     assert.equal(reconnect.operationsPlanned[0]?.args.includeLink, true);
     assert.equal(reconnect.debug.mutationExecuted, false);
@@ -174,6 +295,7 @@ test("V3 reconnect and setup phrases return the real Gmail OAuth URL", async () 
     assertNoGmailSecrets(reconnect);
 
     const connect = await sendAgentMessage(server, newUserId, "send me link to connect my Gmail");
+    assertNoGenericAgentError(connect);
     assert.deepEqual(plannedTools(connect), ["gmail.status"]);
     assert.match(connect.reply, /Gmail is not connected yet/i);
     assert.match(connect.reply, /Connect Gmail here/i);
@@ -181,6 +303,7 @@ test("V3 reconnect and setup phrases return the real Gmail OAuth URL", async () 
     assertNoGmailSecrets(connect);
 
     const integrate = await sendAgentMessage(server, expiredUserId, "integrate email");
+    assertNoGenericAgentError(integrate);
     assert.deepEqual(plannedTools(integrate), ["gmail.status"]);
     assert.match(integrate.reply, /Gmail authorization is expired/i);
     assert.match(integrate.reply, /Reconnect Gmail here/i);
@@ -206,9 +329,11 @@ test("pending proactive settings do not hijack Gmail reconnect-link requests, bu
     await seedExpiredGmailConnection(userId);
 
     const proposal = await sendAgentMessage(server, userId, "turn on Gmail nudges");
+    assertNoGenericAgentError(proposal);
     assert.equal(proposal.needsConfirmation, true);
 
     const reconnect = await sendAgentMessage(server, userId, "send me link to reconnect it");
+    assertNoGenericAgentError(reconnect);
     assert.deepEqual(plannedTools(reconnect), ["gmail.status"]);
     assert.match(reconnect.reply, /Reconnect Gmail here/i);
     assertContainsOAuthLink(reconnect.reply);
@@ -216,14 +341,17 @@ test("pending proactive settings do not hijack Gmail reconnect-link requests, bu
     assert.equal(reconnect.debug.pendingOperation, true, "asking for the link must not clear the pending nudge confirmation");
 
     const confirm = await sendAgentMessage(server, userId, "yes");
+    assertNoGenericAgentError(confirm);
     assert.equal(confirm.operationsExecuted[0]?.tool, "proactive.settings_apply_update");
     assert.equal(confirm.debug.mutationExecuted, true);
     const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
     assert.equal(updated?.gmailNudgeEnabled, true);
 
     const secondProposal = await sendAgentMessage(server, userId, "turn off Gmail nudges");
+    assertNoGenericAgentError(secondProposal);
     assert.equal(secondProposal.needsConfirmation, true);
     const cancel = await sendAgentMessage(server, userId, "cancel");
+    assertNoGenericAgentError(cancel);
     assert.match(cancel.reply, /Cancelled/i);
     assert.equal(cancel.debug.mutationExecuted, false);
     const stillOn = await prisma.notificationSettings.findUnique({ where: { userId } });

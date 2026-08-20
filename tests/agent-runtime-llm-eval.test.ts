@@ -55,6 +55,38 @@ import {
 
 const EVAL_TIMEOUT_MS = 120_000;
 
+type GmailOAuthEnvSnapshot = {
+  GOOGLE_CLIENT_ID: string | undefined;
+  GOOGLE_CLIENT_SECRET: string | undefined;
+  GMAIL_REDIRECT_URI: string | undefined;
+};
+
+function installGmailOAuthEnv(): () => void {
+  const previous: GmailOAuthEnvSnapshot = {
+    GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+    GMAIL_REDIRECT_URI: process.env.GMAIL_REDIRECT_URI
+  };
+
+  process.env.GOOGLE_CLIENT_ID = "test-gmail-client-id.apps.googleusercontent.com";
+  process.env.GOOGLE_CLIENT_SECRET = "test-gmail-client-secret";
+  process.env.GMAIL_REDIRECT_URI = "http://localhost:3000/oauth/gmail/callback";
+
+  return () => {
+    restoreEnv("GOOGLE_CLIENT_ID", previous.GOOGLE_CLIENT_ID);
+    restoreEnv("GOOGLE_CLIENT_SECRET", previous.GOOGLE_CLIENT_SECRET);
+    restoreEnv("GMAIL_REDIRECT_URI", previous.GMAIL_REDIRECT_URI);
+  };
+}
+
+function restoreEnv(key: keyof GmailOAuthEnvSnapshot, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[key];
+  } else {
+    process.env[key] = value;
+  }
+}
+
 test(
   "1. new user onboarding: an empty user asking what to do gets the goal-anchor nudge, never a fake goal",
   { ...llmEvalOptions(["onboarding"]), timeout: EVAL_TIMEOUT_MS },
@@ -420,6 +452,58 @@ test(
         assert.ok(mentionsOn, `expected the status reply to say the morning brief is on — got: ${t3.reply}`);
       });
     } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "9b. Gmail alerts with expired auth: propose, confirm, and reconnect link stay user-facing",
+  { ...llmEvalOptions(["gmail", "proactive-settings"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const restore = installGmailOAuthEnv();
+    const server = buildServer();
+    const userId = `llm-eval-gmail-alerts-${randomUUID()}`;
+    const trace = new EvalTrace("9b-gmail-alerts-expired-auth", ["gmail", "proactive-settings"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.notificationSettings.create({ data: { userId, gmailNudgeEnabled: false, timezone: "Europe/Madrid" } });
+      await prisma.integrationConnection.create({
+        data: {
+          userId,
+          integrationId: "gmail",
+          status: "error",
+          lastSyncedAt: new Date("2026-08-13T11:15:37.863Z"),
+          lastError: "Gmail authorization expired. Reconnect Gmail.",
+          config: { email: "user@example.com" }
+        }
+      });
+
+      await trace.guard(async () => {
+        const proposal = trace.record("tell me when important emails arrive", await sendAgentMessage(server, userId, "tell me when important emails arrive"));
+        trace.checkpoint("proposal needs confirmation", proposal.needsConfirmation, String(proposal.needsConfirmation));
+        assert.equal(proposal.needsConfirmation, true);
+        assert.match(proposal.reply, /Gmail alerts/i);
+        assert.match(proposal.reply, /Reconnect Gmail|connect or reconnect Gmail/i);
+        assert.match(proposal.reply, /https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+        assert.doesNotMatch(proposal.reply, /\bnudges?\b/i);
+        assert.ok(!proposal.operationsPlanned.some((operation) => operation.tool.toLowerCase().includes("sync")), "Gmail alert setup must not plan sync");
+
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const afterConfirm = await prisma.notificationSettings.findUnique({ where: { userId } });
+        trace.checkpoint("Gmail alerts enabled in DB after confirm", afterConfirm?.gmailNudgeEnabled === true, String(afterConfirm?.gmailNudgeEnabled));
+        assert.equal(afterConfirm?.gmailNudgeEnabled, true);
+
+        const reconnect = trace.record("send me the reconnect link", await sendAgentMessage(server, userId, "send me the reconnect link"));
+        assert.match(reconnect.reply, /Reconnect Gmail here/i);
+        assert.match(reconnect.reply, /https:\/\/accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+        assert.doesNotMatch(reconnect.reply, /\bnudges?\b/i);
+      });
+    } finally {
+      restore();
       await server.close();
       await prisma.user.deleteMany({ where: { id: userId } });
     }

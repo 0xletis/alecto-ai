@@ -273,7 +273,7 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
       args,
       status: "needs_clarification",
       requiresConfirmation: false,
-      clarificationQuestion: "What would you like to change — the morning brief, the evening check-in, or the Gmail nudge?",
+      clarificationQuestion: "What would you like to change — the morning brief, the evening check-in, or Gmail alerts?",
       rationale: operation.rationale
     };
   }
