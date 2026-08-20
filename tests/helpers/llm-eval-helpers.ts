@@ -96,9 +96,27 @@ interface EvalTurnRecord {
   turn: number;
   message: string;
   reply: string;
+  /** True when this turn's reply came from planner.ts's heuristicPlan (the real LLM call failed)
+   * rather than genuine reasoning — labeled here so a trace makes an unexpected degraded-mode turn
+   * obvious at a glance, without that alone failing the scenario (see EvalTrace.record below). */
+  usedFallback: boolean;
   operationsPlanned: AgentMessageResponseJson["operationsPlanned"];
   operationsExecuted: AgentMessageResponseJson["operationsExecuted"];
   debug: AgentMessageResponseJson["debug"];
+}
+
+/**
+ * Mirrors planner.ts's degradedFallbackReply's own banned list — a real Telegram smoke test found
+ * fallback-mode wording ("...without my language model available") leaking straight into a user's
+ * chat. This harness must catch that itself, not only trust the deterministic suite that already
+ * regression-tests it (tests/agent-runtime-fallback-degraded-mode.test.ts) — a real end-to-end
+ * scenario is exactly the kind of place a future rewrite could reintroduce it unnoticed.
+ */
+const BANNED_FALLBACK_WORDING = ["language model available", "fallback planner", "heuristic planner", "openai failed", "openai"];
+
+function findLeakedFallbackWording(reply: string): string | undefined {
+  const lower = reply.toLowerCase();
+  return BANNED_FALLBACK_WORDING.find((phrase) => lower.includes(phrase));
 }
 
 interface EvalCheckpointRecord {
@@ -168,14 +186,33 @@ export class EvalTrace {
   ) {}
 
   record(message: string, response: AgentMessageResponseJson): AgentMessageResponseJson {
+    const usedFallback = response.debug.plannerUsed === "fallback";
+    const turnNumber = this.turns.length + 1;
+
     this.turns.push({
-      turn: this.turns.length + 1,
+      turn: turnNumber,
       message,
       reply: response.reply,
+      usedFallback,
       operationsPlanned: response.operationsPlanned,
       operationsExecuted: response.operationsExecuted,
       debug: response.debug
     });
+
+    if (usedFallback) {
+      // Informational only — degraded mode on one turn doesn't fail a scenario by itself unless
+      // that scenario specifically needs real reasoning to pass (its own assertions will fail
+      // naturally in that case); this just makes it visible in the trace at a glance.
+      this.checkpoint(`turn ${turnNumber}: degraded/fallback mode used`, true, response.reply);
+    }
+
+    // UNCONDITIONAL, on every turn regardless of usedFallback: internal fallback wording must
+    // never reach the user. This is the one thing about fallback mode that always fails the
+    // scenario, on every turn, automatically — no scenario has to opt in.
+    const leaked = findLeakedFallbackWording(response.reply);
+    this.checkpoint(`turn ${turnNumber}: no internal fallback wording leaked`, !leaked, leaked ? `found "${leaked}" in: ${response.reply}` : undefined);
+    assert.ok(!leaked, `turn ${turnNumber} ("${message}") leaked internal fallback wording ("${leaked}") into the reply — got: ${response.reply}`);
+
     return response;
   }
 

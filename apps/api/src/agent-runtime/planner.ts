@@ -256,14 +256,40 @@ function heuristicPlan(message: string, context: ContextBundle): RawPlan {
     }
   }
 
+  const degradedReply = degradedFallbackReply(message);
+
   return {
     topic: session.topic ?? "general",
     intent: "fallback_no_match",
     operations: [],
     needsClarification: true,
-    clarificationQuestion: "I couldn't confidently understand that without my language model available. Could you rephrase?",
-    replyDraft: "I couldn't confidently understand that without my language model available. Could you rephrase?"
+    clarificationQuestion: degradedReply,
+    replyDraft: degradedReply
   };
+}
+
+const GMAIL_SHAPE_PATTERN = /\b(email|emails|gmail|inbox|review|reviews)\b/i;
+const GOAL_PROGRESS_SHAPE_PATTERN =
+  /\b(\d+\s*(minutes?|mins?|hours?|pages?|chapters?|sessions?|reps?|sets?|cups?|calls?|steps?|miles?|cvs?|applications?)|goal|progress|log(ged|ging)?)\b/i;
+
+/**
+ * User-facing text for whenever the real LLM planner is unavailable (network error, missing/
+ * invalid OPENAI_API_KEY, timeout — see planMessage's catch above) and this heuristic safety net
+ * has to reply on its own. A real Telegram smoke test caught this leaking dev-internal wording
+ * ("...without my language model available") straight to the user — honest that something didn't
+ * work is fine; naming the internal mechanism (planner, LLM, fallback, heuristic) is not. Never
+ * pretends the message was understood or acted on (needsClarification stays true, no operations),
+ * and offers a concrete, phrasing-shaped example next step rather than a bare "try again" — a
+ * generic shape check (never a specific goal/tool name) picks the most relevant example.
+ */
+function degradedFallbackReply(message: string): string {
+  if (GMAIL_SHAPE_PATTERN.test(message)) {
+    return 'I couldn\'t reason through the email request cleanly. Try "show pending email reviews" or "turn the first email into a task".';
+  }
+  if (GOAL_PROGRESS_SHAPE_PATTERN.test(message)) {
+    return 'I couldn\'t safely interpret that update. Try phrasing it like "read 30 minutes for Nietzsche" or "sent 5 CVs".';
+  }
+  return "I'm having trouble reasoning through that right now. I can still help with simple updates like logging progress, showing goals, or listing actions.";
 }
 
 function blankPlan(topic: string, intent: string, operations: RawPlan["operations"]): RawPlan {
