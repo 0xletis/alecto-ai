@@ -372,20 +372,17 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "goal.log_evidence",
     description:
-      "Log a real, grounded event that counts as evidence toward whichever active goal declares it (a goal's own targetMetrics — set when the goal was created — decide the link; this never guesses). Works for any goal category, not just career/job-search. Use event.log_job_applications instead for 'sent N CVs/applications' and event.log_workout for training sessions. Set EITHER eventType (one of the fixed career signals below) OR signalKey (a CUSTOM per-goal signal key, e.g. 'tea_cups_drunk', 'called_grandmother' — only use a signalKey that is one of the user's OWN active goals' declared custom signals, visible from goal.tracking_show or the goal's own creation; never invent one). Examples: 'got 2 recruiter replies' (eventType recruiter_reply_received, count 2), 'I have an interview tomorrow' (eventType interview_scheduled — also consider planning action.create for the interview itself if a date was given), 'got rejected by Acme' (eventType rejection_received, notes 'Acme'), 'had 2 teas today' for a goal that declared a 'tea_cups_drunk' signal (signalKey 'tea_cups_drunk', count 2). Never invent a signal the user didn't actually describe.",
+      "Log a real, grounded event that counts as evidence toward whichever active goal declares it (a goal's own targetMetrics — set when the goal was created — decide the link; this never guesses). Works for any goal category, not just career/job-search. Use event.log_job_applications instead for 'sent N CVs/applications' and event.log_workout for training sessions. Set EITHER eventType (a registered event type that some active goal's targetMetrics already declares — e.g. 'career.recruiter_reply_received', or 'learning.reading_session_completed' for a reading goal; visible from goal.tracking_show) OR signalKey (a CUSTOM per-goal signal key, e.g. 'tea_cups_drunk', 'called_grandmother' — only use a signalKey that is one of the user's OWN active goals' declared custom signals, visible from goal.tracking_show or the goal's own creation; never invent one). If goalRef is omitted and more than one active goal could plausibly own this signal, this asks which goal instead of guessing. Examples: 'got 2 recruiter replies' (eventType career.recruiter_reply_received, count 2), 'I have an interview tomorrow' (eventType career.interview_scheduled — also consider planning action.create for the interview itself if a date was given), 'got rejected by Acme' (eventType career.rejection_received, notes 'Acme'), 'had 2 teas today' for a goal that declared a 'tea_cups_drunk' signal (signalKey 'tea_cups_drunk', count 2), 'read 5 minutes' for a reading goal that declared 'learning.reading_session_completed' or a custom 'reading_minutes' signal. Never invent a signal the user didn't actually describe, and never invent an eventType that isn't a real registered event type.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
       eventType: z
-        .enum([
-          "career.recruiter_reply_received",
-          "career.interview_scheduled",
-          "career.interview_completed",
-          "career.rejection_received",
-          "career.offer_received"
-        ])
-        .optional(),
+        .string()
+        .min(1)
+        .optional()
+        .describe("A real registered event type (e.g. 'career.recruiter_reply_received', 'learning.reading_session_completed') that some active goal already declares as one of its own targetMetrics — never invented, never guessed."),
       signalKey: z.string().min(1).optional().describe("A CUSTOM signal key an active goal already declared for itself — never invented, never a fixed eventType's own name."),
+      goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it, when it matters for disambiguation (e.g. more than one active goal could own this signal). Matched against real active goal titles/categories, never an invented id. Omit if only one goal could plausibly own this signal."),
       count: z.number().int().positive().max(20).optional().describe("Defaults to 1. Set higher only when the user gave an explicit count, e.g. 'got 2 recruiter replies', 'had 2 teas'."),
       notes: z.string().optional().describe("Free-text detail actually stated by the user, e.g. a company name — never invented.")
     })
@@ -393,7 +390,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "goal.status",
     description:
-      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence counted toward EACH of its declared signals (fixed or custom), and real pending Gmail reviews linked to it. Never invents counts or progress. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', 'how many CVs did I send today?', or the equivalent for any other active goal (e.g. 'how's training going?', 'how's the tea goal going?').",
+      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence counted toward EACH of its declared signals (fixed or custom), and real pending Gmail reviews linked to it. Never invents counts or progress. If goalRef could plausibly mean more than one active goal, this asks which one instead of silently picking or falling back to a generic same-category goal. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', 'how many CVs did I send today?', or the equivalent for any other active goal (e.g. 'how's training going?', 'how's the tea goal going?', 'how's my Nietzsche book going?').",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -449,7 +446,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "goal.tracking_show",
     description:
-      "Show what is actually configured for one active goal — its declared signals (with their real keys, so goal.log_evidence can be used correctly), check-in, and why — never its progress (use goal.status for that). Use for 'what am I tracking for the tea goal?', 'what signals does my job search goal have?', 'show my goal setup for X'.",
+      "Show what is actually configured for one active goal — its declared signals (with their real keys, so goal.log_evidence can be used correctly), check-in cadence, and why — never its progress (use goal.status for that). If goalRef could plausibly mean more than one active goal, this asks which one instead of silently picking. Use for 'what am I tracking for the tea goal?', 'what signals does my job search goal have?', 'show my goal setup for X', 'show tracking for my Nietzsche book'.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({

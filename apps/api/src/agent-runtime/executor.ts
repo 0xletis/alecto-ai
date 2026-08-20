@@ -29,13 +29,15 @@ import {
   countEvidenceForMetric,
   CUSTOM_SIGNAL_EVENT_TYPE,
   describeGoalEvidenceMatch,
+  EventTypeSchema,
   findGoalsForEventType,
   findGoalsForSignalKey,
-  inferGoalLinkForAction,
   parseActionDueDate,
   proactiveOperatorAllowlistActiveFromEnv,
   proactiveOperatorAllowlistFromEnv,
   proactiveOperatorDeliveryEnabledFromEnv,
+  resolveActiveGoalReference,
+  type EventTypeId,
   type Goal,
   type GoalMetric,
   type NotificationSettings,
@@ -470,14 +472,9 @@ export async function executeOperation(
       }
 
       case "goal.log_evidence": {
-        const eventType = args.eventType as
-          | "career.recruiter_reply_received"
-          | "career.interview_scheduled"
-          | "career.interview_completed"
-          | "career.rejection_received"
-          | "career.offer_received"
-          | undefined;
+        const eventType = args.eventType as string | undefined;
         const signalKey = args.signalKey as string | undefined;
+        const goalRef = args.goalRef as string | undefined;
         const count = (args.count as number | undefined) ?? 1;
         const notes = args.notes as string | undefined;
 
@@ -485,27 +482,53 @@ export async function executeOperation(
           return failed(operation.tool, "I need either a known signal type or a custom signal key to log this — try describing it again.");
         }
 
-        // Adaptive Goal Creation MVP (docs/10-v3-readiness-audit.md §21): a signalKey is only
-        // ever trusted when an active goal ALREADY declared it as one of its own targetMetrics —
-        // the LLM can propose a signalKey it believes matches, but this is the deterministic
-        // check that actually decides, exactly like resolveGoalStatusTargets does for goalRef.
+        // eventType used to be a hardcoded 5-value career-only enum, which meant a real,
+        // registered, goal-declared eventType outside that list (e.g.
+        // "learning.reading_session_completed" for a reading goal) could never be logged through
+        // here at all. Now any real registered event type is accepted (checked against the event
+        // registry itself, generically, not a fixed whitelist) — matching the pre-existing
+        // behavior that a fixed career eventType could always be logged even for a goal that
+        // doesn't formally declare it as one of its own targetMetrics (e.g. "career.job_search"
+        // goals list interview_scheduled as a relevant signal but don't all declare a metric for
+        // it); a goal actually declaring the metric only changes the label/note shown below, never
+        // whether the event itself can be logged. signalKey stays strict — unlike a registered
+        // eventType, a custom signalKey has no existence at all outside some goal's own
+        // declaration, so an unmatched one is never valid (unchanged from before this pass).
+        const parsedEventType = eventType ? EventTypeSchema.safeParse(eventType) : undefined;
+        if (eventType && !parsedEventType?.success) {
+          return failed(operation.tool, `"${eventType}" isn't a real event type I can log — try describing what happened again.`);
+        }
+        const verifiedEventType: EventTypeId | undefined = parsedEventType?.success ? parsedEventType.data : undefined;
+
         if (signalKey && findGoalsForSignalKey(context.activeGoals, signalKey).length === 0) {
           return failed(operation.tool, `I don't have a "${signalKey}" signal set up for any of your active goals. Say "what am I tracking for X?" to see the real signals.`);
+        }
+
+        let matchedGoals = verifiedEventType ? findGoalsForEventType(context.activeGoals, verifiedEventType) : findGoalsForSignalKey(context.activeGoals, signalKey!);
+
+        // goalRef only ever NARROWS which of the already-verified matchedGoals this evidence is
+        // attributed to (for the reply's own honesty) — it can never make an otherwise-invalid
+        // signal valid, so an unresolved/ambiguous goalRef still logs the (already-verified) event
+        // rather than blocking it; only the display note becomes "your goal" instead of naming one.
+        if (goalRef && matchedGoals.length > 1) {
+          const resolution = resolveActiveGoalReference(goalRef, matchedGoals, { mostRecent: matchedGoals[0] });
+          if (resolution.status === "matched" && resolution.goal) {
+            matchedGoals = [resolution.goal, ...matchedGoals.filter((goal) => goal.id !== resolution.goal!.id)];
+          }
         }
 
         const created = await createEvents(
           userId,
           Array.from({ length: count }, () => ({
-            type: eventType ?? CUSTOM_SIGNAL_EVENT_TYPE,
+            type: verifiedEventType ?? CUSTOM_SIGNAL_EVENT_TYPE,
             source: "manual" as const,
             confidence: 1,
             data: signalKey ? { signalKey, notes } : notes ? { notes } : undefined,
             evidence: [notes, message].filter(Boolean) as string[]
           }))
         );
-        const matchedGoals = eventType ? findGoalsForEventType(context.activeGoals, eventType) : findGoalsForSignalKey(context.activeGoals, signalKey!);
         const goalNote = describeGoalEvidenceMatch(matchedGoals);
-        const signalLabel = eventType ? describeEventCount(eventType, created.length) : describeCustomSignalCount(matchedGoals[0], signalKey!, created.length);
+        const signalLabel = describeSignalCount(matchedGoals[0], verifiedEventType, signalKey, created.length);
         return {
           tool: operation.tool,
           status: "executed",
@@ -835,20 +858,30 @@ export async function executeOperation(
 
       case "goal.status": {
         const goalRef = args.goalRef as string | undefined;
-        const targetGoals = resolveGoalStatusTargets(goalRef, context.activeGoals);
+        const outcome = resolveGoalReferenceTargets(goalRef, context.activeGoals);
 
-        // resolveGoalStatusTargets falls back to ALL active goals whenever goalRef doesn't
-        // confidently match one of them, so an empty result here only ever means there are no
-        // active goals at all — never "couldn't find a match."
-        if (targetGoals.length === 0) {
+        if (outcome.status === "no_match") {
+          if (context.activeGoals.length === 0) {
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: "You don't have any active goals yet. Tell me what you want to work on and I can propose a plan to track it.",
+              result: []
+            };
+          }
+          return failed(operation.tool, `I couldn't find an active goal matching "${goalRef}". Say "show me all my goals" to see what's active.`);
+        }
+
+        if (outcome.status === "ambiguous") {
           return {
             tool: operation.tool,
             status: "executed",
-            summary: "You don't have any active goals yet. Tell me what you want to work on and I can propose a plan to track it.",
-            result: []
+            summary: describeAmbiguousGoalChoice(outcome.goals),
+            result: outcome.goals
           };
         }
 
+        const targetGoals = outcome.goals;
         const timezone = await getUserTimezone(userId);
         const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
         const recentEvents = await getEventsSince(userId, sevenDaysAgo);
@@ -913,7 +946,7 @@ export async function executeOperation(
           window: signal.cadence ?? "daily",
           unit: signal.unit
         }));
-        const checkInConfig = checkIn ? [{ key: "custom_checkin", question: checkIn.question, answerType: "text" as const }] : undefined;
+        const checkInConfig = checkIn ? [{ key: "custom_checkin", question: checkIn.question, answerType: "text" as const, cadence: checkIn.cadence }] : undefined;
 
         const result = await createGoal(userId, { title, category, why, targetMetrics, checkInConfig });
 
@@ -947,23 +980,38 @@ export async function executeOperation(
           status: "executed",
           summary: `Done — I'll track "${result.goal.title}" with ${signalNames}${checkInNote}.${actionsNote}`,
           result: result.goal,
-          entities: createdActions.map(actionToEntity)
+          // The new goal itself is included here (not just its first actions) so an immediate
+          // follow-up like "show tracking for it" / "how is that goal going?" has a real,
+          // just-created entity to resolve against, not only its actions.
+          entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)]
         };
       }
 
       case "goal.tracking_show": {
         const goalRef = args.goalRef as string | undefined;
-        const targetGoals = resolveGoalStatusTargets(goalRef, context.activeGoals);
+        const outcome = resolveGoalReferenceTargets(goalRef, context.activeGoals);
 
-        if (targetGoals.length === 0) {
-          return { tool: operation.tool, status: "executed", summary: "You don't have any active goals yet.", result: [] };
+        if (outcome.status === "no_match") {
+          if (context.activeGoals.length === 0) {
+            return { tool: operation.tool, status: "executed", summary: "You don't have any active goals yet.", result: [] };
+          }
+          return failed(operation.tool, `I couldn't find an active goal matching "${goalRef}". Say "show me all my goals" to see what's active.`);
+        }
+
+        if (outcome.status === "ambiguous") {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: describeAmbiguousGoalChoice(outcome.goals),
+            result: outcome.goals
+          };
         }
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: targetGoals.map((goal) => formatGoalTrackingForChat(goal)).join("\n\n"),
-          result: targetGoals
+          summary: outcome.goals.map((goal) => formatGoalTrackingForChat(goal)).join("\n\n"),
+          result: outcome.goals
         };
       }
 
@@ -1223,6 +1271,10 @@ function actionToEntity(action: ActionItem): AgentEntity {
   return { type: "action", id: action.id, label: action.title };
 }
 
+function goalToEntity(goal: Goal): AgentEntity {
+  return { type: "goal", id: goal.id, label: goal.title };
+}
+
 function gmailRuleToEntity(rule: EmailSignalRule, index?: number): AgentEntity {
   return { type: "gmail_rule", id: rule.id, label: rule.name, index };
 }
@@ -1322,11 +1374,12 @@ function formatGoalListForChat(goals: Goal[]): string {
   return lines.join("\n");
 }
 
-/** Grammatically correct singular/plural for the event types goal.log_evidence and goal.status
- * both count — separate from email-review-service.ts's humanEmailReviewEventLabel, whose
- * "log X"/outcome phrasing is never pluralized by a count, unlike here. Falls back to the raw
- * type with a bare "s" for any event type not in this small, career-scoped list (the only domain
- * with a curated goal.log_evidence enum today; extending this to other domains later is additive). */
+/** Grammatically correct singular/plural for a small set of career event types that predate
+ * per-goal metric labels — kept only as the LAST-RESORT fallback inside describeSignalCount below,
+ * for the rare case evidence is logged for an eventType no active goal's own metric declares a
+ * label for (evidence still logs; only the English wording falls back). Separate from
+ * email-review-service.ts's humanEmailReviewEventLabel, whose "log X"/outcome phrasing is never
+ * pluralized by a count, unlike here. */
 const EVENT_COUNT_LABELS: Record<string, [singular: string, plural: string]> = {
   "career.application_sent": ["application sent", "applications sent"],
   "career.recruiter_reply_received": ["recruiter reply", "recruiter replies"],
@@ -1345,31 +1398,78 @@ function describeEventCount(eventType: string, count: number): string {
   return `${count} ${count === 1 ? labels[0] : labels[1]}`;
 }
 
-/** Custom-signal counterpart to describeEventCount above — reuses the matched goal's OWN
- * declared metric label (set when the goal was created, from goal.create_propose's signals[])
- * rather than any hardcoded English, since a custom signal's label is never known in advance. */
-function describeCustomSignalCount(goal: Goal | undefined, signalKey: string, count: number): string {
-  const metric = goal?.targetMetrics?.find((item) => item.signalKey === signalKey);
-  return `${count} ${metric?.label ?? signalKey}`;
+/**
+ * Unified goal.log_evidence label: whichever active goal actually matched (eventType OR
+ * signalKey) always wins with ITS OWN declared metric label — set at goal-creation time, from a
+ * template or an adaptive goal.create_propose plan — the same label goal.status and
+ * goal.tracking_show already show for that metric, so the logged confirmation and the later
+ * status count are never described two different ways. describeEventCount's small hardcoded map
+ * is only a fallback for the (rare) case a matched goal somehow has no label on that metric.
+ */
+function describeSignalCount(goal: Goal | undefined, eventType: string | undefined, signalKey: string | undefined, count: number): string {
+  const metric = goal?.targetMetrics?.find((item) => (eventType && item.eventType === eventType) || (signalKey && item.signalKey === signalKey));
+  if (metric) {
+    return `${count} ${metric.label}`;
+  }
+  if (eventType) {
+    return describeEventCount(eventType, count);
+  }
+  return `${count} ${signalKey}`;
+}
+
+export type GoalReferenceOutcomeStatus = "all" | "matched" | "ambiguous" | "no_match";
+
+export interface GoalReferenceOutcome {
+  status: GoalReferenceOutcomeStatus;
+  /** "all"/"matched": the target goal(s) to act on. "ambiguous": the near-tied candidates, for a
+   * clarifying question. "no_match": always empty. */
+  goals: Goal[];
 }
 
 /**
- * Which active goal(s) "goal.status" reports on — reuses goal-linking.ts's inferGoalLinkForAction
- * (the exact same keyword/confidence matcher gmail.review.to_action and action.create already
- * use), treating goalRef as if it were an action title being matched against goal keywords. Not
- * job-search-specific: "training", "Endesa bills", "job search" all resolve the same way. No
- * confident match (or no goalRef given) means "no single goal was clearly named" — report on
- * every active goal instead of guessing which one.
+ * Which active goal(s) goal.status / goal.tracking_show / goal.log_evidence's disambiguation
+ * report on — delegates the actual text-matching to goal-reference.ts's
+ * resolveActiveGoalReference (generic title/typo/category scoring, kept deliberately separate
+ * from goal-linking.ts's inferGoalLinkForAction, which answers a different question — "which
+ * goal's general DOMAIN does this new action belong to" — and was the wrong tool for THIS job: a
+ * real Telegram smoke test asked "show tracking for reading niezsche book" with an active generic
+ * "Read more" (learning) goal AND a just-created "Finish reading Nietzsche book" goal, and
+ * inferGoalLinkForAction's coarse category-bucket scoring matched the generic goal at a HIGHER
+ * confidence than the specific, exactly-named one — backwards from what naming a goal means).
+ *
+ * No goalRef at all means "report on every active goal" (unchanged prior behavior — e.g. "how are
+ * my goals doing?"). A goalRef that resolves to exactly one goal (including a bare "it"/"that
+ * goal" right after creating one, via mostRecent — activeGoals is already newest-first) is
+ * "matched". Two or more goals landing within the resolver's ambiguity margin is "ambiguous" —
+ * never silently guessed. A goalRef naming nothing real is "no_match" — also never silently
+ * widened back to every goal, unlike the old inferGoalLinkForAction-based fallback here.
  */
-function resolveGoalStatusTargets(goalRef: string | undefined, activeGoals: Goal[]): Goal[] {
-  if (!goalRef) {
-    return activeGoals;
+function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: Goal[]): GoalReferenceOutcome {
+  if (activeGoals.length === 0) {
+    return { status: "no_match", goals: [] };
   }
 
-  const link = inferGoalLinkForAction({ actionTitle: goalRef, activeGoals });
-  const matched = link.goalId ? activeGoals.find((goal) => goal.id === link.goalId) : undefined;
+  if (!goalRef || !goalRef.trim()) {
+    return { status: "all", goals: activeGoals };
+  }
 
-  return matched ? [matched] : activeGoals;
+  const resolution = resolveActiveGoalReference(goalRef, activeGoals, { mostRecent: activeGoals[0] });
+
+  if (resolution.status === "matched" && resolution.goal) {
+    return { status: "matched", goals: [resolution.goal] };
+  }
+
+  if (resolution.status === "ambiguous" && resolution.candidates) {
+    return { status: "ambiguous", goals: resolution.candidates };
+  }
+
+  return { status: "no_match", goals: [] };
+}
+
+function describeAmbiguousGoalChoice(candidates: Goal[]): string {
+  const names = candidates.map((goal) => `"${goal.title}"`);
+  const last = names.pop();
+  return `Do you mean ${names.length > 0 ? `${names.join(", ")} or ${last}` : last}?`;
 }
 
 /**
@@ -1468,8 +1568,11 @@ function formatGoalPlanProposal(input: {
 
 /** What's actually CONFIGURED for a goal (its own declared signals/check-in), never its progress
  * — the config-vs-progress split matches goal.list (details) vs goal.status (progress). Shows
- * each metric's real signalKey when it has one, so a follow-up "had 2 teas" can be answered
- * correctly by goal.log_evidence rather than the user needing to know the exact key already. */
+ * each metric's real signalKey OR eventType when it has one, so a follow-up "had 2 teas"/"read 5
+ * minutes" can be answered correctly by goal.log_evidence rather than the user (or the LLM)
+ * needing to know the exact key/type already — before this, only signalKey was ever shown here,
+ * so a template-based goal whose metric is eventType-backed (e.g. "Read more"'s
+ * "learning.reading_session_completed") gave no machine-readable identifier at all. */
 function formatGoalTrackingForChat(goal: Goal): string {
   const metrics = goal.targetMetrics ?? [];
   const lines = [`"${goal.title}" (${goal.category}):`];
@@ -1481,7 +1584,7 @@ function formatGoalTrackingForChat(goal: Goal): string {
   if (metrics.length > 0) {
     lines.push("Signals:");
     for (const metric of metrics) {
-      const keyNote = metric.signalKey ? ` [signal: ${metric.signalKey}]` : "";
+      const keyNote = metric.signalKey ? ` [signal: ${metric.signalKey}]` : metric.eventType ? ` [event: ${metric.eventType}]` : "";
       lines.push(`- ${metric.label}${keyNote}`);
     }
   } else {
@@ -1490,7 +1593,8 @@ function formatGoalTrackingForChat(goal: Goal): string {
 
   const checkIn = (goal.checkInConfig ?? [])[0];
   if (checkIn) {
-    lines.push(`Check-in: "${checkIn.question}"`);
+    const cadenceNote = checkIn.cadence ? `${checkIn.cadence}: ` : "";
+    lines.push(`Check-in: ${cadenceNote}"${checkIn.question}"`);
   }
 
   return lines.join("\n");

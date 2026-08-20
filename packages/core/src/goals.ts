@@ -26,7 +26,11 @@ export const GoalMetricSchema = z.object({
 export const GoalCheckInQuestionSchema = z.object({
   key: z.string().min(1),
   question: z.string().min(1),
-  answerType: CheckInAnswerTypeSchema
+  answerType: CheckInAnswerTypeSchema,
+  /** Free-text cadence as the plan proposed it (e.g. "weekly", "evening") — additive field, kept
+   * loose (not MetricWindowSchema) since a check-in cadence like "morning"/"evening" isn't a
+   * metric aggregation window. Optional so pre-existing stored rows without it still parse. */
+  cadence: z.string().optional()
 });
 
 export const GoalSchema = z.object({
