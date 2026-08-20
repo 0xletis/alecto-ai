@@ -347,6 +347,16 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     });
   }
 
+  const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
+  if (gmailConnectionShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
+  }
+
+  const gmailNudgeSettingsShortcut = !pending ? gmailNudgeSettingsShortcutOperation(message) : undefined;
+  if (gmailNudgeSettingsShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailNudgeSettingsShortcut, "proactive_settings");
+  }
+
   if (pending) {
     const pendingGmailRule = pending.operations.find((op) => op.tool === "gmail.rule.create");
     if (pendingGmailRule && GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE.test(message.trim())) {
@@ -467,6 +477,118 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
 
 function normalizeExactMessage(message: string): string {
   return message.trim().toLowerCase().replace(/[.!]+$/, "");
+}
+
+async function finalizeDeterministicOperation(
+  context: ContextBundle,
+  message: string,
+  plannedOperation: PlannedOperation,
+  topic: string
+): Promise<AgentMessageResponse> {
+  const pendingOperationBefore = context.session.pendingOperation;
+  const visibleEntitiesBefore = context.session.visibleEntities;
+  const validatedOps = validateOperations([plannedOperation], context);
+  const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
+  const pendingConfirmationOps = validatedOps.filter((op) => op.status === "needs_confirmation");
+  const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
+  const executableOps = validatedOps.filter((op) => op.status === "valid" && !META_TOOLS.has(op.tool));
+  const executedOps = await Promise.all(executableOps.map((op) => executeOperation(context.session.userId, op, context, message)));
+  applyExecutionSideEffects(context.session, executedOps);
+
+  if (pendingConfirmationOps.length > 0) {
+    const summary = summarizePendingOperations(pendingConfirmationOps);
+    setPendingOperation(context.session, createPendingOperationRecord(topic, summary, pendingConfirmationOps));
+  }
+
+  const clarification = validatedOps.find((op) => op.status === "needs_clarification")?.clarificationQuestion;
+  const reply = composeReply({
+    replyDraft: "",
+    clarificationQuestion: clarification,
+    pendingConfirmationOps,
+    executedOps,
+    problemOps
+  });
+
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: plannedOperation,
+      validatedOp: validatedOps[0],
+      executedOp: executedOps.find((op) => isPlanningTool(op.tool)),
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: inferComposerSource({ clarificationQuestion: clarification, pendingConfirmationOps, executedOps, problemOps, replyDraft: "" })
+    },
+    context.session
+  );
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [plannedOperation],
+    executedOps,
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed,
+    topic,
+    planningTrace
+  });
+}
+
+function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const text = message.trim().toLowerCase();
+  if (!text || /\bsync\b/.test(text)) {
+    return undefined;
+  }
+  if (looksLikeGmailNudgeSettingsRequest(text)) {
+    return undefined;
+  }
+
+  const mentionsGmailOrEmail = /\b(gmail|email|emails|mail|mails)\b/.test(text);
+  const asksConnectionAction = /\b(connect|reconnect|integrate|setup|set up|authorize|reauthorize|fix)\b/.test(text);
+  const asksForLink = /\blink\b|\boauth\b|\bauth url\b|\bauthori[sz]ation url\b/.test(text);
+  const mentionsAuthProblem = /\bgmail\b[\s\S]{0,50}\b(expired|unauthori[sz]ed|permission|scope|auth|authorization)\b|\b(expired|unauthori[sz]ed|permission|scope|auth|authorization)\b[\s\S]{0,50}\bgmail\b/.test(text);
+  const contextualReconnectLink = asksForLink && /\b(connect|reconnect|authorize|reauthorize|fix|it)\b/.test(text) && hasRecentGmailContext(context);
+
+  if ((mentionsGmailOrEmail && (asksConnectionAction || asksForLink)) || mentionsAuthProblem || contextualReconnectLink) {
+    return { tool: "gmail.status", args: { includeLink: true }, rationale: "user asked for Gmail connection or reconnect help" };
+  }
+
+  return undefined;
+}
+
+function gmailNudgeSettingsShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = message.trim().toLowerCase();
+  if (!looksLikeGmailNudgeSettingsRequest(text)) {
+    return undefined;
+  }
+
+  if (/\b(turn|switch|shut)\s+off\b|\b(stop|disable)\b|\b(no more|don't|do not|dont)\b/.test(text)) {
+    return { tool: "proactive.settings_propose_update", args: { gmailNudgeEnabled: false }, rationale: "user asked to turn off Gmail nudges" };
+  }
+
+  if (/\b(turn|switch|enable|activate|start)\s+(on\s+)?\b|\bnotify me\b|\blet me know\b|\bsend me\b/.test(text)) {
+    return { tool: "proactive.settings_propose_update", args: { gmailNudgeEnabled: true }, rationale: "user asked to turn on Gmail nudges" };
+  }
+
+  return undefined;
+}
+
+function looksLikeGmailNudgeSettingsRequest(text: string): boolean {
+  return (
+    /\bgmail\b[\s\S]{0,40}\b(nudge|nudges|notification|notifications|notify)\b/.test(text) ||
+    /\b(nudge|nudges|notification|notifications|notify)\b[\s\S]{0,40}\bgmail\b/.test(text) ||
+    /\bgmail review\b[\s\S]{0,40}\b(notification|notifications|nudge|nudges)\b/.test(text)
+  );
+}
+
+function hasRecentGmailContext(context: ContextBundle): boolean {
+  if (context.session.topic?.includes("gmail")) {
+    return true;
+  }
+  if (context.session.pendingOperation?.summary.toLowerCase().includes("gmail")) {
+    return true;
+  }
+  return context.session.messages.slice(-8).some((entry) => /\bgmail\b|\bemail rules?\b|\bemail reviews?\b/.test(entry.text.toLowerCase()));
 }
 
 async function finalizeNoPendingReply(context: ContextBundle, tool: string): Promise<AgentMessageResponse> {

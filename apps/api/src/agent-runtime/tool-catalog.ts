@@ -261,10 +261,13 @@ export const toolCatalog: ToolDefinition[] = [
   },
   {
     name: "gmail.status",
-    description: "Report whether Gmail is connected and its sync status.",
+    description:
+      "Show Gmail connection/setup status and the real connect/reconnect OAuth link when needed. Use for 'connect Gmail', 'connect my email', 'integrate email', 'reconnect Gmail', 'send me the Gmail link', 'send me link to reconnect it' when Gmail is the recent topic, 'Gmail authorization expired', 'fix Gmail', or general Gmail status questions. Read-only; never syncs Gmail.",
     mutates: false,
     requiresConfirmation: false,
-    argsSchema: z.object({})
+    argsSchema: z.object({
+      includeLink: z.boolean().optional().describe("Set true when the user asks for the Gmail connect/reconnect link or setup action.")
+    })
   },
   {
     name: "gmail.rule.list",

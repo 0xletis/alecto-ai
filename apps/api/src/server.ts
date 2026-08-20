@@ -227,6 +227,7 @@ import {
   noActiveGmailRulesMessage,
   reactivateOrReuseBuiltInEmailRule
 } from "./legacy/gmail-conversation.js";
+import { buildGmailOAuthUrl, decodeGmailOAuthState, gmailOAuthConfig, gmailOAuthMissingConfigMessage } from "./gmail/oauth.js";
 import { createGoalProgressFromCompletedAction, createCustomGoalProgressEvent } from "./actions/goal-progress.js";
 import { formatActionCreatedReply, maybeCreateManualActionFromText } from "./actions/manual-action.js";
 import {
@@ -932,7 +933,7 @@ export function buildServer() {
 
     if (!config) {
       return reply.status(400).send({
-        error: "Gmail OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GMAIL_REDIRECT_URI."
+        error: gmailOAuthMissingConfigMessage()
       });
     }
 
@@ -4437,37 +4438,6 @@ function githubFetchError(owner: string, repo: string, status: number, body: str
   }
 
   return new GithubFetchError("GITHUB_FETCH_FAILED", `${owner}/${repo}: ${truncatePlainText(body, 160)}`);
-}
-
-function gmailOAuthConfig() {
-  const clientId = process.env.GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
-  const redirectUri = process.env.GMAIL_REDIRECT_URI ?? "http://localhost:3000/oauth/gmail/callback";
-
-  return clientId && clientSecret ? { clientId, clientSecret, redirectUri } : undefined;
-}
-
-function buildGmailOAuthUrl(userId: string, config: { clientId: string; redirectUri: string }): string {
-  const params = new URLSearchParams({
-    client_id: config.clientId,
-    redirect_uri: config.redirectUri,
-    response_type: "code",
-    scope: "https://www.googleapis.com/auth/gmail.readonly",
-    access_type: "offline",
-    prompt: "consent",
-    state: Buffer.from(JSON.stringify({ userId }), "utf8").toString("base64url")
-  });
-
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
-}
-
-function decodeGmailOAuthState(state: string): string | undefined {
-  try {
-    const parsed = JSON.parse(Buffer.from(state, "base64url").toString("utf8")) as { userId?: unknown };
-    return typeof parsed.userId === "string" ? parsed.userId : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 async function exchangeGmailOAuthCode(

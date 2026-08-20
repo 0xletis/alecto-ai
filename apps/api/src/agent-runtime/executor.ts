@@ -23,7 +23,8 @@ import {
   updateNotificationSettings,
   type ActionItem,
   type EmailReviewItem,
-  type EmailSignalRule
+  type EmailSignalRule,
+  type IntegrationConnection
 } from "@operator-agent/db";
 import {
   countEvidenceForMetric,
@@ -59,6 +60,7 @@ import {
   isGmailRuleAlreadyInTargetState,
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
+import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
 import { getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   approveEmailReviewForUser,
@@ -718,12 +720,11 @@ export async function executeOperation(
 
       case "gmail.status": {
         const connection = context.gmailConnection;
+        const settings = await getOrCreateNotificationSettings(userId);
         return {
           tool: operation.tool,
           status: "executed",
-          summary: connection
-            ? `Gmail is ${connection.status}. Last synced: ${connection.lastSyncedAt ? connection.lastSyncedAt.toDateString() : "never"}.`
-            : "Gmail is not connected.",
+          summary: formatGmailConnectionStatusForChat(userId, connection, context.gmailRules, settings.timezone, args.includeLink === true),
           result: connection
         };
       }
@@ -1220,17 +1221,25 @@ export async function executeOperation(
         const changes = describeProactiveSettingsChanges(settings, request);
 
         if (changes.length === 0) {
+          const reconnectNote = gmailNudgeEnabled === true ? gmailReconnectNoteAfterNudgeEnabled(userId, context.gmailConnection) : undefined;
           return {
             tool: operation.tool,
             status: "executed",
-            summary: `That's already how it's set.\n\n${formatProactiveSettingsSummary(settings)}`
+            summary: [
+              `That's already how it's set.\n\n${formatProactiveSettingsSummary(settings)}`,
+              reconnectNote
+            ].filter(Boolean).join("\n\n")
           };
         }
 
+        const reconnectNote = gmailNudgeEnabled === true ? gmailReconnectNoteForNudge(userId, context.gmailConnection) : undefined;
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `You're about to ${changes.map((change) => change.proposal).join(" and ")}. Reply yes to confirm or cancel.`,
+          summary: [
+            `You're about to ${changes.map((change) => change.proposal).join(" and ")}.`,
+            reconnectNote ? `${reconnectNote} Reply yes to confirm or cancel.` : "Reply yes to confirm or cancel."
+          ].join(" "),
           pendingOperationUpdate: {
             topic: "proactive_settings",
             summary: changes.map((change) => change.proposal).join(" and "),
@@ -1257,10 +1266,14 @@ export async function executeOperation(
         const updated = await updateNotificationSettings(userId, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes });
         const changes = describeProactiveSettingsChanges(before, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes });
 
+        const reconnectNote = gmailNudgeEnabled === true ? gmailReconnectNoteAfterNudgeEnabled(userId, context.gmailConnection) : undefined;
         return {
           tool: operation.tool,
           status: "executed",
-          summary: changes.length > 0 ? `Done — ${changes.map((change) => change.done).join(" and ")}.` : "Done — nothing needed to change.",
+          summary: [
+            changes.length > 0 ? `Done — ${changes.map((change) => change.done).join(" and ")}.` : "Done — nothing needed to change.",
+            reconnectNote
+          ].filter(Boolean).join("\n\n"),
           result: updated
         };
       }
@@ -1760,6 +1773,125 @@ function formatProactiveSettingsSummary(settings: NotificationSettings): string 
     `- Evening check-in: ${evening}`,
     `- Gmail nudge: ${settings.gmailNudgeEnabled ? "on" : "off"}`
   ].join("\n");
+}
+
+function formatGmailConnectionStatusForChat(
+  userId: string,
+  connection: IntegrationConnection | undefined,
+  rules: EmailSignalRule[],
+  timezone: string,
+  includeLink: boolean
+): string {
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+  const activeRules = rules.filter((rule) => rule.status === "active" && (!connection || rule.connectionId === connection.id));
+  const ruleLines = activeRules.length > 0
+    ? ["", "Active rules:", ...activeRules.map((rule, index) => `${index + 1}. ${rule.name} — review-first tracking`)]
+    : [];
+
+  if (!connection || connection.status === "archived") {
+    return [
+      "Gmail is not connected yet.",
+      oauthUrl ? `Connect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      "Access is readonly. Alecto cannot send emails or change labels.",
+      "After connecting, enable an email rule before any Gmail scan can run.",
+      ...ruleLines
+    ].join("\n");
+  }
+
+  const email = typeof connection.config.email === "string" && connection.config.email.trim()
+    ? ` as ${connection.config.email.trim()}`
+    : "";
+  const lastSynced = connection.lastSyncedAt ? formatDateInTimezone(connection.lastSyncedAt, timezone) : "never";
+
+  if (connection.status === "error") {
+    return [
+      gmailConnectionProblemLine(connection),
+      oauthUrl ? `Reconnect Gmail here:\n${oauthUrl}` : gmailOAuthMissingConfigMessage(),
+      `Last synced: ${lastSynced}.`,
+      ...ruleLines
+    ].join("\n");
+  }
+
+  if (connection.status === "paused") {
+    return [
+      `Gmail is paused${email}.`,
+      oauthUrl && includeLink ? `Reconnect Gmail here if you want to refresh access:\n${oauthUrl}` : undefined,
+      `Last synced: ${lastSynced}.`,
+      "Gmail sync will not run while the connection is paused.",
+      ...ruleLines
+    ].filter(Boolean).join("\n");
+  }
+
+  return [
+    `Gmail is connected${email}.`,
+    "Access: readonly. Alecto cannot send emails or change labels.",
+    oauthUrl && includeLink ? `Reconnect Gmail here if you need to refresh access:\n${oauthUrl}` : undefined,
+    `Last synced: ${lastSynced}.`,
+    activeRules.length === 0
+      ? "No email tracking rules are active yet. You can say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\"."
+      : undefined,
+    ...ruleLines,
+    "Sync only runs when you say \"sync Gmail\" or when scheduled Gmail checks are enabled."
+  ].filter(Boolean).join("\n");
+}
+
+function gmailOAuthUrlForUser(userId: string): string | undefined {
+  const config = gmailOAuthConfig();
+  return config ? buildGmailOAuthUrl(userId, config) : undefined;
+}
+
+function gmailConnectionProblemLine(connection: IntegrationConnection): string {
+  const lower = (connection.lastError ?? "").toLowerCase();
+
+  if (lower.includes("api") && lower.includes("disabled")) {
+    return "Gmail API is disabled in Google Cloud project. Enable Gmail API and retry.";
+  }
+
+  if (lower.includes("encryption key") || lower.includes("alecto_secret_encryption_key")) {
+    return "Gmail token encryption key is missing. Set ALECTO_SECRET_ENCRYPTION_KEY and restart.";
+  }
+
+  if (lower.includes("permission") || lower.includes("scope") || lower.includes("insufficient")) {
+    return "Gmail permission error. Reconnect Gmail and approve Gmail readonly access.";
+  }
+
+  return "Gmail authorization is expired.";
+}
+
+function gmailReconnectNoteForNudge(userId: string, connection: IntegrationConnection | undefined): string | undefined {
+  if (!gmailConnectionNeedsReconnect(connection)) {
+    return undefined;
+  }
+
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+  const problem = gmailNudgeConnectionProblem(connection);
+  return oauthUrl
+    ? `${problem}, so nudges won't work until you connect or reconnect Gmail: ${oauthUrl}.`
+    : `${problem}, so nudges won't work until Gmail OAuth is configured. ${gmailOAuthMissingConfigMessage()}`;
+}
+
+function gmailReconnectNoteAfterNudgeEnabled(userId: string, connection: IntegrationConnection | undefined): string | undefined {
+  if (!gmailConnectionNeedsReconnect(connection)) {
+    return undefined;
+  }
+
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+  const problem = gmailNudgeConnectionProblem(connection);
+  return oauthUrl
+    ? `${problem}. Gmail needs connecting or reconnecting before nudges can work:\n${oauthUrl}`
+    : `${problem}. Gmail needs connecting or reconnecting before nudges can work. ${gmailOAuthMissingConfigMessage()}`;
+}
+
+function gmailConnectionNeedsReconnect(connection: IntegrationConnection | undefined): boolean {
+  return !connection || connection.status === "error" || connection.status === "archived";
+}
+
+function gmailNudgeConnectionProblem(connection: IntegrationConnection | undefined): string {
+  if (!connection || connection.status === "archived") {
+    return "Gmail is not connected yet";
+  }
+
+  return gmailConnectionProblemLine(connection);
 }
 
 interface ProactiveSettingsChangeDescription {
