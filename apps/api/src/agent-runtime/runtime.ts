@@ -189,6 +189,39 @@ function safeDiagnosticOperation(op: PlannedOperation): { tool: string; args: Re
   return { tool: op.tool, args: safeArgs };
 }
 
+/**
+ * Compound-turn visibility, gated behind AGENT_RUNTIME_DIAGNOSTICS=true like every other
+ * diagnostics call in this file — a "compound turn" here just means more than one operation was
+ * ultimately planned for the message, regardless of whether that came from a deterministic
+ * shortcut or the real LLM planner. Answers exactly the questions a compound-handling bug is
+ * hardest to debug without: how many operations survived to the final plan, which of them
+ * actually mutated something, whether a pending confirmation was opened alongside them, and —
+ * the main thing this hardening pass cares about — whether every executed operation's own
+ * summary actually made it into the composed reply, or got silently dropped.
+ */
+function logCompoundTurnDiagnostics(
+  userId: string,
+  finalOperations: PlannedOperation[],
+  executedOps: ExecutedOperation[],
+  pendingOperationOpen: boolean,
+  reply: string
+): void {
+  if (finalOperations.length <= 1) {
+    return;
+  }
+
+  const summarizedOps = executedOps.filter((op) => op.status === "executed" || op.status === "skipped");
+  const allSummariesIncluded = summarizedOps.every((op) => reply.includes(op.summary));
+
+  logAgentRuntimeDiagnostics({
+    phase: "compound_turn_detected",
+    userId,
+    finalOps: finalOperations,
+    mutationTools: executedOps.filter((op) => op.status === "executed" && getToolDefinition(op.tool)?.mutates).map((op) => op.tool),
+    note: `operationCount=${finalOperations.length} pendingConfirmationOpened=${pendingOperationOpen} allToolSummariesIncluded=${allSummariesIncluded}`
+  });
+}
+
 interface PlanningTraceInputs {
   message: string;
   plannedOp: PlannedOperation | undefined;
@@ -375,6 +408,11 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const gmailBuiltInRuleShortcut = gmailBuiltInRuleEnableShortcutOperation(message, context);
   if (gmailBuiltInRuleShortcut) {
     return finalizeDeterministicOperation(context, message, gmailBuiltInRuleShortcut, "gmail_rule_management");
+  }
+
+  const gmailReviewListAndStatusCompound = gmailReviewListAndAutonomyStatusCompoundShortcutOperations(message, context);
+  if (gmailReviewListAndStatusCompound.length > 0) {
+    return finalizeDeterministicOperations(context, message, gmailReviewListAndStatusCompound, "gmail_reviews");
   }
 
   const gmailReviewListShortcut = gmailReviewListShortcutOperation(message, context);
@@ -615,6 +653,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     executedOps,
     problemOps
   });
+  logCompoundTurnDiagnostics(userId, reconciledOperations, executedOps, context.session.pendingOperation !== null, reply);
 
   const plannedPlanningOp = reconciledOperations.find((op) => isPlanningTool(op.tool));
   const planningTrace = recordPlanningTrace(
@@ -753,6 +792,7 @@ async function finalizeDeterministicOperations(
     executedOps,
     problemOps
   });
+  logCompoundTurnDiagnostics(context.session.userId, plannedOperations, executedOps, context.session.pendingOperation !== null, reply);
 
   const planningTrace = recordPlanningTrace(
     {
@@ -779,13 +819,8 @@ async function finalizeDeterministicOperations(
   });
 }
 
-function gmailReviewListShortcutOperation(message: string, context?: ContextBundle): PlannedOperation | undefined {
-  const text = normalizeIntentText(message);
-  if (!text) {
-    return undefined;
-  }
-
-  const asksReviewList =
+function looksLikeGmailReviewListRequest(text: string, context?: ContextBundle): boolean {
+  return (
     /\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b[\s\S]{0,50}\b(email reviews?|gmail reviews?|emails? to review|items? to review)\b/.test(text) ||
     /\b(email reviews?|gmail reviews?|emails? to review|items? to review)\b[\s\S]{0,50}\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b/.test(text) ||
     /^email reviews?$/.test(text) ||
@@ -796,13 +831,44 @@ function gmailReviewListShortcutOperation(message: string, context?: ContextBund
     // reviews recently (same contextual gate as "show me the reviews" above), since "anything
     // left" alone is too generic a phrase to trust unconditionally.
     (/\b(any|anything)\b[\s\S]{0,30}\bleft\b[\s\S]{0,20}\b(review|reviews|emails?)\b|\b(emails?|reviews?)\b[\s\S]{0,20}\bleft\b[\s\S]{0,20}\breview\b/.test(text) &&
-      Boolean(context && (context.gmailReviews.length > 0 || hasRecentGmailContext(context))));
+      Boolean(context && (context.gmailReviews.length > 0 || hasRecentGmailContext(context))))
+  );
+}
 
-  if (!asksReviewList) {
+function gmailReviewListShortcutOperation(message: string, context?: ContextBundle): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text || !looksLikeGmailReviewListRequest(text, context)) {
     return undefined;
   }
 
   return { tool: "gmail.review.list", args: { status: "pending" }, rationale: "user asked to see pending Gmail reviews" };
+}
+
+/**
+ * "show me email reviews and when do you check Gmail?" — a compound turn asking for both the
+ * review list AND the sync-schedule status in the same message. Without this, whichever
+ * single-op shortcut is checked first in the cascade (gmailReviewListShortcutOperation runs
+ * before gmailAutonomyStatusShortcutOperation) claims the message and returns immediately,
+ * silently dropping the second half — exactly the "handles one part, ignores the rest" failure
+ * mode this compound-hardening pass exists to close. Both tools here are read-only
+ * (mutates: false), so there is no safety concern with answering both unconditionally.
+ */
+function gmailReviewListAndAutonomyStatusCompoundShortcutOperations(message: string, context: ContextBundle): PlannedOperation[] {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return [];
+  }
+
+  const wantsReviewList = looksLikeGmailReviewListRequest(text, context);
+  const wantsStatus = looksLikeGmailAutonomyStatusQuery(text);
+  if (!wantsReviewList || !wantsStatus) {
+    return [];
+  }
+
+  return [
+    { tool: "gmail.review.list", args: { status: "pending" }, rationale: "user asked to see pending Gmail reviews, alongside a Gmail sync-schedule status question" },
+    { tool: "gmail.autonomy.status", args: {}, rationale: "user asked how often Gmail is checked, alongside a request to see pending reviews" }
+  ];
 }
 
 function gmailReviewInspectShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {

@@ -179,6 +179,33 @@ export function assertNoMutationWhenClarificationExpected(reply: AgentMessageRes
   );
 }
 
+/** For a compound turn (one message containing several explicit intents), the reply must mention
+ * EVERY expected category — never silently drop one because a shortcut/planner only handled part
+ * of the request. Each fragment may be a literal substring (case-insensitive) or a RegExp for a
+ * looser match; all must be present somewhere in the reply, in any order. */
+export function assertCompoundReplyAccountsFor(reply: AgentMessageResponseJson, expectedFragments: Array<string | RegExp>, context?: string): void {
+  for (const fragment of expectedFragments) {
+    if (typeof fragment === "string") {
+      assert.ok(
+        reply.reply.toLowerCase().includes(fragment.toLowerCase()),
+        `${context ? `${context}: ` : ""}reply must mention "${fragment}" — got: "${reply.reply}"`
+      );
+    } else {
+      assert.match(reply.reply, fragment, context);
+    }
+  }
+}
+
+/** A compound request naming N explicit operations must plan at least N operations — never fewer,
+ * which would mean part of the request was silently dropped rather than executed, proposed, or
+ * explicitly deferred to a clarification question. */
+export function assertNoSilentPartialHandling(reply: AgentMessageResponseJson, expectedOperationCount: number, context?: string): void {
+  assert.ok(
+    reply.operationsPlanned.length >= expectedOperationCount,
+    `${context ? `${context}: ` : ""}expected at least ${expectedOperationCount} operations for this compound request, got ${reply.operationsPlanned.length} (${reply.operationsPlanned.map((operation) => operation.tool).join(", ") || "none"})`
+  );
+}
+
 /**
  * Env-gated, human-readable one-liner for a single transcript turn — complements (never
  * replaces) the structured `[agent-runtime-diagnostics]` JSON lines runtime.ts's own
