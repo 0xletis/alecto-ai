@@ -1,6 +1,6 @@
 # Architecture Inventory
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 This file is the current architecture handoff for humans and orchestrator agents. It is descriptive, not aspirational. Conversation Orchestrator v2 has been fully retired (see "Conversation Orchestrator v2 — Full Retirement" below) — assume legacy `/messages/process` routing owns anything not explicitly owned by Agent Runtime v3, until tests prove otherwise.
 
@@ -1172,6 +1172,19 @@ Real solo/dev testing of §18's fixes hit a config-format mismatch (`PROACTIVE_O
 ## Generic Goal Evidence Loop MVP
 
 Reframed mid-pass from an initial "Job Search Operator Loop" ask: the architecture is generic — **Goal + Evidence + Source + Confidence + Suggested Mutation** — and job search is only the first goal category exercised against it, never a hardcoded product module. Almost everything needed already existed as generic primitives: a Goal's own `targetMetrics[].eventType` (declares which event types are evidence for it — set at creation, from a template or manually), the event-registry (already spans career/health/work/finance/learning, zero job-search bias), `ActionItem.goalId`/`EmailSignalRule.goalId` (already real FKs), `goal-linking.ts`'s `inferGoalLinkForAction` (an already-generic confidence-scored action↔goal matcher, already used by `gmail.review.to_action`), and `email-review-service.ts`'s `approveEmailReviewForUser` (an already-generic classification→event/action pipeline, previously only reachable via the legacy HTTP route). New, small, and explicitly generic: `packages/core/src/goal-evidence.ts` (`findGoalsForEventType`/`describeGoalEvidenceMatch` — the goal↔evidence lookup, extracted and named rather than left ad hoc); new V3 tools `goal.log_evidence` (logs a career-scoped-today-but-architecturally-generic event signal and names the matched goal), `goal.status` (grounded per-goal progress: linked actions, evidence-event counts, pending linked Gmail reviews — works identically for "how's my job search going?" and "how's training going?"), and `gmail.review.approve` (exposes the existing generic approval pipeline to chat); `action.create` now auto-links to a matching active goal via the same matcher email-review-to-action already used; the morning brief gained one generic line surfacing a goal-linked pending Gmail review, for any goal category. Acceptance suite (`tests/agent-runtime-goal-evidence.test.ts`, 9 tests) uses job-search examples for tests 1–8 and deliberately proves genericness in test 9 with a completely different goal (paying Endesa bills) through the exact same tools. Manual only: nothing auto-detects application/interview/rejection activity outside an already-classified Gmail review; hourly/scheduled Gmail monitoring is not wired by this pass; `evening_checkin`/`gmail_nudge` remain preview-only. Full suite: **441/441**. See `docs/10-v3-readiness-audit.md`'s §20 for the complete design and what a future domain would need to reuse this.
+
+## Integration Observation Boundary For Future Sources
+
+Architecture note for Gmail/proactivity and future integrations: do not make Gmail nudges a one-off downstream system. The intended long-term path is **integration observation -> goal/action/calendar/memory/evidence candidate -> V3 tool/action**.
+
+Today the concrete observation source is `EmailReviewItem` with `provider: "gmail"`, and it is fine for Gmail-specific fetching/classification to keep creating that source object. The next layer should not branch as "Gmail can only do X." It should talk in generic product decisions:
+- create an `ActionItem`
+- log goal evidence through the existing goal/evidence path
+- ask clarification or request approval
+- suggest a calendar event later, once Calendar exists
+- leave unsupported observations as review-only
+
+Calendar is not implemented in this repo, and no fake Calendar tools or placeholder Calendar mutations should be added just to satisfy this shape. A future Calendar integration should plug in by creating its own source observation/candidate object, then reuse the same V3 execution layer for grounded operations. If a shared abstraction such as `IntegrationObservation`, `ActionableObservation`, or `GoalEvidenceCandidate` naturally emerges while adding a second source, introduce it then; do not overbuild it while Gmail reviews are still the only real observation source.
 
 ## Adaptive Goal Creation / Goal Operating Plan MVP
 

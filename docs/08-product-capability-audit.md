@@ -1,6 +1,6 @@
 # Product Capability Audit
 
-Last updated: 2026-08-18
+Last updated: 2026-08-20
 
 This is a product/architecture checkpoint. The implementation ledger remains `docs/07-implementation-status.md`. Route ownership and migration risks live in `docs/09-architecture-inventory.md`.
 
@@ -344,6 +344,7 @@ Why:
 - It makes external signals more useful.
 - Gmail already has OAuth, rules, review inbox, work/action adapters, custom sender/keyword review-only tracking, state-aware setup/status/timing replies, manual/scheduled sync preference, worker-executed scheduled background sync when globally enabled, review-notification preference, and bundled review-waiting notifications on scheduled sync.
 - A good next step is making review handling and setup feel more guided without increasing email-side automation.
+- Architecture boundary: do not design Gmail nudges as a one-off closed system. The long-term shape is `integration observation -> goal/action/calendar/memory/evidence candidate -> V3 tool/action`. `EmailReviewItem` remains fine as the current Gmail source object, but downstream product decisions should be generic operations such as create action, log goal evidence, ask clarification, or later suggest a calendar event. Calendar is not implemented and no fake Calendar tools should be added yet; document where it would plug in instead.
 
 Suggested scope:
 - Keep testing goal-linked Gmail recommendations from real usage: job/work goals should suggest relevant Gmail tracking, while utility/expense goals should suggest custom sender/keyword tracking.
