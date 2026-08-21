@@ -34,12 +34,23 @@ export function composeReply(input: ComposeReplyInput): string {
 
   if (hasProblems) {
     const successLines = executedSummaries(input.executedOps, () => true);
+    // A single blocked multi-op request (e.g. two action.complete calls rejected together for
+    // the same out-of-range numbered reference) produces the identical correction text once per
+    // op — deduped the same way executedSummaries already dedupes matching success lines, so the
+    // user sees one clear explanation, not the same sentence repeated back to back.
+    const seenCorrections = new Set<string>();
     const correctionLines = [
       ...input.executedOps
         .filter((op) => op.status === "failed")
         .map((op) => correctionLine(op.tool, op.error ?? op.summary)),
       ...input.problemOps.map((op) => correctionLine(op.tool, op.error ?? `"${op.tool}" isn't something I can do yet`))
-    ];
+    ].filter((line) => {
+      if (seenCorrections.has(line)) {
+        return false;
+      }
+      seenCorrections.add(line);
+      return true;
+    });
 
     const lines = [...successLines, ...correctionLines];
     return lines.length > 0 ? joinSentences(lines) : "I couldn't do that. Nothing was changed.";

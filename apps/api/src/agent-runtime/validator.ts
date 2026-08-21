@@ -34,7 +34,159 @@ export function validateOperations(
   message: string,
   options: ValidateOperationsOptions = {}
 ): ValidatedOperation[] {
-  return operations.map((operation) => validateOperation(operation, context, message, options));
+  // A real Telegram smoke test found "complete action 10 and 9 now" (only 8 actions ever shown)
+  // marked BOTH resulting action.complete operations "valid" and mutated real data — the planner
+  // had emitted two separate action.complete calls, each with SOME actionId, and per-operation
+  // validation had no way to see that the raw message named TWO explicit numbers at once: the
+  // single-number override only fired when exactly one number was present, and the grounding
+  // safety net below was deliberately skipped whenever ANY digit appeared in the message (on the
+  // assumption a well-behaved planner would always route a multi-number request through
+  // action.hygiene_apply instead — an assumption with no actual enforcement behind it). Resolved
+  // here, once per turn, before any individual action.complete/archive/snooze op is validated:
+  // every explicit number in the message is checked against the CURRENT session.visibleEntities
+  // range, atomically — if even one is out of range, the whole set is blocked, never a partial
+  // mutation on the refs that happened to be valid.
+  const indexResolution = resolveExplicitActionIndexReferences(operations, context, message);
+
+  if (indexResolution.applicable && indexResolution.blocked) {
+    return operations.map((operation) => {
+      if (!ACTION_REFERENCE_TOOLS.has(operation.tool)) {
+        return validateOperation(operation, context, message, options);
+      }
+      return {
+        tool: operation.tool,
+        args: {},
+        status: "invalid",
+        requiresConfirmation: false,
+        error: indexResolution.clarification,
+        rationale: operation.rationale
+      };
+    });
+  }
+
+  return operations.map((operation, index) => {
+    const override = indexResolution.applicable ? indexResolution.overridesByOpIndex?.get(index) : undefined;
+    if (!override) {
+      return validateOperation(operation, context, message, options);
+    }
+    // Already resolved deterministically above against the real visible list — deterministicSource
+    // skips the grounding/outside-page checks below, which exist only to catch an UNVERIFIED
+    // planner-supplied id, not to second-guess one this file already verified itself.
+    const args = typeof operation.args === "object" && operation.args !== null && !Array.isArray(operation.args) ? (operation.args as Record<string, unknown>) : {};
+    return validateOperation({ ...operation, args: { ...args, actionId: override } }, context, message, { ...options, deterministicSource: true });
+  });
+}
+
+interface ExplicitActionIndexResolution {
+  applicable: boolean;
+  blocked?: boolean;
+  clarification?: string;
+  /** Position in the original `operations` array -> the real actionId that index resolves to. */
+  overridesByOpIndex?: Map<number, string>;
+}
+
+/**
+ * Parses every explicit number in the raw message (e.g. "complete action 10 and 9", "archive 1,
+ * 3", "complete #2") and, whenever the turn contains at least one action.complete/archive/snooze
+ * operation, resolves ALL of them against `context.session.visibleEntities`' own `index` field —
+ * never the planner-supplied actionId, never context.openActions' DB ordering, never a fuzzy
+ * match on the number itself. Numbers are paired to action-reference operations in the order both
+ * appear (the Nth number named in the message maps to the Nth action-reference op the planner
+ * produced) — the same order a well-behaved planner naturally emits them in. A count mismatch
+ * (e.g. a stray unrelated number elsewhere in the message) is treated as unresolvable rather than
+ * guessed at.
+ */
+function resolveExplicitActionIndexReferences(operations: PlannedOperation[], context: ContextBundle, message: string): ExplicitActionIndexResolution {
+  const actionRefOpIndices = operations.map((op, i) => (ACTION_REFERENCE_TOOLS.has(op.tool) ? i : -1)).filter((i) => i >= 0);
+
+  if (actionRefOpIndices.length === 0) {
+    return { applicable: false };
+  }
+
+  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  if (referencedNumbers.length === 0) {
+    return { applicable: false };
+  }
+
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  const maxIndex = visibleActions.reduce((max, entity) => Math.max(max, entity.index ?? 0), 0);
+  const resolvedByNumber = new Map<number, string>();
+  const invalidNumbers: number[] = [];
+
+  for (const num of referencedNumbers) {
+    const entity = visibleActions.find((item) => item.index === num);
+    if (entity) {
+      resolvedByNumber.set(num, entity.id);
+    } else if (!invalidNumbers.includes(num)) {
+      invalidNumbers.push(num);
+    }
+  }
+
+  const countsMismatch = referencedNumbers.length !== actionRefOpIndices.length;
+  const blocked = invalidNumbers.length > 0 || countsMismatch;
+
+  logExplicitIndexDiagnostics(context.session.userId, {
+    message,
+    referencedNumbers,
+    visibleIndexRange: maxIndex > 0 ? `1-${maxIndex}` : "(none shown)",
+    allResolved: !blocked,
+    plannerActionIdsIgnored: true,
+    blockedAtomically: blocked
+  });
+
+  if (blocked) {
+    const clarification = countsMismatch && invalidNumbers.length === 0 ? "Which numbers do you mean? Please name them one at a time or say 'show more actions'." : buildOutOfRangeClarification(invalidNumbers, referencedNumbers, maxIndex);
+    return { applicable: true, blocked: true, clarification };
+  }
+
+  const overridesByOpIndex = new Map<number, string>();
+  referencedNumbers.forEach((num, position) => {
+    overridesByOpIndex.set(actionRefOpIndices[position], resolvedByNumber.get(num)!);
+  });
+
+  return { applicable: true, blocked: false, overridesByOpIndex };
+}
+
+/** Exact copy from the reported bug's own hard requirement — "I only showed N actions..." when
+ * EVERY named number was out of range, "I can't do that because N isn't in the shown list..."
+ * when some were valid and at least one wasn't (a partial mutation on the valid ones is unsafe). */
+function buildOutOfRangeClarification(invalidNumbers: number[], allNumbers: number[], maxIndex: number): string {
+  const range = maxIndex > 0 ? `1–${maxIndex}` : "the shown list";
+  if (invalidNumbers.length === allNumbers.length) {
+    return `I only showed ${maxIndex} action${maxIndex === 1 ? "" : "s"}. Use a number from ${range}, or say "show more actions".`;
+  }
+  const invalidList = invalidNumbers.join(" and ");
+  const verb = invalidNumbers.length === 1 ? "isn't" : "aren't";
+  return `I can't do that because ${invalidList} ${verb} in the shown list. Use ${range}, or say "show more actions".`;
+}
+
+function logExplicitIndexDiagnostics(
+  userId: string,
+  input: {
+    message: string;
+    referencedNumbers: number[];
+    visibleIndexRange: string;
+    allResolved: boolean;
+    plannerActionIdsIgnored: boolean;
+    blockedAtomically: boolean;
+  }
+): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "explicit_action_index_check",
+      userId,
+      message: input.message,
+      referencedNumbers: input.referencedNumbers,
+      visibleIndexRange: input.visibleIndexRange,
+      allResolved: input.allResolved,
+      plannerActionIdsIgnored: input.plannerActionIdsIgnored,
+      blockedAtomically: input.blockedAtomically
+    })
+  );
 }
 
 function validateOperation(operation: PlannedOperation, context: ContextBundle, message: string, options: ValidateOperationsOptions): ValidatedOperation {
@@ -81,24 +233,13 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && args.actionId) {
     const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
 
-    // A real Telegram smoke test found "complete action 10 and 9" (right after the ORIGINAL
-    // numbered list was shown) instead resolving against context.openActions's own DB ordering
-    // once visibleEntities had been cleared by an intervening cancel — a completely different
-    // order than what the user actually saw numbered on screen. A single explicit number is now
-    // resolved deterministically against the CURRENT visibleEntities' own `index` field —
-    // overriding whatever actionId the planner supplied — so "10" always means whichever item is
-    // actually numbered 10 in the list the user is looking at, never the planner's own count of
-    // some other ordering. A message naming more than one number ("10 and 9") is left alone here:
-    // a single actionId field can't represent two targets anyway, so that shape belongs to
-    // action.hygiene_apply's own selections-by-index resolution instead (see planner.ts).
+    // Any explicit number in the message was already resolved deterministically (or the whole
+    // operation set already blocked) by validateOperations's own resolveExplicitActionIndexReferences
+    // pre-pass, above the per-operation level this function operates at — by the time a
+    // ACTION_REFERENCE_TOOLS op reaches here with a number still in the message, options
+    // .deterministicSource is already true and the checks below are skipped entirely. This is
+    // kept as a defensive, always-expected-false guard, not the primary index-resolution path.
     const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
-    if (referencedNumbers.length === 1) {
-      const numberedTarget = visibleActions.find((entity) => entity.index === referencedNumbers[0]);
-      if (numberedTarget) {
-        args.actionId = numberedTarget.id;
-      }
-    }
-
     const target = visibleActions.find((entity) => entity.id === args.actionId);
 
     // A real Telegram smoke test + a live-LLM eval reproduction found the planner directly

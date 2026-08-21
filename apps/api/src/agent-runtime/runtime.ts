@@ -704,10 +704,25 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // clarification.ask stub — nothing there to actually confirm, so it must never block an
   // unrelated request the way a real yes/no confirmation does. Does NOT exclude one carrying a
   // real suggestedConfirmOperation ("Did you mean X? Reply yes...") — that DOES have something
-  // real to protect (a bare "yes" must still complete/archive/snooze the suggested candidate),
-  // so an unrelated mutation must not silently drop it either.
+  // real to protect (a bare "yes" must still complete/archive/snooze the suggested candidate) —
+  // EXCEPT an explicit numbered action command ("complete action 10 and 9 now") right on top of
+  // it, which a real Telegram smoke test found getting stuck blocked behind a stale suggestion
+  // indefinitely. An explicit number is a clear, unambiguous instruction of its own — it always
+  // supersedes/replaces a pending action-reference question rather than needing an explicit
+  // "cancel" first; validateOperations's own explicit-index check (which runs regardless of any
+  // pending operation) still decides on its own merits whether those numbers actually resolve.
   const pendingHasRealMutation = pending?.operations.some((op) => getToolDefinition(op.tool)?.mutates === true) ?? false;
-  if (pending && (pending.topic !== ACTION_CLARIFICATION_TOPIC || pendingHasRealMutation) && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
+  const explicitNumberedCommandSupersedesPending =
+    pending?.topic === ACTION_CLARIFICATION_TOPIC && /\d/.test(message) && reconciledOperations.some((op) => ACTION_REFERENCE_TOOLS.has(op.tool));
+  if (explicitNumberedCommandSupersedesPending) {
+    setPendingOperation(context.session, null);
+  }
+  if (
+    !explicitNumberedCommandSupersedesPending &&
+    pending &&
+    (pending.topic !== ACTION_CLARIFICATION_TOPIC || pendingHasRealMutation) &&
+    validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)
+  ) {
     return finalize(context, {
       reply: `You still have a pending confirmation for ${pending.summary}. Confirm, cancel, or tell me a new request.`,
       operationsPlanned: reconciledOperations,
