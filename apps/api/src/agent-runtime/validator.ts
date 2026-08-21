@@ -268,7 +268,8 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
         targetLabel: target.label,
         groundingTokens: actionGroundingWords(message),
         matchTier: tier,
-        trusted: tier === "exact" || tier === "word_exact" || tier === "fuzzy"
+        trusted: tier === "exact" || tier === "word_exact" || tier === "fuzzy",
+        source: "visible_entity_title_grounding"
       });
 
       // A real Telegram smoke test found an old email-generated action (its title just a raw
@@ -341,7 +342,8 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
         targetLabel: candidate?.title,
         groundingTokens: actionGroundingWords(message),
         matchTier: tier,
-        trusted
+        trusted,
+        source: "background_open_actions_title_grounding"
       });
 
       if (candidate && trusted) {
@@ -349,6 +351,21 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
       } else {
         delete args.actionId;
       }
+    } else if (!options.deterministicSource && target && visibleActions.length <= 1) {
+      // Exactly one action is visible and the supplied id matches it — nothing ambiguous to
+      // ground against, so this is trusted with no title check, same as an omitted id would
+      // resolve to below. Logged explicitly so a real reported turn's diagnostics always show
+      // which of the four trust paths applied, never a silent implicit trust with no trace.
+      logActionGroundingDiagnostics(context.session.userId, {
+        tool: tool.name,
+        message,
+        suppliedActionId: String(args.actionId),
+        targetLabel: target.label,
+        groundingTokens: actionGroundingWords(message),
+        matchTier: "exact",
+        trusted: true,
+        source: "single_visible_entity_implicit"
+      });
     }
   }
 
@@ -389,6 +406,21 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
         requiresConfirmation: false,
         clarificationQuestion: resolution.question,
         rationale: operation.rationale
+      };
+    }
+
+    // Mirrors resolveExplicitActionIndexReferences's own atomic block for direct action.complete/
+    // snooze/archive calls: an out-of-range index here must behave identically, not silently
+    // apply the valid selections and skip the bad one.
+    if (resolution.status === "blocked") {
+      return {
+        tool: tool.name,
+        args: {},
+        status: "invalid",
+        requiresConfirmation: false,
+        error: resolution.error,
+        rationale: operation.rationale,
+        standaloneError: true
       };
     }
 
@@ -843,6 +875,9 @@ function logActionGroundingDiagnostics(
     groundingTokens: string[];
     matchTier: ActionTitleMatchTier;
     trusted: boolean;
+    /** Which of the direct-actionId trust paths this decision came from — makes "why was this
+     * id trusted/rejected" answerable from logs alone for a real reported turn. */
+    source: "visible_entity_title_grounding" | "background_open_actions_title_grounding" | "single_visible_entity_implicit";
   }
 ): void {
   if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
@@ -859,6 +894,7 @@ function logActionGroundingDiagnostics(
       groundingTokens: input.groundingTokens,
       matchTier: input.matchTier,
       trusted: input.trusted,
+      source: input.source,
       rejectedAsGenericOrNoMatch: !input.trusted
     })
   );
@@ -998,7 +1034,8 @@ export interface HygieneApplySelectionArgs {
 
 type HygieneApplyResolution =
   | { status: "resolved"; selections: HygieneApplySelectionArgs[] }
-  | { status: "needs_clarification"; question: string };
+  | { status: "needs_clarification"; question: string }
+  | { status: "blocked"; error: string };
 
 /**
  * Resolves each action.hygiene_apply selection's actionId deterministically
@@ -1008,29 +1045,52 @@ type HygieneApplyResolution =
  * precedent for action.snooze/complete/archive (which never cross-check a
  * provided actionId either).
  *
- * If every selection fails to resolve — most commonly because there is no
- * action-hygiene list currently visible in the session — the whole operation
- * asks for clarification and nothing executes. If at least one selection
- * resolves, the rest are passed through unresolved (actionId left unset) so
- * the executor can report them individually as skipped, the same way
- * applyActionHygieneBatchOperations already reports an operation whose
- * action "no longer exists".
+ * An index that doesn't match anything currently visible blocks the WHOLE
+ * operation atomically — the same rule resolveExplicitActionIndexReferences
+ * already enforces for direct action.complete/snooze/archive. This used to
+ * silently drop just the bad selection and apply the rest, which is exactly
+ * the "complete 2 and 12" partial-mutation shape that rule exists to prevent
+ * for the direct tools; action.hygiene_apply must behave identically, not as
+ * a weaker sibling of the same reference. If there is no visible list at all
+ * to resolve against, that's reported as "no list in view" instead, since
+ * naming an out-of-range number is a different problem from there being
+ * nothing to reference yet.
  */
 function resolveHygieneApplySelections(selections: HygieneApplySelectionArgs[], context: ContextBundle): HygieneApplyResolution {
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  const maxIndex = visibleActions.reduce((max, entity) => Math.max(max, entity.index ?? 0), 0);
+  const invalidIndexes: number[] = [];
+  const referencedIndexes: number[] = [];
+
   const resolved = selections.map((selection) => {
     if (selection.actionId) {
       return selection;
     }
 
     if (typeof selection.index === "number") {
-      const entity = context.session.visibleEntities.find((item) => item.type === "action" && item.index === selection.index);
+      referencedIndexes.push(selection.index);
+      const entity = visibleActions.find((item) => item.index === selection.index);
       if (entity) {
         return { ...selection, actionId: entity.id };
       }
+      invalidIndexes.push(selection.index);
+      return selection;
     }
 
     return selection;
   });
+
+  if (invalidIndexes.length > 0) {
+    if (visibleActions.length === 0) {
+      return {
+        status: "needs_clarification",
+        question: 'I don\'t have an action-cleanup list in view right now. Say "clean up my actions" to see one, then tell me what to do with each.'
+      };
+    }
+
+    logHygieneApplyIndexDiagnostics(context.session.userId, { invalidIndexes, referencedIndexes, maxIndex });
+    return { status: "blocked", error: buildOutOfRangeClarification(invalidIndexes, referencedIndexes, maxIndex) };
+  }
 
   const anyResolved = resolved.some((selection) => Boolean(selection.actionId));
 
@@ -1042,6 +1102,26 @@ function resolveHygieneApplySelections(selections: HygieneApplySelectionArgs[], 
   }
 
   return { status: "resolved", selections: resolved };
+}
+
+function logHygieneApplyIndexDiagnostics(
+  userId: string,
+  input: { invalidIndexes: number[]; referencedIndexes: number[]; maxIndex: number }
+): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "hygiene_apply_index_check",
+      userId,
+      invalidIndexes: input.invalidIndexes,
+      referencedIndexes: input.referencedIndexes,
+      visibleIndexRange: input.maxIndex > 0 ? `1-${input.maxIndex}` : "(none shown)",
+      blockedAtomically: true
+    })
+  );
 }
 
 interface GmailReviewRefResolution {

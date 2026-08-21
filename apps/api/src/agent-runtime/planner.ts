@@ -1,5 +1,6 @@
 import { createOpenAIClient } from "@operator-agent/llm";
 import { toolArgsPlannerJsonSchema, toolCatalog, toolCatalogPromptSummary, toolNames } from "./tool-catalog.js";
+import { isReminderCompanionAction } from "../actions/reminder-companion.js";
 import type { ContextBundle, RawPlan } from "./types.js";
 
 const defaultModel = "gpt-4o-mini";
@@ -98,6 +99,7 @@ export function buildSystemPrompt(): string {
     "You are Alecto's Agent Runtime v3 planner.",
     "You only PLAN operations as structured JSON. You never write to any database and your reply text is only a draft.",
     "Deterministic code will validate every operation against a fixed tool catalog, resolve ambiguous references, enforce policy, and execute allowed operations.",
+    "Propose intent and raw references only — code resolves every id. A number in the user's message always refers to its position in conversation.visibleEntities, never to context.backgroundOpenActions or any count. Never substitute an id from context.backgroundOpenActions/activeGoals for an out-of-range or unclear visible reference — that array is background context only, not a numbered or user-visible list. If you're unsure which real item is meant, omit the id field (or use ref/title text instead) or use clarification.ask; a wrong guess is worse than asking.",
     "",
     "Tool catalog (use only these tool names, and match args exactly to the given shape):",
     toolCatalogPromptSummary(),
@@ -140,7 +142,10 @@ export function buildSystemPrompt(): string {
   ].join("\n");
 }
 
-function buildUserPayload(message: string, context: ContextBundle): string {
+/** Exported so tests can assert on exactly what the LLM planner receives for a given
+ * ContextBundle — the real shape sent to OpenAI is otherwise only ever visible via the
+ * AGENT_RUNTIME_DIAGNOSTICS shape-only log, which deliberately doesn't include content. */
+export function buildUserPayload(message: string, context: ContextBundle): string {
   const { session } = context;
 
   return JSON.stringify({
@@ -176,7 +181,22 @@ function buildUserPayload(message: string, context: ContextBundle): string {
           eventType: metric.eventType ?? null
         }))
       })),
-      openActions: context.openActions.map((action) => ({ id: action.id, title: action.title, dueAt: action.dueAt })),
+      // Renamed from "openActions" deliberately — this is background reference data (real ids,
+      // but not numbered and not necessarily shown to the user this turn). visibleEntities above
+      // is the only numbered, user-visible list; a number in the user's message always refers to
+      // ITS index, never to a position in this array. See buildSystemPrompt's own top-level rule.
+      //
+      // Reminder-companion rows (actionType "reminder") are filtered out here — action.list
+      // already hides them from the numbered list the user sees for the same reason (they aren't
+      // real, independent tasks) — so the planner never has an id to guess from for one the user
+      // was never shown as a task. This filter is deliberately scoped to THIS payload, not to
+      // context.openActions itself: validator.ts's own outside-visible-page grounding check still
+      // needs the full, unfiltered pool so a user who explicitly names a reminder by its own
+      // wording ("the reminder for X too") can still be resolved and honestly told its parent is
+      // already done, rather than getting a "which task do you mean?" for something they clearly named.
+      backgroundOpenActions: context.openActions
+        .filter((action) => !isReminderCompanionAction(action))
+        .map((action) => ({ id: action.id, title: action.title, dueAt: action.dueAt })),
       gmailConnected: Boolean(context.gmailConnection && context.gmailConnection.status === "active"),
       gmailRules: context.gmailRules
         .filter((rule) => rule.status === "active")
@@ -216,7 +236,13 @@ function logPlannerContextDiagnostics(model: string, message: string, context: C
       focusedGoalSet: Boolean(session.focusedEntities.goal),
       recentMessageCount: session.messages.slice(-10).length,
       activeGoalCount: context.activeGoals.length,
-      openActionCount: context.openActions.length,
+      // rawOpenActionCount is the full grounding pool (context.openActions, still available to
+      // validator.ts for outside-visible-page resolution); backgroundOpenActionCount is what
+      // actually reaches the LLM in this turn's payload (reminder companions filtered out) — kept
+      // side by side so a real reported turn's diagnostics show the boundary directly, not just
+      // one number that could be either.
+      rawOpenActionCount: context.openActions.length,
+      backgroundOpenActionCount: context.openActions.filter((action) => !isReminderCompanionAction(action)).length,
       gmailConnected: Boolean(context.gmailConnection && context.gmailConnection.status === "active"),
       activeGmailRuleCount: context.gmailRules.filter((rule) => rule.status === "active").length,
       pendingGmailReviewCount: context.gmailReviews.length,
