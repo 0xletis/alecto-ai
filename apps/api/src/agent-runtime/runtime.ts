@@ -8,7 +8,7 @@ import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
-import { ACTION_REFERENCE_TOOLS, revalidateForExecution, validateOperations } from "./validator.js";
+import { ACTION_CLARIFICATION_ELIGIBLE_TOOLS, revalidateForExecution, validateOperations } from "./validator.js";
 import type {
   AgentDebugInfo,
   AgentEntity,
@@ -80,10 +80,10 @@ function looksLikeActionClarificationCancelReply(message: string): boolean {
   return /\bno\s+action\b|\bnone\b|\bnothing\b|\bnever\s*mind\b|\bforget it\b|\bcancel\b/.test(text);
 }
 
-/** Only ever needed for action.complete/archive/snooze's own reference-ambiguity clarification
- * (validator.ts's ACTION_REFERENCE_TOOLS) — a goal-shaped or Gmail-review-shaped clarification
- * question is answered differently (a real confirm/cancel flow, or just re-asking) and must not
- * be mistaken for "waiting on which action the user meant." */
+/** Only ever needed for action.complete/archive/snooze/reschedule's own reference-ambiguity
+ * clarification (validator.ts's ACTION_CLARIFICATION_ELIGIBLE_TOOLS) — a goal-shaped or Gmail-
+ * review-shaped clarification question is answered differently (a real confirm/cancel flow, or
+ * just re-asking) and must not be mistaken for "waiting on which action the user meant." */
 function markActionClarificationPendingIfNeeded(
   session: AgentSessionState,
   validatedOps: ValidatedOperation[],
@@ -92,7 +92,7 @@ function markActionClarificationPendingIfNeeded(
   if (!clarificationQuestion) {
     return;
   }
-  const referenceAmbiguityOp = validatedOps.find((op) => op.status === "needs_clarification" && ACTION_REFERENCE_TOOLS.has(op.tool));
+  const referenceAmbiguityOp = validatedOps.find((op) => op.status === "needs_clarification" && ACTION_CLARIFICATION_ELIGIBLE_TOOLS.has(op.tool));
   if (referenceAmbiguityOp) {
     // A single specific candidate was rejected for weak (generic-only) grounding rather than a
     // genuine multi-way ambiguity — validator.ts attaches the real tool+args so a bare "yes"
@@ -713,7 +713,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // pending operation) still decides on its own merits whether those numbers actually resolve.
   const pendingHasRealMutation = pending?.operations.some((op) => getToolDefinition(op.tool)?.mutates === true) ?? false;
   const explicitNumberedCommandSupersedesPending =
-    pending?.topic === ACTION_CLARIFICATION_TOPIC && /\d/.test(message) && reconciledOperations.some((op) => ACTION_REFERENCE_TOOLS.has(op.tool));
+    pending?.topic === ACTION_CLARIFICATION_TOPIC && /\d/.test(message) && reconciledOperations.some((op) => ACTION_CLARIFICATION_ELIGIBLE_TOOLS.has(op.tool));
   if (explicitNumberedCommandSupersedesPending) {
     setPendingOperation(context.session, null);
   }

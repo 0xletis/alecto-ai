@@ -7,6 +7,22 @@ import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
 export const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
+/**
+ * Deliberately NOT the same set as ACTION_REFERENCE_TOOLS above, and never used for
+ * resolveExplicitActionIndexReferences's pre-pass or the plain "no actionId -> resolveSingleVisibleEntity"
+ * fallback (validateOperation's own `if (ACTION_REFERENCE_TOOLS.has(tool.name) && !args.actionId)`
+ * block) — action.reschedule intentionally keeps its own, more capable ref-based resolver
+ * (resolveActionRef, which searches both visible and background actions by name) for the
+ * "no actionId" case, and folding it into ACTION_REFERENCE_TOOLS there would silently break that
+ * (e.g. a single unrelated visible action would make resolveSingleVisibleEntity "resolve" to it
+ * instead of correctly matching a differently-named task via `ref`). This wider set exists ONLY
+ * for the two runtime.ts call sites that react to "this is a needs_clarification/ambiguity shaped
+ * like an action reference" regardless of which specific tool produced it — action.reschedule's
+ * own direct-actionId grounding (validateOperation, reusing applyDirectActionIdTrust) now produces
+ * the exact same shape of needs_clarification/suggestedConfirmOperation as action.complete/snooze/
+ * archive, so it belongs here too.
+ */
+export const ACTION_CLARIFICATION_ELIGIBLE_TOOLS = new Set([...ACTION_REFERENCE_TOOLS, "action.reschedule"]);
 const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
   "gmail.review.reject",
   "gmail.review.inspect",
@@ -127,6 +143,7 @@ function resolveExplicitActionIndexReferences(operations: PlannedOperation[], co
   const blocked = invalidNumbers.length > 0 || countsMismatch;
 
   logExplicitIndexDiagnostics(context.session.userId, {
+    tool: [...new Set(actionRefOpIndices.map((i) => operations[i]!.tool))].join("+"),
     message,
     referencedNumbers,
     visibleIndexRange: maxIndex > 0 ? `1-${maxIndex}` : "(none shown)",
@@ -164,6 +181,10 @@ function buildOutOfRangeClarification(invalidNumbers: number[], allNumbers: numb
 function logExplicitIndexDiagnostics(
   userId: string,
   input: {
+    /** Which tool(s) this explicit-index resolution ran for — e.g. "action.complete",
+     * "action.reschedule", or a "+"-joined combination for a multi-op turn — so a real reported
+     * turn's diagnostics don't have to guess which numbered-reference path produced this line. */
+    tool: string;
     message: string;
     referencedNumbers: number[];
     visibleIndexRange: string;
@@ -180,6 +201,7 @@ function logExplicitIndexDiagnostics(
     JSON.stringify({
       phase: "explicit_action_index_check",
       userId,
+      tool: input.tool,
       message: input.message,
       referencedNumbers: input.referencedNumbers,
       visibleIndexRange: input.visibleIndexRange,
@@ -188,6 +210,226 @@ function logExplicitIndexDiagnostics(
       blockedAtomically: input.blockedAtomically
     })
   );
+}
+
+interface ExplicitRescheduleIndexResolution {
+  applicable: boolean;
+  blocked?: boolean;
+  clarification?: string;
+  actionId?: string;
+}
+
+/**
+ * action.reschedule has no `index` field in its own schema (unlike action.hygiene_apply's
+ * selections) — the only way the planner can express "task 2" for a single reschedule is by
+ * resolving the index itself from the visibleEntities it was shown and supplying the resulting
+ * real id directly as actionId. That means a WRONG index-to-id mapping (an out-of-range or
+ * miscounted "2") would otherwise reach applyDirectActionIdTrust as an ordinary direct actionId —
+ * and that function deliberately backs off whenever the message has any digit, on the assumption
+ * something upstream already resolved it deterministically (true for action.complete/snooze/
+ * archive via resolveExplicitActionIndexReferences, never true for reschedule without this).
+ * Mirrors that same pre-pass, adapted for a single operation: exactly one digit in the message is
+ * resolved against session.visibleEntities' own index field directly, ignoring whatever actionId
+ * the planner supplied — never guessed against DB order or a title match. More than one digit
+ * (e.g. "reschedule 2 to 5pm", where the second digit is part of the time, not an index) is
+ * treated as not applicable at all, deferring to the direct-actionId-trust/ref-based paths instead
+ * of guessing which digit was meant.
+ */
+function resolveExplicitRescheduleIndexReference(context: ContextBundle, message: string): ExplicitRescheduleIndexResolution {
+  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  if (referencedNumbers.length !== 1) {
+    return { applicable: false };
+  }
+
+  const [num] = referencedNumbers;
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  const maxIndex = visibleActions.reduce((max, entity) => Math.max(max, entity.index ?? 0), 0);
+  const entity = visibleActions.find((item) => item.index === num);
+
+  logExplicitIndexDiagnostics(context.session.userId, {
+    tool: "action.reschedule",
+    message,
+    referencedNumbers,
+    visibleIndexRange: maxIndex > 0 ? `1-${maxIndex}` : "(none shown)",
+    allResolved: Boolean(entity),
+    plannerActionIdsIgnored: true,
+    blockedAtomically: !entity
+  });
+
+  if (!entity) {
+    return { applicable: true, blocked: true, clarification: buildOutOfRangeClarification([num], [num], maxIndex) };
+  }
+
+  return { applicable: true, blocked: false, actionId: entity.id };
+}
+
+interface DirectActionIdTrustResult {
+  /** Set when the caller must return immediately with this exact ValidatedOperation. */
+  earlyReturn?: ValidatedOperation;
+  actionOutsideVisiblePage: boolean;
+}
+
+/**
+ * The tiered grounding check for a directly-supplied actionId — shared by action.complete/snooze/
+ * archive (via ACTION_REFERENCE_TOOLS, args.actionId already known truthy at the call site) and
+ * action.reschedule (via its own call site, kept deliberately separate from ACTION_REFERENCE_TOOLS
+ * — see that set's own doc comment for why it can't just be added there). Mutates `args` in place
+ * (deleting actionId when it's discarded as untrusted), exactly like the single inline block this
+ * was extracted from; callers still need their OWN "no actionId" fallback afterward.
+ */
+function applyDirectActionIdTrust(
+  toolName: string,
+  args: Record<string, unknown>,
+  operation: PlannedOperation,
+  context: ContextBundle,
+  message: string,
+  options: ValidateOperationsOptions
+): DirectActionIdTrustResult {
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+
+  // Any explicit number in the message for action.complete/snooze/archive was already resolved
+  // deterministically (or the whole operation set already blocked) by validateOperations's own
+  // resolveExplicitActionIndexReferences pre-pass; for action.reschedule, the equivalent job is
+  // already done by resolveExplicitRescheduleIndexReference at this function's own call site
+  // (which only calls in here when its own check found no single unambiguous index) — either way,
+  // by the time this runs with a number still in the message, options.deterministicSource is
+  // already true and everything below is skipped. Kept as a defensive, always-expected-false
+  // guard, not the primary index-resolution path.
+  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  const target = visibleActions.find((entity) => entity.id === args.actionId);
+
+  // A real Telegram smoke test + a live-LLM eval reproduction found the planner directly
+  // supplying a concrete (but wrong) actionId for a bare "complete it" with 10 equally
+  // plausible open actions visible and no recent reminder — its own prompt instruction ("if
+  // it's ambiguous, omit the id and let the validator resolve it") is advisory, not
+  // enforced, and a supplied id previously bypassed the ambiguity check below entirely. When
+  // more than one action is visible, a directly-supplied id is only trusted if the message
+  // itself gives a real reason to believe THIS one was meant — otherwise it's discarded and
+  // falls through to the same ambiguity resolution a missing id already gets, never silently
+  // completing/archiving/snoozing/rescheduling the wrong task. A single explicit number
+  // ("complete 2") is exempted: it was already resolved deterministically against the real
+  // visible list above, not a word-overlap guess.
+  if (!options.deterministicSource && visibleActions.length > 1 && referencedNumbers.length === 0 && target) {
+    const tier = actionTitleMatchTier(message, target.label);
+    // A truly bare pronoun ("complete it," "done") has no real words at all to name a target
+    // with — actionGroundingWords(message) is empty — so there is nothing honest to suggest;
+    // that case still falls through to the plain multi-way ambiguity clarification below,
+    // exactly as before.
+    const messageHasContent = actionGroundingWords(message).length > 0;
+    logActionGroundingDiagnostics(context.session.userId, {
+      tool: toolName,
+      message,
+      suppliedActionId: String(args.actionId),
+      targetLabel: target.label,
+      groundingTokens: actionGroundingWords(message),
+      matchTier: tier,
+      trusted: tier === "exact" || tier === "word_exact" || tier === "fuzzy",
+      source: "visible_entity_title_grounding"
+    });
+
+    // A real Telegram smoke test found an old email-generated action (its title just a raw
+    // email subject line, e.g. "Hola Miquel, tu opinión es muy importante para nosotros.")
+    // treated as an equally trustworthy fuzzy-match candidate as a manually-created task — a
+    // low-quality, LLM-classified title deserves a higher bar before it's ever suggested.
+    // "fuzzy" alone isn't enough for one; only "exact"/"word_exact" are trusted either way.
+    const isLowQualitySourceTarget = context.openActions.find((item) => item.id === target.id)?.source === "email_review";
+
+    if (tier === "exact" || tier === "word_exact") {
+      // A real, specific, unambiguous name match — trusted as-is, falls through to execute.
+    } else if (tier === "fuzzy" && messageHasContent && !isLowQualitySourceTarget) {
+      // A real but not exact reason to believe this is the one (a distinctive, non-generic
+      // word fuzzy-matched, typo-tolerant only — not verbatim) — downgraded to a confirmable
+      // suggestion rather than either auto-trusting or silently discarding it. A bare "yes" runs
+      // this exact operation (see runtime.ts's markActionClarificationPendingIfNeeded, which
+      // recognizes this shape for action.reschedule too via ACTION_CLARIFICATION_ELIGIBLE_TOOLS);
+      // any other reply is "not that one."
+      const phrase = extractActionTargetPhrase(message);
+      return {
+        actionOutsideVisiblePage: false,
+        earlyReturn: {
+          tool: toolName,
+          args,
+          status: "needs_clarification",
+          requiresConfirmation: false,
+          clarificationQuestion: `I don't see an open action called "${phrase}". Did you mean "${target.label}"? Reply yes, or tell me which action.`,
+          rationale: operation.rationale,
+          suggestedConfirmOperation: { tool: toolName, args: { ...args } }
+        }
+      };
+    } else if (messageHasContent) {
+      // "generic" (shares only common words like "meeting") or "none" (shares nothing at all),
+      // or a low-quality email-sourced target that only cleared "distinctive" — never produce a
+      // "did you mean," only an honest "I don't see one called X" naming what was actually
+      // asked for. Real Telegram smoke test: a second "complete brainstorm meeting" (after the
+      // first had already completed it) suggested "Hola Miquel, tu opinión..." — the planner's
+      // own next guess — with NOTHING in common with what the user said beyond generic
+      // phrasing; that must never happen again.
+      delete args.actionId;
+      const phrase = extractActionTargetPhrase(message);
+      return {
+        actionOutsideVisiblePage: false,
+        earlyReturn: {
+          tool: toolName,
+          args,
+          status: "needs_clarification",
+          requiresConfirmation: false,
+          clarificationQuestion: `I don't see an open action called "${phrase}". Which action do you mean?`,
+          rationale: operation.rationale
+        }
+      };
+    } else {
+      // A truly bare pronoun with no content at all — falls through to the plain multi-way
+      // ambiguity clarification below, unchanged from before.
+      delete args.actionId;
+    }
+  } else if (!options.deterministicSource && !target && referencedNumbers.length === 0) {
+    // The supplied id isn't even in the currently visible list at all — a real Telegram smoke
+    // test found "complete brainstorm meeting" silently completing a real action that was NOT
+    // in the shown top-10 page (item 11 of 12), with a plain "Completed" reply giving no hint
+    // it came from outside the page. Verified against the wider open-actions pool (not just
+    // what's currently on screen) and only auto-trusted for an "exact" or "word_exact" title
+    // match — real, specific, verbatim evidence, the same bar as the visible-list check's
+    // auto-trust tiers. A merely "fuzzy"/"generic"/"none" tier is always discarded here (never
+    // auto-acting on something the user can't even see on a weak guess), falling through to
+    // the normal ambiguity clarification instead. A trusted match is flagged
+    // (actionOutsideVisiblePage) so the executor's own reply can say plainly that it was found
+    // outside the visible page, rather than silently acting on something never actually shown.
+    const candidate = context.openActions.find((item) => item.id === args.actionId);
+    const tier = candidate ? actionTitleMatchTier(message, candidate.title) : "none";
+    const trusted = tier === "exact" || tier === "word_exact";
+    logActionGroundingDiagnostics(context.session.userId, {
+      tool: toolName,
+      message,
+      suppliedActionId: String(args.actionId),
+      targetLabel: candidate?.title,
+      groundingTokens: actionGroundingWords(message),
+      matchTier: tier,
+      trusted,
+      source: "background_open_actions_title_grounding"
+    });
+
+    if (candidate && trusted) {
+      return { actionOutsideVisiblePage: true };
+    }
+    delete args.actionId;
+  } else if (!options.deterministicSource && target && visibleActions.length <= 1) {
+    // Exactly one action is visible and the supplied id matches it — nothing ambiguous to
+    // ground against, so this is trusted with no title check, same as an omitted id would
+    // resolve to below. Logged explicitly so a real reported turn's diagnostics always show
+    // which of the four trust paths applied, never a silent implicit trust with no trace.
+    logActionGroundingDiagnostics(context.session.userId, {
+      tool: toolName,
+      message,
+      suppliedActionId: String(args.actionId),
+      targetLabel: target.label,
+      groundingTokens: actionGroundingWords(message),
+      matchTier: "exact",
+      trusted: true,
+      source: "single_visible_entity_implicit"
+    });
+  }
+
+  return { actionOutsideVisiblePage: false };
 }
 
 function validateOperation(operation: PlannedOperation, context: ContextBundle, message: string, options: ValidateOperationsOptions): ValidatedOperation {
@@ -232,141 +474,11 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
   let actionOutsideVisiblePage = false;
 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && args.actionId) {
-    const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
-
-    // Any explicit number in the message was already resolved deterministically (or the whole
-    // operation set already blocked) by validateOperations's own resolveExplicitActionIndexReferences
-    // pre-pass, above the per-operation level this function operates at — by the time a
-    // ACTION_REFERENCE_TOOLS op reaches here with a number still in the message, options
-    // .deterministicSource is already true and the checks below are skipped entirely. This is
-    // kept as a defensive, always-expected-false guard, not the primary index-resolution path.
-    const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
-    const target = visibleActions.find((entity) => entity.id === args.actionId);
-
-    // A real Telegram smoke test + a live-LLM eval reproduction found the planner directly
-    // supplying a concrete (but wrong) actionId for a bare "complete it" with 10 equally
-    // plausible open actions visible and no recent reminder — its own prompt instruction ("if
-    // it's ambiguous, omit the id and let the validator resolve it") is advisory, not
-    // enforced, and a supplied id previously bypassed the ambiguity check below entirely. When
-    // more than one action is visible, a directly-supplied id is only trusted if the message
-    // itself gives a real reason to believe THIS one was meant — otherwise it's discarded and
-    // falls through to the same ambiguity resolution a missing id already gets, never silently
-    // completing/archiving/snoozing the wrong task. A single explicit number ("complete 2") is
-    // exempted: it was already resolved deterministically against the real visible list above,
-    // not a word-overlap guess.
-    if (!options.deterministicSource && visibleActions.length > 1 && referencedNumbers.length === 0 && target) {
-      const tier = actionTitleMatchTier(message, target.label);
-      // A truly bare pronoun ("complete it," "done") has no real words at all to name a target
-      // with — actionGroundingWords(message) is empty — so there is nothing honest to suggest;
-      // that case still falls through to the plain multi-way ambiguity clarification below,
-      // exactly as before.
-      const messageHasContent = actionGroundingWords(message).length > 0;
-      logActionGroundingDiagnostics(context.session.userId, {
-        tool: tool.name,
-        message,
-        suppliedActionId: String(args.actionId),
-        targetLabel: target.label,
-        groundingTokens: actionGroundingWords(message),
-        matchTier: tier,
-        trusted: tier === "exact" || tier === "word_exact" || tier === "fuzzy",
-        source: "visible_entity_title_grounding"
-      });
-
-      // A real Telegram smoke test found an old email-generated action (its title just a raw
-      // email subject line, e.g. "Hola Miquel, tu opinión es muy importante para nosotros.")
-      // treated as an equally trustworthy fuzzy-match candidate as a manually-created task — a
-      // low-quality, LLM-classified title deserves a higher bar before it's ever suggested.
-      // "fuzzy" alone isn't enough for one; only "exact"/"word_exact" are trusted either way.
-      const isLowQualitySourceTarget = context.openActions.find((item) => item.id === target.id)?.source === "email_review";
-
-      if (tier === "exact" || tier === "word_exact") {
-        // A real, specific, unambiguous name match — trusted as-is, falls through to execute.
-      } else if (tier === "fuzzy" && messageHasContent && !isLowQualitySourceTarget) {
-        // A real but not exact reason to believe this is the one (a distinctive, non-generic
-        // word fuzzy-matched, typo-tolerant only — not verbatim) — downgraded to a confirmable
-        // suggestion rather than either auto-trusting or silently discarding it. A bare "yes" runs
-        // this exact operation (see runtime.ts's markActionClarificationPendingIfNeeded); any
-        // other reply is "not that one."
-        const phrase = extractActionTargetPhrase(message);
-        return {
-          tool: tool.name,
-          args,
-          status: "needs_clarification",
-          requiresConfirmation: false,
-          clarificationQuestion: `I don't see an open action called "${phrase}". Did you mean "${target.label}"? Reply yes, or tell me which action.`,
-          rationale: operation.rationale,
-          suggestedConfirmOperation: { tool: tool.name, args: { ...args } }
-        };
-      } else if (messageHasContent) {
-        // "generic" (shares only common words like "meeting") or "none" (shares nothing at all),
-        // or a low-quality email-sourced target that only cleared "distinctive" — never produce a
-        // "did you mean," only an honest "I don't see one called X" naming what was actually
-        // asked for. Real Telegram smoke test: a second "complete brainstorm meeting" (after the
-        // first had already completed it) suggested "Hola Miquel, tu opinión..." — the planner's
-        // own next guess — with NOTHING in common with what the user said beyond generic
-        // phrasing; that must never happen again.
-        delete args.actionId;
-        const phrase = extractActionTargetPhrase(message);
-        return {
-          tool: tool.name,
-          args,
-          status: "needs_clarification",
-          requiresConfirmation: false,
-          clarificationQuestion: `I don't see an open action called "${phrase}". Which action do you mean?`,
-          rationale: operation.rationale
-        };
-      } else {
-        // A truly bare pronoun with no content at all — falls through to the plain multi-way
-        // ambiguity clarification below, unchanged from before.
-        delete args.actionId;
-      }
-    } else if (!options.deterministicSource && !target && referencedNumbers.length === 0) {
-      // The supplied id isn't even in the currently visible list at all — a real Telegram smoke
-      // test found "complete brainstorm meeting" silently completing a real action that was NOT
-      // in the shown top-10 page (item 11 of 12), with a plain "Completed" reply giving no hint
-      // it came from outside the page. Verified against the wider open-actions pool (not just
-      // what's currently on screen) and only auto-trusted for an "exact" or "word_exact" title
-      // match — real, specific, verbatim evidence, the same bar as the visible-list check's
-      // auto-trust tiers. A merely "fuzzy"/"generic"/"none" tier is always discarded here (never
-      // auto-completing something the user can't even see on a weak guess), falling through to
-      // the normal ambiguity clarification instead. A trusted match is flagged
-      // (actionOutsideVisiblePage) so the executor's own reply can say plainly that it was found
-      // outside the visible page, rather than silently completing something never actually shown.
-      const candidate = context.openActions.find((item) => item.id === args.actionId);
-      const tier = candidate ? actionTitleMatchTier(message, candidate.title) : "none";
-      const trusted = tier === "exact" || tier === "word_exact";
-      logActionGroundingDiagnostics(context.session.userId, {
-        tool: tool.name,
-        message,
-        suppliedActionId: String(args.actionId),
-        targetLabel: candidate?.title,
-        groundingTokens: actionGroundingWords(message),
-        matchTier: tier,
-        trusted,
-        source: "background_open_actions_title_grounding"
-      });
-
-      if (candidate && trusted) {
-        actionOutsideVisiblePage = true;
-      } else {
-        delete args.actionId;
-      }
-    } else if (!options.deterministicSource && target && visibleActions.length <= 1) {
-      // Exactly one action is visible and the supplied id matches it — nothing ambiguous to
-      // ground against, so this is trusted with no title check, same as an omitted id would
-      // resolve to below. Logged explicitly so a real reported turn's diagnostics always show
-      // which of the four trust paths applied, never a silent implicit trust with no trace.
-      logActionGroundingDiagnostics(context.session.userId, {
-        tool: tool.name,
-        message,
-        suppliedActionId: String(args.actionId),
-        targetLabel: target.label,
-        groundingTokens: actionGroundingWords(message),
-        matchTier: "exact",
-        trusted: true,
-        source: "single_visible_entity_implicit"
-      });
+    const trust = applyDirectActionIdTrust(tool.name, args, operation, context, message, options);
+    if (trust.earlyReturn) {
+      return trust.earlyReturn;
     }
+    actionOutsideVisiblePage = trust.actionOutsideVisiblePage;
   }
 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && !args.actionId) {
@@ -425,6 +537,42 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     }
 
     args.selections = resolution.selections;
+  }
+
+  // action.reschedule has no `index` field of its own (unlike action.hygiene_apply's selections),
+  // so a numbered reference like "move 2 to tomorrow" can only reach here as a directly-supplied
+  // actionId the planner resolved itself from the index it was shown — exactly the shape a bad
+  // planner guess also takes. Resolved deterministically against session.visibleEntities FIRST,
+  // ignoring whatever actionId was supplied, the same "never the planner-supplied actionId when a
+  // number is present" rule resolveExplicitActionIndexReferences already enforces for action.
+  // complete/snooze/archive. When no single unambiguous index applies, a directly-supplied
+  // actionId still gets the exact same tiered title-grounding action.complete/snooze/archive
+  // already have — reusing applyDirectActionIdTrust rather than duplicating it. Deliberately NOT
+  // routed through ACTION_REFERENCE_TOOLS itself (see that set's own doc comment): this is its own
+  // call site so action.reschedule's "no actionId" fallback below keeps using its own ref-based
+  // resolver, never ACTION_REFERENCE_TOOLS's plain resolveSingleVisibleEntity fallback.
+  if (tool.name === "action.reschedule" && !options.deterministicSource) {
+    const indexResolution = resolveExplicitRescheduleIndexReference(context, message);
+    if (indexResolution.applicable) {
+      if (indexResolution.blocked) {
+        return {
+          tool: tool.name,
+          args: {},
+          status: "invalid",
+          requiresConfirmation: false,
+          error: indexResolution.clarification,
+          rationale: operation.rationale,
+          standaloneError: true
+        };
+      }
+      args.actionId = indexResolution.actionId;
+    } else if (args.actionId) {
+      const trust = applyDirectActionIdTrust(tool.name, args, operation, context, message, options);
+      if (trust.earlyReturn) {
+        return trust.earlyReturn;
+      }
+      actionOutsideVisiblePage = trust.actionOutsideVisiblePage;
+    }
   }
 
   if (tool.name === "action.reschedule" && !args.actionId) {
@@ -954,6 +1102,7 @@ function resolveActionRef(args: { ref?: string }, context: ContextBundle): Actio
         .map((action) => ({ id: action.id, name: action.title, status: action.status }))
     ];
     const selected = selectEmailRuleCandidate(args.ref, candidates);
+    logRefResolverDiagnostics(context.session.userId, { ref: args.ref, path: selected ? "ref_name_match" : "ref_no_match", resolved: Boolean(selected) });
     if (selected) {
       return { status: "resolved", actionId: selected.id };
     }
@@ -961,6 +1110,11 @@ function resolveActionRef(args: { ref?: string }, context: ContextBundle): Actio
   }
 
   const resolution = resolveSingleVisibleEntity(visibleActions, "action");
+  logRefResolverDiagnostics(context.session.userId, {
+    ref: undefined,
+    path: resolution.status === "resolved" ? "single_visible_fallback" : resolution.status === "ambiguous" ? "ambiguous_multiple_visible" : "no_visible_action",
+    resolved: resolution.status === "resolved"
+  });
   if (resolution.status === "resolved") {
     return { status: "resolved", actionId: resolution.entity.id };
   }
@@ -968,6 +1122,16 @@ function resolveActionRef(args: { ref?: string }, context: ContextBundle): Actio
     return { status: "needs_clarification", question: "Which task do you mean? I don't have one in view right now." };
   }
   return { status: "needs_clarification", question: "Which action do you mean? Reply with the number or title." };
+}
+
+function logRefResolverDiagnostics(userId: string, input: { ref: string | undefined; path: string; resolved: boolean }): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({ phase: "action_ref_resolver", userId, ref: input.ref, path: input.path, resolved: input.resolved })
+  );
 }
 
 /** Same matching rule the gmail.rule.create executor uses to detect a duplicate. */
