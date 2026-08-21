@@ -34,7 +34,159 @@ export function validateOperations(
   message: string,
   options: ValidateOperationsOptions = {}
 ): ValidatedOperation[] {
-  return operations.map((operation) => validateOperation(operation, context, message, options));
+  // A real Telegram smoke test found "complete action 10 and 9 now" (only 8 actions ever shown)
+  // marked BOTH resulting action.complete operations "valid" and mutated real data — the planner
+  // had emitted two separate action.complete calls, each with SOME actionId, and per-operation
+  // validation had no way to see that the raw message named TWO explicit numbers at once: the
+  // single-number override only fired when exactly one number was present, and the grounding
+  // safety net below was deliberately skipped whenever ANY digit appeared in the message (on the
+  // assumption a well-behaved planner would always route a multi-number request through
+  // action.hygiene_apply instead — an assumption with no actual enforcement behind it). Resolved
+  // here, once per turn, before any individual action.complete/archive/snooze op is validated:
+  // every explicit number in the message is checked against the CURRENT session.visibleEntities
+  // range, atomically — if even one is out of range, the whole set is blocked, never a partial
+  // mutation on the refs that happened to be valid.
+  const indexResolution = resolveExplicitActionIndexReferences(operations, context, message);
+
+  if (indexResolution.applicable && indexResolution.blocked) {
+    return operations.map((operation) => {
+      if (!ACTION_REFERENCE_TOOLS.has(operation.tool)) {
+        return validateOperation(operation, context, message, options);
+      }
+      return {
+        tool: operation.tool,
+        args: {},
+        status: "invalid",
+        requiresConfirmation: false,
+        error: indexResolution.clarification,
+        rationale: operation.rationale
+      };
+    });
+  }
+
+  return operations.map((operation, index) => {
+    const override = indexResolution.applicable ? indexResolution.overridesByOpIndex?.get(index) : undefined;
+    if (!override) {
+      return validateOperation(operation, context, message, options);
+    }
+    // Already resolved deterministically above against the real visible list — deterministicSource
+    // skips the grounding/outside-page checks below, which exist only to catch an UNVERIFIED
+    // planner-supplied id, not to second-guess one this file already verified itself.
+    const args = typeof operation.args === "object" && operation.args !== null && !Array.isArray(operation.args) ? (operation.args as Record<string, unknown>) : {};
+    return validateOperation({ ...operation, args: { ...args, actionId: override } }, context, message, { ...options, deterministicSource: true });
+  });
+}
+
+interface ExplicitActionIndexResolution {
+  applicable: boolean;
+  blocked?: boolean;
+  clarification?: string;
+  /** Position in the original `operations` array -> the real actionId that index resolves to. */
+  overridesByOpIndex?: Map<number, string>;
+}
+
+/**
+ * Parses every explicit number in the raw message (e.g. "complete action 10 and 9", "archive 1,
+ * 3", "complete #2") and, whenever the turn contains at least one action.complete/archive/snooze
+ * operation, resolves ALL of them against `context.session.visibleEntities`' own `index` field —
+ * never the planner-supplied actionId, never context.openActions' DB ordering, never a fuzzy
+ * match on the number itself. Numbers are paired to action-reference operations in the order both
+ * appear (the Nth number named in the message maps to the Nth action-reference op the planner
+ * produced) — the same order a well-behaved planner naturally emits them in. A count mismatch
+ * (e.g. a stray unrelated number elsewhere in the message) is treated as unresolvable rather than
+ * guessed at.
+ */
+function resolveExplicitActionIndexReferences(operations: PlannedOperation[], context: ContextBundle, message: string): ExplicitActionIndexResolution {
+  const actionRefOpIndices = operations.map((op, i) => (ACTION_REFERENCE_TOOLS.has(op.tool) ? i : -1)).filter((i) => i >= 0);
+
+  if (actionRefOpIndices.length === 0) {
+    return { applicable: false };
+  }
+
+  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  if (referencedNumbers.length === 0) {
+    return { applicable: false };
+  }
+
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  const maxIndex = visibleActions.reduce((max, entity) => Math.max(max, entity.index ?? 0), 0);
+  const resolvedByNumber = new Map<number, string>();
+  const invalidNumbers: number[] = [];
+
+  for (const num of referencedNumbers) {
+    const entity = visibleActions.find((item) => item.index === num);
+    if (entity) {
+      resolvedByNumber.set(num, entity.id);
+    } else if (!invalidNumbers.includes(num)) {
+      invalidNumbers.push(num);
+    }
+  }
+
+  const countsMismatch = referencedNumbers.length !== actionRefOpIndices.length;
+  const blocked = invalidNumbers.length > 0 || countsMismatch;
+
+  logExplicitIndexDiagnostics(context.session.userId, {
+    message,
+    referencedNumbers,
+    visibleIndexRange: maxIndex > 0 ? `1-${maxIndex}` : "(none shown)",
+    allResolved: !blocked,
+    plannerActionIdsIgnored: true,
+    blockedAtomically: blocked
+  });
+
+  if (blocked) {
+    const clarification = countsMismatch && invalidNumbers.length === 0 ? "Which numbers do you mean? Please name them one at a time or say 'show more actions'." : buildOutOfRangeClarification(invalidNumbers, referencedNumbers, maxIndex);
+    return { applicable: true, blocked: true, clarification };
+  }
+
+  const overridesByOpIndex = new Map<number, string>();
+  referencedNumbers.forEach((num, position) => {
+    overridesByOpIndex.set(actionRefOpIndices[position], resolvedByNumber.get(num)!);
+  });
+
+  return { applicable: true, blocked: false, overridesByOpIndex };
+}
+
+/** Exact copy from the reported bug's own hard requirement — "I only showed N actions..." when
+ * EVERY named number was out of range, "I can't do that because N isn't in the shown list..."
+ * when some were valid and at least one wasn't (a partial mutation on the valid ones is unsafe). */
+function buildOutOfRangeClarification(invalidNumbers: number[], allNumbers: number[], maxIndex: number): string {
+  const range = maxIndex > 0 ? `1–${maxIndex}` : "the shown list";
+  if (invalidNumbers.length === allNumbers.length) {
+    return `I only showed ${maxIndex} action${maxIndex === 1 ? "" : "s"}. Use a number from ${range}, or say "show more actions".`;
+  }
+  const invalidList = invalidNumbers.join(" and ");
+  const verb = invalidNumbers.length === 1 ? "isn't" : "aren't";
+  return `I can't do that because ${invalidList} ${verb} in the shown list. Use ${range}, or say "show more actions".`;
+}
+
+function logExplicitIndexDiagnostics(
+  userId: string,
+  input: {
+    message: string;
+    referencedNumbers: number[];
+    visibleIndexRange: string;
+    allResolved: boolean;
+    plannerActionIdsIgnored: boolean;
+    blockedAtomically: boolean;
+  }
+): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "explicit_action_index_check",
+      userId,
+      message: input.message,
+      referencedNumbers: input.referencedNumbers,
+      visibleIndexRange: input.visibleIndexRange,
+      allResolved: input.allResolved,
+      plannerActionIdsIgnored: input.plannerActionIdsIgnored,
+      blockedAtomically: input.blockedAtomically
+    })
+  );
 }
 
 function validateOperation(operation: PlannedOperation, context: ContextBundle, message: string, options: ValidateOperationsOptions): ValidatedOperation {
@@ -76,25 +228,124 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
   }
 
   const args = parsed.data as Record<string, unknown>;
+  let actionOutsideVisiblePage = false;
 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && args.actionId) {
+    const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+
+    // Any explicit number in the message was already resolved deterministically (or the whole
+    // operation set already blocked) by validateOperations's own resolveExplicitActionIndexReferences
+    // pre-pass, above the per-operation level this function operates at — by the time a
+    // ACTION_REFERENCE_TOOLS op reaches here with a number still in the message, options
+    // .deterministicSource is already true and the checks below are skipped entirely. This is
+    // kept as a defensive, always-expected-false guard, not the primary index-resolution path.
+    const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+    const target = visibleActions.find((entity) => entity.id === args.actionId);
+
     // A real Telegram smoke test + a live-LLM eval reproduction found the planner directly
     // supplying a concrete (but wrong) actionId for a bare "complete it" with 10 equally
     // plausible open actions visible and no recent reminder — its own prompt instruction ("if
     // it's ambiguous, omit the id and let the validator resolve it") is advisory, not
     // enforced, and a supplied id previously bypassed the ambiguity check below entirely. When
     // more than one action is visible, a directly-supplied id is only trusted if the message
-    // itself gives a real reason to believe THIS one was meant (shares a real word with its own
-    // title) — otherwise it's discarded and falls through to the same ambiguity resolution a
-    // missing id already gets, never silently completing/archiving/snoozing the wrong task. An
-    // explicit number ("complete 2") is exempted: that's a deliberate position-based reference
-    // with no expected word overlap with the target's own title, a different, already-relied-on
-    // resolution path (the deterministic shortcut itself always defers to the planner for any
-    // digit) — not the bare-pronoun ambiguity this check exists to catch.
-    const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
-    if (!options.deterministicSource && visibleActions.length > 1 && !/\d/.test(message)) {
-      const target = visibleActions.find((entity) => entity.id === args.actionId);
-      if (target && !actionReferenceGroundedInMessage(message, target.label)) {
+    // itself gives a real reason to believe THIS one was meant — otherwise it's discarded and
+    // falls through to the same ambiguity resolution a missing id already gets, never silently
+    // completing/archiving/snoozing the wrong task. A single explicit number ("complete 2") is
+    // exempted: it was already resolved deterministically against the real visible list above,
+    // not a word-overlap guess.
+    if (!options.deterministicSource && visibleActions.length > 1 && referencedNumbers.length === 0 && target) {
+      const tier = actionTitleMatchTier(message, target.label);
+      // A truly bare pronoun ("complete it," "done") has no real words at all to name a target
+      // with — actionGroundingWords(message) is empty — so there is nothing honest to suggest;
+      // that case still falls through to the plain multi-way ambiguity clarification below,
+      // exactly as before.
+      const messageHasContent = actionGroundingWords(message).length > 0;
+      logActionGroundingDiagnostics(context.session.userId, {
+        tool: tool.name,
+        message,
+        suppliedActionId: String(args.actionId),
+        targetLabel: target.label,
+        groundingTokens: actionGroundingWords(message),
+        matchTier: tier,
+        trusted: tier === "exact" || tier === "word_exact" || tier === "fuzzy"
+      });
+
+      // A real Telegram smoke test found an old email-generated action (its title just a raw
+      // email subject line, e.g. "Hola Miquel, tu opinión es muy importante para nosotros.")
+      // treated as an equally trustworthy fuzzy-match candidate as a manually-created task — a
+      // low-quality, LLM-classified title deserves a higher bar before it's ever suggested.
+      // "fuzzy" alone isn't enough for one; only "exact"/"word_exact" are trusted either way.
+      const isLowQualitySourceTarget = context.openActions.find((item) => item.id === target.id)?.source === "email_review";
+
+      if (tier === "exact" || tier === "word_exact") {
+        // A real, specific, unambiguous name match — trusted as-is, falls through to execute.
+      } else if (tier === "fuzzy" && messageHasContent && !isLowQualitySourceTarget) {
+        // A real but not exact reason to believe this is the one (a distinctive, non-generic
+        // word fuzzy-matched, typo-tolerant only — not verbatim) — downgraded to a confirmable
+        // suggestion rather than either auto-trusting or silently discarding it. A bare "yes" runs
+        // this exact operation (see runtime.ts's markActionClarificationPendingIfNeeded); any
+        // other reply is "not that one."
+        const phrase = extractActionTargetPhrase(message);
+        return {
+          tool: tool.name,
+          args,
+          status: "needs_clarification",
+          requiresConfirmation: false,
+          clarificationQuestion: `I don't see an open action called "${phrase}". Did you mean "${target.label}"? Reply yes, or tell me which action.`,
+          rationale: operation.rationale,
+          suggestedConfirmOperation: { tool: tool.name, args: { ...args } }
+        };
+      } else if (messageHasContent) {
+        // "generic" (shares only common words like "meeting") or "none" (shares nothing at all),
+        // or a low-quality email-sourced target that only cleared "distinctive" — never produce a
+        // "did you mean," only an honest "I don't see one called X" naming what was actually
+        // asked for. Real Telegram smoke test: a second "complete brainstorm meeting" (after the
+        // first had already completed it) suggested "Hola Miquel, tu opinión..." — the planner's
+        // own next guess — with NOTHING in common with what the user said beyond generic
+        // phrasing; that must never happen again.
+        delete args.actionId;
+        const phrase = extractActionTargetPhrase(message);
+        return {
+          tool: tool.name,
+          args,
+          status: "needs_clarification",
+          requiresConfirmation: false,
+          clarificationQuestion: `I don't see an open action called "${phrase}". Which action do you mean?`,
+          rationale: operation.rationale
+        };
+      } else {
+        // A truly bare pronoun with no content at all — falls through to the plain multi-way
+        // ambiguity clarification below, unchanged from before.
+        delete args.actionId;
+      }
+    } else if (!options.deterministicSource && !target && referencedNumbers.length === 0) {
+      // The supplied id isn't even in the currently visible list at all — a real Telegram smoke
+      // test found "complete brainstorm meeting" silently completing a real action that was NOT
+      // in the shown top-10 page (item 11 of 12), with a plain "Completed" reply giving no hint
+      // it came from outside the page. Verified against the wider open-actions pool (not just
+      // what's currently on screen) and only auto-trusted for an "exact" or "word_exact" title
+      // match — real, specific, verbatim evidence, the same bar as the visible-list check's
+      // auto-trust tiers. A merely "fuzzy"/"generic"/"none" tier is always discarded here (never
+      // auto-completing something the user can't even see on a weak guess), falling through to
+      // the normal ambiguity clarification instead. A trusted match is flagged
+      // (actionOutsideVisiblePage) so the executor's own reply can say plainly that it was found
+      // outside the visible page, rather than silently completing something never actually shown.
+      const candidate = context.openActions.find((item) => item.id === args.actionId);
+      const tier = candidate ? actionTitleMatchTier(message, candidate.title) : "none";
+      const trusted = tier === "exact" || tier === "word_exact";
+      logActionGroundingDiagnostics(context.session.userId, {
+        tool: tool.name,
+        message,
+        suppliedActionId: String(args.actionId),
+        targetLabel: candidate?.title,
+        groundingTokens: actionGroundingWords(message),
+        matchTier: tier,
+        trusted
+      });
+
+      if (candidate && trusted) {
+        actionOutsideVisiblePage = true;
+      } else {
         delete args.actionId;
       }
     }
@@ -408,7 +659,8 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     args,
     status: tool.requiresConfirmation ? "needs_confirmation" : "valid",
     requiresConfirmation: tool.requiresConfirmation,
-    rationale: operation.rationale
+    rationale: operation.rationale,
+    ...(actionOutsideVisiblePage ? { actionOutsideVisiblePage: true } : {})
   };
 }
 
@@ -445,7 +697,17 @@ const ACTION_GROUNDING_STOPWORDS = new Set([
   "snoozed",
   "mark",
   "marked",
-  "as"
+  "as",
+  // A real Telegram smoke test found "complete brainstorm meeting" completing "Branding
+  // direction meeting" — the only shared word was "meeting," a generic activity-shape word that
+  // tells you nothing about WHICH meeting, exactly like "task"/"action"/"item" above. Widened
+  // with the rest of the generic vocabulary a mutation request commonly uses regardless of which
+  // real item is meant, so none of these ever count as evidence on their own.
+  "meeting",
+  "call",
+  "thing",
+  "todo",
+  "reminder"
 ]);
 
 /** A short word (>2 chars), stripped of the generic completion/archive/snooze vocabulary every
@@ -458,16 +720,147 @@ function actionGroundingWords(text: string): string[] {
     .filter((word) => word.length > 2 && !ACTION_GROUNDING_STOPWORDS.has(word));
 }
 
-/** True only if the message shares a real, specific word with the candidate action's own title —
- * "complete the passport renewal task" is grounded in "Renew passport" (shares "passport"); a
- * bare "complete it"/"done"/"mark that done" shares nothing with any title and is never grounded,
- * regardless of which real actionId a planner attached to it. */
-function actionReferenceGroundedInMessage(message: string, actionTitle: string): boolean {
-  const messageWords = new Set(actionGroundingWords(message));
-  if (messageWords.size === 0) {
-    return false;
+type ActionTitleMatchTier = "exact" | "word_exact" | "fuzzy" | "generic" | "none";
+
+function normalizeForActionMatch(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isDistinctiveActionToken(word: string): boolean {
+  return word.length >= 5 && !ACTION_GROUNDING_STOPWORDS.has(word);
+}
+
+/** Plain Levenshtein edit distance — no dependency, small inputs (single words) only. Mirrors
+ * packages/core/src/goal-reference.ts's own fuzzy word matcher, kept as a small local copy here
+ * rather than a cross-package export since action grounding and goal-reference resolution are
+ * unrelated concerns that happen to want the same small algorithm. */
+function levenshteinDistance(a: string, b: string): number {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const distances: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
+
+  for (let i = 0; i < rows; i++) distances[i][0] = i;
+  for (let j = 0; j < cols; j++) distances[0][j] = j;
+
+  for (let i = 1; i < rows; i++) {
+    for (let j = 1; j < cols; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      distances[i][j] = Math.min(distances[i - 1][j] + 1, distances[i][j - 1] + 1, distances[i - 1][j - 1] + cost);
+    }
   }
-  return actionGroundingWords(actionTitle).some((word) => messageWords.has(word));
+
+  return distances[rows - 1][cols - 1];
+}
+
+/** Typo-tolerant word match — threshold scales with length so short words still need to be close
+ * while a long/distinctive word tolerates a couple of edits (e.g. "brainstorm" vs "brianstorm"). */
+function fuzzyActionWordMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const threshold = Math.max(1, Math.floor(Math.max(a.length, b.length) * 0.25));
+  return levenshteinDistance(a, b) <= threshold;
+}
+
+/**
+ * Real Telegram smoke tests found two opposite failures from a plain "shares any non-generic
+ * word" boolean: (1) "complete brainstorm meeting" was accepted against "Branding direction
+ * meeting" because both share "meeting" (a generic activity-shape word, not real evidence), and
+ * (2) once that was fixed, a REJECTED guess was still offered as a "did you mean" suggestion with
+ * zero regard for whether it was actually plausible, suggesting "Hola Miquel, tu opinión..." — a
+ * candidate sharing NOTHING with what the user said. This tiered scorer is the fix for both:
+ * - "exact": the extracted target phrase basically IS the title (near-exact match) — trusted
+ *   outright, never merely suggested.
+ * - "distinctive": a real, specific, non-generic word (length >= 5, not in
+ *   ACTION_GROUNDING_STOPWORDS) fuzzy-matches a word in the title — typo-tolerant, generic for any
+ *   distinctive word, not a hardcoded name check. Real evidence, but not certain enough to
+ *   auto-trust — callers downgrade this to a confirmable "did you mean X?" suggestion.
+ * - "generic": only common/generic words overlap (e.g. "meeting," "task") — never enough on its
+ *   own, either to trust OR to suggest.
+ * - "none": no meaningful overlap at all.
+ */
+function actionTitleMatchTier(phrase: string, actionTitle: string): ActionTitleMatchTier {
+  const normalizedPhrase = normalizeForActionMatch(extractActionTargetPhrase(phrase));
+  const normalizedTitle = normalizeForActionMatch(actionTitle);
+
+  if (!normalizedPhrase) {
+    return "none";
+  }
+
+  if (normalizedPhrase === normalizedTitle || (normalizedPhrase.length > 3 && (normalizedTitle.includes(normalizedPhrase) || normalizedPhrase.includes(normalizedTitle)))) {
+    return "exact";
+  }
+
+  const phraseWords = normalizedPhrase.split(" ").filter(Boolean);
+  const titleWords = normalizedTitle.split(" ").filter(Boolean);
+  const distinctivePhraseWords = phraseWords.filter(isDistinctiveActionToken);
+
+  // A distinctive word appearing VERBATIM in the title ("complete the passport renewal task"
+  // sharing "passport" with "Renew passport") is strong, specific, real-name evidence — trusted
+  // the same as an exact title match, never merely suggested. A distinctive word that only
+  // FUZZY-matches (typo-tolerant, not verbatim — "brainstorm" vs "branding" is NOT one of these;
+  // that pair is simply too different) is real but less certain evidence, downgraded to a
+  // confirmable "did you mean" suggestion instead of auto-trusted.
+  if (distinctivePhraseWords.some((word) => titleWords.includes(word))) {
+    return "word_exact";
+  }
+  if (distinctivePhraseWords.some((word) => titleWords.some((titleWord) => fuzzyActionWordMatch(word, titleWord)))) {
+    return "fuzzy";
+  }
+
+  const hasGenericOverlap = phraseWords.some((word) => word.length > 2 && titleWords.includes(word));
+  return hasGenericOverlap ? "generic" : "none";
+}
+
+const ACTION_TARGET_VERB_PREFIX_RE =
+  /^(please\s+)?(i(?:'ve| have)?\s+)?(complete[d]?|finish(?:ed)?|mark(?:ed)?|archive[d]?|dismiss(?:ed)?|snooze[d]?|done\s+with|done)\s+(the\s+|my\s+)?/i;
+const ACTION_TARGET_TRAILING_RE = /\s+(please|now|already|too)\.?$/i;
+
+/** Best-effort "what did the user actually call it" phrase for the "I don't see an open action
+ * called X" clarification — strips the leading verb ("complete"/"archive"/"snooze"/...) and a
+ * trailing filler word, then capitalizes the first letter so it reads as a quoted name rather
+ * than a mid-sentence fragment. Never perfect (free text has no grammar contract), but far more
+ * honest than echoing the whole raw message back, or a generic "that task" with no specifics. */
+function extractActionTargetPhrase(message: string): string {
+  const trimmed = message.trim();
+  const withoutVerb = trimmed.replace(ACTION_TARGET_VERB_PREFIX_RE, "").replace(ACTION_TARGET_TRAILING_RE, "").trim();
+  const phrase = withoutVerb || trimmed;
+  return phrase.charAt(0).toUpperCase() + phrase.slice(1);
+}
+
+function logActionGroundingDiagnostics(
+  userId: string,
+  input: {
+    tool: string;
+    message: string;
+    suppliedActionId: string;
+    targetLabel: string | undefined;
+    groundingTokens: string[];
+    matchTier: ActionTitleMatchTier;
+    trusted: boolean;
+  }
+): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "action_grounding_check",
+      userId,
+      tool: input.tool,
+      suppliedActionId: input.suppliedActionId,
+      targetLabel: input.targetLabel,
+      groundingTokens: input.groundingTokens,
+      matchTier: input.matchTier,
+      trusted: input.trusted,
+      rejectedAsGenericOrNoMatch: !input.trusted
+    })
+  );
 }
 
 type ActionRefResolution =

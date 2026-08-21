@@ -92,19 +92,21 @@ function markActionClarificationPendingIfNeeded(
   if (!clarificationQuestion) {
     return;
   }
-  const isActionReferenceAmbiguity = validatedOps.some((op) => op.status === "needs_clarification" && ACTION_REFERENCE_TOOLS.has(op.tool));
-  if (isActionReferenceAmbiguity) {
-    // A non-empty, real ValidatedOperation shape — asPendingOperation (session-store.ts) treats
+  const referenceAmbiguityOp = validatedOps.find((op) => op.status === "needs_clarification" && ACTION_REFERENCE_TOOLS.has(op.tool));
+  if (referenceAmbiguityOp) {
+    // A single specific candidate was rejected for weak (generic-only) grounding rather than a
+    // genuine multi-way ambiguity — validator.ts attaches the real tool+args so a bare "yes"
+    // here actually runs it (see the mutation firewall's pendingHasRealMutation check below,
+    // which protects this the same way a real pending confirmation is protected). Otherwise, a
+    // non-empty but inert clarification.ask stub — asPendingOperation (session-store.ts) treats
     // an empty operations array as corrupted data and discards it on the very next load, which
-    // would silently drop this marker before the cancel-phrase check ever saw it. clarification
-    // .ask itself is never executed (nothing reads this array as something to run); it exists
-    // purely so the record round-trips through persistence intact.
-    setPendingOperation(
-      session,
-      createPendingOperationRecord(ACTION_CLARIFICATION_TOPIC, clarificationQuestion, [
-        { tool: "clarification.ask", args: { question: clarificationQuestion }, status: "valid", requiresConfirmation: false }
-      ])
-    );
+    // would silently drop this marker before the cancel-phrase check ever saw it; clarification
+    // .ask itself is never executed, it exists purely so the record round-trips through
+    // persistence intact.
+    const operations = referenceAmbiguityOp.suggestedConfirmOperation
+      ? [{ tool: referenceAmbiguityOp.suggestedConfirmOperation.tool, args: referenceAmbiguityOp.suggestedConfirmOperation.args, status: "valid" as const, requiresConfirmation: false }]
+      : [{ tool: "clarification.ask", args: { question: clarificationQuestion }, status: "valid" as const, requiresConfirmation: false }];
+    setPendingOperation(session, createPendingOperationRecord(ACTION_CLARIFICATION_TOPIC, clarificationQuestion, operations));
   }
 }
 
@@ -413,7 +415,12 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // generic "Cancelled — I won't do that." from finalizeDeterministicCancellation.
   if (pending?.topic === ACTION_CLARIFICATION_TOPIC && looksLikeActionClarificationCancelReply(message)) {
     setPendingOperation(context.session, null);
-    setVisibleEntities(context.session, []);
+    // Same reasoning as finalizeDeterministicCancellation's own ACTION_CLARIFICATION_TOPIC
+    // exemption: the numbered list the user was actually shown is the source of truth for a
+    // later numbered reference and must survive cancelling an unrelated ambiguity/suggestion
+    // question about it — a real Telegram smoke test found "complete action 10 and 9 now" right
+    // after cancelling this way silently resolving against a completely different ordering once
+    // visibleEntities had been wiped.
     return finalize(context, {
       reply: ACTION_CLARIFICATION_CANCEL_REPLY,
       operationsPlanned: [],
@@ -692,10 +699,30 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // Pending-operation firewall: while a mutation is awaiting confirmation, no OTHER mutation
   // may run — not even a fresh, unrelated one, and not even a re-ask of the same one. This is
   // checked on the raw validated ops (any status), so it also blocks a plan that tries to
-  // re-propose gmail.rule.create instead of emitting a genuine confirmation. Excludes
-  // ACTION_CLARIFICATION_TOPIC: that marker has nothing to actually confirm, so it must never
-  // block an unrelated request the way a real yes/no confirmation does.
-  if (pending && pending.topic !== ACTION_CLARIFICATION_TOPIC && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
+  // re-propose gmail.rule.create instead of emitting a genuine confirmation. Excludes a plain
+  // ACTION_CLARIFICATION_TOPIC marker whose own stored operations are just the inert
+  // clarification.ask stub — nothing there to actually confirm, so it must never block an
+  // unrelated request the way a real yes/no confirmation does. Does NOT exclude one carrying a
+  // real suggestedConfirmOperation ("Did you mean X? Reply yes...") — that DOES have something
+  // real to protect (a bare "yes" must still complete/archive/snooze the suggested candidate) —
+  // EXCEPT an explicit numbered action command ("complete action 10 and 9 now") right on top of
+  // it, which a real Telegram smoke test found getting stuck blocked behind a stale suggestion
+  // indefinitely. An explicit number is a clear, unambiguous instruction of its own — it always
+  // supersedes/replaces a pending action-reference question rather than needing an explicit
+  // "cancel" first; validateOperations's own explicit-index check (which runs regardless of any
+  // pending operation) still decides on its own merits whether those numbers actually resolve.
+  const pendingHasRealMutation = pending?.operations.some((op) => getToolDefinition(op.tool)?.mutates === true) ?? false;
+  const explicitNumberedCommandSupersedesPending =
+    pending?.topic === ACTION_CLARIFICATION_TOPIC && /\d/.test(message) && reconciledOperations.some((op) => ACTION_REFERENCE_TOOLS.has(op.tool));
+  if (explicitNumberedCommandSupersedesPending) {
+    setPendingOperation(context.session, null);
+  }
+  if (
+    !explicitNumberedCommandSupersedesPending &&
+    pending &&
+    (pending.topic !== ACTION_CLARIFICATION_TOPIC || pendingHasRealMutation) &&
+    validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)
+  ) {
     return finalize(context, {
       reply: `You still have a pending confirmation for ${pending.summary}. Confirm, cancel, or tell me a new request.`,
       operationsPlanned: reconciledOperations,
@@ -2088,7 +2115,23 @@ async function finalizeDeterministicCancellation(context: ContextBundle, message
   const pendingOperationBefore = pending;
   const visibleEntitiesBefore = context.session.visibleEntities;
   setPendingOperation(context.session, null);
-  setVisibleEntities(context.session, []);
+  // Real Telegram smoke test: cancelling a "did you mean X?" action-reference suggestion used to
+  // wipe visibleEntities unconditionally — so a NUMBERED follow-up right after ("complete action
+  // 10 and 9 now") had nothing real to resolve against and fell back to context.openActions's own
+  // DB ordering instead, silently completing the wrong tasks. The numbered list the user was
+  // actually shown is the source of truth for a numbered reference and must survive cancelling an
+  // unrelated ambiguity question about it — only cleared here for every OTHER kind of pending
+  // operation (a Gmail rule proposal, a goal archive, a next-week plan draft, ...), where the
+  // visible entities really were specific to that now-cancelled flow.
+  const clearedVisibleEntities = pending.topic !== ACTION_CLARIFICATION_TOPIC;
+  if (clearedVisibleEntities) {
+    setVisibleEntities(context.session, []);
+  }
+  logAgentRuntimeDiagnostics({
+    phase: "cancellation",
+    userId: context.session.userId,
+    note: `cancelled pending topic="${pending.topic}"; visibleEntities ${clearedVisibleEntities ? "cleared" : "preserved"} (${visibleEntitiesBefore.length} entities)`
+  });
 
   const reply = "Cancelled — I won't do that.";
   const executedOps: ExecutedOperation[] = [{ tool: "confirmation.cancel", status: "executed", summary: reply }];

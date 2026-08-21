@@ -217,7 +217,7 @@ test("B. bare 'complete it' after 'show all tasks' with 3+ visible actions and n
     mockPlan(actionListPlan());
     const list = await sendAgentMessage(server, userId, "show all tasks");
     assertNoGenericAgentError(list);
-    assert.match(list.reply, /found 3 action item/i);
+    assert.match(list.reply, /you have 3 actions:/i);
 
     // Simulates a planner correctly following its own prompt instruction (omit actionId when
     // ambiguous) rather than the crude no-API-key heuristic fallback the test environment would
@@ -272,12 +272,12 @@ test("D. numbered 'complete 2' after 'show all tasks' completes exactly action 2
   const userId = `action-ambiguity-d-${randomUUID()}`;
 
   try {
-    // action.list's own entities carry no index metadata (unlike gmail.review.list's numbered
-    // entities) and its summary is a plain comma-separated list, not a numbered one — so "2"
-    // here means "the second item in that list," which only a real LLM planner reading the
-    // summary text can resolve; action.complete's schema has no index/ref field of its own. This
-    // seeds the second item as the id a correctly-functioning planner would resolve "2" to,
-    // rather than depending on entity.index (which action.list never sets).
+    // action.list's own entities now DO carry index metadata (matching its numbered chat
+    // output), but action.complete's own schema still has no index/ref field of its own — a real
+    // LLM planner is expected to plan action.hygiene_apply with an index-based selection for a
+    // numbered reply, or resolve "2" to the real id itself for a direct action.complete plan (as
+    // this test does). This seeds the second item as the id a correctly-functioning planner
+    // would resolve "2" to.
     const ids = await seedActionItems(userId, ["Check cheap car listings twice", "Renew passport", "Follow up with recruiter"]);
     const targetId = ids[1]!;
     mockPlan(actionListPlan());

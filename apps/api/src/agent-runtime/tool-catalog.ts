@@ -29,12 +29,14 @@ const planSelectionSchema = z.object({
 export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.list",
-    description: "List the user's action items (open tasks/reminders), optionally filtered by status.",
+    description:
+      "List the user's real action items — never a 'remind me before' reminder companion row, which is shown as a short metadata line on its parent action instead, not as its own list entry. Optionally filtered by status, and by overdueOnly for 'do i have any overdue actions', 'what tasks are overdue?' (open, past due only — never future or already-handled items).",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       status: z.enum(["open", "completed", "snoozed", "archived", "all"]).optional(),
-      limit: z.number().int().positive().max(50).optional()
+      limit: z.number().int().positive().max(50).optional(),
+      overdueOnly: z.boolean().optional()
     })
   },
   {
