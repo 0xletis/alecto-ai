@@ -101,7 +101,7 @@ import {
   generateAndSaveWeeklyReview,
   generateDeterministicWeeklyReview
 } from "../weekly-review/review.js";
-import { formatDateInTimezone, formatLocalDateTime } from "../utils/datetime.js";
+import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
@@ -119,29 +119,67 @@ export async function executeOperation(
     switch (operation.tool) {
       case "action.list": {
         const status = (args.status as ActionItem["status"] | "all" | undefined) ?? "open";
-        const items = await getActionItems(userId, { status, limit: (args.limit as number | undefined) ?? 10 });
+        const limit = (args.limit as number | undefined) ?? 10;
+        const overdueOnly = Boolean(args.overdueOnly);
+        const settings = await getOrCreateNotificationSettings(userId);
+        const now = new Date();
+
+        // "Reminder" companion rows (actionType "reminder" — the "remind me N minutes before"
+        // stubs action.create_pre_due_reminders creates) share the same ActionItem table/status
+        // ordering as real tasks. A real Telegram smoke test showed them leaking into a plain
+        // "show me my actions"/"do i have any overdue actions" reply as if they were standalone
+        // tasks (e.g. "Reminder: Brainstorm meeting" listed right alongside "Brainstorm
+        // meeting") — confusing and robotic. They are filtered out here; a real action that has
+        // one is instead shown with a short "Reminder: N minutes before" metadata line. Because
+        // the DB-level query applies its own limit before this client-side filter, a small pool
+        // could under-return real actions if reminder rows occupied some of its slots — so a
+        // wider pool is fetched and sliced down to `limit` AFTER filtering, the same pattern
+        // action.reminder_list/action.meeting_list already use below.
+        const pool = await getActionItems(userId, { status, limit: Math.max(limit * 4, 40) });
+        const realActions = pool
+          .filter((item) => item.actionType !== "reminder")
+          .filter((item) => !overdueOnly || (item.status === "open" && Boolean(item.dueAt) && item.dueAt! < now));
+        const items = realActions.slice(0, limit);
+
+        const reminderByParentId = new Map<string, ActionItem>();
+        for (const item of pool) {
+          if (item.actionType === "reminder" && item.status !== "archived" && item.status !== "completed") {
+            const parentId = parentActionIdFromReminderSourceId(item.actionType, item.sourceId);
+            if (parentId) {
+              reminderByParentId.set(parentId, item);
+            }
+          }
+        }
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary:
-            items.length === 0
-              ? "No matching action items."
-              : `Found ${items.length} action item(s): ${items.map((item) => `"${item.title}"`).join(", ")}.`,
+          summary: formatActionListForChat(items, status, overdueOnly, reminderByParentId, settings.timezone),
           result: items,
-          entities: items.map(actionToEntity)
+          entities: items.map((item, index) => actionToEntity(item, index + 1))
         };
       }
 
       case "action.reminder_list": {
         const settings = await getOrCreateNotificationSettings(userId);
         const items = await getActionItems(userId, { status: "all", limit: 100 });
-        const reminders = activeReminderActionsFromActionList(items);
+        const parentsById = new Map(items.filter((item) => item.actionType !== "reminder").map((item) => [item.id, item]));
+        // completeActionItem/archiveActionItem never cascade to a reminder companion (no
+        // ActionItem schema change to add that link) — so once the parent task is done, its
+        // reminder is still technically "open" in the DB unless something else already archived
+        // it. Excluded here by parent status so it stops appearing as if it were still relevant,
+        // rather than lingering as a separate active-looking reminder for a task that's finished.
+        const reminders = activeReminderActionsFromActionList(items).filter((reminder) => {
+          const parentId = parentActionIdFromReminderSourceId(reminder.actionType, reminder.sourceId);
+          const parent = parentId ? parentsById.get(parentId) : undefined;
+          return !parent || (parent.status !== "completed" && parent.status !== "archived");
+        });
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatReminderActionsForChat(reminders, settings.timezone),
+          summary: formatReminderActionsForChat(reminders, parentsById, settings.timezone),
           result: reminders,
-          entities: reminders.map(actionToEntity)
+          entities: reminders.map((reminder, index) => actionToEntity(reminder, index + 1))
         };
       }
 
@@ -196,7 +234,33 @@ export async function executeOperation(
       }
 
       case "action.complete": {
-        const updated = await completeActionItem(userId, args.actionId as string);
+        const actionId = args.actionId as string;
+
+        // "complete reminder for X" (explicitly naming a reminder companion, not the real task)
+        // is a real reported pattern once the parent task is already done — completing the stub
+        // too would just be a second, confusing "completion" of what is really one piece of work.
+        // Resolved here rather than in validator.ts since it needs a real DB lookup, not just
+        // session state.
+        const target = await getActionItem(userId, actionId);
+        if (target?.actionType === "reminder") {
+          const parentId = parentActionIdFromReminderSourceId(target.actionType, target.sourceId);
+          const parent = parentId ? await getActionItem(userId, parentId) : undefined;
+
+          if (parent && (parent.status === "completed" || parent.status === "archived")) {
+            // A reminder isn't something you DO, so "complete" doesn't really fit it once it's
+            // irrelevant — archived instead, quietly, so it stops appearing in any future normal
+            // action/reminder list rather than lingering as a separate active-looking row.
+            await archiveActionItem(userId, target.id);
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: `"${parent.title}" is already ${parent.status}. That reminder was for it — nothing more to do.`,
+              result: parent
+            };
+          }
+        }
+
+        const updated = await completeActionItem(userId, actionId);
         if (!updated) return failed(operation.tool, "That task no longer exists or is archived.");
         return { tool: operation.tool, status: "executed", summary: `Completed "${updated.title}".`, result: updated };
       }
@@ -2067,14 +2131,95 @@ function formatMeetingActionsForChat(meetings: ActionItem[], reminders: ActionIt
   return lines.join("\n");
 }
 
-function formatReminderActionsForChat(reminders: ActionItem[], timezone: string): string {
+/**
+ * Numbered, natural-language action list — deliberately parallel to action.hygiene_start's own
+ * "Reply like: complete 1, snooze 2 to Friday, archive 3." numbered format (same convention, same
+ * generic action.hygiene_apply resolution by visible-entity index), so a normal "show me my
+ * actions" list and a hygiene cleanup list behave the same way for a numbered follow-up reply.
+ * `items` never includes a reminder companion row (filtered by the caller) — a real action with
+ * one gets a short "Reminder: N minutes before" metadata line instead of the companion being
+ * listed as if it were its own task.
+ */
+function formatActionListForChat(
+  items: ActionItem[],
+  status: ActionItem["status"] | "all",
+  overdueOnly: boolean,
+  reminderByParentId: Map<string, ActionItem>,
+  timezone: string
+): string {
+  const statusNoun = status === "all" ? "action" : `${status} action`;
+  const noun = overdueOnly ? "overdue action" : statusNoun;
+
+  if (items.length === 0) {
+    return `You don't have any ${noun}s right now.`;
+  }
+
+  const header = `You have ${items.length} ${noun}${items.length === 1 ? "" : "s"}:`;
+
+  const lines = [header];
+  items.forEach((item, index) => {
+    const dueLine = item.dueAt ? ` — ${formatDueLabelForChat(item.dueAt, timezone)}` : "";
+    lines.push(`${index + 1}. ${item.title}${dueLine}`);
+    const reminder = reminderByParentId.get(item.id);
+    if (reminder) {
+      lines.push(`   ${formatReminderMetadataForChat(reminder)}`);
+    }
+  });
+  lines.push("", "Reply: complete 1, snooze 2 tomorrow, archive 3.");
+
+  return lines.join("\n");
+}
+
+/** "due today 14:30" / "due tomorrow 09:00" / a full date+time fallback further out — generic
+ * relative-day phrasing, not specific to any one caller, so any due-date-bearing list (actions,
+ * overdue queries) can read naturally instead of showing a raw timestamp. */
+function formatDueLabelForChat(dueAt: Date, timezone: string): string {
+  const todayLocal = formatDateInTimezone(new Date(), timezone);
+  const dueLocal = formatDateInTimezone(dueAt, timezone);
+  const time = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false }).format(dueAt);
+
+  if (dueLocal === todayLocal) {
+    return `due today ${time}`;
+  }
+  if (dueLocal === addDaysToLocalDateString(todayLocal, 1)) {
+    return `due tomorrow ${time}`;
+  }
+  return `due ${formatLocalDateTime(dueAt, timezone)}`;
+}
+
+/** Short parent-action metadata line for a linked pre-due reminder — "Reminder: 30 minutes
+ * before" / "Reminder at due time" / a generic fallback when the lead time can't be parsed back
+ * out of the reminder's own sourceId (shouldn't happen for a well-formed pre_due_reminder row). */
+function formatReminderMetadataForChat(reminder: ActionItem): string {
+  const leadMinutes = reminder.sourceId ? preDueReminderLeadMinutes(reminder.sourceId) : undefined;
+  if (leadMinutes === undefined) {
+    return "Reminder set";
+  }
+  return leadMinutes === 0 ? "Reminder at due time" : `Reminder: ${leadMinutes} minutes before`;
+}
+
+/**
+ * Reminders shown grouped under the parent action's own title (never the companion's own
+ * denormalized "Reminder: X" title, and never the parent's separate due time confused for the
+ * reminder's own earlier due time) — "Brainstorm meeting — reminder 30 minutes before (due today
+ * 09:00)" reads as one fact about one task, not two disconnected list entries.
+ */
+function formatReminderActionsForChat(reminders: ActionItem[], parentsById: Map<string, ActionItem>, timezone: string): string {
   if (reminders.length === 0) {
     return "No reminders are currently scheduled.";
   }
 
   return [
     "Your reminders:",
-    ...reminders.map((reminder) => `- ${reminderTitleForChat(reminder.title)} — ${formatLocalDateTime(reminder.dueAt, timezone)}`)
+    ...reminders.map((reminder) => {
+      const parentId = reminder.sourceId ? parentActionIdFromReminderSourceId(reminder.actionType, reminder.sourceId) : undefined;
+      const parent = parentId ? parentsById.get(parentId) : undefined;
+      const title = parent?.title ?? reminderTitleForChat(reminder.title);
+      const leadMinutes = reminder.sourceId ? preDueReminderLeadMinutes(reminder.sourceId) : undefined;
+      const leadLine = leadMinutes === undefined ? "" : ` — ${leadMinutes === 0 ? "reminder at due time" : `reminder ${leadMinutes} minutes before`}`;
+      const dueLine = parent?.dueAt ? ` (due ${formatDueLabelForChat(parent.dueAt, timezone)})` : ` (${formatLocalDateTime(reminder.dueAt, timezone)})`;
+      return `- ${title}${leadLine}${dueLine}`;
+    })
   ].join("\n");
 }
 
@@ -2183,8 +2328,8 @@ function isToday(date: Date): boolean {
   return date.toDateString() === now.toDateString();
 }
 
-function actionToEntity(action: ActionItem): AgentEntity {
-  return { type: "action", id: action.id, label: action.title };
+function actionToEntity(action: ActionItem, index?: number): AgentEntity {
+  return { type: "action", id: action.id, label: action.title, index };
 }
 
 function goalToEntity(goal: Goal): AgentEntity {

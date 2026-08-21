@@ -394,7 +394,7 @@ test("Gmail review-to-task transcript creates a clean Nest.js task, honors user 
 
     mockPlan(actionListPlan([op("action.list", { status: "all", limit: 10 }), op("action.list", { status: "all", limit: 10 })]));
     const tasksReply = await sendAgentMessage(server, userId, "show all tasks");
-    assert.equal((tasksReply.reply.match(/Found \d+ action item\(s\)/g) ?? []).length, 1);
+    assert.equal((tasksReply.reply.match(/You have \d+ actions?:/g) ?? []).length, 1);
     assert.match(tasksReply.reply, /upgrade nest\.js to 24/i);
   } finally {
     mock.timers.reset();
@@ -524,7 +524,7 @@ test("Gmail review meeting transcript supports list, QA, multi-task conversion, 
     assert.match(meetings.reply, /Branding direction meeting.*21\/08\/2026, 09:00.*Reminder: 21\/08\/2026, 08:30/i);
     assert.match(meetings.reply, /Brainstorm meeting.*21\/08\/2026, 12:00.*Reminder: 21\/08\/2026, 11:30/i);
     assert.doesNotMatch(meetings.reply, /Jobs Newsletter/i);
-    assert.equal((meetings.reply.match(/Found \d+ action item\(s\)/g) ?? []).length, 0);
+    assert.equal((meetings.reply.match(/You have \d+ actions?:/g) ?? []).length, 0);
   } finally {
     mock.timers.reset();
     clearAgentRuntimeMocks();
@@ -649,7 +649,7 @@ test("mixed Gmail review triage honors explicit ignore/task/keep refs, relative 
     // No separate reminder ActionItems exist (see above) — the two tasks' own due notifications
     // are the only thing that will fire, so the reminder list is honestly empty.
     assert.match(reminders.reply, /no reminders are currently scheduled/i);
-    assert.doesNotMatch(reminders.reply, /Found \d+ action item\(s\)/i);
+    assert.doesNotMatch(reminders.reply, /You have \d+ actions?:/i);
     assert.doesNotMatch(reminders.reply, /getcracked|Jobs Newsletter|RE: duda/i);
   } finally {
     mock.timers.reset();

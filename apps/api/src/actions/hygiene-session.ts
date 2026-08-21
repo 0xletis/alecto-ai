@@ -27,7 +27,12 @@ export async function analyzeActionHygiene(userId: string, now: Date, timezone: 
   ]);
   const today = getLocalTodayRange(now, timezone);
   const goalsById = new Map(goals.map((goal) => [goal.id, goal]));
-  const openActions = actions.filter((action) => action.status === "open" || isSnoozedDue(action, now));
+  // Reminder companion rows (actionType "reminder" — the "remind me N minutes before" stubs
+  // action.create_pre_due_reminders creates) share this same ActionItem table/status ordering as
+  // real tasks, so an overdue/stale one could otherwise surface here as a "cleanup" candidate as
+  // if it were a standalone task — the same leak fixed for action.list/action.reminder_list in
+  // apps/api/src/agent-runtime/executor.ts.
+  const openActions = actions.filter((action) => action.actionType !== "reminder" && (action.status === "open" || isSnoozedDue(action, now)));
   const analyzed = openActions
     .map((action) => analyzeActionHygieneItem(action, goalsById.get(action.goalId ?? ""), today, now, timezone))
     .filter(Boolean) as ActionHygieneAction[];
