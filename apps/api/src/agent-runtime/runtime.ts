@@ -489,6 +489,24 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       return finalizeDeterministicOperations(context, message, gmailReviewToActionShortcuts, "gmail_reviews");
     }
 
+    const gmailReviewVagueClarification = gmailReviewVagueMutationClarification(message, context);
+    if (gmailReviewVagueClarification) {
+      logAgentRuntimeDiagnostics({
+        phase: "ambiguous_mutation_blocked",
+        userId,
+        note: "vague Gmail-review instruction with no specific intent — clarification asked instead of guessing"
+      });
+      return finalize(context, {
+        reply: gmailReviewVagueClarification,
+        operationsPlanned: [],
+        executedOps: [],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: "gmail_reviews"
+      });
+    }
+
     const actionTimeCorrectionShortcut = actionTimeCorrectionShortcutOperation(message, context);
     if (actionTimeCorrectionShortcut) {
       return finalizeDeterministicOperation(context, message, actionTimeCorrectionShortcut, "actions");
@@ -972,6 +990,46 @@ function gmailReviewToActionShortcutOperations(message: string, context: Context
   }));
 }
 
+const VAGUE_GMAIL_REVIEW_MUTATION_PATTERNS = [
+  /\bhandle\s+(it|them|these|those|this)\b/,
+  /\btake care of\s+(it|them|these|those|this)\b/,
+  /\bdeal with\s+(it|them|these|those|this)\b/,
+  /\bdo something with\s+(it|them|these|those|this)\b/,
+  /\bsort\s+(it|them|these|those|this)(\s+\w+)?\s+out\b/,
+  /\bsort\s+out\s+(it|them|these|those|this)\b/,
+  /\bclean\s+(it|them|these|those|this)(\s+\w+)?\s+up\b/,
+  /\bclean\s+up\s+(it|them|these|those|this)\b/
+];
+
+const GMAIL_REVIEW_CLARIFICATION_REPLY = "I can ignore them, turn them into tasks, keep them for later, or show more detail. Which should I do?";
+
+/**
+ * "Ambiguity + mutation = clarification first" — a real product-hardening pass found that a
+ * genuinely vague instruction like "handle it," "take care of them," "sort these out," or "clean
+ * this up," with one or more Gmail reviews visible, has no specific-enough intent (no ignore/
+ * keep/task verb, no index, no ref) for ANY tool to safely resolve. Left alone, this class of
+ * message would fall through every deterministic shortcut straight to the real LLM planner, which
+ * has no reliable way to avoid guessing a destructive operation (reject/to_action) for a message
+ * that never actually specified one. Checked LAST among the Gmail-review shortcuts — every more
+ * specific one above it (explicit ignore/keep/task, plural "keep them", numbered refs) gets first
+ * chance to resolve the message on its own merits; this is only the vague-instruction fallback.
+ * Returns the clarification text directly rather than a PlannedOperation: nothing here is a real
+ * tool call, so there is nothing for the executor/validator to run or reject.
+ */
+function gmailReviewVagueMutationClarification(message: string, context: ContextBundle): string | undefined {
+  const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+  if (visibleReviews.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text || !VAGUE_GMAIL_REVIEW_MUTATION_PATTERNS.some((pattern) => pattern.test(text))) {
+    return undefined;
+  }
+
+  return GMAIL_REVIEW_CLARIFICATION_REPLY;
+}
+
 function reconcileExplicitGmailReviewIntentOperations(
   message: string,
   context: ContextBundle,
@@ -1120,11 +1178,12 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
       addAllVisibleEntries("keep", match.index ?? 0);
     }
   }
-  // Spanish: "deja los dos para luego", "mantén ambos en revisión" (accents already stripped by
-  // normalizeIntentText, so "mantén" arrives as "manten" and "revisión" as "revision").
+  // Spanish: "deja los dos para luego", "mantén ambos en revisión", "deja estos para luego"
+  // (accents already stripped by normalizeIntentText, so "mantén" arrives as "manten" and
+  // "revisión" as "revision").
   {
     const match = text.match(
-      /\b(?:deja|dejalo|dejalos|dejalas|manten|mantenlo|mantenlos|mantenlas|guarda|guardalo|guardalos|guardalas)\b[\s\S]{0,20}\b(?:los\s+dos|las\s+dos|ambos|ambas|todos|todas)\b/
+      /\b(?:deja|dejalo|dejalos|dejalas|manten|mantenlo|mantenlos|mantenlas|guarda|guardalo|guardalos|guardalas)\b[\s\S]{0,20}\b(?:los\s+dos|las\s+dos|ambos|ambas|todos|todas|estos|estas)\b/
     );
     if (match) {
       addAllVisibleEntries("keep", match.index ?? 0);
@@ -1280,8 +1339,15 @@ async function resolveMostRecentlyNotifiedOrVisibleActionId(
     return { actionId: remindedAction.id, source: "reminded_by_worker" };
   }
 
-  const visibleAction = context.session.visibleEntities.find((entity) => entity.type === "action");
-  return visibleAction ? { actionId: visibleAction.id, source: "visible_session_entity" } : undefined;
+  // Only a SINGLE visible action is safe to resolve silently here. With no recent worker
+  // reminder to disambiguate and more than one action item in view, `.find()` used to just grab
+  // the first one — a real ambiguity-hardening pass found this meant "complete it"/"done" could
+  // silently mutate the WRONG task whenever two or more were visible at once. Returning undefined
+  // here makes the shortcut fall through to the normal planner + validator's own ambiguity check
+  // (resolveSingleVisibleEntity in validator.ts), which already asks a real clarification
+  // question instead of guessing.
+  const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+  return visibleActions.length === 1 ? { actionId: visibleActions[0]!.id, source: "visible_session_entity" } : undefined;
 }
 
 function actionTimeCorrectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {

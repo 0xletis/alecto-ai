@@ -79,7 +79,7 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
         args,
         status: "needs_clarification",
         requiresConfirmation: false,
-        clarificationQuestion: "I see more than one task that could match — which one did you mean?",
+        clarificationQuestion: "Which action do you mean? Reply with the number or title.",
         rationale: operation.rationale
       };
     }
@@ -382,7 +382,7 @@ function resolveActionRef(args: { ref?: string }, context: ContextBundle): Actio
   if (resolution.status === "none") {
     return { status: "needs_clarification", question: "Which task do you mean? I don't have one in view right now." };
   }
-  return { status: "needs_clarification", question: "I see more than one task that could match — which one did you mean?" };
+  return { status: "needs_clarification", question: "Which action do you mean? Reply with the number or title." };
 }
 
 /** Same matching rule the gmail.rule.create executor uses to detect a duplicate. */

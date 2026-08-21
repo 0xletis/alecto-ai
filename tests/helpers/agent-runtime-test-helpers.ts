@@ -206,6 +206,31 @@ export function assertNoSilentPartialHandling(reply: AgentMessageResponseJson, e
   );
 }
 
+/** The reply must actually be clarification-shaped (a real question, not a bare statement) AND
+ * nothing may have mutated — combines assertNoMutationWhenClarificationExpected's mutation check
+ * with a sanity check that the reply text itself reads like a question, not a silent guess. */
+export function assertClarificationResponse(reply: AgentMessageResponseJson, context?: string): void {
+  assertNoMutationWhenClarificationExpected(reply, context);
+  assert.match(reply.reply, /\?/, `${context ? `${context}: ` : ""}expected a clarification-shaped reply (containing a question) — got: "${reply.reply}"`);
+}
+
+/** No ActionItem of any kind (task, reminder, etc.) may exist for this user — for an ambiguous
+ * request that should have asked a question instead of guessing which task/review to act on. */
+export async function assertNoActionItemsCreated(userId: string, context?: string): Promise<void> {
+  const count = await prisma.actionItem.count({ where: { userId } });
+  assert.equal(count, 0, `${context ? `${context}: ` : ""}expected no ActionItems to exist, found ${count}`);
+}
+
+/** Every given Gmail review id must still be "pending" — for an ambiguous or explicitly
+ * deferred ("keep them") request that must never silently reject/approve a review. */
+export async function assertEmailReviewsRemainPending(reviewIds: string[], context?: string): Promise<void> {
+  const reviews = await prisma.emailReviewItem.findMany({ where: { id: { in: reviewIds } } });
+  assert.equal(reviews.length, reviewIds.length, `${context ? `${context}: ` : ""}expected to find all ${reviewIds.length} seeded reviews`);
+  for (const review of reviews) {
+    assert.equal(review.status, "pending", `${context ? `${context}: ` : ""}review ${review.id} must remain pending, got "${review.status}"`);
+  }
+}
+
 /**
  * Env-gated, human-readable one-liner for a single transcript turn — complements (never
  * replaces) the structured `[agent-runtime-diagnostics]` JSON lines runtime.ts's own

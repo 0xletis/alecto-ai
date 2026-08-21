@@ -169,24 +169,14 @@ test("ambiguous 'handle it' with multiple visible reviews and no clear operation
     const { ssrfId, dosId } = await seedTwoAdvisoryReviews(userId);
     await sendAgentMessage(server, userId, "show me email reviews");
 
-    mockPlan({
-      topic: "gmail_reviews",
-      intent: "unclear",
-      operations: [
-        {
-          tool: "clarification.ask",
-          args: { question: "I'm not sure what you'd like me to do with those — keep them, ignore them, or turn one into a task?" },
-          rationale: null
-        }
-      ],
-      needsClarification: true,
-      clarificationQuestion: "I'm not sure what you'd like me to do with those — keep them, ignore them, or turn one into a task?",
-      replyDraft: ""
-    });
+    // No mockPlan needed: a later ambiguity-hardening pass made "handle it" (a vague instruction
+    // with no specific ignore/keep/task intent) resolve deterministically to a clarification —
+    // see gmailReviewVagueMutationClarification in apps/api/src/agent-runtime/runtime.ts — so the
+    // real planner is never even reached for this exact phrase.
     const reply = await sendAgentMessage(server, userId, "handle it");
 
     assert.equal(reply.debug.mutationExecuted, false);
-    assert.match(reply.reply, /not sure what|keep them, ignore them/i);
+    assert.match(reply.reply, /ignore them.*tasks.*keep them/i);
 
     const ssrfAfter = await prisma.emailReviewItem.findUnique({ where: { id: ssrfId } });
     const dosAfter = await prisma.emailReviewItem.findUnique({ where: { id: dosId } });
