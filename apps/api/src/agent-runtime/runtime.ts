@@ -593,7 +593,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const { plan, plannerUsed } = await planMessage(message, context);
   const reconciledOperations = reconcileExplicitGmailReviewIntentOperations(message, context, plan.operations);
 
-  const validatedOps = validateOperations(reconciledOperations, context);
+  const validatedOps = validateOperations(reconciledOperations, context, message);
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
   const explicitReviewIntentPlan = buildExplicitGmailReviewIntentPlan(message, context);
   logAgentRuntimeDiagnostics({
@@ -717,7 +717,7 @@ async function finalizeDeterministicOperation(
   });
   const pendingOperationBefore = context.session.pendingOperation;
   const visibleEntitiesBefore = context.session.visibleEntities;
-  const validatedOps = validateOperations([plannedOperation], context);
+  const validatedOps = validateOperations([plannedOperation], context, message, { deterministicSource: true });
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
   const pendingConfirmationOps = validatedOps.filter((op) => op.status === "needs_confirmation");
   const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
@@ -778,7 +778,7 @@ async function finalizeDeterministicOperations(
   });
   const pendingOperationBefore = context.session.pendingOperation;
   const visibleEntitiesBefore = context.session.visibleEntities;
-  const validatedOps = validateOperations(plannedOperations, context);
+  const validatedOps = validateOperations(plannedOperations, context, message, { deterministicSource: true });
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
   const pendingConfirmationOps = validatedOps.filter((op) => op.status === "needs_confirmation");
   const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
@@ -1171,9 +1171,15 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
   // referring back to the numbers just named, not a request to keep every visible review; without
   // this guard, a real mixed-triage message ("...4 and 6 keep them in review for later") had this
   // plural match incorrectly override the correctly-extracted numbered task/keep decisions for
-  // OTHER, unrelated indexes elsewhere in the same message.
+  // OTHER, unrelated indexes elsewhere in the same message. "em"/"'em" is included as informal
+  // slang for "them" ("keep em all for later") — a real Telegram smoke test found this exact
+  // phrasing, sent as a direct answer to Alecto's own "which should I do?" clarification, fell
+  // through every shortcut (no literal "them") all the way to the goal-avoidance guardrail. No
+  // separate "pending clarification" state needed: once the slang is recognized, this same
+  // deterministic-shortcut-first architecture that already protects "check gmail every hour"
+  // from the guardrail protects this too.
   {
-    const match = text.match(/(?<!\d\s)\b(?:keep|leave)\s+(?:them|these|those|both|all(?:\s+of\s+them)?)\b/);
+    const match = text.match(/(?<!\d\s)\b(?:keep|leave)\s+(?:them|these|those|both|all(?:\s+of\s+them)?|'?em)\b/);
     if (match) {
       addAllVisibleEntries("keep", match.index ?? 0);
     }
@@ -1202,13 +1208,13 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
   // case above so "ignore them"/"delete both"/"turn both into tasks" don't hit the same
   // ambiguous-ref bug the keep phrasing did.
   {
-    const match = text.match(/(?<!\d\s)\b(?:ignore|ifnore|reject|skip|delete|remove|discard)\s+(?:them|these|those|both|all(?:\s+of\s+them)?)\b/);
+    const match = text.match(/(?<!\d\s)\b(?:ignore|ifnore|reject|skip|delete|remove|discard)\s+(?:them|these|those|both|all(?:\s+of\s+them)?|'?em)\b/);
     if (match) {
       addAllVisibleEntries("ignore", match.index ?? 0);
     }
   }
   {
-    const match = text.match(/(?<!\d\s)\b(?:turn|convert|make|create|add)\s+(?:them|these|those|both|all(?:\s+of\s+them)?)\s+(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/);
+    const match = text.match(/(?<!\d\s)\b(?:turn|convert|make|create|add)\s+(?:them|these|those|both|all(?:\s+of\s+them)?|'?em)\s+(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/);
     if (match) {
       addAllVisibleEntries("task", match.index ?? 0);
     }

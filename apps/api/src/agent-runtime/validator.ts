@@ -15,11 +15,29 @@ const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
   "gmail.review.approve"
 ]);
 
-export function validateOperations(operations: PlannedOperation[], context: ContextBundle): ValidatedOperation[] {
-  return operations.map((operation) => validateOperation(operation, context));
+export interface ValidateOperationsOptions {
+  /**
+   * True when `operations` came from one of this file's own deterministic shortcuts (runtime.ts)
+   * rather than the real LLM planner — those already resolved any actionId through a verified
+   * mechanism (the worker's own most-recently-reminded-action log, or the single visible action
+   * when there's no ambiguity at all), so the actionId-grounding check below (which exists
+   * specifically to catch the LLM PLANNER guessing) would only ever produce false rejections
+   * here, never a real catch. Defaults to false (untrusted planner output) at every call site
+   * that doesn't explicitly opt in.
+   */
+  deterministicSource?: boolean;
 }
 
-function validateOperation(operation: PlannedOperation, context: ContextBundle): ValidatedOperation {
+export function validateOperations(
+  operations: PlannedOperation[],
+  context: ContextBundle,
+  message: string,
+  options: ValidateOperationsOptions = {}
+): ValidatedOperation[] {
+  return operations.map((operation) => validateOperation(operation, context, message, options));
+}
+
+function validateOperation(operation: PlannedOperation, context: ContextBundle, message: string, options: ValidateOperationsOptions): ValidatedOperation {
   const tool = getToolDefinition(operation.tool);
 
   if (!tool) {
@@ -58,6 +76,29 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
   }
 
   const args = parsed.data as Record<string, unknown>;
+
+  if (ACTION_REFERENCE_TOOLS.has(tool.name) && args.actionId) {
+    // A real Telegram smoke test + a live-LLM eval reproduction found the planner directly
+    // supplying a concrete (but wrong) actionId for a bare "complete it" with 10 equally
+    // plausible open actions visible and no recent reminder — its own prompt instruction ("if
+    // it's ambiguous, omit the id and let the validator resolve it") is advisory, not
+    // enforced, and a supplied id previously bypassed the ambiguity check below entirely. When
+    // more than one action is visible, a directly-supplied id is only trusted if the message
+    // itself gives a real reason to believe THIS one was meant (shares a real word with its own
+    // title) — otherwise it's discarded and falls through to the same ambiguity resolution a
+    // missing id already gets, never silently completing/archiving/snoozing the wrong task. An
+    // explicit number ("complete 2") is exempted: that's a deliberate position-based reference
+    // with no expected word overlap with the target's own title, a different, already-relied-on
+    // resolution path (the deterministic shortcut itself always defers to the planner for any
+    // digit) — not the bare-pronoun ambiguity this check exists to catch.
+    const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
+    if (!options.deterministicSource && visibleActions.length > 1 && !/\d/.test(message)) {
+      const target = visibleActions.find((entity) => entity.id === args.actionId);
+      if (target && !actionReferenceGroundedInMessage(message, target.label)) {
+        delete args.actionId;
+      }
+    }
+  }
 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && !args.actionId) {
     const resolution = resolveSingleVisibleEntity(context.session.visibleEntities, "action");
@@ -352,6 +393,64 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle):
     requiresConfirmation: tool.requiresConfirmation,
     rationale: operation.rationale
   };
+}
+
+const ACTION_GROUNDING_STOPWORDS = new Set([
+  "the",
+  "a",
+  "an",
+  "to",
+  "my",
+  "of",
+  "for",
+  "and",
+  "or",
+  "on",
+  "in",
+  "at",
+  "it",
+  "that",
+  "this",
+  "one",
+  "task",
+  "action",
+  "item",
+  "please",
+  "complete",
+  "completed",
+  "finish",
+  "finished",
+  "done",
+  "archive",
+  "archived",
+  "dismiss",
+  "snooze",
+  "snoozed",
+  "mark",
+  "marked",
+  "as"
+]);
+
+/** A short word (>2 chars), stripped of the generic completion/archive/snooze vocabulary every
+ * message in this family uses regardless of which task is meant — so "complete" or "done"
+ * matching itself never counts as evidence the RIGHT task was identified. */
+function actionGroundingWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word.length > 2 && !ACTION_GROUNDING_STOPWORDS.has(word));
+}
+
+/** True only if the message shares a real, specific word with the candidate action's own title —
+ * "complete the passport renewal task" is grounded in "Renew passport" (shares "passport"); a
+ * bare "complete it"/"done"/"mark that done" shares nothing with any title and is never grounded,
+ * regardless of which real actionId a planner attached to it. */
+function actionReferenceGroundedInMessage(message: string, actionTitle: string): boolean {
+  const messageWords = new Set(actionGroundingWords(message));
+  if (messageWords.size === 0) {
+    return false;
+  }
+  return actionGroundingWords(actionTitle).some((word) => messageWords.has(word));
 }
 
 type ActionRefResolution =

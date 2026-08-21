@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createGoal } from "../packages/db/src/index.ts";
+import { createActionItem, createGoal } from "../packages/db/src/index.ts";
 import { buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertActionCreated,
@@ -567,6 +567,72 @@ test(
         const mentionsStaleGoal = /guitar/i.test(message);
         trace.checkpoint("does not mention the unrelated, actionless goal", !mentionsStaleGoal, message);
         assert.doesNotMatch(message, /guitar/i, `the brief must never surface a goal with no real actions/activity — got: ${message}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "11. ambiguous 'complete it' after 'show all tasks' with 10 visible actions must clarify, never guess the first one",
+  { ...llmEvalOptions(["actions", "ambiguity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    // Reproduces a real Telegram smoke test bug report verbatim: the deterministic mocked-planner
+    // suite (tests/agent-runtime-ambiguity-hardening.test.ts) proved the VALIDATOR correctly
+    // clarifies when action.complete is planned with no actionId and multiple actions are
+    // visible — but never proved what the REAL planner actually puts in `args` for "complete it"
+    // after a real "show all tasks" turn. A real LLM might supply a CONCRETE (if wrong/guessed)
+    // actionId directly, which the validator has no way to distinguish from a genuinely correct
+    // one — that bypasses the ambiguity check entirely, regardless of how well it works in the
+    // mocked suite. This scenario is the only place in the repo that can actually observe that.
+    const server = buildServer();
+    const userId = `llm-eval-action-ambiguity-${randomUUID()}`;
+    const trace = new EvalTrace("11-action-completion-ambiguity", ["actions", "ambiguity"], userId);
+
+    try {
+      await seedUser(userId);
+      const titles = [
+        "We need to seriously talk about getcracked",
+        "Review GitHub security advisory for vulnerabilities",
+        "Review security advisory on GitHub repository",
+        "Review security alert",
+        "Branding direction meeting",
+        "Upgrade to Node.js 24",
+        "Apply to 3 developer jobs",
+        "Write 5 bullets for the YouTube script",
+        "Read 20 minutes on 3 days",
+        "Do 2 strength sessions"
+      ];
+      const createdIds: string[] = [];
+      for (const title of titles) {
+        const created = await createActionItem(userId, { source: "manual", title });
+        createdIds.push(created.id);
+      }
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show all tasks", await sendAgentMessage(server, userId, "show all tasks"));
+        trace.checkpoint("action.list planned", t1.operationsPlanned.some((operation) => operation.tool === "action.list"), JSON.stringify(t1.operationsPlanned));
+
+        const t2 = trace.record("complete it", await sendAgentMessage(server, userId, "complete it"));
+
+        const completedIds = await prisma.actionItem.findMany({ where: { userId, status: "completed" } }).then((rows) => rows.map((row) => row.id));
+        trace.checkpoint("no action completed without clarification", completedIds.length === 0 || t2.debug.mutationExecuted === false, JSON.stringify({ completedIds, mutationExecuted: t2.debug.mutationExecuted, plannedOps: t2.operationsPlanned }));
+
+        // The real, actionable assertion: with 10 equally-plausible visible actions and no recent
+        // worker reminder to disambiguate, "complete it" must never mutate — it must either ask a
+        // clarification or (informationally) decline, but it must not guess.
+        assert.equal(
+          t2.debug.mutationExecuted,
+          false,
+          `"complete it" must not mutate with 10 ambiguous visible actions and no reminder — planned: ${JSON.stringify(t2.operationsPlanned)}, reply: ${t2.reply}`
+        );
+
+        for (const id of createdIds) {
+          const item = await prisma.actionItem.findUnique({ where: { id } });
+          trace.checkpoint(`action ${id} untouched`, item?.status === "open", item?.status);
+        }
       });
     } finally {
       await server.close();
