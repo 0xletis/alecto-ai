@@ -921,7 +921,17 @@ test("8. no pending reviews returns an honest empty state", async () => {
   }
 });
 
-test("a direct reviewId is still honored as-is (already-resolved internal case)", async () => {
+test("a direct reviewId is no longer trusted when the review was never actually shown (audit/v3-mutating-tool-boundaries)", async () => {
+  // Was previously "a direct reviewId is still honored as-is (already-resolved internal case)" —
+  // that name assumed a directly-supplied reviewId only ever came from an already-verified
+  // internal source, but nothing enforced that: the real LLM planner path (exercised via mockPlan
+  // here, same as any other test in this file) could supply one too, with zero grounding — the
+  // exact pre-hardening shape action.complete/snooze/archive used to have for actionId. Closed by
+  // validator.ts's new gmail-review-id trust check: a directly-supplied reviewId is only honored
+  // when it matches a review from THIS turn's own visibleEntities (the only place a real id is
+  // ever actually shown to the planner — buildUserPayload never sends real review ids at all,
+  // only a bare pendingGmailReviewCount) — never trusted purely because it belongs to this user
+  // and exists in the database.
   const server = buildServer();
   const userId = `gmail-review-direct-id-${randomUUID()}`;
 
@@ -930,6 +940,38 @@ test("a direct reviewId is still honored as-is (already-resolved internal case)"
     const rule = await prisma.emailSignalRule.create({ data: { userId, connectionId, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" } });
     const review = await seedReview(userId, connectionId, rule.id, { subject: "Recruiter reply from Example Labs", providerMessageId: "m1" });
 
+    // No gmail.review.list call first — this review was never shown, so nothing about it is in
+    // session.visibleEntities. A "bad planner" that nonetheless supplies its real id directly
+    // must be blocked, not trusted.
+    mockPlan(gmailReviewRejectPlan({ reviewId: review.id }));
+    const reply = await sendAgentMessage(server, userId, "reject that review directly by id");
+
+    assert.doesNotMatch(reply.reply, /rejected/i);
+    assert.match(reply.reply, /i don't have any gmail reviews in view/i);
+    const reviewAfter = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+    assert.equal(reviewAfter?.status, "pending", "an unverified direct reviewId must never mutate the review");
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("a direct reviewId IS still honored when it matches a review the user was actually just shown", async () => {
+  const server = buildServer();
+  const userId = `gmail-review-direct-id-visible-${randomUUID()}`;
+
+  try {
+    const connectionId = await seedGmailUser(userId);
+    const rule = await prisma.emailSignalRule.create({ data: { userId, connectionId, adapterId: "custom_email_review", name: "Recruiter replies", status: "active", createdBy: "user" } });
+    const review = await seedReview(userId, connectionId, rule.id, { subject: "Recruiter reply from Example Labs", providerMessageId: "m1" });
+
+    mockPlan({ topic: "gmail_reviews", intent: "list", operations: [op("gmail.review.list", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    await sendAgentMessage(server, userId, "what emails need my attention?");
+
+    // Now that it's genuinely visible, the real planner supplying its real id directly (rather
+    // than index/ref) must still work — this isn't a new restriction on the legitimate case, only
+    // on an unverified one.
     mockPlan(gmailReviewRejectPlan({ reviewId: review.id }));
     const reply = await sendAgentMessage(server, userId, "reject that review directly by id");
 

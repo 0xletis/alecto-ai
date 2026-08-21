@@ -455,6 +455,28 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     };
   }
 
+  if (GMAIL_REVIEW_REFERENCE_TOOLS.has(tool.name) && args.reviewId && !options.deterministicSource) {
+    // Mirrors the exact hardening ACTION_REFERENCE_TOOLS already got: a directly-supplied id is
+    // never trusted just because it exists and belongs to this user. Unlike actions, reviews have
+    // no legitimate "outside the visible page" case — buildUserPayload never sends the planner any
+    // real review ids at all (only a bare pendingGmailReviewCount), so the ONLY place a genuine
+    // reviewId could have come from is THIS turn's own visibleEntities; anything else is either a
+    // stale id from several turns ago or an invented one, and neither is safe to act on silently
+    // (e.g. rejecting/approving a DIFFERENT pending review than the one just discussed). No title-
+    // grounding fallback is offered here (unlike actions) — a review's identity outside the current
+    // visible list was never something the user gave the model any real text to ground against.
+    const visibleReviews = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+    const target = visibleReviews.find((entity) => entity.id === args.reviewId);
+    logGmailReviewIdTrustDiagnostics(context.session.userId, {
+      tool: tool.name,
+      suppliedReviewId: String(args.reviewId),
+      trusted: Boolean(target)
+    });
+    if (!target) {
+      delete args.reviewId;
+    }
+  }
+
   if (GMAIL_REVIEW_REFERENCE_TOOLS.has(tool.name) && !args.reviewId) {
     const resolution = resolveGmailReviewRef(args as { index?: number; ref?: string }, context);
 
@@ -896,6 +918,23 @@ function logActionGroundingDiagnostics(
       trusted: input.trusted,
       source: input.source,
       rejectedAsGenericOrNoMatch: !input.trusted
+    })
+  );
+}
+
+function logGmailReviewIdTrustDiagnostics(userId: string, input: { tool: string; suppliedReviewId: string; trusted: boolean }): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "gmail_review_id_trust_check",
+      userId,
+      tool: input.tool,
+      suppliedReviewId: input.suppliedReviewId,
+      trusted: input.trusted,
+      rejectedAsNotCurrentlyVisible: !input.trusted
     })
   );
 }
