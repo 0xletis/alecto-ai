@@ -1,19 +1,15 @@
 import { config } from "dotenv";
 import {
-  createActionItemReminderLog,
   createNotificationLog,
-  getActionItemsEligibleForReminder,
   getActiveGoals,
   getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getRecentEvents,
   getUsersWithEnabledNotifications,
-  hasNotificationLog,
-  reopenSnoozedActionItem,
-  type ActionItem,
-  type ActionItemReminderType
+  hasNotificationLog
 } from "@operator-agent/db";
 import { buildDailyCheckinPrompt, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
+import { sendDueActionReminders as sendDueActionRemindersImpl } from "./action-reminders.js";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
 import { runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
@@ -107,48 +103,11 @@ async function runTick() {
   await sendDueActionReminders(now);
 }
 
-export async function sendDueActionReminders(now = new Date()) {
-  const candidates = await getActionItemsEligibleForReminder({
-    now,
-    limit: 20
-  });
-
-  for (const candidate of candidates) {
-    const chatId = telegramChatIdFromUserId(candidate.actionItem.userId);
-
-    if (!chatId) {
-      console.log(`Skipping action reminder for unroutable user ${candidate.actionItem.userId}.`);
-      continue;
-    }
-
-    try {
-      const settings = await getOrCreateNotificationSettings(candidate.actionItem.userId);
-      await sendTelegramMessage(
-        chatId,
-        formatActionReminderMessage(candidate.actionItem, candidate.reminderType, settings.timezone)
-      );
-      await createActionItemReminderLog({
-        userId: candidate.actionItem.userId,
-        actionItemId: candidate.actionItem.id,
-        reminderType: candidate.reminderType,
-        sentAt: now
-      });
-
-      if (candidate.reminderType === "snoozed") {
-        await createActionItemReminderLog({
-          userId: candidate.actionItem.userId,
-          actionItemId: candidate.actionItem.id,
-          reminderType: "due",
-          sentAt: now
-        });
-        await reopenSnoozedActionItem(candidate.actionItem.userId, candidate.actionItem.id);
-      }
-
-      console.log(`Sent ${candidate.reminderType} action reminder for ${candidate.actionItem.id}.`);
-    } catch (error) {
-      console.error(`Action reminder failed for ${candidate.actionItem.id}`, error);
-    }
-  }
+// Delegates to action-reminders.ts (see that file's own doc comment for why it lives separately
+// from index.ts and how the bundled/numbered notification UX works) — kept as a thin wrapper here
+// so the rest of index.ts's tick loop is unaffected.
+async function sendDueActionReminders(now: Date) {
+  await sendDueActionRemindersImpl(now, { sendTelegramMessage });
 }
 
 export async function runDailyEveningReviews(now = new Date(), settings?: NotificationSettings[]) {
@@ -322,40 +281,6 @@ function parseApiError(text: string): string | undefined {
   } catch {
     return text.trim();
   }
-}
-
-function formatActionReminderMessage(actionItem: ActionItem, reminderType: ActionItemReminderType, timezone = "Europe/Madrid"): string {
-  const isOverdue = reminderType === "due" && Boolean(actionItem.dueAt && actionItem.dueAt < new Date());
-  const header = reminderType === "snoozed" ? "Snoozed action is back:" : isOverdue ? "Action overdue:" : "Action due:";
-  const dueLine = actionItem.dueAt ? `due: ${formatLocalDateTime(actionItem.dueAt, timezone)}` : undefined;
-
-  return [
-    header,
-    actionItem.title,
-    dueLine,
-    `complete: /complete_action ${actionItem.id}`,
-    `snooze tomorrow: /snooze_action ${actionItem.id} tomorrow`,
-    `archive: /archive_action ${actionItem.id}`
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function telegramChatIdFromUserId(userId: string): string | undefined {
-  const match = userId.match(/^telegram:(\d+)$/);
-  return match?.[1];
-}
-
-function formatLocalDateTime(date: Date, timezone: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).format(date);
 }
 
 async function sendTelegramMessage(chatId: string, text: string) {

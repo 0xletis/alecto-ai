@@ -1514,19 +1514,25 @@ export async function executeOperation(
 
         // "delete"/"remove" (English) and "elimina"/"borra" (Spanish) are honored as intent to
         // archive — Alecto never permanently deletes goal history — but the confirmation must say
-        // so honestly rather than silently reinterpreting the user's own destructive wording.
-        const usedDeleteWording = /\b(delete|remove|elimina|elimina[r]?|borra[r]?)\b/i.test(message);
-        const consequenceLine =
-          lifecycleOperation === "archive"
-            ? usedDeleteWording
-              ? "I'll archive it so it stops being active, not permanently delete the history."
-              : "It will stop appearing as active, but history stays."
-            : "It will stop appearing as active until you resume it.";
+        // so honestly rather than silently reinterpreting the user's own destructive wording. A
+        // critical-priority goal gets an extra friction line instead of the plain archive/delete
+        // wording (never a hard block — the user can still confirm with a plain "yes") so an
+        // important goal is never silently archived without the user noticing its weight.
+        const usedDeleteWording = /\b(delete|remove|elimina[r]?|borra[r]?)\b/i.test(message);
+        const isCriticalArchive = lifecycleOperation === "archive" && goal.priority === "critical";
+        const summaryText =
+          lifecycleOperation === "pause"
+            ? `You're about to pause "${goal.title}". It will stop appearing as active, but history stays. Reply yes to confirm or cancel.`
+            : isCriticalArchive
+              ? `This is marked critical, so I won't archive it silently. If you really want to stop tracking it, reply yes to confirm or cancel.`
+              : usedDeleteWording
+                ? `I won't permanently delete the history. I can archive "${goal.title}" so it stops being active. Reply yes to confirm or cancel.`
+                : `You're about to archive "${goal.title}". It will stop appearing as active, but history stays. Reply yes to confirm or cancel.`;
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `You're about to ${lifecycleOperation} "${goal.title}". ${consequenceLine} Reply yes to confirm or cancel.`,
+          summary: summaryText,
           entities: [goalToEntity(goal)],
           pendingOperationUpdate: {
             topic: "goal_lifecycle",
@@ -2264,8 +2270,9 @@ function formatThinWeeklyReviewSummary(context: WeeklyReviewContext): string {
 /**
  * Grounded in real Goal rows only — title/category/priority/why, never an invented progress
  * figure (targetMetrics/checkInConfig would need real event aggregation this tool doesn't do).
- * Always ends with an honest boundary: EDITING an existing goal isn't wired through chat yet —
- * creating a NEW one is (goal.create_propose, docs/10-v3-readiness-audit.md §21).
+ * Closing line was rewritten from an "editing/deleting isn't wired yet" boundary (stale since
+ * §29's goal.archive_propose/goal.archive_apply shipped) to a natural-examples line covering both
+ * lifecycle management and the other real goal tools — see docs/10-v3-readiness-audit.md §29/§30.
  */
 function formatGoalListForChat(goals: Goal[]): string {
   if (goals.length === 0) {
@@ -2279,7 +2286,10 @@ function formatGoalListForChat(goals: Goal[]): string {
       lines.push(`   Why: ${goal.why}`);
     }
   });
-  lines.push("", "Editing or deleting an existing goal through chat isn't wired yet. Use /create_goal, or tell me about a new goal and I can propose a plan for it.");
+  lines.push(
+    "",
+    'You can manage goals naturally: "pause the Meditations goal", "archive the car goal", "show progress on job search", or "log 20 pages for reading".'
+  );
 
   return lines.join("\n");
 }
@@ -2413,7 +2423,7 @@ function resolveGoalForLifecycleAction(goalRef: string | undefined, activeGoals:
  * an id+label, e.g. the goal could have been archived since). Undefined when nothing is focused
  * yet (a session's first goal-related turn) or the focused goal is no longer active.
  */
-function resolveCurrentFocusGoal(context: ContextBundle): Goal | undefined {
+export function resolveCurrentFocusGoal(context: ContextBundle): Goal | undefined {
   const focusedGoalEntity = context.session.focusedEntities?.goal;
   return focusedGoalEntity ? context.activeGoals.find((goal) => goal.id === focusedGoalEntity.id) : undefined;
 }

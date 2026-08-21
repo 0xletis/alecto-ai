@@ -2,7 +2,7 @@ import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, rejectP
 import { loadContext } from "./context-loader.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
-import { executeOperation, parentActionIdFromReminderSourceId } from "./executor.js";
+import { executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
@@ -519,6 +519,18 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const gmailNudgeSettingsShortcut = !pending ? gmailNudgeSettingsShortcutOperation(message) : undefined;
   if (gmailNudgeSettingsShortcut) {
     return finalizeDeterministicOperation(context, message, gmailNudgeSettingsShortcut, "proactive_settings");
+  }
+
+  // Checked deterministically, BEFORE the goal-avoidance guardrail below — a real Telegram smoke
+  // test found "pause my Meditations goal" and "remove the meditations goal" both intercepted as
+  // avoidance/lapse of that very goal, since the guardrail ran on every message before goal
+  // lifecycle tools (goal.archive_propose) ever got a chance to run through the LLM planner.
+  // "Pause/archive/remove/delete THIS GOAL" is an operational goal-MANAGEMENT command, not an
+  // avoidance event about the goal's underlying activity — exactly the same class of fix as the
+  // Gmail domain shortcuts above (see the comment ahead of the guardrail check below).
+  const goalLifecycleShortcut = goalLifecycleShortcutOperation(message, context);
+  if (goalLifecycleShortcut) {
+    return finalizeDeterministicOperation(context, message, goalLifecycleShortcut, "goal_lifecycle");
   }
 
   if (!pending) {
@@ -1908,6 +1920,80 @@ function gmailNudgeSettingsShortcutOperation(message: string): PlannedOperation 
   }
 
   return undefined;
+}
+
+const GOAL_LIFECYCLE_PAUSE_RE = /\b(pause|pausa|pausar)\b/;
+const GOAL_LIFECYCLE_ARCHIVE_VERB_RE = /\b(archive|archivar|archiva|delete|remove|elimina|eliminar|borra|borrar)\b/;
+const GOAL_LIFECYCLE_STOP_TRACKING_RE = /\bstop tracking\b/;
+const GOAL_LIFECYCLE_STOP_FOLLOWING_RE = /\b(deixa de seguir|deja de seguir)\b/;
+const GOAL_LIFECYCLE_NOT_IMPORTANT_RE = /\b(not important anymore|ya no es importante|ja no es important)\b/;
+const GOAL_LIFECYCLE_DONT_WANT_ANYMORE_RE = /\b(don'?t|dont) (?:want|wanna)[\s\S]{0,25}anymore\b|\bya no quiero\b|\bja no vull\b/;
+const GOAL_WORD_RE = /\b(goal|goals|objetivo|objetivos|meta|metas|objectiu|objectius)\b/;
+const GOAL_LIFECYCLE_BARE_PRONOUN_COMMAND_RE =
+  /^(?:okay|ok|vale|va)?[,.\s]*(pause|archive|delete|remove|pausa|pausar|archiva|archivar|elimina|eliminar|borra|borrar)\s+(it|that|this|lo|la|ho)\.?$/;
+
+/**
+ * Deterministic goal-lifecycle intent shortcut — checked BEFORE the goal-avoidance guardrail (see
+ * the call site's comment) so "pause/archive/remove/delete THIS GOAL" is always recognized as an
+ * operational goal-management command rather than reaching the guardrail's avoidance/lapse
+ * classification, which has no way to distinguish "I don't want to keep tracking this" from "I'm
+ * avoiding the underlying activity." Deliberately narrow: fires only when the message names a
+ * goal explicitly ("my Meditations goal," "stop tracking X") or uses a bare pronoun command
+ * ("okay pause it") while a real goal is already the conversation's focus — never for a stray
+ * "delete it"/"pause it" with no established goal context, which could just as easily mean an
+ * email, a Gmail rule, or a task. goalRef is left undefined whenever no explicit name was
+ * captured, which resolveGoalForLifecycleAction/resolveActiveGoalReference already treat exactly
+ * like a pronoun reference (falls back to the conversation's current focus, or asks/declines if
+ * there isn't one) — so a pronoun-shaped request never needs to be text-matched here at all.
+ */
+function goalLifecycleShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  if (context.activeGoals.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return undefined;
+  }
+
+  const stopTracking = GOAL_LIFECYCLE_STOP_TRACKING_RE.test(text);
+  const stopFollowing = GOAL_LIFECYCLE_STOP_FOLLOWING_RE.test(text);
+  const notImportant = GOAL_LIFECYCLE_NOT_IMPORTANT_RE.test(text);
+  const dontWantAnymore = GOAL_LIFECYCLE_DONT_WANT_ANYMORE_RE.test(text);
+  const archiveVerb = GOAL_LIFECYCLE_ARCHIVE_VERB_RE.test(text);
+  const pauseVerb = GOAL_LIFECYCLE_PAUSE_RE.test(text);
+
+  const isArchive = archiveVerb || stopTracking || stopFollowing || notImportant || dontWantAnymore;
+  const isPause = pauseVerb && !isArchive;
+
+  if (!isArchive && !isPause) {
+    return undefined;
+  }
+
+  const goalWordPresent = GOAL_WORD_RE.test(text);
+  const bareCommandMatch = GOAL_LIFECYCLE_BARE_PRONOUN_COMMAND_RE.test(text);
+  const focusedGoal = bareCommandMatch ? resolveCurrentFocusGoal(context) : undefined;
+
+  if (!goalWordPresent && !stopTracking && !stopFollowing && !(bareCommandMatch && focusedGoal)) {
+    return undefined;
+  }
+
+  let goalRef: string | undefined;
+  const stopTrackingMatch = text.match(/\bstop tracking\s+(.+)$/);
+  if (stopTrackingMatch) {
+    goalRef = stopTrackingMatch[1].replace(/[.!?]+$/, "").trim();
+  } else {
+    const namedMatch = text.match(/\b(?:my|the)\s+(.+?)\s+goals?\b/);
+    if (namedMatch) {
+      goalRef = namedMatch[1].trim();
+    }
+  }
+
+  return {
+    tool: "goal.archive_propose",
+    args: { goalRef, operation: isPause ? "pause" : "archive" },
+    rationale: `deterministic goal lifecycle shortcut: ${isPause ? "pause" : "archive"}`
+  };
 }
 
 function looksLikeGmailAlertSettingsRequest(text: string): boolean {

@@ -93,7 +93,7 @@ test("B. 'delete this goal' after a focused goal archives it honestly, not as a 
     const reply = await sendAgentMessage(server, userId, "delete this goal");
 
     assert.match(reply.reply, /learn guitar/i);
-    assert.match(reply.reply, /i'll archive it so it stops being active, not permanently delete the history/i);
+    assert.match(reply.reply, /won't permanently delete the history/i);
     assert.equal(reply.needsConfirmation, true);
     assert.equal(reply.debug.mutationExecuted, false);
 
@@ -192,7 +192,7 @@ test("E. Spanish 'pausa este objetivo' after a focused goal pauses it, resumably
     });
     const proposeReply = await sendAgentMessage(server, userId, "pausa este objetivo");
     assert.match(proposeReply.reply, /meditar cada dia/i);
-    assert.match(proposeReply.reply, /it will stop appearing as active until you resume it/i);
+    assert.match(proposeReply.reply, /it will stop appearing as active, but history stays/i);
 
     const confirmReply = await sendAgentMessage(server, userId, "yes");
     assert.match(confirmReply.reply, /paused "meditar cada dia"/i);
