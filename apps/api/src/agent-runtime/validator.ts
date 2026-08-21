@@ -94,7 +94,42 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
     if (!options.deterministicSource && visibleActions.length > 1 && !/\d/.test(message)) {
       const target = visibleActions.find((entity) => entity.id === args.actionId);
-      if (target && !actionReferenceGroundedInMessage(message, target.label)) {
+      const grounded = target ? actionReferenceGroundedInMessage(message, target.label) : undefined;
+      // A truly bare pronoun ("complete it," "done") has no real words at all to name a target
+      // with — actionGroundingWords(message) is empty — so there is nothing honest to suggest;
+      // that case still falls through to the plain multi-way ambiguity clarification below,
+      // exactly as before. The "did you mean X?" suggestion is only for a message that DOES name
+      // something specific ("complete brainstorm meeting") but not the candidate the planner
+      // picked.
+      const messageHasContent = actionGroundingWords(message).length > 0;
+      logActionGroundingDiagnostics(context.session.userId, {
+        tool: tool.name,
+        message,
+        suppliedActionId: String(args.actionId),
+        targetLabel: target?.label,
+        groundingTokens: actionGroundingWords(message),
+        trusted: grounded !== false
+      });
+
+      if (target && !grounded && messageHasContent) {
+        // Not silently discarded anymore — the planner's own guess is downgraded to a
+        // confirmable suggestion instead ("Did you mean X?"), since it's often a reasonable
+        // candidate even when the message alone doesn't specifically name it. A bare "yes" runs
+        // this exact operation (see runtime.ts's markActionClarificationPendingIfNeeded); any
+        // other reply is treated as "not that one."
+        const phrase = extractActionTargetPhrase(message);
+        return {
+          tool: tool.name,
+          args,
+          status: "needs_clarification",
+          requiresConfirmation: false,
+          clarificationQuestion: `I don't see an open action called "${phrase}". Did you mean "${target.label}"? Reply yes, or tell me which action.`,
+          rationale: operation.rationale,
+          suggestedConfirmOperation: { tool: tool.name, args: { ...args } }
+        };
+      }
+
+      if (target && !grounded) {
         delete args.actionId;
       }
     }
@@ -445,7 +480,17 @@ const ACTION_GROUNDING_STOPWORDS = new Set([
   "snoozed",
   "mark",
   "marked",
-  "as"
+  "as",
+  // A real Telegram smoke test found "complete brainstorm meeting" completing "Branding
+  // direction meeting" — the only shared word was "meeting," a generic activity-shape word that
+  // tells you nothing about WHICH meeting, exactly like "task"/"action"/"item" above. Widened
+  // with the rest of the generic vocabulary a mutation request commonly uses regardless of which
+  // real item is meant, so none of these ever count as evidence on their own.
+  "meeting",
+  "call",
+  "thing",
+  "todo",
+  "reminder"
 ]);
 
 /** A short word (>2 chars), stripped of the generic completion/archive/snooze vocabulary every
@@ -468,6 +513,44 @@ function actionReferenceGroundedInMessage(message: string, actionTitle: string):
     return false;
   }
   return actionGroundingWords(actionTitle).some((word) => messageWords.has(word));
+}
+
+const ACTION_TARGET_VERB_PREFIX_RE =
+  /^(please\s+)?(i(?:'ve| have)?\s+)?(complete[d]?|finish(?:ed)?|mark(?:ed)?|archive[d]?|dismiss(?:ed)?|snooze[d]?|done\s+with|done)\s+(the\s+|my\s+)?/i;
+const ACTION_TARGET_TRAILING_RE = /\s+(please|now|already|too)\.?$/i;
+
+/** Best-effort "what did the user actually call it" phrase for the "I don't see an open action
+ * called X" clarification — strips the leading verb ("complete"/"archive"/"snooze"/...) and a
+ * trailing filler word, then capitalizes the first letter so it reads as a quoted name rather
+ * than a mid-sentence fragment. Never perfect (free text has no grammar contract), but far more
+ * honest than echoing the whole raw message back, or a generic "that task" with no specifics. */
+function extractActionTargetPhrase(message: string): string {
+  const trimmed = message.trim();
+  const withoutVerb = trimmed.replace(ACTION_TARGET_VERB_PREFIX_RE, "").replace(ACTION_TARGET_TRAILING_RE, "").trim();
+  const phrase = withoutVerb || trimmed;
+  return phrase.charAt(0).toUpperCase() + phrase.slice(1);
+}
+
+function logActionGroundingDiagnostics(
+  userId: string,
+  input: { tool: string; message: string; suppliedActionId: string; targetLabel: string | undefined; groundingTokens: string[]; trusted: boolean }
+): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "action_grounding_check",
+      userId,
+      tool: input.tool,
+      suppliedActionId: input.suppliedActionId,
+      targetLabel: input.targetLabel,
+      groundingTokens: input.groundingTokens,
+      trusted: input.trusted,
+      rejectedForGenericOnlyOverlap: !input.trusted
+    })
+  );
 }
 
 type ActionRefResolution =

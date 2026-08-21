@@ -4,6 +4,7 @@ import type { ActionHygieneAction, ActionHygieneReport } from "../server-types.j
 import { isSnoozedDue } from "../utils/action-item.js";
 import { goalPriorityRank } from "../utils/goal-priority.js";
 import { daysBetween, daysBetweenLocalDates, formatDateInTimezone } from "../utils/datetime.js";
+import { isReminderCompanionAction } from "./reminder-companion.js";
 
 /**
  * Pure action-hygiene candidate-analysis logic, extracted from
@@ -27,12 +28,13 @@ export async function analyzeActionHygiene(userId: string, now: Date, timezone: 
   ]);
   const today = getLocalTodayRange(now, timezone);
   const goalsById = new Map(goals.map((goal) => [goal.id, goal]));
-  // Reminder companion rows (actionType "reminder" — the "remind me N minutes before" stubs
-  // action.create_pre_due_reminders creates) share this same ActionItem table/status ordering as
-  // real tasks, so an overdue/stale one could otherwise surface here as a "cleanup" candidate as
-  // if it were a standalone task — the same leak fixed for action.list/action.reminder_list in
-  // apps/api/src/agent-runtime/executor.ts.
-  const openActions = actions.filter((action) => action.actionType !== "reminder" && (action.status === "open" || isSnoozedDue(action, now)));
+  // Reminder companion rows (see reminder-companion.ts's isReminderCompanionAction — actionType
+  // "reminder," a pre_due_reminder: sourceId, or a "Reminder for X"/"Reminder: X" legacy title,
+  // whichever field is actually reliable for a given row) share this same ActionItem table/status
+  // ordering as real tasks, so an overdue/stale one could otherwise surface here as a "cleanup"
+  // candidate as if it were a standalone task — the same leak fixed for
+  // action.list/action.reminder_list in apps/api/src/agent-runtime/executor.ts.
+  const openActions = actions.filter((action) => !isReminderCompanionAction(action) && (action.status === "open" || isSnoozedDue(action, now)));
   const analyzed = openActions
     .map((action) => analyzeActionHygieneItem(action, goalsById.get(action.goalId ?? ""), today, now, timezone))
     .filter(Boolean) as ActionHygieneAction[];

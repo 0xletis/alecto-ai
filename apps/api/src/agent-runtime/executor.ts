@@ -61,6 +61,7 @@ import {
 import { inferActionGoalLink } from "../utils/action-goal-link.js";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
+import { isReminderCompanionAction, REMINDER_TITLE_PREFIX_RE, resolveReminderParent } from "../actions/reminder-companion.js";
 import { applyActionHygieneBatchOperations, type ActionHygieneBatchOperation, type HygieneOperation } from "../actions/hygiene.js";
 import { findEmailRulesByTarget, sortEmailRuleCandidates } from "../conversation/email-rule-selection.js";
 import {
@@ -137,18 +138,26 @@ export async function executeOperation(
         // action.reminder_list/action.meeting_list already use below.
         const pool = await getActionItems(userId, { status, limit: Math.max(limit * 4, 40) });
         const realActions = pool
-          .filter((item) => item.actionType !== "reminder")
+          .filter((item) => !isReminderCompanionAction(item))
           .filter((item) => !overdueOnly || (item.status === "open" && Boolean(item.dueAt) && item.dueAt! < now));
         const items = realActions.slice(0, limit);
 
         const reminderByParentId = new Map<string, ActionItem>();
         for (const item of pool) {
-          if (item.actionType === "reminder" && item.status !== "archived" && item.status !== "completed") {
-            const parentId = parentActionIdFromReminderSourceId(item.actionType, item.sourceId);
-            if (parentId) {
-              reminderByParentId.set(parentId, item);
+          if (isReminderCompanionAction(item) && item.status !== "archived" && item.status !== "completed") {
+            const parent = resolveReminderParent(item, pool);
+            if (parent) {
+              reminderByParentId.set(parent.id, item);
             }
           }
+        }
+
+        if (process.env.AGENT_RUNTIME_DIAGNOSTICS === "true") {
+          const excludedCount = pool.filter(isReminderCompanionAction).length;
+          console.log(
+            "[agent-runtime-diagnostics]",
+            JSON.stringify({ phase: "action_list_reminder_filter", userId, poolSize: pool.length, excludedReminderCount: excludedCount, returned: items.length })
+          );
         }
 
         return {
@@ -163,21 +172,22 @@ export async function executeOperation(
       case "action.reminder_list": {
         const settings = await getOrCreateNotificationSettings(userId);
         const items = await getActionItems(userId, { status: "all", limit: 100 });
-        const parentsById = new Map(items.filter((item) => item.actionType !== "reminder").map((item) => [item.id, item]));
+        const parentsById = new Map(items.filter((item) => !isReminderCompanionAction(item)).map((item) => [item.id, item]));
         // completeActionItem/archiveActionItem never cascade to a reminder companion (no
         // ActionItem schema change to add that link) — so once the parent task is done, its
         // reminder is still technically "open" in the DB unless something else already archived
         // it. Excluded here by parent status so it stops appearing as if it were still relevant,
         // rather than lingering as a separate active-looking reminder for a task that's finished.
+        // A reminder whose parent can't be resolved at all (a genuinely unlinked/malformed
+        // companion) is kept — shown honestly as unlinked rather than silently dropped.
         const reminders = activeReminderActionsFromActionList(items).filter((reminder) => {
-          const parentId = parentActionIdFromReminderSourceId(reminder.actionType, reminder.sourceId);
-          const parent = parentId ? parentsById.get(parentId) : undefined;
+          const parent = resolveReminderParent(reminder, items);
           return !parent || (parent.status !== "completed" && parent.status !== "archived");
         });
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatReminderActionsForChat(reminders, parentsById, settings.timezone),
+          summary: formatReminderActionsForChat(reminders, items, settings.timezone),
           result: reminders,
           entities: reminders.map((reminder, index) => actionToEntity(reminder, index + 1))
         };
@@ -240,11 +250,13 @@ export async function executeOperation(
         // is a real reported pattern once the parent task is already done — completing the stub
         // too would just be a second, confusing "completion" of what is really one piece of work.
         // Resolved here rather than in validator.ts since it needs a real DB lookup, not just
-        // session state.
+        // session state. isReminderCompanionAction catches this even for a legacy/malformed
+        // companion whose actionType isn't "reminder" — resolveReminderParent falls back to
+        // matching its own denormalized title text when its sourceId can't be parsed.
         const target = await getActionItem(userId, actionId);
-        if (target?.actionType === "reminder") {
-          const parentId = parentActionIdFromReminderSourceId(target.actionType, target.sourceId);
-          const parent = parentId ? await getActionItem(userId, parentId) : undefined;
+        if (target && isReminderCompanionAction(target)) {
+          const pool = await getActionItems(userId, { status: "all", limit: 100 });
+          const parent = resolveReminderParent(target, pool);
 
           if (parent && (parent.status === "completed" || parent.status === "archived")) {
             // A reminder isn't something you DO, so "complete" doesn't really fit it once it's
@@ -2077,6 +2089,7 @@ export function parentActionIdFromReminderSourceId(actionType: string | null | u
   return match?.[1];
 }
 
+
 function preDueReminderLeadMinutes(sourceId: string): number | undefined {
   const match = sourceId.match(/^pre_due_reminder:[^:]+:(\d+)$/);
   const minutes = match?.[1] ? Number(match[1]) : undefined;
@@ -2086,7 +2099,7 @@ function preDueReminderLeadMinutes(sourceId: string): number | undefined {
 function activeReminderActionsFromActionList(actions: ActionItem[]): ActionItem[] {
   return actions
     .filter((action) => action.status !== "archived" && action.status !== "completed")
-    .filter((action) => action.actionType === "reminder")
+    .filter(isReminderCompanionAction)
     .filter((action) => Boolean(action.dueAt))
     .sort((left, right) => (left.dueAt?.getTime() ?? Number.POSITIVE_INFINITY) - (right.dueAt?.getTime() ?? Number.POSITIVE_INFINITY));
 }
@@ -2094,7 +2107,7 @@ function activeReminderActionsFromActionList(actions: ActionItem[]): ActionItem[
 function meetingActionsFromActionList(actions: ActionItem[]): ActionItem[] {
   return actions
     .filter((action) => action.status !== "archived" && action.status !== "completed")
-    .filter((action) => action.actionType !== "reminder")
+    .filter((action) => !isReminderCompanionAction(action))
     .filter((action) => Boolean(action.dueAt))
     .filter(isMeetingLikeAction)
     .sort((left, right) => (left.dueAt?.getTime() ?? Number.POSITIVE_INFINITY) - (right.dueAt?.getTime() ?? Number.POSITIVE_INFINITY));
@@ -2102,12 +2115,7 @@ function meetingActionsFromActionList(actions: ActionItem[]): ActionItem[] {
 
 function preDueReminderActionsFromActionList(actions: ActionItem[]): ActionItem[] {
   return actions.filter(
-    (action) =>
-      action.status !== "archived" &&
-      action.status !== "completed" &&
-      action.actionType === "reminder" &&
-      action.source === "system" &&
-      Boolean(action.sourceId?.startsWith("pre_due_reminder:"))
+    (action) => action.status !== "archived" && action.status !== "completed" && isReminderCompanionAction(action) && Boolean(action.sourceId?.startsWith("pre_due_reminder:"))
   );
 }
 
@@ -2204,27 +2212,38 @@ function formatReminderMetadataForChat(reminder: ActionItem): string {
  * reminder's own earlier due time) — "Brainstorm meeting — reminder 30 minutes before (due today
  * 09:00)" reads as one fact about one task, not two disconnected list entries.
  */
-function formatReminderActionsForChat(reminders: ActionItem[], parentsById: Map<string, ActionItem>, timezone: string): string {
+function formatReminderActionsForChat(reminders: ActionItem[], candidates: ActionItem[], timezone: string): string {
   if (reminders.length === 0) {
     return "No reminders are currently scheduled.";
   }
 
-  return [
-    "Your reminders:",
-    ...reminders.map((reminder) => {
-      const parentId = reminder.sourceId ? parentActionIdFromReminderSourceId(reminder.actionType, reminder.sourceId) : undefined;
-      const parent = parentId ? parentsById.get(parentId) : undefined;
-      const title = parent?.title ?? reminderTitleForChat(reminder.title);
-      const leadMinutes = reminder.sourceId ? preDueReminderLeadMinutes(reminder.sourceId) : undefined;
-      const leadLine = leadMinutes === undefined ? "" : ` — ${leadMinutes === 0 ? "reminder at due time" : `reminder ${leadMinutes} minutes before`}`;
-      const dueLine = parent?.dueAt ? ` (due ${formatDueLabelForChat(parent.dueAt, timezone)})` : ` (${formatLocalDateTime(reminder.dueAt, timezone)})`;
-      return `- ${title}${leadLine}${dueLine}`;
-    })
-  ].join("\n");
+  const linked = reminders.filter((reminder) => resolveReminderParent(reminder, candidates));
+  const unlinked = reminders.filter((reminder) => !resolveReminderParent(reminder, candidates));
+
+  const lines = ["Your reminders:"];
+  linked.forEach((reminder) => {
+    const parent = resolveReminderParent(reminder, candidates)!;
+    const leadMinutes = reminder.sourceId ? preDueReminderLeadMinutes(reminder.sourceId) : undefined;
+    const leadLine = leadMinutes === undefined ? "" : ` — ${leadMinutes === 0 ? "reminder at due time" : `reminder ${leadMinutes} minutes before`}`;
+    const dueLine = parent.dueAt ? ` (due ${formatDueLabelForChat(parent.dueAt, timezone)})` : ` (${formatLocalDateTime(reminder.dueAt, timezone)})`;
+    lines.push(`- ${parent.title}${leadLine}${dueLine}`);
+  });
+
+  // A reminder whose parent can't be resolved at all (deleted, or a genuinely malformed legacy
+  // row with no matching title) — shown honestly as unlinked rather than silently hidden or
+  // mixed in as if it belonged to a real, current task.
+  if (unlinked.length > 0) {
+    lines.push("", "Unlinked reminders (no matching task found):");
+    unlinked.forEach((reminder) => {
+      lines.push(`- ${reminderTitleForChat(reminder.title)} (${formatLocalDateTime(reminder.dueAt, timezone)})`);
+    });
+  }
+
+  return lines.join("\n");
 }
 
 function reminderTitleForChat(title: string): string {
-  return title.replace(/^reminder:\s*/i, "").trim() || title;
+  return title.replace(REMINDER_TITLE_PREFIX_RE, "").trim() || title;
 }
 
 function normalizeSearchText(text: string): string {

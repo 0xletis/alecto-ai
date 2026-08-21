@@ -111,6 +111,15 @@ export interface ValidatedOperation {
   error?: string;
   clarificationQuestion?: string;
   rationale?: string;
+  /**
+   * Set only on a "needs_clarification" action-reference op (validator.ts's ACTION_REFERENCE_TOOLS
+   * grounding check) when exactly one specific candidate was rejected for weak (generic-only)
+   * grounding — carries the real tool+args a bare "yes" should run, so the clarification reads as
+   * a confirmable suggestion ("Did you mean X? Reply yes...") rather than a dead end that discards
+   * the planner's own guess entirely. runtime.ts's markActionClarificationPendingIfNeeded installs
+   * this as the session's real pending operation instead of the inert clarification.ask stub.
+   */
+  suggestedConfirmOperation?: { tool: string; args: Record<string, unknown> };
 }
 
 export interface ExecutedOperation {
