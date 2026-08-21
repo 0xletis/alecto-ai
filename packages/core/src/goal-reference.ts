@@ -110,7 +110,28 @@ function fuzzyWordMatches(a: string, b: string): boolean {
  * recency), rather than trying to text-match "it" against real goal titles. */
 export function isPronounGoalReference(goalRef: string): boolean {
   const normalized = normalizeGoalText(goalRef);
-  return ["it", "that", "this", "that goal", "this goal", "that one", "this one", "the new one", "the one i just made", "the one i just created"].includes(normalized);
+  return [
+    "it",
+    "that",
+    "this",
+    "that goal",
+    "this goal",
+    "that one",
+    "this one",
+    "the new one",
+    "the one i just made",
+    "the one i just created",
+    // Spanish/Catalan equivalents — added for goal-lifecycle phrases like "pausa este objetivo"
+    // ("pause this goal") and "deixa de seguir aquest objectiu" ("stop following this goal").
+    "eso",
+    "esto",
+    "ese objetivo",
+    "este objetivo",
+    "esa meta",
+    "esta meta",
+    "aquest objectiu",
+    "aquest"
+  ].includes(normalized);
 }
 
 export type ActiveGoalReferenceStatus = "matched" | "ambiguous" | "no_match";

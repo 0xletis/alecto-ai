@@ -16,6 +16,7 @@ import type {
   ExtractedEvent,
   GithubPublicConnectionInput,
   Goal,
+  GoalStatus,
   MemoryEntry,
   NotificationSettings,
   PendingMemoryCreatePayload,
@@ -434,6 +435,32 @@ export async function archiveGoal(userId: string, goalId: string): Promise<Goal 
   const goal = await prisma.goal.update({
     where: { id: goalId },
     data: { status: "archived" }
+  });
+
+  return toGoal(goal);
+}
+
+/**
+ * Generic goal-lifecycle status transition (active/paused/archived) — the schema's own
+ * GoalStatus enum already has all three states, so pausing/resuming/archiving a goal is a plain
+ * status write, never a new field or a schema change. Added for Agent Runtime v3's
+ * goal.archive_propose/goal.archive_apply (pause and archive both use this; archiveGoal above is
+ * kept as-is for its existing legacy/REST callers rather than rewritten to call this).
+ */
+export async function setGoalStatus(userId: string, goalId: string, status: GoalStatus): Promise<Goal | undefined> {
+  await ensureUser(userId);
+
+  const existingGoal = await prisma.goal.findFirst({
+    where: { id: goalId, userId }
+  });
+
+  if (!existingGoal) {
+    return undefined;
+  }
+
+  const goal = await prisma.goal.update({
+    where: { id: goalId },
+    data: { status }
   });
 
   return toGoal(goal);

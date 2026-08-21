@@ -1,8 +1,8 @@
-import { createMemory, getMostRecentlyRemindedActionItem, rejectPendingAction, type PendingAction } from "@operator-agent/db";
+import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, rejectPendingAction, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
-import { executeOperation } from "./executor.js";
+import { executeOperation, parentActionIdFromReminderSourceId } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
@@ -1418,6 +1418,18 @@ async function resolveMostRecentlyNotifiedOrVisibleActionId(
     since: new Date(Date.now() - 24 * 60 * 60 * 1000)
   });
   if (remindedAction) {
+    // A "remind me N minutes before" companion ActionItem (actionType "reminder") is a stub
+    // about a real task, not the task itself — the worker's own ActionItemReminderLog points at
+    // the STUB's own id when it fires one of these. A core-operator audit found that "complete
+    // it" right after such a reminder was silently completing the stub while the real task
+    // stayed open, untouched, and still due. Resolve back to the real parent task instead.
+    const parentActionId = parentActionIdFromReminderSourceId(remindedAction.actionType, remindedAction.sourceId);
+    if (parentActionId) {
+      const parent = await getActionItem(context.session.userId, parentActionId);
+      if (parent && parent.status !== "archived" && parent.status !== "completed") {
+        return { actionId: parent.id, source: "reminded_by_worker" };
+      }
+    }
     return { actionId: remindedAction.id, source: "reminded_by_worker" };
   }
 

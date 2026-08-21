@@ -271,7 +271,13 @@ async function persistVisibleEntitiesForDeliveredNudge(
     visibleEntities: entities,
     recentMutations: existing?.recentMutations ?? [],
     messages: nextMessages,
-    expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000)
+    // Deliberately real wall-clock time, not the `now` parameter above (which is the SIMULATED
+    // decision time used only for proactive-eligibility windowing/message timestamping, and in
+    // tests is a fixed historical date). Session TTL is a real runtime concept — conversation-
+    // session.ts's own loadPersistedSession compares this against the real Date.now() on every
+    // later load, so basing it on a simulated "now" would make the session expire at the wrong
+    // real-world moment (or, for a fixed-past test date, already-expired the instant it's read).
+    expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
   });
 }
 

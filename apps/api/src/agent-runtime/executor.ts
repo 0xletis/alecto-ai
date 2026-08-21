@@ -21,6 +21,7 @@ import {
   getNotificationLog,
   hasNotificationLog,
   rescheduleActionItem,
+  setGoalStatus,
   snoozeActionItem,
   updateEmailSignalRule,
   updateIntegrationConnectionConfig,
@@ -1474,6 +1475,94 @@ export async function executeOperation(
         };
       }
 
+      case "goal.archive_propose": {
+        const goalRef = args.goalRef as string | undefined;
+        const lifecycleOperation = args.operation as "archive" | "pause";
+        const outcome = resolveGoalForLifecycleAction(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
+
+        if (outcome.status === "no_match") {
+          if (context.activeGoals.length === 0) {
+            return { tool: operation.tool, status: "executed", summary: "You don't have any active goals to archive or pause.", result: [] };
+          }
+          return failed(operation.tool, `I couldn't find an active goal matching "${goalRef ?? ""}". Say "show me all my goals" to see what's active.`);
+        }
+
+        if (outcome.status === "ambiguous") {
+          // Deliberately status "executed" with a question as the summary, exactly like goal
+          // .status/goal.tracking_show's own ambiguous case above — never opens a pending
+          // confirmation, so goal.archive_apply is never queued against an unresolved target.
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: describeAmbiguousGoalChoice(outcome.goals),
+            result: outcome.goals
+          };
+        }
+
+        const goal = outcome.goals[0];
+        const targetStatus = lifecycleOperation === "archive" ? "archived" : "paused";
+
+        if (goal.status === targetStatus) {
+          const stateLabel = goal.status === "archived" ? "archived" : "paused";
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `"${goal.title}" is already ${stateLabel}. Nothing to change.`,
+            entities: [goalToEntity(goal)]
+          };
+        }
+
+        // "delete"/"remove" (English) and "elimina"/"borra" (Spanish) are honored as intent to
+        // archive — Alecto never permanently deletes goal history — but the confirmation must say
+        // so honestly rather than silently reinterpreting the user's own destructive wording.
+        const usedDeleteWording = /\b(delete|remove|elimina|elimina[r]?|borra[r]?)\b/i.test(message);
+        const consequenceLine =
+          lifecycleOperation === "archive"
+            ? usedDeleteWording
+              ? "I'll archive it so it stops being active, not permanently delete the history."
+              : "It will stop appearing as active, but history stays."
+            : "It will stop appearing as active until you resume it.";
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `You're about to ${lifecycleOperation} "${goal.title}". ${consequenceLine} Reply yes to confirm or cancel.`,
+          entities: [goalToEntity(goal)],
+          pendingOperationUpdate: {
+            topic: "goal_lifecycle",
+            summary: `${lifecycleOperation} "${goal.title}"`,
+            operations: [
+              {
+                tool: "goal.archive_apply",
+                args: { goalId: goal.id, goalTitle: goal.title, operation: lifecycleOperation },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "goal.archive_apply": {
+        const goalId = args.goalId as string;
+        const goalTitle = args.goalTitle as string;
+        const lifecycleOperation = args.operation as "archive" | "pause" | "resume";
+        const nextStatus = lifecycleOperation === "resume" ? "active" : lifecycleOperation === "pause" ? "paused" : "archived";
+
+        const updated = await setGoalStatus(userId, goalId, nextStatus);
+        if (!updated) {
+          return failed(operation.tool, `"${goalTitle}" no longer exists.`);
+        }
+
+        const verb = lifecycleOperation === "resume" ? "Resumed" : lifecycleOperation === "pause" ? "Paused" : "Archived";
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `${verb} "${goalTitle}".`,
+          entities: [goalToEntity(updated)]
+        };
+      }
+
       case "operator.today": {
         const dueToday = context.openActions.filter((action) => action.dueAt && isToday(action.dueAt));
         const parts = [
@@ -1902,6 +1991,22 @@ function preDueReminderSourceId(actionId: string, leadMinutes: number): string {
   return `pre_due_reminder:${actionId}:${leadMinutes}`;
 }
 
+/**
+ * Inverse of preDueReminderSourceId — resolves a "remind me N minutes before" companion
+ * ActionItem (actionType "reminder", source "system") back to the real task it's about. Exported
+ * for runtime.ts's resolveMostRecentlyNotifiedOrVisibleActionId: the worker's own
+ * ActionItemReminderLog points at the companion stub's own id when a positive-lead reminder
+ * fires, and a bare "complete it" right after must resolve to the real task, never silently
+ * complete the stub while the real task stays open and due.
+ */
+export function parentActionIdFromReminderSourceId(actionType: string | null | undefined, sourceId: string | null | undefined): string | undefined {
+  if (actionType !== "reminder" || !sourceId) {
+    return undefined;
+  }
+  const match = sourceId.match(/^pre_due_reminder:([^:]+):\d+$/);
+  return match?.[1];
+}
+
 function preDueReminderLeadMinutes(sourceId: string): number | undefined {
   const match = sourceId.match(/^pre_due_reminder:[^:]+:(\d+)$/);
   const minutes = match?.[1] ? Number(match[1]) : undefined;
@@ -2262,6 +2367,34 @@ function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: G
   }
 
   const resolution = resolveActiveGoalReference(goalRef, activeGoals, { mostRecent: activeGoals[0], currentFocus });
+
+  if (resolution.status === "matched" && resolution.goal) {
+    return { status: "matched", goals: [resolution.goal] };
+  }
+
+  if (resolution.status === "ambiguous" && resolution.candidates) {
+    return { status: "ambiguous", goals: resolution.candidates };
+  }
+
+  return { status: "no_match", goals: [] };
+}
+
+/**
+ * Goal resolution for lifecycle mutations (archive/pause) — deliberately STRICTER than
+ * resolveGoalReferenceTargets above. That function falls back to `mostRecent` (activeGoals[0], the
+ * newest-created goal) for a bare/empty reference, which is fine for a read-only goal.status
+ * question but not safe for a mutation: "archive it" with no goalRef and no established
+ * conversation focus must never silently archive "whichever goal happens to be newest" — it must
+ * ask, or say there's nothing in view, never guess. `mostRecent` is intentionally omitted here;
+ * only an explicit title match or the conversation's own currentFocus (e.g. right after
+ * goal.status showed exactly one goal) can resolve a lifecycle target.
+ */
+function resolveGoalForLifecycleAction(goalRef: string | undefined, activeGoals: Goal[], currentFocus?: Goal): GoalReferenceOutcome {
+  if (activeGoals.length === 0) {
+    return { status: "no_match", goals: [] };
+  }
+
+  const resolution = resolveActiveGoalReference(goalRef, activeGoals, { currentFocus });
 
   if (resolution.status === "matched" && resolution.goal) {
     return { status: "matched", goals: [resolution.goal] };

@@ -596,6 +596,28 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "goal.archive_propose",
+    description:
+      "Propose archiving (making inactive, history kept) or pausing (temporarily inactive, resumable) one active goal — opens a pending confirmation, never applies until an exact 'yes'. Use for 'archive this goal', 'stop tracking this goal', 'delete this goal', 'remove this goal', 'I don't want to track Meditations anymore' (English); 'deja de seguir este objetivo', 'elimina este objetivo' (Spanish, operation archive); 'pausa este objetivo', 'pause this goal' (operation pause). 'Delete'/'remove'/'elimina' wording is honored as intent to archive (Alecto never permanently deletes goal history) — the tool's own response corrects the framing honestly, never silently reinterprets it as something else. goalRef is the goal's own wording as the user referred to it (a title, or a bare pronoun like 'this goal' right after it was shown/discussed) — matched the same way goal.status matches it, including 'this goal' resolving to whichever goal the conversation is currently focused on. If it could plausibly mean more than one active goal, or matches none, this asks/says so instead of guessing — never plan goal.archive_apply directly to force a target.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalRef: z.string().min(1).optional().describe("The goal's own wording, e.g. 'Meditations', 'this goal', 'my reading goal'. Never an invented id."),
+      operation: z.enum(["archive", "pause"]).describe("archive = inactive, history kept, not resumable through chat today. pause = temporarily inactive, resumable via 'resume this goal'.")
+    })
+  },
+  {
+    name: "goal.archive_apply",
+    description: "Internal: applies the confirmed goal archive/pause. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalId: z.string().min(1),
+      goalTitle: z.string().min(1),
+      operation: z.enum(["archive", "pause", "resume"])
+    })
+  },
+  {
     name: "proactive.settings_show",
     description:
       "Show which automatic messages (morning brief, evening check-in, Gmail alerts) are currently on/off for the user, including their scheduled time when on. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', 'are Gmail alerts on?'.",

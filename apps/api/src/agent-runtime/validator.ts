@@ -351,6 +351,23 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     };
   }
 
+  // Same reasoning again: goal.archive_apply is never planned by the LLM directly, only ever
+  // reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by goal.archive_propose after resolving a real, unambiguous goal. A
+  // direct plan would have no verified goalId/operation to put there anyway — this is the one
+  // place an archive/pause actually happens, so it must never run without an exact confirmation
+  // of the plan goal.archive_propose already showed the user.
+  if (tool.name === "goal.archive_apply") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending goal archive/pause change",
+      rationale: operation.rationale
+    };
+  }
+
   if (
     tool.name === "proactive.settings_propose_update" &&
     args.morningBriefEnabled === undefined &&
