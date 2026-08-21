@@ -59,7 +59,8 @@ export function validateOperations(
         status: "invalid",
         requiresConfirmation: false,
         error: indexResolution.clarification,
-        rationale: operation.rationale
+        rationale: operation.rationale,
+        standaloneError: true
       };
     });
   }

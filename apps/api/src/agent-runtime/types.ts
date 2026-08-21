@@ -128,6 +128,15 @@ export interface ValidatedOperation {
    * your last shown list") instead of a plain "Completed" that gives no hint it wasn't visible.
    */
   actionOutsideVisiblePage?: boolean;
+  /**
+   * Set on an "invalid"/"unsupported" op whose `error` is already a complete, user-ready sentence
+   * (e.g. validator.ts's own explicit-index-out-of-range copy: "I only showed 8 actions. Use a
+   * number from 1–8..."), rather than a short clause meant to be dropped into
+   * response-composer.ts's "I couldn't {action} because {error}. Nothing was changed." template.
+   * Without this, the two combine into an awkward, sometimes doubly-punctuated composite line —
+   * response-composer.ts uses the error text as-is when this is true.
+   */
+  standaloneError?: boolean;
 }
 
 export interface ExecutedOperation {
