@@ -6,7 +6,7 @@ import type { NextWeekPlanSuggestion } from "../server-types.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
-const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
+export const ACTION_REFERENCE_TOOLS = new Set(["action.snooze", "action.complete", "action.archive"]);
 const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
   "gmail.review.reject",
   "gmail.review.inspect",

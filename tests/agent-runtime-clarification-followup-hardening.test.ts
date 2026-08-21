@@ -9,6 +9,7 @@ import {
   assertNoGenericAgentError,
   buildServer,
   clearAgentRuntimeMocks,
+  getAgentSession,
   mockGuardrail,
   mockPlan,
   op,
@@ -368,6 +369,101 @@ test("F. a planner supplying an actionId grounded in a specific named reference 
       const item = await prisma.actionItem.findUnique({ where: { id } });
       assert.equal(item?.status, "open", `action ${id} must remain untouched`);
     }
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// A real Telegram smoke test found that after Alecto asks "Which action do you mean?", a direct
+// "cancel this" answer ("none," "no action," "nothing," "never mind," "cancel," "i mean NO
+// ACTION") fell through to the real planner with no way to know a clarification was just open,
+// and got misread as an unrelated action-cleanup request. Root cause: a needs_clarification
+// result never persisted ANY session state, so the next turn had nothing to distinguish "this is
+// answering my own question" from a fresh, unrelated message. Fixed by marking
+// session.pendingOperation with a lightweight ACTION_CLARIFICATION_TOPIC marker (operations: [],
+// so it can never trip the mutation firewall meant for real yes/no confirmations) whenever an
+// action.complete/archive/snooze reference is genuinely ambiguous, and checking a dedicated
+// cancel-phrase pattern against it before anything else runs.
+
+const ACTION_CLARIFICATION_CANCEL_PHRASES = [
+  ["1", "none"],
+  ["2", "no action"],
+  ["3", "nothing"],
+  ["4", "never mind"],
+  ["5", "cancel"],
+  ["6", "i mean NO ACTION"]
+] as const;
+
+for (const [label, phrase] of ACTION_CLARIFICATION_CANCEL_PHRASES) {
+  test(`G-${label}. '${phrase}' cancels an open action-completion clarification, no mutation`, async () => {
+    const server = buildServer();
+    const userId = `action-clarification-cancel-${label}-${randomUUID()}`;
+
+    try {
+      const ids = await seedActionItems(userId, ["Check cheap car listings twice", "Renew passport", "Follow up with recruiter"]);
+      mockPlan(actionListPlan());
+      await sendAgentMessage(server, userId, "show all tasks");
+
+      // Simulates the real planner's own observed behavior for a genuinely ambiguous "complete
+      // it": omitting actionId and letting the validator ask.
+      mockPlan({ topic: "actions", intent: "complete", operations: [op("action.complete", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+      const clarify = await sendAgentMessage(server, userId, "complete it");
+      assertNoGenericAgentError(clarify);
+      assertClarificationResponse(clarify, "complete it");
+      assert.match(clarify.reply, /which action do you mean/i);
+
+      const rowAfterClarify = await getAgentSession(userId);
+      assert.equal((rowAfterClarify?.pendingOperation as { topic?: string } | null)?.topic, "action_clarification", "the clarification must be tracked as pending");
+
+      const reply = await sendAgentMessage(server, userId, phrase);
+      assertNoGenericAgentError(reply);
+      assert.equal(reply.reply, "Okay — I won't complete anything.", phrase);
+      assert.equal(reply.debug.mutationExecuted, false, phrase);
+      assert.deepEqual(reply.operationsPlanned, [], phrase);
+      assert.doesNotMatch(reply.reply, /which action do you mean|actions worth cleaning up/i, phrase);
+
+      const rowAfterCancel = await getAgentSession(userId);
+      assert.equal(rowAfterCancel?.pendingOperation, null, "the pending clarification must be cleared");
+
+      for (const id of ids) {
+        const item = await prisma.actionItem.findUnique({ where: { id } });
+        assert.equal(item?.status, "open", `action ${id} must remain untouched (${phrase})`);
+      }
+    } finally {
+      clearAgentRuntimeMocks();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  });
+}
+
+test("H. cancelling an action-completion clarification does not block a later, unrelated mutation", async () => {
+  const server = buildServer();
+  const userId = `action-clarification-cancel-then-new-${randomUUID()}`;
+
+  try {
+    const ids = await seedActionItems(userId, ["Check cheap car listings twice", "Renew passport", "Follow up with recruiter"]);
+    mockPlan(actionListPlan());
+    await sendAgentMessage(server, userId, "show all tasks");
+
+    mockPlan({ topic: "actions", intent: "complete", operations: [op("action.complete", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    await sendAgentMessage(server, userId, "complete it");
+
+    await sendAgentMessage(server, userId, "none");
+
+    // A fresh, unrelated, unambiguous named completion right after cancelling must work
+    // normally — the cleared marker must not leave any stale firewall/state behind.
+    const targetId = ids[1]!;
+    mockPlan({ topic: "actions", intent: "complete_named", operations: [op("action.complete", { actionId: targetId })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const reply = await sendAgentMessage(server, userId, "complete the passport renewal task");
+    assertNoGenericAgentError(reply);
+    assert.deepEqual(reply.operationsPlanned.map((operation) => operation.tool), ["action.complete"]);
+    assert.equal(reply.debug.mutationExecuted, true);
+
+    const target = await prisma.actionItem.findUnique({ where: { id: targetId } });
+    assert.equal(target?.status, "completed");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

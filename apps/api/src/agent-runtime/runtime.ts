@@ -8,7 +8,7 @@ import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
-import { revalidateForExecution, validateOperations } from "./validator.js";
+import { ACTION_REFERENCE_TOOLS, revalidateForExecution, validateOperations } from "./validator.js";
 import type {
   AgentDebugInfo,
   AgentEntity,
@@ -54,6 +54,59 @@ const CONFIRM_WHITELIST = new Set([
 const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget it", "cancelar", "cancela"]);
 
 const NO_PENDING_REPLY = "I don't have anything pending to confirm.";
+
+// Marks session.pendingOperation as "an ambiguous action-completion clarification is open" —
+// there is nothing here to actually confirm, so the mutation firewall below (which exempts this
+// exact topic) never treats it like a real yes/no confirmation and blocks an unrelated later
+// request the way a genuine pending mutation should.
+const ACTION_CLARIFICATION_TOPIC = "action_clarification";
+const ACTION_CLARIFICATION_CANCEL_REPLY = "Okay — I won't complete anything.";
+
+/**
+ * "none," "no action," "nothing," "never mind," "cancel," "i mean NO ACTION" — a direct answer
+ * to Alecto's own "Which action do you mean?" clarification that means "don't do anything,"
+ * never a fresh, unrelated request. A real Telegram smoke test found this fell through to the
+ * real planner with no way to know a clarification was just asked, and got misread as an
+ * action-cleanup request ("Here are the actions worth cleaning up..."). Only ever checked when
+ * session.pendingOperation.topic is ACTION_CLARIFICATION_TOPIC (see call site), so this never
+ * touches an unrelated "none"/"nothing" said at some other point in the conversation.
+ */
+function looksLikeActionClarificationCancelReply(message: string): boolean {
+  const normalized = normalizeExactMessage(message);
+  if (["none", "no action", "nothing", "never mind", "nevermind", "cancel", "forget it"].includes(normalized)) {
+    return true;
+  }
+  const text = normalizeIntentText(message);
+  return /\bno\s+action\b|\bnone\b|\bnothing\b|\bnever\s*mind\b|\bforget it\b|\bcancel\b/.test(text);
+}
+
+/** Only ever needed for action.complete/archive/snooze's own reference-ambiguity clarification
+ * (validator.ts's ACTION_REFERENCE_TOOLS) — a goal-shaped or Gmail-review-shaped clarification
+ * question is answered differently (a real confirm/cancel flow, or just re-asking) and must not
+ * be mistaken for "waiting on which action the user meant." */
+function markActionClarificationPendingIfNeeded(
+  session: AgentSessionState,
+  validatedOps: ValidatedOperation[],
+  clarificationQuestion: string | undefined
+): void {
+  if (!clarificationQuestion) {
+    return;
+  }
+  const isActionReferenceAmbiguity = validatedOps.some((op) => op.status === "needs_clarification" && ACTION_REFERENCE_TOOLS.has(op.tool));
+  if (isActionReferenceAmbiguity) {
+    // A non-empty, real ValidatedOperation shape — asPendingOperation (session-store.ts) treats
+    // an empty operations array as corrupted data and discards it on the very next load, which
+    // would silently drop this marker before the cancel-phrase check ever saw it. clarification
+    // .ask itself is never executed (nothing reads this array as something to run); it exists
+    // purely so the record round-trips through persistence intact.
+    setPendingOperation(
+      session,
+      createPendingOperationRecord(ACTION_CLARIFICATION_TOPIC, clarificationQuestion, [
+        { tool: "clarification.ask", args: { question: clarificationQuestion }, status: "valid", requiresConfirmation: false }
+      ])
+    );
+  }
+}
 
 // Deliberately narrow, hardcoded-safe pattern: Gmail send/reply/forward/delete
 // has no tool in the catalog at all, so this is enforced deterministically
@@ -354,6 +407,24 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const pending = context.session.pendingOperation;
   const normalized = normalizeExactMessage(message);
 
+  // Checked before the general confirm/cancel whitelist below so all six supported cancel
+  // phrases ("none," "no action," "nothing," "never mind," "cancel," "i mean NO ACTION") get the
+  // SAME specific reply here, rather than "cancel"/"never mind" alone falling through to the
+  // generic "Cancelled — I won't do that." from finalizeDeterministicCancellation.
+  if (pending?.topic === ACTION_CLARIFICATION_TOPIC && looksLikeActionClarificationCancelReply(message)) {
+    setPendingOperation(context.session, null);
+    setVisibleEntities(context.session, []);
+    return finalize(context, {
+      reply: ACTION_CLARIFICATION_CANCEL_REPLY,
+      operationsPlanned: [],
+      executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: ACTION_CLARIFICATION_CANCEL_REPLY }],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: ACTION_CLARIFICATION_TOPIC
+    });
+  }
+
   // Exact confirm/cancel is checked FIRST and ALWAYS — regardless of whether a pending
   // operation exists — so a bare "yes"/"no" with nothing pending gets the deterministic
   // "nothing pending" reply instead of falling through to the LLM planner, which has been
@@ -609,8 +680,10 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // Pending-operation firewall: while a mutation is awaiting confirmation, no OTHER mutation
   // may run — not even a fresh, unrelated one, and not even a re-ask of the same one. This is
   // checked on the raw validated ops (any status), so it also blocks a plan that tries to
-  // re-propose gmail.rule.create instead of emitting a genuine confirmation.
-  if (pending && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
+  // re-propose gmail.rule.create instead of emitting a genuine confirmation. Excludes
+  // ACTION_CLARIFICATION_TOPIC: that marker has nothing to actually confirm, so it must never
+  // block an unrelated request the way a real yes/no confirmation does.
+  if (pending && pending.topic !== ACTION_CLARIFICATION_TOPIC && validatedOps.some((op) => getToolDefinition(op.tool)?.mutates === true)) {
     return finalize(context, {
       reply: `You still have a pending confirmation for ${pending.summary}. Confirm, cancel, or tell me a new request.`,
       operationsPlanned: reconciledOperations,
@@ -661,6 +734,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
 
     if (referenceClarifications.length > 0) {
       clarificationQuestion = referenceClarifications[0]?.clarificationQuestion;
+      markActionClarificationPendingIfNeeded(context.session, validatedOps, clarificationQuestion);
     }
   }
 
@@ -731,6 +805,7 @@ async function finalizeDeterministicOperation(
   }
 
   const clarification = validatedOps.find((op) => op.status === "needs_clarification")?.clarificationQuestion;
+  markActionClarificationPendingIfNeeded(context.session, validatedOps, clarification);
   const reply = composeReply({
     replyDraft: "",
     clarificationQuestion: clarification,
@@ -803,6 +878,7 @@ async function finalizeDeterministicOperations(
   }
 
   const clarification = validatedOps.find((op) => op.status === "needs_clarification")?.clarificationQuestion;
+  markActionClarificationPendingIfNeeded(context.session, validatedOps, clarification);
   const reply = composeReply({
     replyDraft: "",
     clarificationQuestion: clarification,
