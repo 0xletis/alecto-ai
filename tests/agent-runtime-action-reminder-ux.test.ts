@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, prisma } from "../packages/db/src/index.ts";
-import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+import { buildServer, clearAgentRuntimeMocks, getAgentSession, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
  * Real Telegram smoke test after the goal-lifecycle pass: "do i have any overdue actions"
@@ -162,30 +162,37 @@ test("E. numbered replies after a normal action list operate on real parent acti
   try {
     await seedUser(userId);
     const future = new Date(Date.now() + 24 * 60 * 60 * 1000);
-    const a = await createActionItem(userId, { source: "manual", title: "Apply to 3 developer jobs" });
-    const b = await createActionItem(userId, { source: "manual", title: "Upgrade to Node.js 24" });
-    const c = await createActionItem(userId, { source: "manual", title: "Branding direction meeting", dueAt: future });
+    await createActionItem(userId, { source: "manual", title: "Apply to 3 developer jobs" });
+    await createActionItem(userId, { source: "manual", title: "Upgrade to Node.js 24" });
+    await createActionItem(userId, { source: "manual", title: "Branding direction meeting", dueAt: future });
     await seedActionWithReminder(userId, "Team offsite", future);
 
     mockPlan({ topic: "actions", intent: "list_actions", operations: [op("action.list", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const list = await sendAgentMessage(server, userId, "show me my actions");
     assert.match(list.reply, /you have 4 open actions:/i);
 
-    mockPlan({ topic: "actions", intent: "complete_numbered", operations: [op("action.complete", { actionId: a.id })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // The numbered list itself (session.visibleEntities, set by action.list) is the source of
+    // truth for what "1"/"2"/"3" mean — never assumed from seed/creation order, since DB
+    // ordering (status/dueAt/updatedAt) does not match insertion order here.
+    const session = await getAgentSession(userId, "telegram");
+    const visible = session?.visibleEntities as Array<{ index: number; id: string; title?: string; label?: string }>;
+    const byIndex = (index: number) => visible.find((entity) => entity.index === index)!.id;
+
+    mockPlan({ topic: "actions", intent: "complete_numbered", operations: [op("action.complete", { actionId: byIndex(1) })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const completeReply = await sendAgentMessage(server, userId, "complete 1");
     assert.equal(completeReply.debug.mutationExecuted, true);
 
-    mockPlan({ topic: "actions", intent: "snooze_numbered", operations: [op("action.snooze", { actionId: b.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    mockPlan({ topic: "actions", intent: "snooze_numbered", operations: [op("action.snooze", { actionId: byIndex(2), untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const snoozeReply = await sendAgentMessage(server, userId, "snooze 2 tomorrow");
     assert.equal(snoozeReply.debug.mutationExecuted, true);
 
-    mockPlan({ topic: "actions", intent: "archive_numbered", operations: [op("action.archive", { actionId: c.id })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    mockPlan({ topic: "actions", intent: "archive_numbered", operations: [op("action.archive", { actionId: byIndex(3) })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const archiveReply = await sendAgentMessage(server, userId, "archive 3");
     assert.equal(archiveReply.debug.mutationExecuted, true);
 
-    const rowA = await prisma.actionItem.findUnique({ where: { id: a.id } });
-    const rowB = await prisma.actionItem.findUnique({ where: { id: b.id } });
-    const rowC = await prisma.actionItem.findUnique({ where: { id: c.id } });
+    const rowA = await prisma.actionItem.findUnique({ where: { id: byIndex(1) } });
+    const rowB = await prisma.actionItem.findUnique({ where: { id: byIndex(2) } });
+    const rowC = await prisma.actionItem.findUnique({ where: { id: byIndex(3) } });
     assert.equal(rowA?.status, "completed");
     assert.equal(rowB?.status, "snoozed");
     assert.equal(rowC?.status, "archived");

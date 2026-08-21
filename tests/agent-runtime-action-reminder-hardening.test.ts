@@ -151,7 +151,7 @@ test("C. completing the parent hides/archives its reminder from later normal-act
   }
 });
 
-test("D. a distinctive-but-wrong target is never silently completed — a specific 'did you mean' suggestion opens instead, confirmable with yes", async () => {
+test("D. a target sharing only a generic word is never silently completed or suggested — a genuinely wrong guess gets a plain 'I don't see one' instead", async () => {
   const server = buildServer();
   const userId = `action-hardening-d-${randomUUID()}`;
 
@@ -164,24 +164,22 @@ test("D. a distinctive-but-wrong target is never silently completed — a specif
     await listActions(server, userId);
 
     // Simulates the real reported bug: the planner's own best (wrong) guess for "brainstorm
-    // meeting" was the branding one — the validator must never trust it outright.
+    // meeting" was the branding one. "brainstorm" does not fuzzy-match "branding" (too different
+    // an edit distance) and the only literal shared word is "meeting" — generic, not real
+    // evidence — so this must be rejected outright, with no "did you mean" suggestion at all. A
+    // second, later real Telegram smoke test found this exact shape of weak match instead
+    // producing a nonsense suggestion for an unrelated low-quality email-derived action ("Did you
+    // mean 'Hola Miquel, tu opinión...'?") — see tests/agent-runtime-action-grounding-v2.test.ts
+    // for that specific regression's own coverage.
     mockPlan({ topic: "actions", intent: "complete", operations: [op("action.complete", { actionId: branding.id })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "complete brainstorm meeting");
 
     assert.equal(reply.debug.mutationExecuted, false, "no action may be completed on a generic-only/no match");
     assert.match(reply.reply, /don't see an open action called "brainstorm meeting"/i);
-    assert.match(reply.reply, /did you mean "branding direction meeting"/i);
-    assert.equal(reply.needsConfirmation, true);
+    assert.doesNotMatch(reply.reply, /did you mean/i, "a purely generic-word overlap must never produce a fabricated suggestion");
 
-    const rowBeforeYes = await prisma.actionItem.findUnique({ where: { id: branding.id } });
-    assert.equal(rowBeforeYes?.status, "open");
-
-    const confirmReply = await sendAgentMessage(server, userId, "yes");
-    assert.equal(confirmReply.debug.mutationExecuted, true);
-    assert.match(confirmReply.reply, /completed "branding direction meeting"/i);
-
-    const rowAfterYes = await prisma.actionItem.findUnique({ where: { id: branding.id } });
-    assert.equal(rowAfterYes?.status, "completed");
+    const row = await prisma.actionItem.findUnique({ where: { id: branding.id } });
+    assert.equal(row?.status, "open");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

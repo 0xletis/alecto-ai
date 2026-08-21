@@ -120,6 +120,14 @@ export interface ValidatedOperation {
    * this as the session's real pending operation instead of the inert clarification.ask stub.
    */
   suggestedConfirmOperation?: { tool: string; args: Record<string, unknown> };
+  /**
+   * Set only on a "valid" action-reference op (validator.ts's ACTION_REFERENCE_TOOLS) whose
+   * actionId was verified against context.openActions rather than the session's currently
+   * visible/numbered list — an exact-title match for something the user asked about but hasn't
+   * been shown on the current page. Lets the executor's own reply say so plainly ("found outside
+   * your last shown list") instead of a plain "Completed" that gives no hint it wasn't visible.
+   */
+  actionOutsideVisiblePage?: boolean;
 }
 
 export interface ExecutedOperation {

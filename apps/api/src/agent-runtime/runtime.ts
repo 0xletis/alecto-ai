@@ -415,7 +415,12 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // generic "Cancelled — I won't do that." from finalizeDeterministicCancellation.
   if (pending?.topic === ACTION_CLARIFICATION_TOPIC && looksLikeActionClarificationCancelReply(message)) {
     setPendingOperation(context.session, null);
-    setVisibleEntities(context.session, []);
+    // Same reasoning as finalizeDeterministicCancellation's own ACTION_CLARIFICATION_TOPIC
+    // exemption: the numbered list the user was actually shown is the source of truth for a
+    // later numbered reference and must survive cancelling an unrelated ambiguity/suggestion
+    // question about it — a real Telegram smoke test found "complete action 10 and 9 now" right
+    // after cancelling this way silently resolving against a completely different ordering once
+    // visibleEntities had been wiped.
     return finalize(context, {
       reply: ACTION_CLARIFICATION_CANCEL_REPLY,
       operationsPlanned: [],
@@ -2095,7 +2100,23 @@ async function finalizeDeterministicCancellation(context: ContextBundle, message
   const pendingOperationBefore = pending;
   const visibleEntitiesBefore = context.session.visibleEntities;
   setPendingOperation(context.session, null);
-  setVisibleEntities(context.session, []);
+  // Real Telegram smoke test: cancelling a "did you mean X?" action-reference suggestion used to
+  // wipe visibleEntities unconditionally — so a NUMBERED follow-up right after ("complete action
+  // 10 and 9 now") had nothing real to resolve against and fell back to context.openActions's own
+  // DB ordering instead, silently completing the wrong tasks. The numbered list the user was
+  // actually shown is the source of truth for a numbered reference and must survive cancelling an
+  // unrelated ambiguity question about it — only cleared here for every OTHER kind of pending
+  // operation (a Gmail rule proposal, a goal archive, a next-week plan draft, ...), where the
+  // visible entities really were specific to that now-cancelled flow.
+  const clearedVisibleEntities = pending.topic !== ACTION_CLARIFICATION_TOPIC;
+  if (clearedVisibleEntities) {
+    setVisibleEntities(context.session, []);
+  }
+  logAgentRuntimeDiagnostics({
+    phase: "cancellation",
+    userId: context.session.userId,
+    note: `cancelled pending topic="${pending.topic}"; visibleEntities ${clearedVisibleEntities ? "cleared" : "preserved"} (${visibleEntitiesBefore.length} entities)`
+  });
 
   const reply = "Cancelled — I won't do that.";
   const executedOps: ExecutedOperation[] = [{ tool: "confirmation.cancel", status: "executed", summary: reply }];

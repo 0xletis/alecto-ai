@@ -131,16 +131,23 @@ export async function executeOperation(
         // "show me my actions"/"do i have any overdue actions" reply as if they were standalone
         // tasks (e.g. "Reminder: Brainstorm meeting" listed right alongside "Brainstorm
         // meeting") — confusing and robotic. They are filtered out here; a real action that has
-        // one is instead shown with a short "Reminder: N minutes before" metadata line. Because
-        // the DB-level query applies its own limit before this client-side filter, a small pool
-        // could under-return real actions if reminder rows occupied some of its slots — so a
-        // wider pool is fetched and sliced down to `limit` AFTER filtering, the same pattern
-        // action.reminder_list/action.meeting_list already use below.
-        const pool = await getActionItems(userId, { status, limit: Math.max(limit * 4, 40) });
+        // one is instead shown with a short "Reminder: N minutes before" metadata line.
+        //
+        // A separate real Telegram smoke test found the reply claiming "You have 10 open
+        // actions" when 12 actually existed — the DB-level query's own limit silently truncated
+        // the pool before anyone could tell the difference between "there are exactly 10" and
+        // "there are more, only 10 shown." Reminder filtering happens client-side (packages/db
+        // has no concept of a reminder companion), so an accurate total needs a wide-enough pool
+        // to almost always capture a real user's FULL list rather than a second COUNT query — a
+        // deliberate, documented tradeoff for a personal-operator product's realistic scale, not
+        // a claim of exactness at unbounded scale.
+        const ACTION_LIST_POOL_CAP = 500;
+        const pool = await getActionItems(userId, { status, limit: ACTION_LIST_POOL_CAP });
         const realActions = pool
           .filter((item) => !isReminderCompanionAction(item))
           .filter((item) => !overdueOnly || (item.status === "open" && Boolean(item.dueAt) && item.dueAt! < now));
         const items = realActions.slice(0, limit);
+        const truncated = realActions.length > items.length;
 
         const reminderByParentId = new Map<string, ActionItem>();
         for (const item of pool) {
@@ -156,14 +163,30 @@ export async function executeOperation(
           const excludedCount = pool.filter(isReminderCompanionAction).length;
           console.log(
             "[agent-runtime-diagnostics]",
-            JSON.stringify({ phase: "action_list_reminder_filter", userId, poolSize: pool.length, excludedReminderCount: excludedCount, returned: items.length })
+            JSON.stringify({
+              phase: "action_list_reminder_filter",
+              userId,
+              poolSize: pool.length,
+              excludedReminderCount: excludedCount,
+              totalOpenActions: realActions.length,
+              displayed: items.length,
+              truncated
+            })
+          );
+          console.log(
+            "[agent-runtime-diagnostics]",
+            JSON.stringify({
+              phase: "action_list_visible_entities",
+              userId,
+              visibleEntities: items.map((item, index) => ({ index: index + 1, id: item.id, title: item.title }))
+            })
           );
         }
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatActionListForChat(items, status, overdueOnly, reminderByParentId, settings.timezone),
+          summary: formatActionListForChat(items, realActions.length, status, overdueOnly, reminderByParentId, settings.timezone),
           result: items,
           entities: items.map((item, index) => actionToEntity(item, index + 1))
         };
@@ -238,7 +261,9 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Snoozed "${updated.title}" to ${updated.snoozedUntil?.toDateString()}.`,
+          summary: operation.actionOutsideVisiblePage
+            ? `Found "${updated.title}" outside your last shown list (an exact title match) and snoozed it to ${updated.snoozedUntil?.toDateString()}.`
+            : `Snoozed "${updated.title}" to ${updated.snoozedUntil?.toDateString()}.`,
           result: updated
         };
       }
@@ -274,13 +299,27 @@ export async function executeOperation(
 
         const updated = await completeActionItem(userId, actionId);
         if (!updated) return failed(operation.tool, "That task no longer exists or is archived.");
-        return { tool: operation.tool, status: "executed", summary: `Completed "${updated.title}".`, result: updated };
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: operation.actionOutsideVisiblePage
+            ? `Found "${updated.title}" outside your last shown list (an exact title match) and completed it.`
+            : `Completed "${updated.title}".`,
+          result: updated
+        };
       }
 
       case "action.archive": {
         const updated = await archiveActionItem(userId, args.actionId as string);
         if (!updated) return failed(operation.tool, "That task no longer exists.");
-        return { tool: operation.tool, status: "executed", summary: `Archived "${updated.title}".`, result: updated };
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: operation.actionOutsideVisiblePage
+            ? `Found "${updated.title}" outside your last shown list (an exact title match) and archived it.`
+            : `Archived "${updated.title}".`,
+          result: updated
+        };
       }
 
       case "action.reschedule": {
@@ -2148,8 +2187,26 @@ function formatMeetingActionsForChat(meetings: ActionItem[], reminders: ActionIt
  * one gets a short "Reminder: N minutes before" metadata line instead of the companion being
  * listed as if it were its own task.
  */
+/**
+ * Light provenance label for a real action list entry — real Telegram smoke test found
+ * old email-generated actions (a raw email subject line like "Hola Miquel, tu opinión es muy
+ * importante para nosotros.") sitting in the list with no indication they came from an
+ * automated Gmail rule rather than something the user actually asked to track, and later fuzzy-
+ * matched against an unrelated command as if they were an equally-trustworthy manual task.
+ * ActionItem.source/sourceProvider already carry this (no schema change needed) — just never
+ * surfaced to chat before. Returns undefined for a manually-created or system action, which
+ * needs no such caveat.
+ */
+function actionSourceLabel(action: ActionItem): string | undefined {
+  if (action.source !== "email_review") {
+    return undefined;
+  }
+  return action.sourceProvider === "gmail" ? "(from Gmail)" : "(from email review)";
+}
+
 function formatActionListForChat(
   items: ActionItem[],
+  totalMatching: number,
   status: ActionItem["status"] | "all",
   overdueOnly: boolean,
   reminderByParentId: Map<string, ActionItem>,
@@ -2162,12 +2219,22 @@ function formatActionListForChat(
     return `You don't have any ${noun}s right now.`;
   }
 
-  const header = `You have ${items.length} ${noun}${items.length === 1 ? "" : "s"}:`;
+  // Real Telegram smoke test: "You have 10 open actions" when 12 actually existed — never claim
+  // a total that's actually just the page size. Only the exact count when everything is shown;
+  // "Showing N of M" the moment the real total is larger than what's displayed.
+  const header =
+    totalMatching > items.length
+      ? `Showing ${items.length} of ${totalMatching} ${noun}s:`
+      : `You have ${items.length} ${noun}${items.length === 1 ? "" : "s"}:`;
 
   const lines = [header];
   items.forEach((item, index) => {
     const dueLine = item.dueAt ? ` — ${formatDueLabelForChat(item.dueAt, timezone)}` : "";
     lines.push(`${index + 1}. ${item.title}${dueLine}`);
+    const sourceLine = actionSourceLabel(item);
+    if (sourceLine) {
+      lines.push(`   ${sourceLine}`);
+    }
     const reminder = reminderByParentId.get(item.id);
     if (reminder) {
       lines.push(`   ${formatReminderMetadataForChat(reminder)}`);
