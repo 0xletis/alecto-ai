@@ -183,6 +183,22 @@ export async function executeOperation(
           );
         }
 
+        // "Show me more actions" after a page that already showed everything (nothing was
+        // actually truncated) used to just re-print the identical numbered list with no
+        // acknowledgement that there was nothing more — confusing since it looks like the
+        // request was ignored. Only replaces the summary when there truly is nothing more to
+        // show; a genuine "more" request against a truncated list still shows the next page
+        // normally via formatActionListForChat below.
+        if (!truncated && items.length > 0 && /\b(more|others?|the rest|additional)\b/i.test(message) && /\b(action|task)/i.test(message)) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `That's all ${items.length} ${status === "all" ? "" : `${status} `}action${items.length === 1 ? "" : "s"} — nothing more to show.`,
+            result: items,
+            entities: items.map((item, index) => actionToEntity(item, index + 1))
+          };
+        }
+
         return {
           tool: operation.tool,
           status: "executed",

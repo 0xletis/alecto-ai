@@ -43,7 +43,9 @@ export function composeReply(input: ComposeReplyInput): string {
       ...input.executedOps
         .filter((op) => op.status === "failed")
         .map((op) => correctionLine(op.tool, op.error ?? op.summary)),
-      ...input.problemOps.map((op) => correctionLine(op.tool, op.error ?? `"${op.tool}" isn't something I can do yet`))
+      ...input.problemOps.map((op) =>
+        op.standaloneError && op.error ? op.error : correctionLine(op.tool, op.error ?? `"${op.tool}" isn't something I can do yet`)
+      )
     ].filter((line) => {
       if (seenCorrections.has(line)) {
         return false;

@@ -43,6 +43,8 @@ async function planWithLLM(message: string, context: ContextBundle): Promise<Raw
   const client = createOpenAIClient();
   const model = process.env.AGENT_RUNTIME_PLANNER_MODEL ?? process.env.OPENAI_MODEL ?? defaultModel;
 
+  logPlannerContextDiagnostics(model, message, context);
+
   const response = await withPlannerTimeout(
     client.responses.create({
       model,
@@ -183,6 +185,52 @@ function buildUserPayload(message: string, context: ContextBundle): string {
       recentMemorySummaries: context.memories.slice(0, 10).map((memory) => memory.summary)
     }
   });
+}
+
+/**
+ * Dev-only visibility into exactly what shape of context reached the LLM for a given turn —
+ * added during the V3 planner-context audit (docs — see the audit's own report), where the main
+ * gap found was that this was previously invisible: buildUserPayload's real JSON.stringify output
+ * was only ever sent to OpenAI, never logged anywhere, making "what did the model actually see"
+ * unanswerable after the fact for a real reported misunderstanding. Deliberately shape-only (ids
+ * truncated, no raw titles/message content) — this is a size/structure sanity check, not a
+ * transcript dump; the full untruncated payload can still be reconstructed locally from
+ * buildUserPayload for a specific repro if needed.
+ */
+function logPlannerContextDiagnostics(model: string, message: string, context: ContextBundle): void {
+  if (process.env.AGENT_RUNTIME_DIAGNOSTICS !== "true") {
+    return;
+  }
+  const { session } = context;
+  console.log(
+    "[agent-runtime-diagnostics]",
+    JSON.stringify({
+      phase: "planner_context",
+      userId: session.userId,
+      model,
+      messageLength: message.length,
+      sessionTopic: session.topic,
+      pendingOperationTopic: session.pendingOperation?.topic ?? null,
+      visibleEntityCount: session.visibleEntities.length,
+      visibleEntityIndexRange: describeIndexRange(session.visibleEntities.map((entity) => entity.index)),
+      focusedGoalSet: Boolean(session.focusedEntities.goal),
+      recentMessageCount: session.messages.slice(-10).length,
+      activeGoalCount: context.activeGoals.length,
+      openActionCount: context.openActions.length,
+      gmailConnected: Boolean(context.gmailConnection && context.gmailConnection.status === "active"),
+      activeGmailRuleCount: context.gmailRules.filter((rule) => rule.status === "active").length,
+      pendingGmailReviewCount: context.gmailReviews.length,
+      recentMemoryCount: Math.min(context.memories.length, 10)
+    })
+  );
+}
+
+function describeIndexRange(indexes: Array<number | undefined>): string {
+  const known = indexes.filter((index): index is number => typeof index === "number");
+  if (known.length === 0) {
+    return "(none)";
+  }
+  return `${Math.min(...known)}-${Math.max(...known)}`;
 }
 
 function buildPlanJsonSchema() {
