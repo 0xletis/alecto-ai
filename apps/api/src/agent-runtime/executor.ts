@@ -1147,8 +1147,56 @@ export async function executeOperation(
           };
         }
 
+        // Goal linking is STRICT (resolveGoalForLifecycleAction, not the permissive
+        // resolveGoalReferenceTargets) and only even attempted when the user actually referenced a
+        // goal — a rule's link is long-lived and drives future evidence, so it deserves the same
+        // no-silent-guess bar as a lifecycle mutation, not the looser "fall back to whatever's most
+        // recent" behavior used for a single read-only status question. An ambiguous reference asks
+        // rather than guessing; a goalRef that matches nothing real still creates the rule, just
+        // unlinked — the tool schema itself tells the planner to omit goalRef entirely when there
+        // was no goal mentioned, so reaching here with an unmatched goalRef means the user named
+        // something real that isn't currently an active goal, and blocking rule creation entirely
+        // over that would be worse than creating it and saying so honestly.
+        const goalRef = args.goalRef as string | undefined;
+        const requestedSignalKey = args.signalKey as string | undefined;
+        const requestedEventType = args.eventType as string | undefined;
+        let linkedGoal: Goal | undefined;
+        let noMatchGoalRef = false;
+
+        if (goalRef && goalRef.trim()) {
+          const outcome = resolveGoalForLifecycleAction(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
+          if (outcome.status === "ambiguous") {
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: describeAmbiguousGoalChoice(outcome.goals),
+              result: outcome.goals
+            };
+          }
+          if (outcome.status === "matched") {
+            linkedGoal = outcome.goals[0];
+          } else {
+            noMatchGoalRef = true;
+          }
+        }
+
+        // Never trusts the planner's signalKey/eventType directly — only accepted when it exactly
+        // matches one of the LINKED goal's own declared targetMetrics (same convention
+        // goal.log_evidence enforces above). A goal with no matching signal, or no goal linked at
+        // all, still creates the rule — it just carries no evidence mapping, matching the tool's
+        // own "omit both if nothing clearly matches" schema guidance.
+        const metrics = linkedGoal?.targetMetrics ?? [];
+        const signalKey = requestedSignalKey && metrics.some((metric) => metric.signalKey === requestedSignalKey) ? requestedSignalKey : undefined;
+        const eventType =
+          !signalKey && requestedEventType && EventTypeSchema.safeParse(requestedEventType).success && metrics.some((metric) => metric.eventType === requestedEventType)
+            ? requestedEventType
+            : undefined;
+
         const rule = await createEmailSignalRule(userId, {
           connectionId: connection.id,
+          goalId: linkedGoal?.id,
+          signalKey,
+          eventType,
           adapterId: "custom_email_review",
           name: label,
           query,
@@ -1162,10 +1210,19 @@ export async function executeOperation(
           reviewBeforeLogging: true,
           createdBy: "user"
         });
+
+        const goalNote = linkedGoal
+          ? signalKey || eventType
+            ? ` Matches you approve can count as "${linkedGoal.title}" evidence.`
+            : ` Linked to "${linkedGoal.title}", but I didn't find a matching signal to log evidence automatically — you can still review and act on matches manually.`
+          : noMatchGoalRef
+            ? ` I didn't find an active goal matching "${goalRef}", so this isn't linked to a goal yet — let me know if you'd like to link it.`
+            : "";
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${rule.name} tracking is on. New matches go to email review before anything is logged — never instant, never auto-logged.`,
+          summary: `${rule.name} tracking is on. New matches go to email review before anything is logged — never instant, never auto-logged.${goalNote}`,
           result: rule
         };
       }

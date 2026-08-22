@@ -116,6 +116,13 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "weekly_review.save",
   "gmail.rule.apply_update",
   "gmail.review.inspect",
+  // A real-LLM eval run (feat/gmail-rule-signal-mapping, scenario 51) caught this: the planner's
+  // pre-execution replyDraft ("I've approved the invoice email from ClientCo.") was shown instead
+  // of the tool's own honest, grounded summary — which is the ONLY place a real extracted amount
+  // (e.g. "$120.00") or a "this counts toward X" evidence note actually appears. Approving a review
+  // is exactly the case groundTruthOnly exists for: the real outcome (whether evidence was logged,
+  // what was extracted, which goal it counts toward) is only known AFTER execution, never before.
+  "gmail.review.approve",
   "daily_loop.settings_apply_update",
   "gmail.review.reject",
   "gmail.review.to_action",

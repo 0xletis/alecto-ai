@@ -375,12 +375,33 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.rule.create",
     description:
-      "Create a new custom, review-first Gmail tracking rule. Matches always go to email review first, never auto-logged, never instant.",
+      "Create a new custom, review-first Gmail tracking rule. Matches always go to email review first, never auto-logged, never instant. Optionally links to an active goal and one of that goal's own declared signals, so approving a matching review can log real goal evidence — never invents a link the user didn't ask for.",
     mutates: true,
     requiresConfirmation: true,
     argsSchema: z.object({
       label: z.string().min(1).describe("Short human label for what to track, e.g. 'Endesa bills'."),
-      matchHint: z.string().optional().describe("Extra keywords/sender hints to narrow the Gmail search query.")
+      matchHint: z.string().optional().describe("Extra keywords/sender hints to narrow the Gmail search query."),
+      goalRef: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "The user's own wording for the goal this tracking is for, e.g. 'Endesa under 50', 'my job search' — only when the user actually connected this rule to a goal (e.g. 'track Endesa bills for my electricity goal'). Matched against real active goal titles, never an invented id. Omit if the user didn't reference a goal at all."
+        ),
+      signalKey: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "A CUSTOM signal key the referenced goal (goalRef) already declared in its own targetMetrics — copy it EXACTLY from context.activeGoals[].signals, never invent one. Set this XOR eventType, never both. Omit both if the goal has no signal that clearly matches what this rule tracks — the rule still gets created, just without evidence logging."
+        ),
+      eventType: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "A real, registered event type the referenced goal already declares (visible in context.activeGoals[].signals), e.g. 'career.recruiter_reply_received' — copy it EXACTLY, never invent one. Set this XOR signalKey, never both."
+        )
     })
   },
   {
