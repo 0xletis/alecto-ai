@@ -178,6 +178,11 @@ export interface EmailSignalRule {
   userId: string;
   connectionId: string;
   goalId?: string;
+  /** A custom, per-goal signal key the linked goal (goalId) already declares in its own
+   * targetMetrics — set XOR with eventType, never both. */
+  signalKey?: string;
+  /** A real, registered EventTypeSchema member — set XOR with signalKey, never both. */
+  eventType?: string;
   adapterId: string;
   name: string;
   query?: string;
@@ -1165,6 +1170,8 @@ export async function createEmailSignalRule(
       userId,
       connectionId: input.connectionId,
       goalId: input.goalId,
+      signalKey: input.signalKey,
+      eventType: input.eventType,
       adapterId: input.adapterId,
       name: input.name,
       query: input.query,
@@ -3093,6 +3100,8 @@ function toEmailSignalRule(rule: Prisma.EmailSignalRuleGetPayload<object>): Emai
     userId: rule.userId,
     connectionId: rule.connectionId,
     goalId: rule.goalId ?? undefined,
+    signalKey: rule.signalKey ?? undefined,
+    eventType: rule.eventType ?? undefined,
     adapterId: rule.adapterId,
     name: rule.name,
     query: rule.query ?? undefined,

@@ -271,6 +271,15 @@ model EmailSignalRule {
   userId              String
   connectionId        String
   goalId              String?
+  // Generic goal-signal mapping (feat/gmail-rule-signal-mapping) — deliberately mirrors
+  // GoalMetric's own signalKey XOR eventType convention (see packages/core/src/goals.ts):
+  // eventType is a real, registered EventTypeSchema member (e.g. "career.recruiter_reply_
+  // received"); signalKey is a custom, per-goal key the linked goal itself already declared in
+  // its own targetMetrics (e.g. "endesa_bill_received"). At most one is ever set — code enforces
+  // this, never both. Both null means this rule has no goal-evidence mapping at all (the pre-
+  // existing, still-fully-supported "review/action only" behavior).
+  signalKey           String?
+  eventType           String?
   adapterId           String
   name                String
   query               String?

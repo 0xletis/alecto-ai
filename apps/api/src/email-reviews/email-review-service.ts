@@ -1,4 +1,4 @@
-import { EventTypeSchema, parseActionDueDate, type StoredEvent } from "@operator-agent/core";
+import { CUSTOM_SIGNAL_EVENT_TYPE, EventTypeSchema, parseActionDueDate, type StoredEvent } from "@operator-agent/core";
 import {
   approveEmailReviewItem,
   createActionItemIfNotExists,
@@ -195,14 +195,79 @@ export async function approveEmailReviewForUser(userId: string, reviewId: string
   }
 
   if (review.adapterId === "custom_email_review") {
-    const updated = await approveEmailReviewItem(userId, review.id);
+    // Fresh lookup, never the goalId snapshot classification wrote into review.extracted — a
+    // rule's own goal/signal mapping (see EmailSignalRule.signalKey/eventType, feat/gmail-rule-
+    // signal-mapping) could have changed between classification and approval, and this mirrors
+    // createActionItemFromEmailReview's own established pattern below for exactly the same reason.
+    // No mapping (no rule, no linked goal, goal no longer active, or a signalKey/eventType that no
+    // longer matches anything the goal itself declares) falls through to the exact old no-op
+    // behavior — a custom rule with no mapping must keep behaving exactly as before this feature.
+    const rule = (await getEmailSignalRules(userId)).find((item) => item.id === review.ruleId);
+    const linkedGoal = rule?.goalId && (rule.signalKey || rule.eventType) ? (await getGoals(userId)).find((goal) => goal.id === rule.goalId && goal.status === "active") : undefined;
+    const metrics = linkedGoal?.targetMetrics ?? [];
+    const mappedSignalKey = linkedGoal && rule?.signalKey && metrics.some((metric) => metric.signalKey === rule.signalKey) ? rule.signalKey : undefined;
+    const mappedEventType =
+      linkedGoal && !mappedSignalKey && rule?.eventType && EventTypeSchema.safeParse(rule.eventType).success && metrics.some((metric) => metric.eventType === rule.eventType)
+        ? rule.eventType
+        : undefined;
+
+    if (!linkedGoal || (!mappedSignalKey && !mappedEventType)) {
+      const updated = await approveEmailReviewItem(userId, review.id);
+
+      return {
+        status: "ok",
+        emailReview: updated ?? review,
+        event: null,
+        actionItem: null,
+        message: "Custom email review approved. No event or action was created."
+      };
+    }
+
+    // MVP extraction only: simple regex over the review's OWN already-stored subject/snippet/
+    // evidence text — no attachment/PDF parsing, no re-fetch, no full email body sent anywhere.
+    // Missing fields are simply omitted, never guessed.
+    const extractedFields = extractGenericEvidenceFields([review.subject, review.snippet, review.evidence].filter(Boolean).join(" "));
+    const eventExternalId = review.externalId.replace(/^gmail-review:/, "gmail:");
+    const created = await createExternalEventIfNotExists(userId, {
+      type: mappedEventType ? EventTypeSchema.parse(mappedEventType) : CUSTOM_SIGNAL_EVENT_TYPE,
+      timestamp: new Date(),
+      source: "gmail",
+      provider: "gmail",
+      externalId: eventExternalId,
+      data: {
+        ...(mappedSignalKey ? { signalKey: mappedSignalKey } : {}),
+        ...extractedFields,
+        provider: "gmail",
+        emailAdapterId: review.adapterId,
+        adapterId: review.adapterId,
+        classification: review.reason,
+        ruleId: review.ruleId,
+        gmailMessageId: review.providerMessageId,
+        subject: review.subject,
+        from: review.from,
+        snippet: review.snippet,
+        confidence: review.confidence,
+        reason: review.reason,
+        reviewItemId: review.id,
+        externalId: eventExternalId
+      },
+      confidence: review.confidence,
+      evidence: review.evidence ? [review.evidence] : undefined
+    });
+    const updated = await approveEmailReviewItem(userId, review.id, created.event.id);
+    const amountNote =
+      typeof extractedFields.amount_eur === "number"
+        ? ` (€${extractedFields.amount_eur.toFixed(2)})`
+        : typeof extractedFields.amount_usd === "number"
+          ? ` ($${extractedFields.amount_usd.toFixed(2)})`
+          : "";
 
     return {
       status: "ok",
       emailReview: updated ?? review,
-      event: null,
+      event: created.event,
       actionItem: null,
-      message: "Custom email review approved. No event or action was created."
+      message: `${created.created ? "Custom email review approved and evidence logged" : "Custom email review approved. Evidence already logged"}${amountNote}. This counts toward "${linkedGoal.title}".`
     };
   }
 
@@ -376,6 +441,75 @@ function relativeDateTimeTextFromEmailReviewText(text: string): string | undefin
 
 function normalizeEmailReviewTimeText(text: string): string {
   return text.replace(/\s+/g, "").replace(/\./g, "").toLowerCase();
+}
+
+/**
+ * Small, generic, rule-independent MVP extraction over a review's own already-stored
+ * subject/snippet/evidence text — no per-rule extraction config, no attachment/PDF parsing, no
+ * full email body sent anywhere. Produces well-known keys only when confidently found; a field
+ * that isn't obviously present is simply omitted, never guessed (feat/gmail-rule-signal-mapping).
+ */
+export function extractGenericEvidenceFields(text: string): Record<string, number | string> {
+  const fields: Record<string, number | string> = {};
+
+  const eurMatch = text.match(/€\s?(\d{1,6}(?:[.,]\d{2})?)|(\d{1,6}(?:[.,]\d{2})?)\s?€/);
+  const eurAmount = eurMatch ? parseAmountText(eurMatch[1] ?? eurMatch[2] ?? "") : undefined;
+  if (eurAmount !== undefined) {
+    fields.amount_eur = eurAmount;
+  }
+
+  const usdMatch = text.match(/\$\s?(\d{1,6}(?:[.,]\d{2})?)/);
+  const usdAmount = usdMatch?.[1] ? parseAmountText(usdMatch[1]) : undefined;
+  if (usdAmount !== undefined) {
+    fields.amount_usd = usdAmount;
+  }
+
+  const date = extractDateField(text);
+  if (date) {
+    fields.date = date;
+  }
+
+  return fields;
+}
+
+function parseAmountText(raw: string): number | undefined {
+  // Small bill/invoice amounts only — a comma is always a decimal separator here, never a
+  // thousands separator (e.g. "43,20" -> 43.20, never 4320).
+  const normalized = raw.includes(",") ? raw.replace(",", ".") : raw;
+  const value = Number(normalized);
+  return Number.isFinite(value) ? Math.round(value * 100) / 100 : undefined;
+}
+
+function extractDateField(text: string): string | undefined {
+  const numericMatch = text.match(/\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b/);
+  if (numericMatch?.[1] && numericMatch[2] && numericMatch[3]) {
+    const first = Number(numericMatch[1]);
+    const second = Number(numericMatch[2]);
+    const year = numericMatch[3];
+    // DD/MM vs MM/DD is genuinely ambiguous unless one part can only be a day (>12) — left blank
+    // rather than guessed when both parts could be either.
+    if (first > 12 && second <= 12) {
+      return `${year}-${String(second).padStart(2, "0")}-${String(first).padStart(2, "0")}`;
+    }
+    if (second > 12 && first <= 12) {
+      return `${year}-${String(first).padStart(2, "0")}-${String(second).padStart(2, "0")}`;
+    }
+    return undefined;
+  }
+
+  const monthMatch = text.match(
+    /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?\b/i
+  );
+  if (monthMatch?.[1] && monthMatch[2]) {
+    const month = monthNumber(monthMatch[1]);
+    const day = Number(monthMatch[2]);
+    if (month && day >= 1 && day <= 31) {
+      const year = monthMatch[3] ? Number(monthMatch[3]) : new Date().getFullYear();
+      return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    }
+  }
+
+  return undefined;
 }
 
 function monthNumber(month: string): number | undefined {

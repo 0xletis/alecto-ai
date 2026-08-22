@@ -29,6 +29,8 @@ export const EmailClassifierModeSchema = z.enum(["rules", "llm", "hybrid"]);
 export const CreateEmailSignalRuleInputSchema = z.object({
   connectionId: z.string().min(1),
   goalId: z.string().min(1).optional(),
+  signalKey: z.string().min(1).optional(),
+  eventType: z.string().min(1).optional(),
   adapterId: z.string().min(1),
   name: z.string().min(1),
   query: z.string().min(1).nullable().optional(),

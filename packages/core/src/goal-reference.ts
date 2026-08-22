@@ -213,6 +213,24 @@ export function resolveActiveGoalReference<T extends Goal = Goal>(
         reason = "category match";
       }
 
+      // A real RC smoke run caught this: "pause my job search goal" against a goal titled "Find a
+      // new developer job" (templateId "career.job_search") scored 0 everywhere above — none of
+      // "job"/"search" appear in the title text at all, only in the template id. Deliberately
+      // conservative (unlike every tier above, which accepts a partial match): ALL significant ref
+      // words must appear among the template id's own segments, since a template id is a coarse,
+      // machine-facing label, not something the user is expected to name precisely — one stray
+      // matching word is not enough signal on its own the way one distinctive title word is.
+      const templateSegments = normalizeGoalText(goal.templateId ?? "").split(" ").filter(Boolean);
+      const significantRefWords = refWords.filter((word) => word.length >= 3);
+      const templateMatches = significantRefWords.filter((word) => templateSegments.includes(word));
+      if (templateSegments.length > 0 && significantRefWords.length > 0 && templateMatches.length === significantRefWords.length) {
+        const templateScore = 45 + templateMatches.length * 5;
+        if (templateScore > score) {
+          score = templateScore;
+          reason = `template id match: ${templateMatches.join(", ")}`;
+        }
+      }
+
       if (options.currentFocus?.id === goal.id) {
         score += 2;
       } else if (options.mostRecent?.id === goal.id) {
