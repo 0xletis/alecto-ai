@@ -31,7 +31,12 @@ test("1. an empty user asking 'so what today' gets the goal/guardrail anchor nud
     const reply = await sendAgentMessage(server, userId, "so what today");
 
     assert.match(reply.reply, /one real goal or guardrail/i);
-    assert.match(reply.reply, /\/create_goal/);
+    // Regression guard for audit/v3-goal-onboarding-evals: this text used to point a brand-new
+    // user at a slash command ("/create_goal") for something chat-based goal creation already
+    // does — actively bad onboarding, and inconsistent with the planner's own "never recommend a
+    // slash command" rule. It must invite a plain-language goal statement instead.
+    assert.doesNotMatch(reply.reply, /\/create_goal/, "must never point a new user at a slash command for something chat can already do");
+    assert.match(reply.reply, /tell me what you want to work on/i);
     assert.equal(reply.debug.llmPlannerAttempted, false, "the planner must never run once the nudge fires");
     assert.deepEqual(reply.operationsPlanned, []);
     assert.equal(reply.debug.mutationExecuted, false);

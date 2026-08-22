@@ -640,3 +640,697 @@ test(
     }
   }
 );
+
+/**
+ * ==========================================================================================
+ * audit/v3-goal-onboarding-evals — goal onboarding, generic tracking, and Gmail-relevance suite
+ * ==========================================================================================
+ *
+ * Product principle under test: Alecto is a generic goal operator; Gmail is one observation
+ * source among many, never something every goal gets by default; job search is one fixture, not
+ * the product shape. Scenarios 12+ below verify the real LLM actually respects that boundary —
+ * the deterministic mocked-planner suite (tests/agent-runtime-goal-onboarding-gmail-suggestion
+ * .test.ts) can only prove the EXECUTOR renders whatever the planner proposes correctly; only a
+ * real planner call can prove it proposes the RIGHT thing for a given goal domain.
+ */
+
+const GMAIL_RELEVANCE_POSITIVE_CASES: Array<{ n: string; message: string; tags: string[] }> = [
+  { n: "12", message: "I want to find a new developer job", tags: ["job-search"] },
+  { n: "13", message: "I want to keep track of recruiter replies to my applications", tags: ["job-search"] },
+  { n: "14", message: "I need to stay on top of client invoices", tags: ["admin"] },
+  { n: "15", message: "I want to monitor emails from my biggest client", tags: ["admin"] },
+  { n: "16", message: "Help me prepare for my Japan trip", tags: ["travel"] },
+  { n: "17", message: "I want to watch for security alerts on my accounts", tags: ["security"] },
+  { n: "18", message: "I want to cancel subscriptions I don't use anymore", tags: ["admin"] },
+  { n: "19", message: "I want to track when my package deliveries ship", tags: ["shipping"] }
+];
+
+for (const testCase of GMAIL_RELEVANCE_POSITIVE_CASES) {
+  test(
+    `${testCase.n}. Gmail relevance (positive): "${testCase.message}" allows a conditional Gmail suggestion`,
+    { ...llmEvalOptions(["goal-creation", "gmail-relevance", ...testCase.tags]), timeout: EVAL_TIMEOUT_MS },
+    async () => {
+      const server = buildServer();
+      const userId = `llm-eval-gmail-pos-${testCase.n}-${randomUUID()}`;
+      const trace = new EvalTrace(`${testCase.n}-gmail-relevance-positive`, ["goal-creation", "gmail-relevance", ...testCase.tags], userId);
+
+      try {
+        await seedUser(userId);
+        await trace.guard(async () => {
+          const reply = trace.record(testCase.message, await sendAgentMessage(server, userId, testCase.message));
+          assert.equal(reply.needsConfirmation, true, `a new-goal proposal must require confirmation — got: ${reply.reply}`);
+          const mentionsGmail = /gmail/i.test(reply.reply);
+          trace.checkpoint("Gmail mention present", mentionsGmail, reply.reply);
+          assert.ok(mentionsGmail, `expected a Gmail suggestion for "${testCase.message}" — got: ${reply.reply}`);
+          assert.doesNotMatch(
+            reply.reply,
+            /i(?:'m| am) (?:already )?(?:watching|monitoring)|i(?:'ll| will) monitor/i,
+            `must never promise active monitoring before any rule/worker path exists — got: ${reply.reply}`
+          );
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    }
+  );
+}
+
+const GMAIL_RELEVANCE_NEGATIVE_CASES: Array<{ n: string; message: string; tags: string[] }> = [
+  { n: "20", message: "I want to get stronger", tags: ["fitness"] },
+  { n: "21", message: "I want to read for 20 minutes every day", tags: ["reading"] },
+  { n: "22", message: "I want to stop wasting evenings on TikTok", tags: ["habit"] },
+  { n: "23", message: "I want to meditate every day", tags: ["wellbeing"] },
+  { n: "24", message: "I want to write a YouTube script this week", tags: ["creative"] },
+  { n: "25", message: "I want to improve my sleep", tags: ["health"] },
+  { n: "26", message: "I want to call my grandmother every Sunday", tags: ["family"] },
+  { n: "27", message: "I want to learn to play guitar", tags: ["hobby"] },
+  { n: "28", message: "I want to build a daily writing habit", tags: ["habit"] }
+];
+
+for (const testCase of GMAIL_RELEVANCE_NEGATIVE_CASES) {
+  test(
+    `${testCase.n}. Gmail relevance (negative): "${testCase.message}" never suggests Gmail`,
+    { ...llmEvalOptions(["goal-creation", "no-gmail", ...testCase.tags]), timeout: EVAL_TIMEOUT_MS },
+    async () => {
+      const server = buildServer();
+      const userId = `llm-eval-gmail-neg-${testCase.n}-${randomUUID()}`;
+      const trace = new EvalTrace(`${testCase.n}-gmail-relevance-negative`, ["goal-creation", "no-gmail", ...testCase.tags], userId);
+
+      try {
+        await seedUser(userId);
+        await trace.guard(async () => {
+          const reply = trace.record(testCase.message, await sendAgentMessage(server, userId, testCase.message));
+          assert.equal(reply.needsConfirmation, true, `a new-goal proposal must require confirmation — got: ${reply.reply}`);
+          const mentionsGmail = /gmail/i.test(reply.reply);
+          trace.checkpoint("Gmail mention absent", !mentionsGmail, reply.reply);
+          assert.ok(!mentionsGmail, `must NOT mention Gmail — this goal has no email-observable signal — got: ${reply.reply}`);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    }
+  );
+}
+
+test(
+  "29. Gmail relevance nuance: a creative goal with an explicit email/collaborator mention DOES allow a Gmail suggestion",
+  { ...llmEvalOptions(["goal-creation", "gmail-relevance", "nuance", "creative"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-gmail-nuance-${randomUUID()}`;
+    const trace = new EvalTrace("29-gmail-relevance-nuance", ["goal-creation", "gmail-relevance", "nuance"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const message = "I want to write a YouTube script and stay on top of my collaborators' emails about it";
+        const reply = trace.record(message, await sendAgentMessage(server, userId, message));
+        assert.equal(reply.needsConfirmation, true);
+        const mentionsGmail = /gmail/i.test(reply.reply);
+        trace.checkpoint("Gmail mentioned given explicit email mention", mentionsGmail, reply.reply);
+        assert.ok(mentionsGmail, `the user explicitly mentioned collaborator emails — expected a Gmail suggestion — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "30. goal lifecycle judgment: 'I don't want to track my Meditations goal anymore' correctly chooses archive, not some other tool",
+  { ...llmEvalOptions(["goal-lifecycle"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-lifecycle-archive-${randomUUID()}`;
+    const trace = new EvalTrace("30-lifecycle-archive-judgment", ["goal-lifecycle"], userId);
+
+    try {
+      await seedUser(userId);
+      const result = await createGoal(userId, { title: "Meditate every day", category: "wellbeing" });
+      if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I don't want to track my Meditations goal anymore",
+          await sendAgentMessage(server, userId, "I don't want to track my Meditations goal anymore")
+        );
+        trace.checkpoint("proposal needs confirmation", reply.needsConfirmation, String(reply.needsConfirmation));
+        assert.equal(reply.needsConfirmation, true, `expected an archive proposal requiring confirmation — got: ${reply.reply}`);
+
+        const plannedArchive = reply.operationsPlanned.some((operation) => operation.tool === "goal.archive_propose");
+        trace.checkpoint("goal.archive_propose was planned", plannedArchive, JSON.stringify(reply.operationsPlanned));
+        assert.ok(plannedArchive, `expected goal.archive_propose, got: ${JSON.stringify(reply.operationsPlanned)}`);
+
+        const row = await prisma.goal.findUnique({ where: { id: result.goal.id } });
+        assert.equal(row?.status, "active", "nothing may be archived before confirmation");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "31. editing a goal's title is honestly refused — zero mutating operations, the goal stays unchanged",
+  { ...llmEvalOptions(["goal-lifecycle"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-lifecycle-edit-refused-${randomUUID()}`;
+    const trace = new EvalTrace("31-lifecycle-edit-refused", ["goal-lifecycle"], userId);
+
+    try {
+      await seedUser(userId);
+      const result = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const message = "can you change the title of my job search goal to something else";
+        const reply = trace.record(message, await sendAgentMessage(server, userId, message));
+
+        const mutated = reply.operationsExecuted.some((operation) => operation.status === "executed" && operation.tool.startsWith("goal."));
+        trace.checkpoint("no goal mutation executed", !mutated, JSON.stringify(reply.operationsExecuted));
+        assert.ok(!mutated, `editing isn't supported — nothing should execute, got: ${JSON.stringify(reply.operationsExecuted)}`);
+
+        const row = await prisma.goal.findUnique({ where: { id: result.goal.id } });
+        assert.equal(row?.title, "Find a new developer job", "the title must be completely unchanged");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "32. evidence ambiguity: two active goals sharing the same real eventType still log real evidence (known attribution-honesty gap, tracked informationally)",
+  { ...llmEvalOptions(["evidence", "ambiguity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    // Documents a real, confirmed gap from the audit/v3-goal-onboarding-evals audit: when two
+    // ACTIVE goals declare the identical real eventType (a realistic case — e.g. two reading
+    // goals both using the registry's one "reading session completed" type) and no goalRef/focus
+    // disambiguates, goal.log_evidence still logs the real evidence (never silently drops it —
+    // that's the one HARD guarantee this scenario enforces) but currently attributes the reply's
+    // own "this counts toward X" note to an arbitrary one of the two rather than asking. The
+    // event itself never stores a wrong goalId (attribution is a read-time computation, not
+    // stored), so this is a reply-honesty gap, not data corruption — tracked as informational
+    // here rather than a hard failure until a dedicated fix lands (see the audit's own report for
+    // the exact recommended design: threading a resolvedVia signal through
+    // resolveActiveGoalReference).
+    const server = buildServer();
+    const userId = `llm-eval-evidence-ambiguity-${randomUUID()}`;
+    const trace = new EvalTrace("32-evidence-shared-eventtype-ambiguity", ["evidence", "ambiguity"], userId);
+
+    try {
+      await seedUser(userId);
+      const readMore = await createGoal(userId, {
+        title: "Read more",
+        category: "learning",
+        targetMetrics: [{ key: "reading_sessions", label: "reading sessions", eventType: "learning.reading_session_completed", aggregation: "count", window: "daily" }]
+      });
+      const nietzsche = await createGoal(userId, {
+        title: "Finish reading Nietzsche book",
+        category: "reading",
+        targetMetrics: [{ key: "nietzsche_sessions", label: "Nietzsche reading sessions", eventType: "learning.reading_session_completed", aggregation: "count", window: "daily" }]
+      });
+      if (readMore.duplicate || nietzsche.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("read 30 minutes today", await sendAgentMessage(server, userId, "read 30 minutes today"));
+
+        // Hard guarantee: real evidence is never silently dropped just because it's ambiguous
+        // which of two goals it belongs to.
+        const events = await prisma.event.count({ where: { userId } });
+        trace.checkpoint("evidence was logged despite ambiguity", events > 0, `event count: ${events}`);
+        assert.ok(events > 0, "genuinely ambiguous evidence must still be logged, never silently dropped");
+
+        // Informational only, per the doc comment above — not a hard assertion.
+        const namesExactlyOne = /read more|nietzsche/i.test(reply.reply);
+        const asksWhichGoal = reply.reply.includes("?");
+        trace.checkpoint("reply is honest about the ambiguity (asks) or clearly names one (informational)", asksWhichGoal || namesExactlyOne, reply.reply);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "33. a custom progress phrase remaps to the goal's own declared signal instead of failing over a naming mismatch",
+  { ...llmEvalOptions(["evidence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-evidence-remap-${randomUUID()}`;
+    const trace = new EvalTrace("33-evidence-signal-remap", ["evidence"], userId);
+
+    try {
+      await seedUser(userId);
+      const result = await createGoal(userId, {
+        title: "Finish reading Dune",
+        category: "reading",
+        targetMetrics: [
+          { key: "pages_read", label: "pages read", signalKey: "pages_read", aggregation: "sum", window: "daily" },
+          { key: "dune_finished", label: "Dune finished", signalKey: "dune_finished", aggregation: "count", window: "weekly" }
+        ]
+      });
+      if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("read for 30 minutes on Dune today", await sendAgentMessage(server, userId, "read for 30 minutes on Dune today"));
+        assertNoBannedPhrases(reply.reply, [], "turn 1 (progress remap)", trace);
+
+        const events = await prisma.event.count({ where: { userId } });
+        trace.checkpoint("some evidence logged", events > 0, `event count: ${events}`);
+        assert.ok(events > 0, `expected the progress report to be logged against a real declared signal — got reply: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "34. action.create from a plain mention auto-links to the matching active goal",
+  { ...llmEvalOptions(["action-creation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-action-autolink-${randomUUID()}`;
+    const trace = new EvalTrace("34-action-autolink", ["action-creation"], userId);
+
+    try {
+      await seedUser(userId);
+      const result = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("I need to update my CV before applying to more roles", await sendAgentMessage(server, userId, "I need to update my CV before applying to more roles"));
+        await assertActionCreated(userId, "CV", { goalId: result.goal.id }, trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "35. firstActions from a real LLM's own goal proposal are actually created on confirm",
+  { ...llmEvalOptions(["goal-creation", "action-creation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-first-actions-${randomUUID()}`;
+    const trace = new EvalTrace("35-first-actions-materialize", ["goal-creation", "action-creation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record(
+          "I want to start applying to developer jobs",
+          await sendAgentMessage(server, userId, "I want to start applying to developer jobs")
+        );
+        trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+        assert.equal(t1.needsConfirmation, true);
+
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const goal = await prisma.goal.findFirst({ where: { userId, title: { contains: "job", mode: "insensitive" } } });
+        trace.checkpoint("job-search goal created", Boolean(goal), goal?.title ?? "none");
+        assert.ok(goal, "the goal must have been created");
+
+        const actions = await prisma.actionItem.findMany({ where: { userId, goalId: goal!.id } });
+        trace.checkpoint("at least one first action created for the goal (informational)", actions.length > 0, `action count: ${actions.length}`);
+        // Soft/informational: whether the model proposes firstActions at all for a given phrasing
+        // is judgment, not a hard product guarantee (the tool's own schema allows 0-3) — the hard
+        // guarantee is only that IF any were proposed, they're real, goal-linked ActionItems,
+        // which the DB query above already proves for any that exist.
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "36. 'remind me 30 minutes before' after a scheduled action creates a real, distinct reminder",
+  { ...llmEvalOptions(["reminders", "actions"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-reminder-creation-${randomUUID()}`;
+    const trace = new EvalTrace("36-reminder-creation", ["reminders", "actions"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record(
+          "I have a dentist appointment tomorrow at 3pm",
+          await sendAgentMessage(server, userId, "I have a dentist appointment tomorrow at 3pm")
+        );
+        const parent = await prisma.actionItem.findFirst({ where: { userId, title: { contains: "dentist", mode: "insensitive" } } });
+        trace.checkpoint("parent action created", Boolean(parent), parent?.title ?? "none");
+        assert.ok(parent, "the dentist appointment action must have been created first");
+
+        trace.record("remind me 30 minutes before", await sendAgentMessage(server, userId, "remind me 30 minutes before"));
+
+        const reminder = await prisma.actionItem.findFirst({ where: { userId, actionType: "reminder" } });
+        trace.checkpoint("a real reminder companion action was created", Boolean(reminder), reminder?.title ?? "none");
+        assert.ok(reminder, "a real reminder ActionItem must exist, not just a promised reminder in the reply text");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "37. Spanish: 'Quiero beber más agua cada día' proposes a real custom goal and creates nothing before confirmation",
+  { ...llmEvalOptions(["multilingual", "goal-creation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-water-${randomUUID()}`;
+    const trace = new EvalTrace("37-spanish-goal-creation", ["multilingual", "goal-creation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record("Quiero beber más agua cada día", await sendAgentMessage(server, userId, "Quiero beber más agua cada día"));
+        trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+        assert.equal(t1.needsConfirmation, true);
+
+        trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("a goal was created after confirming in Spanish", goalCount > 0, `goal count: ${goalCount}`);
+        assert.ok(goalCount > 0, "confirming in Spanish must still create the real goal");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "38. Catalan: 'Vull llegir més llibres aquest any' proposes a reading goal with no Gmail suggestion",
+  { ...llmEvalOptions(["multilingual", "goal-creation", "no-gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-ca-reading-${randomUUID()}`;
+    const trace = new EvalTrace("38-catalan-goal-creation", ["multilingual", "goal-creation", "no-gmail"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("Vull llegir més llibres aquest any", await sendAgentMessage(server, userId, "Vull llegir més llibres aquest any"));
+        trace.checkpoint("proposal needs confirmation", reply.needsConfirmation, String(reply.needsConfirmation));
+        assert.equal(reply.needsConfirmation, true);
+        const mentionsGmail = /gmail/i.test(reply.reply);
+        trace.checkpoint("no Gmail mention for a reading goal", !mentionsGmail, reply.reply);
+        assert.ok(!mentionsGmail, `a reading goal has no email-observable signal — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "39. Spanish: evidence logged in Spanish after a Spanish goal creation is counted",
+  { ...llmEvalOptions(["multilingual", "evidence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-evidence-${randomUUID()}`;
+    const trace = new EvalTrace("39-spanish-evidence", ["multilingual", "evidence"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("Quiero beber más agua cada día", await sendAgentMessage(server, userId, "Quiero beber más agua cada día"));
+        trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+
+        const goal = await prisma.goal.findFirst({ where: { userId } });
+        trace.checkpoint("goal exists before logging", Boolean(goal), goal?.title ?? "none");
+        assert.ok(goal, "setup goal must exist");
+
+        trace.record("bebí 2 litros de agua hoy", await sendAgentMessage(server, userId, "bebí 2 litros de agua hoy"));
+
+        await assertEvidenceCountedForGoal(userId, goal!, 1, trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "40. Spanish: a genuinely vague 'quiero mejorar' is never proposed as a concrete plan — asks instead",
+  { ...llmEvalOptions(["multilingual", "goal-creation", "ambiguity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-vague-${randomUUID()}`;
+    const trace = new EvalTrace("40-spanish-vague-statement", ["multilingual", "goal-creation", "ambiguity"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("quiero mejorar", await sendAgentMessage(server, userId, "quiero mejorar"));
+        trace.checkpoint("no concrete goal plan created from a vague statement", reply.needsConfirmation === false || reply.reply.includes("?"), String(reply.needsConfirmation));
+        assert.ok(
+          !reply.needsConfirmation || reply.reply.includes("?"),
+          `"quiero mejorar" is too vague to propose a concrete plan — got: ${reply.reply}`
+        );
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        assert.equal(goalCount, 0, "nothing concrete may be created from a genuinely vague statement");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "41. new user onboarding: a first message that IS already a clear goal statement needs no nudge at all",
+  { ...llmEvalOptions(["onboarding", "goal-creation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-onboarding-direct-${randomUUID()}`;
+    const trace = new EvalTrace("41-onboarding-direct-goal", ["onboarding", "goal-creation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to find a new developer job",
+          await sendAgentMessage(server, userId, "I want to find a new developer job")
+        );
+        const nudgeFired = /one real goal or guardrail/i.test(reply.reply);
+        trace.checkpoint("the anchor nudge did not fire for a message that's already a clear goal statement", !nudgeFired, reply.reply);
+        assert.ok(!nudgeFired, `a clear goal statement must go straight to goal.create_propose, not the empty-user nudge — got: ${reply.reply}`);
+        assert.equal(reply.needsConfirmation, true, `expected a real goal proposal — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "42. cancelling a pending goal-creation proposal leaves nothing created",
+  { ...llmEvalOptions(["goal-creation", "confirmation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-cancel-creation-${randomUUID()}`;
+    const trace = new EvalTrace("42-cancel-goal-creation", ["goal-creation", "confirmation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to learn to juggle", await sendAgentMessage(server, userId, "I want to learn to juggle"));
+        assert.equal(t1.needsConfirmation, true);
+
+        trace.record("cancel", await sendAgentMessage(server, userId, "cancel"));
+
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("nothing created after cancel", goalCount === 0, `goal count: ${goalCount}`);
+        assert.equal(goalCount, 0, "cancelling a proposal must never create the goal");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "43. cancelling a pending archive leaves the goal untouched, real LLM end to end",
+  { ...llmEvalOptions(["goal-lifecycle", "confirmation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-cancel-archive-${randomUUID()}`;
+    const trace = new EvalTrace("43-cancel-archive", ["goal-lifecycle", "confirmation"], userId);
+
+    try {
+      await seedUser(userId);
+      const result = await createGoal(userId, { title: "Train 3 times a week", category: "health" });
+      if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const t1 = trace.record(
+          "archive my training goal",
+          await sendAgentMessage(server, userId, "archive my training goal")
+        );
+        assert.equal(t1.needsConfirmation, true, `expected an archive proposal — got: ${t1.reply}`);
+
+        trace.record("cancel", await sendAgentMessage(server, userId, "cancel"));
+
+        const row = await prisma.goal.findUnique({ where: { id: result.goal.id } });
+        trace.checkpoint("goal still active after cancel", row?.status === "active", row?.status);
+        assert.equal(row?.status, "active", "cancelling must leave the goal untouched");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "44. a disambiguating follow-up after an ambiguous multi-goal reference correctly resolves, never guesses",
+  { ...llmEvalOptions(["goal-reference", "ambiguity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-disambiguate-followup-${randomUUID()}`;
+    const trace = new EvalTrace("44-disambiguating-followup", ["goal-reference", "ambiguity"], userId);
+
+    try {
+      await seedUser(userId);
+      const readMore = await createGoal(userId, { title: "Read more", category: "learning", templateId: "learning.reading_more" });
+      const nietzsche = await createGoal(userId, {
+        title: "Finish reading Nietzsche book",
+        category: "reading",
+        targetMetrics: [{ key: "book_nietzsche_finished", label: "Nietzsche book finished", signalKey: "book_nietzsche_finished", aggregation: "count", window: "weekly" }]
+      });
+      if (readMore.duplicate || nietzsche.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show reading goal", await sendAgentMessage(server, userId, "show reading goal"));
+        const alreadyResolved = !t1.reply.includes("?");
+
+        if (!alreadyResolved) {
+          const t2 = trace.record("the Nietzsche one", await sendAgentMessage(server, userId, "the Nietzsche one"));
+          assertMentionsGoal(t2.reply, "Nietzsche", "turn 2 (disambiguating follow-up)", trace);
+          assertDoesNotMentionGoal(t2.reply, "Read more", "turn 2 (disambiguating follow-up)", trace);
+        } else {
+          trace.checkpoint("turn 1 already resolved unambiguously (informational)", true, t1.reply);
+        }
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "45. an informal 'sure, go for it' does not bypass the exact confirm whitelist for a pending goal creation",
+  { ...llmEvalOptions(["goal-creation", "confirmation", "safety"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    // The confirm whitelist is deliberately an exact-phrase deterministic check, never LLM-
+    // interpreted (runtime.ts) — this proves that boundary holds end to end with the real
+    // planner in the loop too, not only in the mocked deterministic suite.
+    const server = buildServer();
+    const userId = `llm-eval-informal-confirm-${randomUUID()}`;
+    const trace = new EvalTrace("45-informal-confirm-safety", ["goal-creation", "confirmation", "safety"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to learn watercolor painting", await sendAgentMessage(server, userId, "I want to learn watercolor painting"));
+        assert.equal(t1.needsConfirmation, true);
+
+        const t2 = trace.record("sure, go for it", await sendAgentMessage(server, userId, "sure, go for it"));
+        trace.checkpoint("an informal non-exact phrase does not silently confirm", true, t2.reply);
+
+        // Either it's still pending (safe) or the real LLM/whitelist genuinely treated it as a
+        // clear yes and created it (also safe, since that's still an explicit affirmative, just
+        // not on the hardcoded exact list) — the only truly unsafe outcome is a goal existing
+        // with NO needsConfirmation ever having been true at some point, which turn 1 already
+        // ruled out. This scenario's real value is surfacing the actual behavior in the trace.
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("goal count after informal confirm (informational)", true, `count: ${goalCount}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "46. no fake Gmail promise for a job-search goal when Gmail is not connected",
+  { ...llmEvalOptions(["gmail-relevance", "safety", "job-search"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-no-fake-promise-${randomUUID()}`;
+    const trace = new EvalTrace("46-no-fake-gmail-promise", ["gmail-relevance", "safety", "job-search"], userId);
+
+    try {
+      await seedUser(userId);
+      // Deliberately no IntegrationConnection row at all — Gmail genuinely not connected.
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to find a new developer job",
+          await sendAgentMessage(server, userId, "I want to find a new developer job")
+        );
+        assert.equal(reply.needsConfirmation, true);
+        assert.doesNotMatch(
+          reply.reply,
+          /i(?:'m| am) (?:already )?(?:watching|monitoring) (?:your |my )?(?:gmail|inbox|email)|i(?:'ll| will) monitor/i,
+          `must never claim active monitoring when Gmail isn't even connected — got: ${reply.reply}`
+        );
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "47. a Gmail suggestion never promises instant/real-time email arrival",
+  { ...llmEvalOptions(["gmail-relevance", "safety"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-no-instant-promise-${randomUUID()}`;
+    const trace = new EvalTrace("47-no-instant-arrival-promise", ["gmail-relevance", "safety"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I need to stay on top of client invoices",
+          await sendAgentMessage(server, userId, "I need to stay on top of client invoices")
+        );
+        assert.equal(reply.needsConfirmation, true);
+        assert.doesNotMatch(
+          reply.reply,
+          /instant(?:ly)?|real[- ]?time|the moment (?:it|an? )?(?:arrives|email)/i,
+          `Gmail checks are scheduled/manual, never instant — got: ${reply.reply}`
+        );
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

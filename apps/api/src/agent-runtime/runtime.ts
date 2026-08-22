@@ -139,6 +139,13 @@ const GOAL_ANCHOR_NUDGE_MARKER = "one real goal or guardrail";
 
 // Exported so apps/operator/proactive.ts's morning-brief decision can reuse the exact same
 // empty-user text (task explicitly asks for "goal-anchor nudge style") instead of duplicating it.
+//
+// This text used to say "Goal creation through chat isn't wired yet, so use /create_goal for
+// now" — stale since Adaptive Goal Creation (goal.create_propose/apply) shipped, and it directly
+// contradicted the same system prompt's own "never recommend a slash command, describe the
+// natural-language equivalent instead" rule (planner.ts's buildSystemPrompt). This is the FIRST
+// thing a genuinely new, goal-less user sees, so telling them to go run a command instead of just
+// describing what they want — which already works — was actively bad onboarding, not neutral.
 export const GOAL_ANCHOR_NUDGE_REPLY = [
   `I can help, but I work best with ${GOAL_ANCHOR_NUDGE_MARKER} to anchor to — right now you don't have one set.`,
   "",
@@ -148,7 +155,7 @@ export const GOAL_ANCHOR_NUDGE_REPLY = [
   "3. Avoid impulsive spending",
   "4. Build a project",
   "",
-  "Goal creation through chat isn't wired yet, so use /create_goal for now — or tell me the context and I'll remember it."
+  "Tell me what you want to work on in your own words — e.g. \"I want to find a new developer job\" — and I'll set it up with you."
 ].join("\n");
 
 /**

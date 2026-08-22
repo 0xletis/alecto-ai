@@ -248,6 +248,15 @@ export class EvalTrace {
           scenario: this.scenarioName,
           tags: this.tags,
           failedWith: error instanceof Error ? error.message : String(error),
+          // Same resolution order planner.ts's own planWithLLM uses — not read from a live
+          // response (the harness never sees the raw OpenAI response object), but this is the
+          // exact model every turn in this scenario actually ran against, so it's accurate
+          // whenever AGENT_RUNTIME_PLANNER_MODEL/OPENAI_MODEL are held constant for the run.
+          config: {
+            model: process.env.AGENT_RUNTIME_PLANNER_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+            guardrailModel: process.env.AGENT_RUNTIME_GUARDRAIL_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4o-mini",
+            llmEvalTagsFilter: process.env.LLM_EVAL_TAGS ?? null
+          },
           turns: this.turns,
           checkpoints: this.checkpoints,
           finalDbState
