@@ -170,9 +170,20 @@ export async function runScheduledIntegrationSync(
       continue;
     }
 
-    await options.sendTelegramMessage(settings.telegramUserId, messages.slice(0, 5).join("\n"));
-    notifiedUserIds.push(userId);
-    notificationSentByUser.add(userId);
+    // One user's failed Telegram send (e.g. they blocked the bot, or a transient Telegram API
+    // error) must never abort this whole function — an uncaught throw here previously propagated
+    // all the way up through the caller's un-wrapped runTick() sequence (apps/worker/src/index.ts),
+    // silently skipping every call after runIntegrationSync for the entire tick — Gmail nudges and
+    // due-action reminders included, for every user, not just the one whose send failed. Self-
+    // healed on the next 60s tick either way, but there's no reason to accept even that delay for
+    // an isolated per-user delivery failure.
+    try {
+      await options.sendTelegramMessage(settings.telegramUserId, messages.slice(0, 5).join("\n"));
+      notifiedUserIds.push(userId);
+      notificationSentByUser.add(userId);
+    } catch (error) {
+      logger.error?.(`Integration sync notification failed to send for ${userId}`, error);
+    }
   }
 
   for (const entry of gmailSuccessLogs) {
