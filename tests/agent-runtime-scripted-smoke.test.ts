@@ -1144,7 +1144,11 @@ test("scripted smoke 16: so what today (empty user) -> what can you help me with
           assert: (turn) => {
             assertNoGenericError(turn);
             assert.match(turn.reply, /one real goal or guardrail/i);
-            assert.match(turn.reply, /\/create_goal/);
+            // Regression guard for audit/v3-goal-onboarding-evals: must invite a plain-language
+            // goal statement (chat-based creation already works), never point a brand-new user at
+            // a slash command for something chat can already do.
+            assert.doesNotMatch(turn.reply, /\/create_goal/);
+            assert.match(turn.reply, /tell me what you want to work on/i);
             assertNoMutationYet(turn);
           }
         },
