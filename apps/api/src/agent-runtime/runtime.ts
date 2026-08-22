@@ -784,13 +784,29 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     }
   }
 
-  const reply = composeReply({
-    replyDraft: plan.replyDraft,
-    clarificationQuestion,
-    pendingConfirmationOps,
-    executedOps,
-    problemOps
-  });
+  // A real RC smoke run caught this: the planner sometimes plans ONLY an untrusted
+  // confirmation.confirm/confirmation.cancel (e.g. for "no cancel that," which isn't an exact
+  // CANCEL_WHITELIST phrase) with a replyDraft written as if it had already taken effect ("I've
+  // canceled the creation of..."). Since that meta op is never actually executed (see the comment
+  // above), executedOps stays empty and composeReply would otherwise show that false claim
+  // verbatim while the real pending operation is still untouched — the honest "still pending"
+  // reply already used by the firewall above is reused here instead, whatever replyDraft claimed.
+  const untrustedConfirmOrCancelOnly =
+    !askMeta &&
+    executedOps.length === 0 &&
+    !clarificationQuestion &&
+    pending !== null &&
+    metaOps.some((op) => op.tool === "confirmation.confirm" || op.tool === "confirmation.cancel");
+
+  const reply = untrustedConfirmOrCancelOnly
+    ? `That didn't match an exact yes/no, so nothing changed. You still have a pending confirmation for ${pending!.summary}. Reply with an exact "yes"/"cancel" to confirm or cancel it.`
+    : composeReply({
+        replyDraft: plan.replyDraft,
+        clarificationQuestion,
+        pendingConfirmationOps,
+        executedOps,
+        problemOps
+      });
   logCompoundTurnDiagnostics(userId, reconciledOperations, executedOps, context.session.pendingOperation !== null, reply);
 
   const plannedPlanningOp = reconciledOperations.find((op) => isPlanningTool(op.tool));
@@ -2020,6 +2036,16 @@ function goalLifecycleShortcutOperation(message: string, context: ContextBundle)
     const namedMatch = text.match(/\b(?:my|the)\s+(.+?)\s+goals?\b/);
     if (namedMatch) {
       goalRef = namedMatch[1].trim();
+    } else {
+      // Spanish/Catalan name the goal AFTER the word for "goal" ("objetivo/objectiu/meta de X"),
+      // reversed from English's "my X goal" above — a real RC smoke run caught "vull pausar el
+      // meu objectiu de lectura" ("I want to pause my reading goal") extracting no goalRef at all
+      // under the English-only pattern, silently failing to resolve on a fresh session with no
+      // established conversation focus to fall back on.
+      const esCaMatch = text.match(/\b(?:objetivo|objectiu|meta)\s+(?:de|d')\s*(.+?)[.!?]*$/);
+      if (esCaMatch) {
+        goalRef = esCaMatch[1].trim();
+      }
     }
   }
 

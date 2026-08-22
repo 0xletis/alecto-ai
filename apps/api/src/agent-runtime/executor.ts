@@ -725,12 +725,18 @@ export async function executeOperation(
           // A real-LLM eval run caught this too: even with the target goal's own real signals now
           // included in the planner's context payload, a call sometimes still omits both fields
           // entirely (no bad guess, just nothing) — rather than failing outright, check the one
-          // goal this evidence is actually about (goalRef, else conversation focus): if it has
-          // EXACTLY ONE declared signal, there is no real ambiguity about what a plain progress
-          // report against it could mean, so use that signal automatically. Two or more declared
-          // signals is genuinely ambiguous — that case still fails honestly below.
+          // goal this evidence is actually about (goalRef, else conversation focus, else — a real
+          // RC smoke run caught this exact gap — the account's only active goal, when there is
+          // exactly one): if it has EXACTLY ONE declared signal, there is no real ambiguity about
+          // what a plain progress report against it could mean, so use that signal automatically.
+          // The single-active-goal fallback is never a guess among several goals — it only ever
+          // fires when there is nothing else the evidence COULD be about. Two or more declared
+          // signals (or two or more active goals with no goalRef/focus) is genuinely ambiguous —
+          // that case still fails honestly below.
           const referencedForMissingSignal = goalRef ? resolveGoalReferenceTargets(goalRef, context.activeGoals, currentFocusGoal) : undefined;
-          const targetGoalForMissingSignal = referencedForMissingSignal?.status === "matched" ? referencedForMissingSignal.goals[0] : currentFocusGoal;
+          const onlyActiveGoal = context.activeGoals.length === 1 ? context.activeGoals[0] : undefined;
+          const targetGoalForMissingSignal =
+            referencedForMissingSignal?.status === "matched" ? referencedForMissingSignal.goals[0] : (currentFocusGoal ?? onlyActiveGoal);
           const onlyMetric = targetGoalForMissingSignal?.targetMetrics?.length === 1 ? targetGoalForMissingSignal.targetMetrics[0] : undefined;
 
           if (onlyMetric?.signalKey) {
