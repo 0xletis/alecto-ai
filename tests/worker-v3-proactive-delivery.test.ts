@@ -3,7 +3,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, createGoal, createNotificationLog, hasNotificationLog, prisma } from "../packages/db/src/index.ts";
 import { buildServer } from "../apps/api/src/server.ts";
-import { runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs, type V3ProactiveNotificationSettingsLike } from "../apps/worker/src/v3-proactive-delivery.ts";
+import {
+  runV3ProactiveEveningCheckins,
+  runV3ProactiveGmailNudges,
+  runV3ProactiveMorningBriefs,
+  type V3ProactiveNotificationSettingsLike
+} from "../apps/worker/src/v3-proactive-delivery.ts";
 import { clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
@@ -17,9 +22,11 @@ import { clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage } from "./helper
  */
 
 const MORNING_UTC = new Date("2026-08-20T07:00:00.000Z"); // 09:00 Europe/Madrid
+const EVENING_UTC = new Date("2026-08-20T17:00:00.000Z"); // 19:00 Europe/Madrid
 const GMAIL_NUDGE_UTC = new Date("2026-08-20T11:00:00.000Z"); // 13:00 Europe/Madrid
 const MORNING_SENT_FOR_DATE = "2026-08-20";
 const MORNING_DEDUPE_KEY = "v3_morning_brief";
+const EVENING_DEDUPE_KEY = "v3_evening_checkin";
 
 function injectApiGet(server: ReturnType<typeof buildServer>) {
   return async <T>(path: string): Promise<T> => {
@@ -45,7 +52,13 @@ function stubTelegram(options: { fail?: boolean } = {}) {
 async function seedMorningUser(
   userId: string,
   telegramUserId: string,
-  overrides: { dailyLoopEnabled?: boolean; eveningTimeMinutes?: number; morningBriefEnabled?: boolean; gmailNudgeEnabled?: boolean } = {}
+  overrides: {
+    dailyLoopEnabled?: boolean;
+    eveningTimeMinutes?: number;
+    morningBriefEnabled?: boolean;
+    eveningCheckinEnabled?: boolean;
+    gmailNudgeEnabled?: boolean;
+  } = {}
 ) {
   await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
   await prisma.notificationSettings.create({
@@ -54,6 +67,7 @@ async function seedMorningUser(
       telegramUserId,
       dailyLoopEnabled: overrides.dailyLoopEnabled ?? true,
       morningBriefEnabled: overrides.morningBriefEnabled ?? true,
+      eveningCheckinEnabled: overrides.eveningCheckinEnabled ?? true,
       gmailNudgeEnabled: overrides.gmailNudgeEnabled ?? false,
       morningTimeMinutes: 540,
       eveningTimeMinutes: overrides.eveningTimeMinutes ?? 1140,
@@ -63,7 +77,20 @@ async function seedMorningUser(
 }
 
 function settingsFor(userId: string, telegramUserId: string, overrides: Partial<V3ProactiveNotificationSettingsLike> = {}): V3ProactiveNotificationSettingsLike[] {
-  return [{ userId, telegramUserId, dailyLoopEnabled: true, morningBriefEnabled: true, gmailNudgeEnabled: false, timezone: "Europe/Madrid", morningTimeMinutes: 540, ...overrides }];
+  return [
+    {
+      userId,
+      telegramUserId,
+      dailyLoopEnabled: true,
+      morningBriefEnabled: true,
+      eveningCheckinEnabled: true,
+      gmailNudgeEnabled: false,
+      timezone: "Europe/Madrid",
+      morningTimeMinutes: 540,
+      eveningTimeMinutes: 1140,
+      ...overrides
+    }
+  ];
 }
 
 async function seedPendingGmailReview(userId: string, overrides: { subject?: string; from?: string; snippet?: string } = {}) {
@@ -242,7 +269,7 @@ test("5. a duplicate dedupe key (already sent today) suppresses the send", async
   }
 });
 
-test("6. an evening_checkin candidate is never sent this pass", async () => {
+test("6. runV3ProactiveMorningBriefs itself never sends an evening_checkin decision, even when the preview offers one — each function only ever sends its own expected type", async () => {
   const server = buildServer();
   const userId = `delivery-evening-not-sent-${randomUUID()}`;
 
@@ -274,7 +301,198 @@ test("6. an evening_checkin candidate is never sent this pass", async () => {
       sendTelegramMessage: telegram.send
     });
 
-    assert.equal(telegram.sent.length, 0, "evening_checkin must stay preview-only this pass");
+    assert.equal(telegram.sent.length, 0, "runV3ProactiveMorningBriefs must never send a decision of a different type, regardless of what the preview offers");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+// fix/private-alpha-known-gaps: evening_checkin now has a real send path
+// (runV3ProactiveEveningCheckins), mirroring runV3ProactiveMorningBriefs exactly. Reuses the same
+// active-goal-with-a-daily-eventType-metric-and-no-event-logged-today fixture the test above
+// already established produces a real evening_checkin candidate from the actual, unmocked
+// decision module.
+async function seedEveningCandidateGoal(userId: string) {
+  await createGoal(userId, {
+    title: "Apply to developer jobs",
+    category: "career",
+    priority: "high",
+    targetMetrics: [{ key: "applications", label: "Applications sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+  });
+}
+
+test("A. evening check-in sends when opted in, allowlisted, due, and delivery is enabled", async () => {
+  const server = buildServer();
+  const userId = `evening-sends-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "700001");
+    await seedEveningCandidateGoal(userId);
+    const telegram = stubTelegram();
+
+    await runV3ProactiveEveningCheckins(settingsFor(userId, "700001"), {
+      now: EVENING_UTC,
+      deliveryEnabled: true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    assert.equal(telegram.sent.length, 1);
+    assert.equal(telegram.sent[0].chatId, "700001");
+    assert.match(telegram.sent[0].text, /apply to developer jobs/i);
+    assert.equal(await hasNotificationLog({ userId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), true);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("B. evening check-in does not send twice the same day — a duplicate dedupe key suppresses the second send", async () => {
+  const server = buildServer();
+  const userId = `evening-no-dupe-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "700002");
+    await seedEveningCandidateGoal(userId);
+    await createNotificationLog({ userId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE });
+    const telegram = stubTelegram();
+
+    await runV3ProactiveEveningCheckins(settingsFor(userId, "700002"), {
+      now: EVENING_UTC,
+      deliveryEnabled: true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    assert.equal(telegram.sent.length, 0, "must not send a second evening check-in for the same local day");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("C. evening check-in does not send when PROACTIVE_OPERATOR_DELIVERY_ENABLED is off, even fully opted in and due", async () => {
+  const server = buildServer();
+  const userId = `evening-delivery-disabled-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "700003");
+    await seedEveningCandidateGoal(userId);
+    const telegram = stubTelegram();
+
+    await runV3ProactiveEveningCheckins(settingsFor(userId, "700003"), {
+      now: EVENING_UTC,
+      deliveryEnabled: false,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    assert.equal(telegram.sent.length, 0);
+    assert.equal(await hasNotificationLog({ userId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("D. evening check-in does not send when the user is not on the configured allowlist, even fully opted in and due", async () => {
+  const server = buildServer();
+  const userId = `evening-not-allowlisted-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "700004");
+    await seedEveningCandidateGoal(userId);
+    const telegram = stubTelegram();
+
+    await runV3ProactiveEveningCheckins(settingsFor(userId, "700004"), {
+      now: EVENING_UTC,
+      deliveryEnabled: true,
+      isAllowed: () => false,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: telegram.send
+    });
+
+    assert.equal(telegram.sent.length, 0);
+    assert.equal(await hasNotificationLog({ userId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), false);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("E. one user's failed Telegram send does not block another user's evening check-in in the same run — same isolation pattern as morning brief/Gmail nudge", async () => {
+  const server = buildServer();
+  const failingUserId = `evening-fails-${randomUUID()}`;
+  const okUserId = `evening-ok-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(failingUserId, "700005");
+    await seedEveningCandidateGoal(failingUserId);
+    await seedMorningUser(okUserId, "700006");
+    await seedEveningCandidateGoal(okUserId);
+
+    const failingTelegram = stubTelegram({ fail: true });
+    const okTelegram = stubTelegram();
+    const sendTelegramMessage = async (chatId: string, text: string) => {
+      if (chatId === "700005") {
+        return failingTelegram.send(chatId, text);
+      }
+      return okTelegram.send(chatId, text);
+    };
+
+    await runV3ProactiveEveningCheckins(
+      [...settingsFor(failingUserId, "700005"), ...settingsFor(okUserId, "700006")],
+      {
+        now: EVENING_UTC,
+        deliveryEnabled: true,
+        apiGet: injectApiGet(server),
+        sendTelegramMessage
+      }
+    );
+
+    assert.equal(failingTelegram.sent.length, 0);
+    assert.equal(okTelegram.sent.length, 1, "the second user's evening check-in must still send despite the first user's send failure");
+    assert.equal(await hasNotificationLog({ userId: failingUserId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), false);
+    assert.equal(await hasNotificationLog({ userId: okUserId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), true);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: { in: [failingUserId, okUserId] } } });
+  }
+});
+
+test("F. morning brief and Gmail nudge behavior is unchanged by evening check-in's new send path — all three can run in the same tick without cross-contamination", async () => {
+  const server = buildServer();
+  const userId = `evening-no-cross-contamination-${randomUUID()}`;
+
+  try {
+    await seedMorningUser(userId, "700007");
+    await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
+    await seedEveningCandidateGoal(userId);
+    const morningTelegram = stubTelegram();
+    const eveningTelegram = stubTelegram();
+
+    // Same shape as apps/worker/src/index.ts's own runTick(): morning and evening are each their
+    // own call, at each moment's own due time — not a single combined call.
+    await runV3ProactiveMorningBriefs(settingsFor(userId, "700007"), {
+      now: MORNING_UTC,
+      deliveryEnabled: true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: morningTelegram.send
+    });
+    await runV3ProactiveEveningCheckins(settingsFor(userId, "700007"), {
+      now: EVENING_UTC,
+      deliveryEnabled: true,
+      apiGet: injectApiGet(server),
+      sendTelegramMessage: eveningTelegram.send
+    });
+
+    assert.equal(morningTelegram.sent.length, 1, "morning brief must still send exactly as before");
+    assert.match(morningTelegram.sent[0].text, /apply to jobs/i);
+    assert.equal(eveningTelegram.sent.length, 1, "evening check-in must send independently, at its own time");
+    assert.match(eveningTelegram.sent[0].text, /apply to developer jobs/i);
+    assert.equal(await hasNotificationLog({ userId, type: MORNING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), true);
+    assert.equal(await hasNotificationLog({ userId, type: EVENING_DEDUPE_KEY, sentForDate: MORNING_SENT_FOR_DATE }), true);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });

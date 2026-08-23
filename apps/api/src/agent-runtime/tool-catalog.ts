@@ -685,6 +685,14 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({})
   },
   {
+    name: "proactive.diagnose_evening_checkin",
+    description:
+      "Diagnose why the proactive evening check-in did or didn't (or won't) send — grounded in real settings and delivery state, never a generic settings summary. Use for 'why didn't you check in last night?', 'no evening check-in', 'it's 9pm and no check-in', 'where is my evening check-in?'. Read-only.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
     name: "operator.today",
     description: "Summarize what's on for today: open/due actions, active goals, today's logged progress.",
     mutates: false,

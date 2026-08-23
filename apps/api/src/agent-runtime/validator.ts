@@ -31,6 +31,36 @@ const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
   "gmail.review.approve"
 ]);
 
+/**
+ * fix/private-alpha-known-gaps: a real-LLM eval run caught a bare, contextless question like
+ * "això compta pel meu objectiu?" ("does this count toward my goal?") sometimes getting planned
+ * as goal.log_evidence, logging a spurious entry — the planner reading a QUESTION about whether
+ * something would count as a STATEMENT that something already happened. This is a deterministic,
+ * validator-level guard specifically because prompt tightening alone can't guarantee a bad planner
+ * call never mutates (see the RC report's own finding) — matches this repo's established pattern
+ * of never trusting the planner's raw mutation intent (the same reasoning behind
+ * ACTION_REFERENCE_TOOLS' own id-grounding checks above).
+ *
+ * Deliberately blunt and uniform rather than attempting to distinguish "a bare question" from "a
+ * question WITH concrete evidence in the same message" (e.g. "I read 20 minutes, does that
+ * count?") — extracting and trusting that evidence is exactly the kind of confident guess this
+ * guard exists to avoid, and the product rule's own suggested reply for the ambiguous case
+ * ("Yes, 20 minutes of reading can count — say 'log 20 minutes reading' if you want me to record
+ * it") already asks rather than silently logs. So: ANY goal.log_evidence attempt whose raw message
+ * matches this question shape is blocked and clarified, whether or not it also names a number —
+ * a real, unambiguous progress statement with no question ("I read 20 minutes today") never
+ * matches this pattern at all and logs exactly as before.
+ */
+const BARE_EVIDENCE_QUESTION_RE =
+  /\b(?:does|would|is)\s+(?:this|that|it)\b[\s\S]{0,20}\b(?:count|enough)\b|\bdoes\s+it\s+count\b|\bcounts?\s+if\b|\bshould\s+i\s+(?:log|count|record)\s+(?:this|that|it)?\b|\b(?:esto|eso)\s+cuenta\b|\bcuenta\s+(?:para|como)\b|\b(?:aix[oò]|aquest[oòa]?)\s+compta\b|\bcompta\s+(?:pel|per|com)\b/i;
+
+function looksLikeBareEvidenceCountQuestion(message: string): boolean {
+  return message.includes("?") && BARE_EVIDENCE_QUESTION_RE.test(message);
+}
+
+const EVIDENCE_QUESTION_CLARIFICATION =
+  "I don't want to guess — tell me plainly what you did (e.g. \"log 20 minutes of reading\") and I'll log it for real. Just asking whether something counts doesn't log anything on its own.";
+
 export interface ValidateOperationsOptions {
   /**
    * True when `operations` came from one of this file's own deterministic shortcuts (runtime.ts)
@@ -472,6 +502,17 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
 
   const args = parsed.data as Record<string, unknown>;
   let actionOutsideVisiblePage = false;
+
+  if (tool.name === "goal.log_evidence" && looksLikeBareEvidenceCountQuestion(message)) {
+    return {
+      tool: tool.name,
+      args,
+      status: "needs_clarification",
+      requiresConfirmation: false,
+      clarificationQuestion: EVIDENCE_QUESTION_CLARIFICATION,
+      rationale: operation.rationale
+    };
+  }
 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && args.actionId) {
     const trust = applyDirectActionIdTrust(tool.name, args, operation, context, message, options);

@@ -4,9 +4,9 @@ import { formatLocalDate, formatLocalTime, formatMinutesOfDay } from "./datetime
 
 /**
  * Real-delivery path for Agent Runtime v3's Proactive Operator MVP
- * (apps/api/src/operator/proactive.ts / docs/10-v3-readiness-audit.md §13): morning_brief
- * plus gmail_nudge, both off by default behind PROACTIVE_OPERATOR_DELIVERY_ENABLED and their
- * per-user NotificationSettings opt-ins. evening_checkin stays preview-only. Nothing here
+ * (apps/api/src/operator/proactive.ts / docs/10-v3-readiness-audit.md §13): morning_brief,
+ * evening_checkin, and gmail_nudge — all off by default behind PROACTIVE_OPERATOR_DELIVERY_ENABLED
+ * and their own per-user NotificationSettings opt-ins. Nothing here
  * decides message content — that stays
  * entirely inside apps/api's decideProactiveOperatorMessage, reached ONLY via the existing,
  * UNCHANGED GET /users/:userId/operator/proactive/preview route (never called with markSent or
@@ -17,6 +17,15 @@ import { formatLocalDate, formatLocalTime, formatMinutesOfDay } from "./datetime
  * Kept in its own file, not apps/worker/src/index.ts, specifically so it can be imported by
  * tests without triggering index.ts's top-level `await runTick(); setInterval(...)` — the same
  * reason apps/worker/src/integration-sync.ts is its own file.
+ *
+ * evening_checkin (fix/private-alpha-known-gaps): the decision layer (decideProactiveOperatorMessage's
+ * buildEveningCheckin) and the preview HTTP route were already fully built and evening_checkin-aware
+ * — EVENING_CHECKIN_DEDUPE_KEY was already included in the preview route's own candidateDedupeKeys,
+ * and buildEveningCheckin already produces real, grounded message content (untracked goals today).
+ * The only missing piece was a worker-side send loop — runV3ProactiveEveningCheckins below mirrors
+ * runV3ProactiveMorningBriefs exactly (same gating order: telegramUserId, the moment's own opt-in,
+ * exact-minute time match, dailyLoopEnabled, allowlist), reusing the same maybeSendV3ProactiveDecision
+ * send/log/isolate helper morning_brief and gmail_nudge already share.
  *
  * Relationship to apps/api/src/operator/proactive-eligibility.ts's getProactiveDeliveryStatus
  * (the "why didn't I get my morning brief?" diagnostic): both gate on the same six concerns —
@@ -41,10 +50,13 @@ export interface V3ProactiveNotificationSettingsLike {
   dailyLoopEnabled: boolean;
   /** The actual per-user product consent for morning-brief delivery — see packages/core/src/notifications.ts. Distinct from dailyLoopEnabled. */
   morningBriefEnabled: boolean;
+  /** The actual per-user product consent for evening-check-in delivery. Distinct from dailyLoopEnabled. */
+  eveningCheckinEnabled: boolean;
   /** The actual per-user product consent for proactive Gmail review nudges. */
   gmailNudgeEnabled: boolean;
   timezone: string;
   morningTimeMinutes: number;
+  eveningTimeMinutes: number;
 }
 
 export interface V3ProactiveDeliveryOptions {
@@ -78,10 +90,6 @@ interface ProactiveDecisionResponse {
   };
 }
 
-/**
- * Sends morning_brief only. evening_checkin candidates from the preview route are deliberately
- * ignored because that moment remains preview-only.
- */
 export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificationSettingsLike[], options: V3ProactiveDeliveryOptions): Promise<void> {
   const now = options.now ?? new Date();
   const deliveryEnabled = options.deliveryEnabled ?? proactiveOperatorDeliveryEnabledFromEnv();
@@ -123,8 +131,58 @@ export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificat
   }
 }
 
+/**
+ * Sends evening_checkin candidates — mirrors runV3ProactiveMorningBriefs exactly (same gating
+ * order: telegramUserId, the moment's own opt-in, exact-minute time match, dailyLoopEnabled,
+ * allowlist), reusing the same maybeSendV3ProactiveDecision send/log/isolate helper. The actual
+ * message content (which goals are untracked today) is entirely decided by
+ * decideProactiveOperatorMessage's buildEveningCheckin — this function only decides WHETHER to
+ * ask for that decision and send it, never what to say.
+ */
+export async function runV3ProactiveEveningCheckins(settings: V3ProactiveNotificationSettingsLike[], options: V3ProactiveDeliveryOptions): Promise<void> {
+  const now = options.now ?? new Date();
+  const deliveryEnabled = options.deliveryEnabled ?? proactiveOperatorDeliveryEnabledFromEnv();
+  const isAllowed = options.isAllowed ?? proactiveOperatorAllowlistFromEnv();
+  const logger = options.logger ?? console;
+
+  if (!deliveryEnabled) {
+    logger.log("V3 proactive evening check-in: PROACTIVE_OPERATOR_DELIVERY_ENABLED is not \"true\" in this process — skipping for every user this tick.");
+    return;
+  }
+
+  for (const item of settings) {
+    if (!item.telegramUserId || !item.eveningCheckinEnabled) {
+      continue;
+    }
+
+    // Only log from here on — this is the exact minute this user's evening check-in was
+    // scheduled for, the one moment a silent skip is actually worth surfacing.
+    if (formatMinutesOfDay(item.eveningTimeMinutes) !== formatLocalTime(now, item.timezone)) {
+      continue;
+    }
+
+    // dailyLoopEnabled is a separate, older feature (legacy daily-loop start/end-day messages).
+    // eveningCheckinEnabled is the actual per-user product consent for THIS feature — required
+    // independently, exactly mirroring morningBriefEnabled's own relationship to dailyLoopEnabled
+    // above (decideProactiveOperatorMessage itself also gates centrally on dailyLoopEnabled as the
+    // quiet-hours proxy — this re-check here just avoids an HTTP round trip for an already-known
+    // skip, the same reason runV3ProactiveMorningBriefs re-checks it too).
+    if (!item.dailyLoopEnabled) {
+      logger.log(`V3 proactive evening check-in: time matched for ${item.userId} but dailyLoopEnabled is false — skipping.`);
+      continue;
+    }
+
+    if (!isAllowed(item.userId)) {
+      logger.log(`V3 proactive evening check-in: time matched for ${item.userId} but they are not in PROACTIVE_OPERATOR_ALLOWLIST — skipping.`);
+      continue;
+    }
+
+    await maybeSendV3ProactiveDecision(item, "evening_checkin", now, options.apiGet, options.sendTelegramMessage, logger);
+  }
+}
+
 export interface V3ProactiveDeliveryResult {
-  type: "morning_brief" | "gmail_nudge";
+  type: "morning_brief" | "evening_checkin" | "gmail_nudge";
   userId: string;
   status: "sent" | "skipped" | "preview_failed" | "send_failed" | "session_failed";
   reason: string;
@@ -178,7 +236,7 @@ export async function runV3ProactiveGmailNudges(
 
 async function maybeSendV3ProactiveDecision(
   item: V3ProactiveNotificationSettingsLike,
-  expectedType: "morning_brief" | "gmail_nudge",
+  expectedType: "morning_brief" | "evening_checkin" | "gmail_nudge",
   now: Date,
   apiGet: V3ProactiveDeliveryOptions["apiGet"],
   sendTelegramMessage: V3ProactiveDeliveryOptions["sendTelegramMessage"],
@@ -201,6 +259,8 @@ async function maybeSendV3ProactiveDecision(
     const reason = decision.decision === "no_message" ? decision.reason : `decision type was "${decision.type}", not ${expectedType}`;
     if (expectedType === "morning_brief") {
       logger.log(`V3 proactive morning brief: preview for ${item.userId} did not propose a morning brief this tick (${reason}) — nothing sent.`);
+    } else if (expectedType === "evening_checkin") {
+      logger.log(`V3 proactive evening check-in: preview for ${item.userId} did not propose an evening check-in this tick (${reason}) — nothing sent.`);
     }
     return { type: expectedType, userId: item.userId, status: "skipped", reason };
   }
@@ -228,6 +288,8 @@ async function maybeSendV3ProactiveDecision(
 
   if (logged && expectedType === "morning_brief") {
     logger.log(`Sent v3 morning brief to ${item.userId} for ${sentForDate}.`);
+  } else if (logged && expectedType === "evening_checkin") {
+    logger.log(`Sent v3 evening check-in to ${item.userId} for ${sentForDate}.`);
   } else if (logged && expectedType === "gmail_nudge") {
     logger.log(`Sent v3 Gmail nudge to ${item.userId} for ${sentForDate}.`);
   }

@@ -3,6 +3,7 @@ import type { ContextBundle } from "../agent-runtime/types.js";
 import { formatMinutesOfDay } from "./daily-loop-settings.js";
 import {
   decideProactiveOperatorMessage,
+  EVENING_CHECKIN_DEDUPE_KEY,
   isWithinWindow,
   minutesOfDayInTimezone,
   MORNING_BRIEF_DEDUPE_KEY,
@@ -199,4 +200,109 @@ export function formatProactiveDeliveryDiagnosis(
       : formatMinutesOfDay(settings.morningTimeMinutes);
 
   return DIAGNOSIS_MESSAGE[status](time, allowlistActive);
+}
+
+/**
+ * Evening-check-in equivalent of getProactiveDeliveryStatus/formatProactiveDeliveryDiagnosis
+ * above (fix/private-alpha-known-gaps) — a separate, mirrored pair rather than parameterizing the
+ * morning-brief one, deliberately: that function's own legacy-daily-loop-sent-instead branch and
+ * its DIAGNOSIS_MESSAGE strings are morning-specific by name, and generalizing it risked touching
+ * already-correct, already-tested morning-brief behavior for a smoke/bugfix pass that should stay
+ * small. "why didn't you check in last night?" now has a real, grounded answer instead of the
+ * planner having nothing but proactive.settings_show (which answers "is it on," not "why didn't
+ * it send") — same shape as the morning-brief diagnostic, since evening check-in is now equally
+ * real, live delivery, not a preview-only stub.
+ */
+export type EveningCheckinDeliveryStatus =
+  | "legacy_daily_loop_sent_instead"
+  | "delivery_disabled"
+  | "user_not_allowlisted"
+  | "user_not_opted_in"
+  | "daily_loop_disabled"
+  | "outside_evening_window"
+  | "duplicate_dedupe_key"
+  | "no_candidate"
+  | "eligible";
+
+export interface EveningCheckinDeliveryStatusInput {
+  context: ContextBundle;
+  notificationSettings: NotificationSettings;
+  now: Date;
+  alreadySentDedupeKeys: Set<string>;
+  sentCountToday: number;
+  deliveryEnabled: boolean;
+  isAllowlisted: boolean;
+  /** The real sentAt of today's LEGACY daily-loop evening review (NotificationLog type
+   * "daily_loop_evening"), when one exists — mirrors legacyDailyLoopSentAt above. */
+  legacyDailyLoopSentAt: Date | undefined;
+}
+
+export function getEveningCheckinDeliveryStatus(input: EveningCheckinDeliveryStatusInput): EveningCheckinDeliveryStatus {
+  const settings = input.notificationSettings;
+
+  if (input.alreadySentDedupeKeys.has(EVENING_CHECKIN_DEDUPE_KEY)) {
+    return "duplicate_dedupe_key";
+  }
+  if (input.legacyDailyLoopSentAt) {
+    return "legacy_daily_loop_sent_instead";
+  }
+  if (!input.deliveryEnabled) {
+    return "delivery_disabled";
+  }
+  if (!input.isAllowlisted) {
+    return "user_not_allowlisted";
+  }
+  if (!settings.eveningCheckinEnabled) {
+    return "user_not_opted_in";
+  }
+  if (!settings.dailyLoopEnabled) {
+    return "daily_loop_disabled";
+  }
+
+  const nowMinutes = minutesOfDayInTimezone(input.now, settings.timezone);
+  if (!isWithinWindow(nowMinutes, settings.eveningTimeMinutes, TIME_TRIGGER_WINDOW_MINUTES)) {
+    return "outside_evening_window";
+  }
+
+  const decision = decideProactiveOperatorMessage({
+    context: input.context,
+    notificationSettings: settings,
+    now: input.now,
+    alreadySentDedupeKeys: input.alreadySentDedupeKeys,
+    sentCountToday: input.sentCountToday
+  });
+
+  if (decision.decision === "no_message" || decision.type !== "evening_checkin") {
+    return "no_candidate";
+  }
+
+  return "eligible";
+}
+
+const EVENING_DIAGNOSIS_MESSAGE: Record<EveningCheckinDeliveryStatus, (time: string, allowlistActive: boolean) => string> = {
+  legacy_daily_loop_sent_instead: (time) =>
+    `You did get an evening message today around ${time} — but it came from the older legacy daily-loop system, not the V3 proactive evening check-in you're asking about. Ask "what proactive messages are on?" to check your V3 opt-in and scheduled time.`,
+  delivery_disabled: (time) => `Evening check-in is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
+  user_not_allowlisted: (time) => `Evening check-in is on at ${time}, but a PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment and this user isn't on it.`,
+  user_not_opted_in: () => "Evening check-in is currently off — turn it on and I'll start sending it.",
+  daily_loop_disabled: (time) => `Evening check-in is on at ${time}, but the daily loop itself is off, which blocks both the V3 evening check-in and the legacy daily-loop message — turn the daily loop back on too.`,
+  outside_evening_window: (time) => `Evening check-in is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
+  duplicate_dedupe_key: (time) => `Evening check-in is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
+  no_candidate: (time) => `Evening check-in is on at ${time}, but there isn't anything grounded to ask about right now (every trackable goal already has today's progress logged) — check back closer to ${time}.`,
+  eligible: (time, allowlistActive) =>
+    `Settings look eligible — evening check-in is on at ${time}${allowlistActive ? ", and you're in the configured allowlist" : " (no allowlist is configured, so that's not restricting anyone)"}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
+};
+
+export function formatEveningCheckinDeliveryDiagnosis(
+  status: EveningCheckinDeliveryStatus,
+  settings: NotificationSettings,
+  legacyDailyLoopSentAt?: Date,
+  allowlistActive = false
+): string {
+  const time =
+    status === "legacy_daily_loop_sent_instead" && legacyDailyLoopSentAt
+      ? formatMinutesOfDay(minutesOfDayInTimezone(legacyDailyLoopSentAt, settings.timezone))
+      : formatMinutesOfDay(settings.eveningTimeMinutes);
+
+  return EVENING_DIAGNOSIS_MESSAGE[status](time, allowlistActive);
 }
