@@ -3340,3 +3340,334 @@ test(
     }
   }
 );
+
+/**
+ * Planner structured-output schema fix — gated LLM evals (11 scenarios, tags `planner-schema` and
+ * `settings-intent`). Unlike tests/planner-schema.test.ts (which validates the GENERATED SCHEMA's
+ * own structure, no live call), these prove the fix holds against the REAL model: for each
+ * scenario, the planned operation's args must only ever contain that SAME tool's own declared
+ * fields — never a foreign tool's field name leaking in (the exact shape of the original bug,
+ * confirmed reproducible 100% of the time before this fix, for "turn on evening check-ins"
+ * specifically).
+ */
+
+function assertNoForeignArgs(args: Record<string, unknown>, allowedKeys: string[], context: string): void {
+  const foreignKeys = Object.keys(args).filter((key) => !allowedKeys.includes(key));
+  assert.deepEqual(foreignKeys, [], `${context}: args must only ever contain this tool's own fields — got extra keys: ${foreignKeys.join(", ")} (args: ${JSON.stringify(args)})`);
+}
+
+const SETTINGS_PROPOSE_UPDATE_KEYS = ["morningBriefEnabled", "eveningCheckinEnabled", "gmailNudgeEnabled", "morningTimeText", "eveningTimeText"];
+const GOAL_LOG_EVIDENCE_KEYS = ["eventType", "signalKey", "goalRef", "count", "notes"];
+const GMAIL_RULE_CREATE_KEYS = ["label", "matchHint", "goalRef", "signalKey", "eventType"];
+const GMAIL_AUTONOMY_KEYS = ["syncMode", "intervalMinutes"];
+
+test(
+  "106. planner-schema: 'turn on evening check-ins' — correct tool, args are ONLY proactive.settings_propose_update's own fields, no goal.log_evidence leakage",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "evening-checkin"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-turn-on-evening-${randomUUID()}`;
+    const trace = new EvalTrace("106-schema-turn-on-evening", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("turn on evening check-ins", await sendAgentMessage(server, userId, "turn on evening check-ins"));
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "proactive.settings_propose_update", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "proactive.settings_propose_update");
+        assertNoForeignArgs(planned!.args, SETTINGS_PROPOSE_UPDATE_KEYS, "turn on evening check-ins");
+        assert.equal(reply.needsConfirmation, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "107. planner-schema: 'stop evening check-ins' — correct tool, no cross-tool args",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "evening-checkin"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-stop-evening-${randomUUID()}`;
+    const trace = new EvalTrace("107-schema-stop-evening", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid", eveningCheckinEnabled: true } });
+
+      await trace.guard(async () => {
+        const reply = trace.record("stop evening check-ins", await sendAgentMessage(server, userId, "stop evening check-ins"));
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "proactive.settings_propose_update", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "proactive.settings_propose_update");
+        assertNoForeignArgs(planned!.args, SETTINGS_PROPOSE_UPDATE_KEYS, "stop evening check-ins");
+        assert.equal(reply.needsConfirmation, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "108. planner-schema: 'check in with me every evening' — whatever tool is chosen, no cross-tool args leak in",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "evening-checkin"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-check-in-every-evening-${randomUUID()}`;
+    const trace = new EvalTrace("108-schema-check-in-every-evening", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("check in with me every evening", await sendAgentMessage(server, userId, "check in with me every evening"));
+        assertNoGenericAgentError(reply, "turn 1");
+        const planned = reply.operationsPlanned[0];
+        if (planned?.tool === "proactive.settings_propose_update") {
+          assertNoForeignArgs(planned.args, SETTINGS_PROPOSE_UPDATE_KEYS, "check in with me every evening");
+          trace.checkpoint("requires confirmation", reply.needsConfirmation === true, String(reply.needsConfirmation));
+        } else {
+          trace.checkpoint("no settings mutation without the settings tool", reply.needsConfirmation === false || planned === undefined, JSON.stringify(planned));
+        }
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "109. planner-schema: 'don't send proactive messages' — honest handling, no cross-tool args if the settings tool is used",
+  { ...llmEvalOptions(["planner-schema", "settings-intent"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-dont-send-proactive-${randomUUID()}`;
+    const trace = new EvalTrace("109-schema-dont-send-proactive", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("don't send proactive messages", await sendAgentMessage(server, userId, "don't send proactive messages"));
+        assertNoGenericAgentError(reply, "turn 1");
+        for (const planned of reply.operationsPlanned) {
+          if (planned.tool === "proactive.settings_propose_update") {
+            assertNoForeignArgs(planned.args, SETTINGS_PROPOSE_UPDATE_KEYS, "don't send proactive messages");
+          }
+        }
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        trace.checkpoint("nothing mutated before confirmation", settings === null || (!settings.morningBriefEnabled && !settings.eveningCheckinEnabled), JSON.stringify(settings));
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "110. planner-schema: 'send me a morning brief' — whatever tool is chosen, no cross-tool args leak in",
+  { ...llmEvalOptions(["planner-schema", "settings-intent"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-send-morning-brief-${randomUUID()}`;
+    const trace = new EvalTrace("110-schema-send-morning-brief", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("send me a morning brief", await sendAgentMessage(server, userId, "send me a morning brief"));
+        assertNoGenericAgentError(reply, "turn 1");
+        const planned = reply.operationsPlanned[0];
+        if (planned?.tool === "proactive.settings_propose_update") {
+          assertNoForeignArgs(planned.args, SETTINGS_PROPOSE_UPDATE_KEYS, "send me a morning brief");
+        }
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("no goal fabricated", goalCount === 0, `goal count: ${goalCount}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "111. planner-schema: 'check Gmail every hour' — routes to gmail.autonomy.propose_update, never proactive settings, args are its own real fields only",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-check-gmail-hourly-${randomUUID()}`;
+    const trace = new EvalTrace("111-schema-check-gmail-hourly", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const reply = trace.record("check Gmail every hour", await sendAgentMessage(server, userId, "check Gmail every hour"));
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "gmail.autonomy.propose_update", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "gmail.autonomy.propose_update");
+        assertNoForeignArgs(planned!.args, GMAIL_AUTONOMY_KEYS, "check Gmail every hour");
+        assert.equal(planned!.args.syncMode, "scheduled");
+        assert.equal(planned!.args.intervalMinutes, 60);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "112. planner-schema: 'track Endesa bill emails for my Endesa goal' — gmail.rule.create with its own real signal-mapping fields only",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "signal-mapping"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-endesa-rule-${randomUUID()}`;
+    const trace = new EvalTrace("112-schema-endesa-rule", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, {
+        title: "Keep Endesa bills under control",
+        category: "admin",
+        targetMetrics: [{ key: "endesa_bill_received", label: "Endesa bills received", signalKey: "endesa_bill_received", aggregation: "count", window: "weekly" }]
+      });
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "track Endesa bill emails for my Endesa goal",
+          await sendAgentMessage(server, userId, "track Endesa bill emails for my Endesa goal")
+        );
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "gmail.rule.create", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "gmail.rule.create");
+        assertNoForeignArgs(planned!.args, GMAIL_RULE_CREATE_KEYS, "track Endesa bill emails");
+        assert.equal(reply.needsConfirmation, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "113. planner-schema: 'log 20 minutes reading' — goal.log_evidence with its own real fields only, no gmail.rule.create leakage",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "evidence-question"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-log-reading-${randomUUID()}`;
+    const trace = new EvalTrace("113-schema-log-reading", ["planner-schema", "settings-intent"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, {
+        title: "Read more books",
+        category: "learning",
+        targetMetrics: [{ key: "reading_minutes", label: "reading minutes", signalKey: "reading_minutes", aggregation: "sum", window: "daily" }]
+      });
+
+      await trace.guard(async () => {
+        const reply = trace.record("log 20 minutes reading", await sendAgentMessage(server, userId, "log 20 minutes reading"));
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "goal.log_evidence", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "goal.log_evidence");
+        assertNoForeignArgs(planned!.args, GOAL_LOG_EVIDENCE_KEYS, "log 20 minutes reading");
+        const events = await prisma.event.count({ where: { userId } });
+        trace.checkpoint("real evidence logged", events > 0, `event count: ${events}`);
+        assert.ok(events > 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "114. planner-schema: 'does this count?' — no evidence logged, and if the planner attempts goal.log_evidence at all it still carries only its own fields",
+  { ...llmEvalOptions(["planner-schema", "evidence-question"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-does-this-count-${randomUUID()}`;
+    const trace = new EvalTrace("114-schema-does-this-count", ["planner-schema", "evidence-question"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, {
+        title: "Read more books",
+        category: "learning",
+        targetMetrics: [{ key: "reading_minutes", label: "reading minutes", signalKey: "reading_minutes", aggregation: "sum", window: "daily" }]
+      });
+
+      await trace.guard(async () => {
+        const reply = trace.record("does this count?", await sendAgentMessage(server, userId, "does this count?"));
+        assertNoGenericAgentError(reply, "turn 1");
+        const events = await prisma.event.count({ where: { userId } });
+        trace.checkpoint("no evidence logged", events === 0, `event count: ${events}`);
+        assert.equal(events, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "115. planner-schema: Spanish 'activa los check-ins por la noche' — correct tool, no cross-tool args",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "i18n"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-activa-noche-${randomUUID()}`;
+    const trace = new EvalTrace("115-schema-activa-noche", ["planner-schema", "settings-intent", "i18n"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("activa los check-ins por la noche", await sendAgentMessage(server, userId, "activa los check-ins por la noche"));
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "proactive.settings_propose_update", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "proactive.settings_propose_update");
+        assertNoForeignArgs(planned!.args, SETTINGS_PROPOSE_UPDATE_KEYS, "activa los check-ins por la noche");
+        assert.equal(reply.needsConfirmation, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "116. planner-schema: Catalan 'activa els check-ins del vespre' — correct tool, no cross-tool args",
+  { ...llmEvalOptions(["planner-schema", "settings-intent", "i18n"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `schema-activa-vespre-${randomUUID()}`;
+    const trace = new EvalTrace("116-schema-activa-vespre", ["planner-schema", "settings-intent", "i18n"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("activa els check-ins del vespre", await sendAgentMessage(server, userId, "activa els check-ins del vespre"));
+        const planned = reply.operationsPlanned[0];
+        trace.checkpoint("correct tool chosen", planned?.tool === "proactive.settings_propose_update", planned?.tool ?? "none");
+        assert.equal(planned?.tool, "proactive.settings_propose_update");
+        assertNoForeignArgs(planned!.args, SETTINGS_PROPOSE_UPDATE_KEYS, "activa els check-ins del vespre");
+        assert.equal(reply.needsConfirmation, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

@@ -1,5 +1,5 @@
 import { createOpenAIClient } from "@operator-agent/llm";
-import { toolArgsPlannerJsonSchema, toolCatalog, toolCatalogPromptSummary, toolNames } from "./tool-catalog.js";
+import { toolArgsPlannerJsonSchema, toolCatalog, toolCatalogPromptSummary, type ToolDefinition } from "./tool-catalog.js";
 import { isReminderCompanionAction } from "../actions/reminder-companion.js";
 import type { ContextBundle, RawPlan } from "./types.js";
 
@@ -261,6 +261,43 @@ function describeIndexRange(indexes: Array<number | undefined>): string {
   return `${Math.min(...known)}-${Math.max(...known)}`;
 }
 
+/**
+ * fix/private-alpha-known-gaps follow-up: one full operation-branch schema — tool NAME and its
+ * OWN args shape fixed together in the same anyOf branch, so a valid response for this branch can
+ * only ever pair this exact tool name with this exact tool's own args. Exported for tests only
+ * (schema-shape regression coverage — see tests/planner-schema.test.ts); never used outside this
+ * file at runtime.
+ *
+ * Why this matters (root cause of a real, reproducible bug — see docs/10-v3-readiness-audit.md and
+ * the RC eval suite's own scenario 98): the PREVIOUS shape had `tool` as a bare `enum` and `args`
+ * as a SEPARATE `anyOf` over every tool's args schema, as two independent sibling properties.
+ * OpenAI's structured-output constrained decoding satisfies each property against its OWN schema
+ * independently — nothing in a plain `{tool: {enum}, args: {anyOf}}` shape ties WHICH anyOf branch
+ * `args` must satisfy to the actual STRING VALUE generated for `tool`. That let the model legally
+ * emit `{tool: "proactive.settings_propose_update", args: <goal.log_evidence's own shape>}` —
+ * confirmed reproducible 100% of the time for that exact phrase family, never a one-off model
+ * slip. Restructuring so `tool` and `args` are co-located inside the SAME anyOf branch (this
+ * function) is OpenAI's own documented pattern for a discriminated union in Structured Outputs;
+ * `enum: [tool.name]` (a single-value enum) is used as the discriminator rather than `const` —
+ * functionally identical, but `enum` is the form already proven to work in this exact file (the
+ * old top-level `tool: {enum: toolNames}`), so this reuses a known-working keyword instead of
+ * introducing a new one under a pre-deploy deadline. This is purely an input-schema change: the
+ * JSON *shape* a valid response takes ({tool, args, rationale}) is completely unchanged, so
+ * normalizePlan/validateOperations/executeOperation need no changes at all.
+ */
+export function buildOperationVariantSchema(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["tool", "args", "rationale"],
+    properties: {
+      tool: { type: "string", enum: [tool.name] },
+      args: toolArgsPlannerJsonSchema(tool),
+      rationale: { type: ["string", "null"], maxLength: 300 }
+    }
+  };
+}
+
 function buildPlanJsonSchema() {
   return {
     type: "object",
@@ -272,16 +309,7 @@ function buildPlanJsonSchema() {
       operations: {
         type: "array",
         maxItems: 5,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["tool", "args", "rationale"],
-          properties: {
-            tool: { type: "string", enum: toolNames },
-            args: { anyOf: toolCatalog.map((tool) => toolArgsPlannerJsonSchema(tool)) },
-            rationale: { type: ["string", "null"], maxLength: 300 }
-          }
-        }
+        items: { anyOf: toolCatalog.map((tool) => buildOperationVariantSchema(tool)) }
       },
       needsClarification: { type: "boolean" },
       clarificationQuestion: { type: ["string", "null"], maxLength: 300 },
