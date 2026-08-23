@@ -2,6 +2,7 @@ import { config } from "dotenv";
 import { Bot, type Context } from "grammy";
 import {
   buildNormalizedInboundMessage,
+  describeDeployConfigWarnings,
   explainNormalizedInboundRoute,
   looksLikeMultiIntentText,
   routeNormalizedInboundMessage,
@@ -23,6 +24,14 @@ const allowedUserIds = parseAllowedUserIds(process.env.TELEGRAM_ALLOWED_USER_IDS
 
 if (!token) {
   throw new Error("TELEGRAM_BOT_TOKEN is required.");
+}
+
+console.log(`Telegram bot starting. API base URL: ${apiBaseUrl}`);
+// fix/private-alpha-known-gaps: the RC smoke pass found API_BASE_URL silently defaults to
+// localhost with zero startup-time visibility here at all — reuses @operator-agent/core's shared
+// describeDeployConfigWarnings (also used by apps/api and apps/worker's own startup logging).
+for (const warning of describeDeployConfigWarnings({ apiBaseUrl })) {
+  console.warn(`[startup] ${warning}`);
 }
 
 const bot = new Bot(token);

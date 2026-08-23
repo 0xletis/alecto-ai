@@ -1,5 +1,5 @@
 import { createOpenAIClient } from "@operator-agent/llm";
-import { toolArgsPlannerJsonSchema, toolCatalog, toolCatalogPromptSummary, toolNames } from "./tool-catalog.js";
+import { toolArgsPlannerJsonSchema, toolCatalog, toolCatalogPromptSummary, type ToolDefinition } from "./tool-catalog.js";
 import { isReminderCompanionAction } from "../actions/reminder-companion.js";
 import type { ContextBundle, RawPlan } from "./types.js";
 
@@ -135,8 +135,9 @@ export function buildSystemPrompt(): string {
     "- For 'review my week', 'give me my weekly review', 'how did this week go?', 'what changed this week?' (this is week-scoped, about the user's own week — do NOT confuse with the bare 'what changed?'/'what did you do?' above, which is about this conversation), or 'what should I improve next week?', plan weekly_review.start. It builds and shows a grounded review from real data and opens its own pending save state — do not also plan confirmation.confirm. It's safe to plan again later in the same conversation to re-show the (still real, still current) review. Never plan weekly_review.save yourself; it only runs when the user confirms saving (e.g. an exact 'yes' or 'save this review'), which is handled deterministically.",
     "- Ownership rule for morning-brief-shaped requests: plain 'morning brief' language ALWAYS means the V3 proactive morning brief (proactive.*) — never the legacy daily loop (daily_loop.*) — regardless of whether the request is about on/off or timing. Only route to daily_loop.* when the user explicitly says 'daily loop' or 'daily review' (or 'start-day'/'end-day' message). 'setup morning brief at 9', 'turn on morning briefs', 'move my morning brief to 9', 'what proactive messages are on?' are ALL proactive.*, never daily_loop.*, even though daily_loop.* also has a start-day time field.",
     "- For 'what are my daily loop settings?', 'when is my daily review?', 'is daily review on?', plan daily_loop.settings_show. For 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day', 'change my daily loop start time to 9am', plan daily_loop.settings_propose_update with only the field(s) actually being changed (enabled for on/off, morningTimeText/eveningTimeText for a time change, as natural text like '9am' or '21:30') — it resolves and compares against the real current settings itself and opens a pending confirmation on its own; do not also plan confirmation.confirm. The daily loop only supports on/off plus its start-day and end-day times — nothing else (no delivery channel, no other reminder types, no scheduling beyond these two times) is supported; if asked for something outside that, explain honestly in replyDraft instead of planning a mutation. Never plan daily_loop.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically.",
-    "- For 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', plan proactive.settings_show — it shows on/off AND the scheduled time for each moment that's on. For 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail alerts', 'stop Gmail alerts', 'turn on Gmail nudges', 'tell me when important emails arrive', 'notify me about important Gmail', 'avísame de correos importantes', plan proactive.settings_propose_update with only the field(s) actually being changed (morningBriefEnabled/eveningCheckinEnabled/gmailNudgeEnabled). Say 'Gmail alerts' or 'email alerts' to users; `gmailNudgeEnabled` is only the internal field name. A Gmail alert settings change is only a notification preference; it must NOT call Gmail sync, Gmail status, or Gmail rule tools unless the user separately asks for connection help. For a COMBINED request that both schedules and turns something on — 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', 'setup morning brief tomorrow at 9', 'setup morning brief at 01:35' — set BOTH the enabled flag (true) AND the matching time field (morningTimeText/eveningTimeText, natural text like '9am' or '01:06') in the SAME call; this turns it on and schedules it in one proposal, matching what the user actually asked for. For a TIME-ONLY request with no on/off language — 'move morning brief to 9', 'change morning brief time to 9' — set ONLY the time field; do not also set the enabled flag, since the user didn't ask to turn anything on or off. It opens a pending confirmation on its own; do not also plan confirmation.confirm. This engine ONLY has these three on/off toggles plus their two times — no per-goal targeting, no strictness/frequency dial, no other proactive moment; for a vaguer request like 'be stricter with this goal', 'fewer alerts please', 'less often', that finer control isn't supported — explain honestly in replyDraft instead of guessing which toggle they mean. Never plan proactive.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically. PROACTIVE_OPERATOR_DELIVERY_ENABLED/allowlist are separate, developer-only rollout controls the user cannot see or change through chat — never mention them.",
-    "- For 'why didn't I get my morning brief?', 'it's 9 and no morning brief', 'I didn't get the morning brief', 'where is my morning brief?', plan proactive.diagnose_morning_brief instead of proactive.settings_show or proactive.settings_propose_update — this question is about DELIVERY, not settings, and 'that's already how it's set' is not a helpful answer to it. It returns a grounded, specific diagnosis (off, blocked by an environment/rollout control, outside the scheduled window, already sent today, or genuinely eligible) — never invent your own explanation for a missed send.",
+    "- For 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', plan proactive.settings_show — it shows on/off AND the scheduled time for each moment that's on. For 'turn on morning briefs', 'stop morning briefs', 'turn on evening check-ins', 'check in every evening', 'check in with me tonight', 'stop evening check-ins', 'turn on Gmail alerts', 'stop Gmail alerts', 'turn on Gmail nudges', 'tell me when important emails arrive', 'notify me about important Gmail', 'avísame de correos importantes', plan proactive.settings_propose_update with ONLY the real fields this tool actually has — morningBriefEnabled / eveningCheckinEnabled / gmailNudgeEnabled (booleans) and morningTimeText / eveningTimeText (natural time text) — never signalKey/eventType/goalRef/count/notes, which belong to a completely different tool (goal.log_evidence) and must never appear in this call. Say 'Gmail alerts' or 'email alerts' to users; `gmailNudgeEnabled` is only the internal field name. A Gmail alert settings change is only a notification preference; it must NOT call Gmail sync, Gmail status, or Gmail rule tools unless the user separately asks for connection help. For a COMBINED request that both schedules and turns something on — 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', 'setup morning brief tomorrow at 9', 'setup morning brief at 01:35' — set BOTH the enabled flag (true) AND the matching time field (morningTimeText/eveningTimeText, natural text like '9am' or '01:06') in the SAME call; this turns it on and schedules it in one proposal, matching what the user actually asked for. For a TIME-ONLY request with no on/off language — 'move morning brief to 9', 'change morning brief time to 9' — set ONLY the time field; do not also set the enabled flag, since the user didn't ask to turn anything on or off. It opens a pending confirmation on its own; do not also plan confirmation.confirm. This engine ONLY has these three on/off toggles plus their two times — no per-goal targeting, no strictness/frequency dial, no other proactive moment; for a vaguer request like 'be stricter with this goal', 'fewer alerts please', 'less often', that finer control isn't supported — explain honestly in replyDraft instead of guessing which toggle they mean. Never plan proactive.settings_apply_update yourself; it only runs when the user confirms with an exact yes, handled deterministically. PROACTIVE_OPERATOR_DELIVERY_ENABLED/allowlist are separate, developer-only rollout controls the user cannot see or change through chat — never mention them.",
+    "- For 'why didn't I get my morning brief?', 'it's 9 and no morning brief', 'I didn't get the morning brief', 'where is my morning brief?', plan proactive.diagnose_morning_brief instead of proactive.settings_show or proactive.settings_propose_update — this question is about DELIVERY, not settings, and 'that's already how it's set' is not a helpful answer to it. It returns a grounded, specific diagnosis (off, blocked by an environment/rollout control, outside the scheduled window, already sent today, or genuinely eligible) — never invent your own explanation for a missed send. Same shape, same reasoning, for evening check-in: 'why didn't you check in last night?', 'no evening check-in', 'where is my evening check-in?' — plan proactive.diagnose_evening_checkin instead, never proactive.diagnose_morning_brief for an evening question.",
+    "- STANDALONE WARNING, read this before touching anything with the words 'evening check-in' in it: 'evening check-in' names a SCHEDULED MESSAGE SETTING (proactive.settings_propose_update / proactive.diagnose_evening_checkin), and has NOTHING to do with 'checking in' progress, logging evidence, or goal.log_evidence — despite the surface-level word overlap with 'check-in,' these are two completely unrelated tools with completely unrelated argument shapes. 'turn on evening check-ins', 'stop evening check-ins', 'check in with me tonight', 'avísame por la noche' are ALL settings requests for proactive.settings_propose_update, using ONLY its real boolean/time fields (morningBriefEnabled/eveningCheckinEnabled/gmailNudgeEnabled/morningTimeText/eveningTimeText) — never signalKey, never eventType, never goalRef, never count, never notes. If you notice yourself reaching for signalKey/eventType/goalRef/count/notes while handling an 'evening check-in' request, STOP — that is always the wrong tool's arguments; go back and use proactive.settings_propose_update's own real fields instead.",
     "- When a user describes or sets a new goal that is clearly a DAILY, RECURRING habit (e.g. 'my goal is to go to the gym every day', 'I want to apply to jobs every weekday'), it's fine to ALSO plan proactive.settings_propose_update in the same turn, proposing morningBriefEnabled/eveningCheckinEnabled true — but only ever as a proposal, exactly like any other settings change: it opens a pending confirmation, never enables anything by itself, and the user must reply with an exact yes before anything is stored. Do not do this for a one-off, non-recurring, or vague goal, and do not repeat the offer if the user already has that same toggle on or has already declined it earlier in the conversation.",
     "- Keep replyDraft concise and specific about what you understood/did, in the user's own language.",
     "- Return only JSON matching the schema."
@@ -260,6 +261,43 @@ function describeIndexRange(indexes: Array<number | undefined>): string {
   return `${Math.min(...known)}-${Math.max(...known)}`;
 }
 
+/**
+ * fix/private-alpha-known-gaps follow-up: one full operation-branch schema — tool NAME and its
+ * OWN args shape fixed together in the same anyOf branch, so a valid response for this branch can
+ * only ever pair this exact tool name with this exact tool's own args. Exported for tests only
+ * (schema-shape regression coverage — see tests/planner-schema.test.ts); never used outside this
+ * file at runtime.
+ *
+ * Why this matters (root cause of a real, reproducible bug — see docs/10-v3-readiness-audit.md and
+ * the RC eval suite's own scenario 98): the PREVIOUS shape had `tool` as a bare `enum` and `args`
+ * as a SEPARATE `anyOf` over every tool's args schema, as two independent sibling properties.
+ * OpenAI's structured-output constrained decoding satisfies each property against its OWN schema
+ * independently — nothing in a plain `{tool: {enum}, args: {anyOf}}` shape ties WHICH anyOf branch
+ * `args` must satisfy to the actual STRING VALUE generated for `tool`. That let the model legally
+ * emit `{tool: "proactive.settings_propose_update", args: <goal.log_evidence's own shape>}` —
+ * confirmed reproducible 100% of the time for that exact phrase family, never a one-off model
+ * slip. Restructuring so `tool` and `args` are co-located inside the SAME anyOf branch (this
+ * function) is OpenAI's own documented pattern for a discriminated union in Structured Outputs;
+ * `enum: [tool.name]` (a single-value enum) is used as the discriminator rather than `const` —
+ * functionally identical, but `enum` is the form already proven to work in this exact file (the
+ * old top-level `tool: {enum: toolNames}`), so this reuses a known-working keyword instead of
+ * introducing a new one under a pre-deploy deadline. This is purely an input-schema change: the
+ * JSON *shape* a valid response takes ({tool, args, rationale}) is completely unchanged, so
+ * normalizePlan/validateOperations/executeOperation need no changes at all.
+ */
+export function buildOperationVariantSchema(tool: ToolDefinition): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["tool", "args", "rationale"],
+    properties: {
+      tool: { type: "string", enum: [tool.name] },
+      args: toolArgsPlannerJsonSchema(tool),
+      rationale: { type: ["string", "null"], maxLength: 300 }
+    }
+  };
+}
+
 function buildPlanJsonSchema() {
   return {
     type: "object",
@@ -271,16 +309,7 @@ function buildPlanJsonSchema() {
       operations: {
         type: "array",
         maxItems: 5,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["tool", "args", "rationale"],
-          properties: {
-            tool: { type: "string", enum: toolNames },
-            args: { anyOf: toolCatalog.map((tool) => toolArgsPlannerJsonSchema(tool)) },
-            rationale: { type: ["string", "null"], maxLength: 300 }
-          }
-        }
+        items: { anyOf: toolCatalog.map((tool) => buildOperationVariantSchema(tool)) }
       },
       needsClarification: { type: "boolean" },
       clarificationQuestion: { type: ["string", "null"], maxLength: 300 },

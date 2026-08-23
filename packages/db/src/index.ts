@@ -2477,7 +2477,13 @@ export async function getUsersWithEnabledNotifications(): Promise<NotificationSe
         { dailyCheckinEnabled: true },
         { dailyInsightEnabled: true },
         { weeklyInsightEnabled: true },
-        { dailyLoopEnabled: true }
+        { dailyLoopEnabled: true },
+        // Without this, a user who opted into ONLY the V3 evening check-in (never touching the
+        // legacy daily-loop/checkin/insight flags) would never even appear in this coarse
+        // prefetch — apps/worker/src/index.ts's runTick() would have no row to run its own
+        // eveningCheckinEnabled check against at all. Every individual feature branch downstream
+        // still does its own fine-grained gate before acting; this only widens the prefetch.
+        { eveningCheckinEnabled: true }
       ]
     },
     orderBy: {

@@ -8,12 +8,18 @@ import {
   getUsersWithEnabledNotifications,
   hasNotificationLog
 } from "@operator-agent/db";
-import { buildDailyCheckinPrompt, proactiveOperatorAllowlistActiveFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
+import {
+  buildDailyCheckinPrompt,
+  describeDeployConfigWarnings,
+  proactiveOperatorAllowlistActiveFromEnv,
+  proactiveOperatorDeliveryEnabledFromEnv
+} from "@operator-agent/core";
 import { sendDueActionReminders as sendDueActionRemindersImpl } from "./action-reminders.js";
-import { formatLocalDate, formatLocalTime, formatMinutesOfDay, getPart } from "./datetime.js";
+import { formatLocalDate, formatLocalTime, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
-import { runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
+import { runV3ProactiveEveningCheckins, runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
 import { runLegacyDailyLoopMorningBriefs } from "./legacy-daily-loop-morning.js";
+import { runLegacyDailyLoopEveningReviews } from "./legacy-daily-loop-evening.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -30,7 +36,9 @@ if (!telegramBotToken) {
 }
 
 console.log(`Worker started. API base URL: ${apiBaseUrl}`);
+logStartupWarnings();
 logEffectiveProactiveDeliveryConfig();
+console.log(`INTEGRATION_SYNC_ENABLED=${integrationSyncEnabled}`);
 
 await runTick();
 setInterval(() => {
@@ -38,6 +46,17 @@ setInterval(() => {
     console.error("Worker tick failed", error);
   });
 }, tickMs);
+
+/** fix/private-alpha-known-gaps: the RC smoke pass found API_BASE_URL silently defaults to
+ * localhost with zero startup-time visibility — the worker would then quietly fail every API call
+ * against a real deploy with no clue why. Reuses @operator-agent/core's shared
+ * describeDeployConfigWarnings (also used by apps/api and apps/telegram-bot's own startup
+ * logging) — never prints a secret value, only presence booleans and this already-public URL. */
+function logStartupWarnings(): void {
+  for (const warning of describeDeployConfigWarnings({ databaseUrlPresent: Boolean(process.env.DATABASE_URL), apiBaseUrl })) {
+    console.warn(`[startup] ${warning}`);
+  }
+}
 
 /** Logged once at startup so it's immediately visible whether the two developer rollout controls
  * are actually live in THIS process — .env is only read at startup, so a stale env value here is
@@ -82,17 +101,19 @@ async function runTick() {
 
   }
 
-  // Legacy daily-loop morning message and V3's proactive morning brief are mutually exclusive
-  // per user — see apps/worker/src/legacy-daily-loop-morning.ts's doc comment. Order between
-  // these two calls does not matter: the legacy call skips based on configuration
-  // (morningBriefEnabled + V3 delivery actually live for that user), not on whether V3 actually
-  // sends this tick.
+  // Legacy daily-loop morning/evening messages and V3's proactive morning brief/evening check-in
+  // are each mutually exclusive per user — see apps/worker/src/legacy-daily-loop-morning.ts and
+  // legacy-daily-loop-evening.ts's own doc comments. Order between each pair does not matter: the
+  // legacy call skips based on configuration (morningBriefEnabled/eveningCheckinEnabled + V3
+  // delivery actually live for that user), not on whether V3 actually sends this tick.
   await runLegacyDailyLoopMorningBriefs(settings, { apiGet, sendTelegramMessage });
-  await runDailyEveningReviews(now, settings);
+  await runLegacyDailyLoopEveningReviews(settings, { apiGet, sendTelegramMessage });
 
-  // V3 proactive delivery remains opt-in and env-gated. morning_brief is time-triggered; Gmail
-  // nudges only surface already-created EmailReviewItems and never scan Gmail by themselves.
+  // V3 proactive delivery remains opt-in and env-gated. morning_brief and evening_checkin are
+  // time-triggered; Gmail nudges only surface already-created EmailReviewItems and never scan
+  // Gmail by themselves.
   await runV3ProactiveMorningBriefs(settings, { apiGet, sendTelegramMessage });
+  await runV3ProactiveEveningCheckins(settings, { apiGet, sendTelegramMessage });
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
@@ -108,20 +129,6 @@ async function runTick() {
 // so the rest of index.ts's tick loop is unaffected.
 async function sendDueActionReminders(now: Date) {
   await sendDueActionRemindersImpl(now, { sendTelegramMessage });
-}
-
-export async function runDailyEveningReviews(now = new Date(), settings?: NotificationSettings[]) {
-  const notificationSettings = settings ?? (await getUsersWithEnabledNotifications());
-
-  for (const item of notificationSettings) {
-    if (!item.telegramUserId || !item.dailyLoopEnabled) {
-      continue;
-    }
-
-    if (formatMinutesOfDay(item.eveningTimeMinutes) === formatLocalTime(now, item.timezone)) {
-      await maybeSendDailyLoopEnd(item, now);
-    }
-  }
 }
 
 async function runIntegrationSync(now: Date) {
@@ -215,32 +222,6 @@ async function maybeSendWeeklyInsight(item: NotificationSettings, now: Date) {
   }
 }
 
-async function maybeSendDailyLoopEnd(item: NotificationSettings, now: Date) {
-  if (!item.telegramUserId) {
-    return;
-  }
-
-  const sentForDate = formatLocalDate(now, item.timezone);
-  const logInput = {
-    userId: item.userId,
-    type: "daily_loop_evening",
-    sentForDate
-  };
-
-  if (await hasNotificationLog(logInput)) {
-    return;
-  }
-
-  const response = await apiGet<DailyLoopMessageResponse>(
-    `/users/${item.userId}/daily-loop/end-day?markSent=true&now=${encodeURIComponent(now.toISOString())}`
-  );
-  await sendTelegramMessage(item.telegramUserId, response.message);
-  const logged = await createNotificationLog(logInput);
-
-  if (logged) {
-    console.log(`Sent daily loop evening review to ${item.userId} for ${sentForDate}.`);
-  }
-}
 
 async function apiGet<T>(path: string): Promise<T> {
   const response = await fetch(`${apiBaseUrl}${path}`);
@@ -362,6 +343,7 @@ interface NotificationSettings {
   weeklyInsightTime?: string;
   dailyLoopEnabled: boolean;
   morningBriefEnabled: boolean;
+  eveningCheckinEnabled: boolean;
   gmailNudgeEnabled: boolean;
   timezone: string;
   morningTimeMinutes: number;
@@ -370,10 +352,6 @@ interface NotificationSettings {
 
 interface InsightResponse {
   insight: InsightReport;
-}
-
-interface DailyLoopMessageResponse {
-  message: string;
 }
 
 interface InsightReport {

@@ -685,6 +685,14 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({})
   },
   {
+    name: "proactive.diagnose_evening_checkin",
+    description:
+      "Diagnose why the proactive evening check-in did or didn't (or won't) send — grounded in real settings and delivery state, never a generic settings summary. Use for 'why didn't you check in last night?', 'no evening check-in', 'it's 9pm and no check-in', 'where is my evening check-in?'. Read-only.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
     name: "operator.today",
     description: "Summarize what's on for today: open/due actions, active goals, today's logged progress.",
     mutates: false,
@@ -823,7 +831,16 @@ function zodFieldToPlannerJsonSchema(field: z.ZodTypeAny): Record<string, unknow
     const items = element instanceof z.ZodObject ? zodObjectToPlannerJsonSchema(element) : zodFieldToPlannerJsonSchema(element);
     schema = optional ? { type: ["array", "null"], items } : { type: "array", items };
   } else if (inner instanceof z.ZodObject) {
-    schema = zodObjectToPlannerJsonSchema(inner);
+    // A real, separate latent bug found while adding tests for the tool/args discriminated-union
+    // fix: unlike every other branch here, this one never modeled `optional` at all — an OPTIONAL
+    // object field (e.g. goal.create_propose's `checkIn`) was emitted as plain `{type: "object"}`,
+    // never `["object", "null"]`, so OpenAI's strict mode (which requires every property in
+    // `required` and models optionality via nullability, never omission) left the model with NO
+    // schema-valid way to actually omit it — it was structurally FORCED to invent a checkIn object
+    // on every single goal.create_propose call, contradicting the tool's own "optional single
+    // check-in suggestion" description. Fixed the same way every other branch already does it.
+    const objectSchema = zodObjectToPlannerJsonSchema(inner);
+    schema = optional ? { ...objectSchema, type: ["object", "null"] } : objectSchema;
   } else if (inner instanceof z.ZodEnum) {
     const values = inner.options as string[];
     schema = optional ? { type: ["string", "null"], enum: [...values, null] } : { type: "string", enum: values };

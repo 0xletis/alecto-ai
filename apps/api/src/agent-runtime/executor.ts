@@ -83,8 +83,13 @@ import {
   rejectEmailReviewForUser
 } from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
-import { formatProactiveDeliveryDiagnosis, getProactiveDeliveryStatus } from "../operator/proactive-eligibility.js";
-import { MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
+import {
+  formatEveningCheckinDeliveryDiagnosis,
+  formatProactiveDeliveryDiagnosis,
+  getEveningCheckinDeliveryStatus,
+  getProactiveDeliveryStatus
+} from "../operator/proactive-eligibility.js";
+import { EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
 import {
   actionInputFromPlanSuggestion,
   buildNextWeekPlanContext,
@@ -1915,6 +1920,37 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: formatProactiveDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive),
+          result: { status }
+        };
+      }
+
+      case "proactive.diagnose_evening_checkin": {
+        const settings = await getOrCreateNotificationSettings(userId);
+        const now = new Date();
+        const sentForDate = formatDateInTimezone(now, settings.timezone);
+        const eveningKey = EVENING_CHECKIN_DEDUPE_KEY;
+        const [alreadySentToday, legacyDailyLoopLog] = await Promise.all([
+          hasNotificationLog({ userId, type: eveningKey, sentForDate }),
+          getNotificationLog({ userId, type: "daily_loop_evening", sentForDate })
+        ]);
+        const legacyDailyLoopSentAt = legacyDailyLoopLog?.sentAt;
+
+        const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
+        const status = getEveningCheckinDeliveryStatus({
+          context,
+          notificationSettings: settings,
+          now,
+          alreadySentDedupeKeys: alreadySentToday ? new Set([eveningKey]) : new Set(),
+          sentCountToday: alreadySentToday ? 1 : 0,
+          deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
+          isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId),
+          legacyDailyLoopSentAt
+        });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: formatEveningCheckinDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive),
           result: { status }
         };
       }
