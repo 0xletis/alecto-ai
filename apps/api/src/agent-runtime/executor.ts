@@ -18,6 +18,7 @@ import {
   getEventsSince,
   getIntegrationConnection,
   getOrCreateNotificationSettings,
+  getOrCreateUserOperatingProfile,
   getNotificationLog,
   hasNotificationLog,
   rescheduleActionItem,
@@ -26,6 +27,7 @@ import {
   updateEmailSignalRule,
   updateIntegrationConnectionConfig,
   updateNotificationSettings,
+  updateUserOperatingProfile,
   type ActionItem,
   type EmailReviewItem,
   type EmailSignalRule,
@@ -56,7 +58,8 @@ import {
   type Goal,
   type GoalMetric,
   type NotificationSettings,
-  type StoredEvent
+  type StoredEvent,
+  type UserOperatingProfile
 } from "@operator-agent/core";
 import { inferActionGoalLink } from "../utils/action-goal-link.js";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
@@ -1893,6 +1896,57 @@ export async function executeOperation(
         };
       }
 
+      case "operator_profile.propose_update": {
+        const directnessStyle = args.directness as "gentle" | "balanced" | "blunt" | undefined;
+        const motivationalStyle = args.motivationalStyle as string | undefined;
+        const accountabilityStyle = args.accountabilityStrictness as "relaxed" | "balanced" | "strict" | undefined;
+
+        const directness = directnessStyle ? OPERATOR_PROFILE_STYLE_SCALE[directnessStyle] : undefined;
+        const accountabilityStrictness = accountabilityStyle ? OPERATOR_PROFILE_STYLE_SCALE[accountabilityStyle] : undefined;
+
+        const before = await getOrCreateUserOperatingProfile(userId);
+        const changes = describeOperatorProfileChanges(before, { directness, motivationalStyle, accountabilityStrictness });
+
+        if (changes.length === 0) {
+          return { tool: operation.tool, status: "executed", summary: "That's already how I'm set up with you." };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `You're about to ${changes.map((change) => change.proposal).join(" and ")}. Reply yes to confirm or cancel.`,
+          pendingOperationUpdate: {
+            topic: "operator_profile",
+            summary: changes.map((change) => change.proposal).join(" and "),
+            operations: [
+              {
+                tool: "operator_profile.apply_update",
+                args: { directness, motivationalStyle, accountabilityStrictness },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "operator_profile.apply_update": {
+        const directness = args.directness as number | undefined;
+        const motivationalStyle = args.motivationalStyle as string | undefined;
+        const accountabilityStrictness = args.accountabilityStrictness as number | undefined;
+        const before = await getOrCreateUserOperatingProfile(userId);
+
+        const updated = await updateUserOperatingProfile(userId, { directness, motivationalStyle, accountabilityStrictness });
+        const changes = describeOperatorProfileChanges(before, { directness, motivationalStyle, accountabilityStrictness });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: changes.length > 0 ? `Done — ${changes.map((change) => change.done).join(" and ")}.` : "Done — nothing needed to change.",
+          result: updated
+        };
+      }
+
       case "proactive.diagnose_morning_brief": {
         const settings = await getOrCreateNotificationSettings(userId);
         const now = new Date();
@@ -3307,6 +3361,44 @@ function describeProactiveSettingsChanges(current: NotificationSettings, request
         ? { proposal: "turn on Gmail alerts", done: "Gmail alerts are now on" }
         : { proposal: "turn off Gmail alerts", done: "Gmail alerts are now off" }
     );
+  }
+
+  return changes;
+}
+
+// Maps the planner's natural-language style words to the profile's internal 1-5 scale — kept
+// deliberately small (one gentle/soft point, the schema default, one firm point) rather than
+// exposing the full 1-5 range to the LLM, which would invite it to guess an arbitrary number.
+const OPERATOR_PROFILE_STYLE_SCALE: Record<"gentle" | "balanced" | "blunt" | "relaxed" | "strict", number> = {
+  gentle: 2,
+  relaxed: 2,
+  balanced: 3,
+  blunt: 5,
+  strict: 5
+};
+
+interface OperatorProfileChangeRequest {
+  directness?: number;
+  motivationalStyle?: string;
+  accountabilityStrictness?: number;
+}
+
+function describeOperatorProfileChanges(
+  current: UserOperatingProfile,
+  request: OperatorProfileChangeRequest
+): ProactiveSettingsChangeDescription[] {
+  const changes: ProactiveSettingsChangeDescription[] = [];
+
+  if (request.directness !== undefined && request.directness !== current.directness) {
+    const label = request.directness >= 5 ? "be more blunt and direct" : request.directness <= 2 ? "be gentler and more encouraging" : "use a balanced tone";
+    changes.push({ proposal: label, done: `I'll ${label} with you from now on` });
+  }
+  if (request.motivationalStyle !== undefined && request.motivationalStyle !== current.motivationalStyle) {
+    changes.push({ proposal: `use a "${request.motivationalStyle}" motivational style`, done: `motivational style is now "${request.motivationalStyle}"` });
+  }
+  if (request.accountabilityStrictness !== undefined && request.accountabilityStrictness !== current.accountabilityStrictness) {
+    const label = request.accountabilityStrictness >= 5 ? "hold you to your commitments strictly" : request.accountabilityStrictness <= 2 ? "go easy on accountability" : "keep a balanced level of accountability";
+    changes.push({ proposal: label, done: `I'll now ${label}` });
   }
 
   return changes;
