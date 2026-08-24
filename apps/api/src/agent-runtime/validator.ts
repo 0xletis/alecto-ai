@@ -830,6 +830,20 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     };
   }
 
+  // Same reasoning again: operator_profile.apply_update is never planned by the LLM directly,
+  // only ever reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by operator_profile.propose_update.
+  if (tool.name === "operator_profile.apply_update") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending coaching-style preference change",
+      rationale: operation.rationale
+    };
+  }
+
   // Same reasoning again: goal.create_apply is never planned by the LLM directly, only ever
   // reached via the deterministic confirm whitelist re-executing an already-stored
   // pendingOperation set by goal.create_propose. This is the one place an LLM-proposed goal

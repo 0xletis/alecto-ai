@@ -3671,3 +3671,301 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-onboarding-flow: a real Railway smoke test found a nuanced goal-proposal
+ * refinement ("...let me know when some of them Reply as my mail get flooded...") hijacked by the
+ * deterministic UNSUPPORTED_GMAIL_ACTION_RE shortcut before the planner ever ran. Scenarios 117-126
+ * cover the fix: the shortcut must only fire for genuine Gmail send/reply/forward/delete requests,
+ * a pending goal proposal must be revisable in place, tracking-only (no forced numeric target)
+ * proposals must work, and a lightweight operator-onboarding/coaching-style flow must exist.
+ */
+
+test(
+  "117. private-alpha regression: the exact real Railway transcript — job goal proposal, then a nuanced refinement, must revise the proposal, not refuse Gmail",
+  { ...llmEvalOptions(["onboarding-flow", "goal-proposal-revision", "gmail-passive-observation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-railway-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("117-railway-transcript", ["onboarding-flow", "goal-proposal-revision", "gmail-passive-observation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        assert.equal(t1.debug.pendingOperation, true, "the initial goal proposal must open a pending confirmation");
+
+        const t2 = trace.record(
+          "3 jobs per week is low, I can send more than that, what if we have no number goal but you keep tracking how much i sent? Gmail would be nice, so you know how many I get, and if possible let me know when some of then Reply as my mail get flooded with automatic responses from CV sent. And would like some daily checking and motivation",
+          await sendAgentMessage(
+            server,
+            userId,
+            "3 jobs per week is low, I can send more than that, what if we have no number goal but you keep tracking how much i sent? Gmail would be nice, so you know how many I get, and if possible let me know when some of then Reply as my mail get flooded with automatic responses from CV sent. And would like some daily checking and motivation"
+          )
+        );
+
+        const hitUnsupportedShortcut = t2.debug.conversationTopic === "gmail_unsupported_action";
+        trace.checkpoint("did NOT hit the unsupported-Gmail-action shortcut", !hitUnsupportedShortcut, t2.reply);
+        assert.ok(!hitUnsupportedShortcut, `must not refuse Gmail reply for a passive tracking request — got: ${t2.reply}`);
+
+        assertNoBannedPhrases(t2.reply, ["i'll monitor", "i'm watching your inbox", "i can reply", "i'll reply"], "turn 2 (refinement)", trace);
+        trace.checkpoint("pending confirmation still open after revision", t2.debug.pendingOperation === true, String(t2.debug.pendingOperation));
+        assert.equal(t2.debug.pendingOperation, true, "the revised proposal must still require confirmation, not apply itself");
+
+        const goalCountBeforeConfirm = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("no goal created before confirmation", goalCountBeforeConfirm === 0, `count: ${goalCountBeforeConfirm}`);
+        assert.equal(goalCountBeforeConfirm, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "118. Gmail unsupported action: 'reply to the recruiter for me' is genuinely refused, no email is ever sent",
+  { ...llmEvalOptions(["gmail-passive-observation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-gmail-refuse-${randomUUID()}`;
+    const trace = new EvalTrace("118-gmail-refuse-reply", ["gmail-passive-observation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("reply to the recruiter for me", await sendAgentMessage(server, userId, "reply to the recruiter for me"));
+        const refused = /can't reply/i.test(reply.reply);
+        trace.checkpoint("refused with the honest unsupported-action reply", refused, reply.reply);
+        assert.ok(refused, `expected an honest refusal — got: ${reply.reply}`);
+        assert.equal(reply.debug.llmPlannerAttempted, false, "a genuinely unsupported Gmail action must be blocked deterministically, before the planner");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "119. Gmail passive observation: 'let me know when recruiters reply' is treated as a trackable signal, never refused as an email-send request",
+  { ...llmEvalOptions(["gmail-passive-observation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-gmail-passive-${randomUUID()}`;
+    const trace = new EvalTrace("119-gmail-passive-observation", ["gmail-passive-observation"], userId);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("let me know when recruiters reply", await sendAgentMessage(server, userId, "let me know when recruiters reply"));
+        const refused = reply.debug.conversationTopic === "gmail_unsupported_action";
+        trace.checkpoint("not treated as an unsupported email-send request", !refused, reply.reply);
+        assert.ok(!refused, `a passive notification request must not be refused as email-sending — got: ${reply.reply}`);
+        assertNoBannedPhrases(reply.reply, ["i can't reply to gmail messages"], "passive observation", trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "120. tracking-only goal: 'no target, just track how much I do' produces count/trend tracking with no forced numeric target",
+  { ...llmEvalOptions(["goal-proposal-revision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-no-target-${randomUUID()}`;
+    const trace = new EvalTrace("120-no-target-tracking", ["goal-proposal-revision"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to send more job applications", await sendAgentMessage(server, userId, "I want to send more job applications"));
+        assert.equal(t1.debug.pendingOperation, true);
+
+        const t2 = trace.record(
+          "no fixed target, just track how many I send",
+          await sendAgentMessage(server, userId, "no fixed target, just track how many I send")
+        );
+        trace.checkpoint("revision reached the planner (not refused)", t2.debug.conversationTopic !== "gmail_unsupported_action", t2.reply);
+        assert.notEqual(t2.debug.conversationTopic, "gmail_unsupported_action");
+        assert.equal(t2.debug.pendingOperation, true, "the revised no-target proposal must still open a pending confirmation");
+
+        const noHardNumber = !/\b\d+\s*(a|per)\s*week\b/i.test(t2.reply);
+        trace.checkpoint("reply does not restate a mandatory weekly number", noHardNumber, t2.reply);
+        assert.ok(noHardNumber, `expected no forced weekly number after explicitly asking for count-only tracking — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "121. operator onboarding: 'help me set up' starts a real guided setup, never the generic catch-all",
+  { ...llmEvalOptions(["onboarding-flow"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-help-setup-${randomUUID()}`;
+    const trace = new EvalTrace("121-help-me-set-up", ["onboarding-flow"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("help me set up", await sendAgentMessage(server, userId, "help me set up"));
+        trace.checkpoint("deterministic onboarding topic", reply.debug.conversationTopic === "operator_onboarding", reply.debug.conversationTopic ?? "null");
+        assert.equal(reply.debug.conversationTopic, "operator_onboarding");
+        assert.equal(reply.debug.llmPlannerAttempted, false);
+        assert.match(reply.reply, /gmail/i);
+        assert.match(reply.reply, /gentle|balanced|blunt/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "122. coaching style + daily cadence: 'I want you to be blunt and check on me daily' proposes real style + real settings, no fake capability",
+  { ...llmEvalOptions(["onboarding-flow", "daily-coaching-setup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-blunt-daily-${randomUUID()}`;
+    const trace = new EvalTrace("122-blunt-daily-checkin", ["onboarding-flow", "daily-coaching-setup"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want you to be blunt and check on me daily",
+          await sendAgentMessage(server, userId, "I want you to be blunt and check on me daily")
+        );
+        const planned = reply.operationsPlanned.map((operation) => operation.tool);
+        const proposedRealTool = planned.some((tool) => tool === "operator_profile.propose_update" || tool === "proactive.settings_propose_update");
+        trace.checkpoint("proposed a real existing tool (style or cadence)", proposedRealTool, planned.join(", ") || "(none)");
+        assert.ok(proposedRealTool, `expected operator_profile.propose_update and/or proactive.settings_propose_update — planned: ${planned.join(", ") || "none"}`);
+        assertNoBannedPhrases(reply.reply, ["afternoon check-in is on", "midday check-in is on"], "blunt + daily", trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "123. Spanish: 'quiero buscar trabajo y que Gmail me avise si responden' is passive Gmail tracking, never refused as email-sending",
+  { ...llmEvalOptions(["gmail-passive-observation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-gmail-avise-${randomUUID()}`;
+    const trace = new EvalTrace("123-es-gmail-avise", ["gmail-passive-observation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "quiero buscar trabajo y que Gmail me avise si responden",
+          await sendAgentMessage(server, userId, "quiero buscar trabajo y que Gmail me avise si responden")
+        );
+        const refused = reply.debug.conversationTopic === "gmail_unsupported_action";
+        trace.checkpoint("not refused as an email-send request", !refused, reply.reply);
+        assert.ok(!refused, `expected passive Gmail tracking, not a refusal — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "124. Catalan: 'vull que em facis seguiment cada dia' maps to real daily coaching/cadence tools, honestly",
+  { ...llmEvalOptions(["daily-coaching-setup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-ca-seguiment-${randomUUID()}`;
+    const trace = new EvalTrace("124-ca-seguiment-diari", ["daily-coaching-setup"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "vull que em facis seguiment cada dia",
+          await sendAgentMessage(server, userId, "vull que em facis seguiment cada dia")
+        );
+        assertNoGenericAgentError(reply, "Catalan daily follow-up request");
+        assertNoBannedPhrases(reply.reply, [], "Catalan daily follow-up", trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "125. goal-proposal revision: 'make the goal less aggressive' revises the pending proposal in place, still requires confirmation",
+  { ...llmEvalOptions(["goal-proposal-revision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-less-aggressive-${randomUUID()}`;
+    const trace = new EvalTrace("125-make-less-aggressive", ["goal-proposal-revision"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to train 6 times a week", await sendAgentMessage(server, userId, "I want to train 6 times a week"));
+        assert.equal(t1.debug.pendingOperation, true);
+
+        const t2 = trace.record("make the goal less aggressive", await sendAgentMessage(server, userId, "make the goal less aggressive"));
+        trace.checkpoint("revision reached the planner", t2.debug.llmPlannerAttempted === true, String(t2.debug.llmPlannerAttempted));
+        assert.equal(t2.debug.llmPlannerAttempted, true);
+        assert.equal(t2.debug.pendingOperation, true, "a revised proposal must still require a fresh confirmation");
+
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("no goal created before confirming the revision", goalCount === 0, `count: ${goalCount}`);
+        assert.equal(goalCount, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "126. goal-proposal revision: after a revision, 'yes' applies the REVISED plan, and the goal is real and grounded",
+  { ...llmEvalOptions(["goal-proposal-revision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-confirm-revised-${randomUUID()}`;
+    const trace = new EvalTrace("126-confirm-revised-proposal", ["goal-proposal-revision"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to read more books", await sendAgentMessage(server, userId, "I want to read more books"));
+        trace.record("no page target, just track minutes read", await sendAgentMessage(server, userId, "no page target, just track minutes read"));
+
+        const confirmed = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("confirmation actually mutated", confirmed.debug.mutationExecuted === true, String(confirmed.debug.mutationExecuted));
+        assert.equal(confirmed.debug.mutationExecuted, true);
+
+        const goals = await prisma.goal.findMany({ where: { userId } });
+        trace.checkpoint("exactly one goal created", goals.length === 1, `count: ${goals.length}`);
+        assert.equal(goals.length, 1, `expected exactly one goal from the revised (not the original) proposal — got: ${goals.map((g) => g.title).join(", ")}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

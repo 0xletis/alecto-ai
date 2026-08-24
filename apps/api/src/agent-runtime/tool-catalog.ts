@@ -677,6 +677,30 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "operator_profile.propose_update",
+    description:
+      "Propose a change to the user's stored coaching-style preferences (communication directness, motivational approach, accountability strictness) — shows what would change and opens a pending confirmation. Use when the user states a coaching-style preference: 'be blunt with me', 'I want you to be direct', 'go easy on me', 'be gentle', 'push me harder', 'be strict about accountability', 'I like tough love', 'be more encouraging' — including as part of an onboarding/setup flow. Set only the field(s) the user actually expressed a preference for. Never applies anything by itself — the user must still confirm.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      directness: z.enum(["gentle", "balanced", "blunt"]).optional().describe("Overall communication directness: gentle (soft, encouraging), balanced (default), or blunt (direct, no sugar-coating)."),
+      motivationalStyle: z.string().optional().describe("Free-text motivational approach in the user's own words, e.g. 'tough love', 'strategic', 'cheerleader', 'encouraging'."),
+      accountabilityStrictness: z.enum(["relaxed", "balanced", "strict"]).optional().describe("How firmly Alecto should hold the user to their stated goals/commitments.")
+    })
+  },
+  {
+    name: "operator_profile.apply_update",
+    description:
+      "Internal: applies the confirmed coaching-style preference change. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      directness: z.number().int().min(1).max(5).optional(),
+      motivationalStyle: z.string().optional(),
+      accountabilityStrictness: z.number().int().min(1).max(5).optional()
+    })
+  },
+  {
     name: "proactive.diagnose_morning_brief",
     description:
       "Diagnose why the proactive morning brief did or didn't (or won't) send — grounded in real settings and delivery state, never a generic settings summary. Use for 'why didn't I get my morning brief?', 'it's 9 and no morning brief', 'I didn't get the morning brief', 'where is my morning brief?'. Read-only.",

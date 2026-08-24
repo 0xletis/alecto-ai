@@ -115,11 +115,32 @@ function markActionClarificationPendingIfNeeded(
 // rather than left to the planner's judgment — it must never depend on
 // whether the LLM correctly refuses in a given turn. Runs unconditionally,
 // including while a pending operation is open, and never touches pendingOperation.
+//
+// The reply/respond/answer branch requires an AGENT-DIRECTED shape (a "to"
+// object, an explicit "for me"/"on my behalf", or "can/could/would you
+// reply") rather than mere proximity to email/mail/gmail — a real private-
+// alpha Telegram transcript found the old, looser proximity match ("reply"
+// within 40 chars of "mail") false-triggering on "let me know when some of
+// them Reply as my mail get flooded with automatic responses," a passive
+// notification request, not a request for Alecto to send/reply to anything.
+// `\breply\b`/`\brespond\b` intentionally don't match "replies"/"responses"
+// (no word boundary between "y"/"d" and the following "ies"/"ses"), so
+// passive plural phrasing ("recruiter replies," "automatic responses")
+// never reaches this branch either.
 const UNSUPPORTED_GMAIL_ACTION_RE =
-  /\b(reply|respond|answer)\b[\s\S]{0,40}\b(email|mail|message|gmail)\b|\bsend\b[\s\S]{0,20}\b(email|mail|reply)\b|\bforward\b[\s\S]{0,20}\b(email|mail)\b|\b(delete|remove)\b[\s\S]{0,20}\b(email|mail)\b[\s\S]{0,20}\b(gmail|inbox)\b/i;
+  /\b(reply|respond|answer)\s+to\b|\b(reply|respond|answer)\b[\s\S]{0,20}\b(for me|on my behalf|myself)\b|\b(can|could|would)\s+you\s+(reply|respond|answer)\b|\bsend\b[\s\S]{0,20}\b(email|mail|reply)\b|\bforward\b[\s\S]{0,20}\b(email|mail)\b|\b(delete|remove|archive|label)\b[\s\S]{0,20}\b(email|mail)\b[\s\S]{0,20}\b(gmail|inbox)\b|\b(delete|remove|archive|label)\s+(this|that|the)\s+(email|gmail)\b/i;
 
 const UNSUPPORTED_GMAIL_ACTION_REPLY =
   "I can't reply to Gmail messages or send emails yet. I can only read matching emails through active rules and create review items.";
+
+// Defense-in-depth, checked ONLY alongside UNSUPPORTED_GMAIL_ACTION_RE above: even a precise
+// agent-directed match ("for me", "you reply") should not hijack a pending, not-yet-confirmed
+// goal proposal that the user is actively refining with ordinary goal-editing language (targets,
+// cadence, integrations, tracking preferences) — that message should reach the planner so it can
+// revise the proposal instead. Does not soften the shortcut for a genuinely unsupported request
+// with no such language (e.g. "reply to the recruiter for me" on its own still blocks).
+const GOAL_EDIT_LANGUAGE_RE =
+  /\b(target|goal|track(ing)?|cadence|check-?in|integration|prefer|instead|aggressive|no (fixed |hard )?(target|number)|daily|weekly|motivation)\b/i;
 
 // Covers "let me know when I receive one/it arrives", "notify me when I get one", "just let
 // me know", "I wanna know", "about those emails", "when they arrive", and close paraphrases.
@@ -134,6 +155,31 @@ const GMAIL_PENDING_NOTIFICATION_FOLLOWUP_RE =
 // planner unchanged. See goal-anchor-nudge below.
 const BROAD_OPERATOR_QUESTION_RE =
   /^(so )?what should i do( today)?\??$|^what can you help( me)?( with)?\??$|^help me get (organized|started)\??$|^so what('s| is)? today\??$|^how do i (start|get started|begin)\??$|^where do i start\??$|^what now\??$|^what'?s next\??$/i;
+
+// Deliberately narrow (allowlist): an explicit request to be walked through setup/onboarding,
+// not a general capability question (those already go through BROAD_OPERATOR_QUESTION_RE/the
+// goal-anchor nudge, or straight to the planner). Checked regardless of whether the user already
+// has goals — a returning user asking to redo setup is a real, if less common, case too.
+const ONBOARDING_SETUP_REQUEST_RE =
+  /\bset me up\b|\b(help|get) me set up\b|\bset up alecto\b|\bonboard(ing)? me\b|\bhow do i set (this|you|alecto) up\b/i;
+
+// Deliberately deterministic, not left to the planner — a fixed, numbered 5-question setup
+// checklist so it's identical every time and never silently balloons into a longer wizard. Each
+// question maps to a real, existing storage primitive (operator_profile.propose_update for style,
+// proactive.settings_propose_update for cadence, the existing Gmail OAuth flow for the
+// integration) — answers are collected in plain language over the following turns and only ever
+// stored once the user explicitly confirms each proposed change.
+export const ONBOARDING_SETUP_REPLY = [
+  "Happy to set this up properly. A few quick questions — answer in your own words, one at a time or all at once:",
+  "",
+  "1. What do you want help with? (a job search, fitness, spending, a habit, admin/bills — anything)",
+  "2. How should I talk to you — gentle, balanced, or blunt?",
+  "3. Want daily check-ins? I have a morning brief and an evening check-in — either, both, or neither.",
+  "4. Any guardrails I should watch for — spending, gambling, avoidance, sleep, job search burnout, or something else?",
+  "5. Want to connect Gmail so I can watch for relevant emails (read-only — I can never send or reply)?",
+  "",
+  "Nothing is saved until you confirm each change. Skip any question you'd rather not answer."
+].join("\n");
 
 const GOAL_ANCHOR_NUDGE_MARKER = "one real goal or guardrail";
 
@@ -155,7 +201,9 @@ export const GOAL_ANCHOR_NUDGE_REPLY = [
   "3. Avoid impulsive spending",
   "4. Build a project",
   "",
-  "Tell me what you want to work on in your own words — e.g. \"I want to find a new developer job\" — and I'll set it up with you."
+  "Tell me what you want to work on in your own words — e.g. \"I want to find a new developer job\" — and I'll set it up with you.",
+  "",
+  "Prefer a quick guided setup instead? Just say \"set me up\" and I'll ask a few questions about how you want to work together."
 ].join("\n");
 
 /**
@@ -466,7 +514,9 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeNoPendingReply(context, "confirmation.cancel");
   }
 
-  if (UNSUPPORTED_GMAIL_ACTION_RE.test(message.trim())) {
+  const pendingGoalProposalBeingRefined =
+    pending?.topic === "goal_creation" && GOAL_EDIT_LANGUAGE_RE.test(message.trim());
+  if (UNSUPPORTED_GMAIL_ACTION_RE.test(message.trim()) && !pendingGoalProposalBeingRefined) {
     // Deliberately does not touch pendingOperation: an unrelated, unsupported
     // request must not silently cancel or continue an unrelated pending flow.
     return finalize(context, {
@@ -640,6 +690,21 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
         topic: pending.topic
       });
     }
+  }
+
+  // Checked before the goal-anchor nudge and gated on !pending, same reasoning as the other
+  // deterministic shortcuts above: an explicit setup request is a clear, unambiguous instruction
+  // that must not be swallowed by an unrelated open confirmation, but also must not fight one.
+  if (!pending && ONBOARDING_SETUP_REQUEST_RE.test(message.trim())) {
+    return finalize(context, {
+      reply: ONBOARDING_SETUP_REPLY,
+      operationsPlanned: [],
+      executedOps: [],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: "operator_onboarding"
+    });
   }
 
   if (shouldShowGoalAnchorNudge(context, message)) {
