@@ -188,7 +188,39 @@ Simulate an expired connection (Google's own OAuth Testing-mode policy expires u
 refresh tokens after ~7 days — this is expected, not a bug) and confirm "Gmail status" honestly
 reports the expired state with a working reconnect link, never a silent failure.
 
-## 15. Rollback plan
+## 15. Railway-specific verification (deploy/railway-private-alpha)
+
+Run once against the real Railway deployment, in this order — see `docs/railway-deploy.md` for the
+full setup this assumes (three services, one public API domain, Railway Postgres). Sections 4–13
+above (connect Gmail through evening check-in) apply completely unchanged once you're pointed at
+the real Railway URL instead of `localhost` — this section only covers what's actually different
+about verifying a Railway deployment specifically.
+
+1. **Check Railway service logs** — for each of the three services (API, Telegram bot, worker),
+   open **Deployments → (latest) → View Logs** and confirm:
+   - a clean startup with no crash loop (worker/bot throw immediately and exit if
+     `TELEGRAM_BOT_TOKEN` is missing — a crash loop almost always means a missing/misspelled var)
+   - the `[startup]` warning block (API and worker) is **empty** — no `DATABASE_URL is not set`, no
+     `looks like localhost` for `API_BASE_URL`/`GMAIL_REDIRECT_URI`
+   - API logs show `[startup] Gmail OAuth callback URL: https://...` (never `localhost`) and
+     `[startup] PROACTIVE_OPERATOR_DELIVERY_ENABLED=true`
+   - worker logs show `Worker started. API base URL: https://...`, `INTEGRATION_SYNC_ENABLED=true`,
+     and the `V3 proactive delivery config: ...` line naming your own allowlisted id
+2. **Confirm the API's public URL is real** — open the API service's generated/custom domain
+   directly in a browser at `/health`; expect `{"ok":true,"service":"operator-agent-api"}`, served
+   over `https://`, not `localhost` or `127.0.0.1`.
+3. **Connect Gmail** (§4 above) — using the real Railway URL; confirm the OAuth redirect lands back
+   on the Railway domain, not a local address.
+4. **Create your first goal, then a Gmail signal rule linked to it** (§5–§6 above) — identical flow,
+   just confirm the DB rows are actually landing in the Railway Postgres instance (e.g. via
+   `railway run --service <api-service-name> psql $DATABASE_URL -c "select count(*) from \"Goal\";"`
+   if you want to check directly, though the chat replies themselves are sufficient confirmation).
+5. **Manual sync, approve a review, verify evidence, action reminder, evening check-in** (§7–§13
+   above) — unchanged.
+6. **Reconnect Gmail flow** (§14 above) — unchanged; remember Testing-mode's 7-day refresh-token
+   expiry is a Google policy independent of where Alecto is hosted.
+
+## 16. Rollback plan
 
 - **Application code**: redeploy the previous known-good commit/build. No migration rollback is
   required for that alone — every schema change through this pass has been additive (new nullable
