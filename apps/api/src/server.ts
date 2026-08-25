@@ -1000,7 +1000,16 @@ export function buildServer() {
             activeRulesPreserved > 0
               ? `Preserved ${activeRulesPreserved} active Gmail rule${activeRulesPreserved === 1 ? "" : "s"}.`
               : "No active Gmail rules needed moving.",
-            "You can return to Telegram."
+            "Access is readonly — Alecto cannot send emails or change labels.",
+            // fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: a real reported gap
+            // — this page previously only said "you can return to Telegram," leaving the user to
+            // guess what to say next. A direct Telegram push from here isn't available (apps/api
+            // has no Telegram bot client/token — that lives entirely in apps/telegram-bot as a
+            // separate process; wiring one in is a real cross-service change, out of scope for
+            // this branch). The next Telegram message already sees this connection as active
+            // (context-loader.ts reads it fresh every turn), so this is just about giving the
+            // user something concrete to say when they get there.
+            "Return to Telegram and say: enable job search rule for Gmail."
           ].join(" "));
       } catch (error) {
         return reply.status(400).type("text/plain").send(safeGmailErrorMessage(error));

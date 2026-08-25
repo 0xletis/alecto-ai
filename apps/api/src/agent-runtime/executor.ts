@@ -75,7 +75,7 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthLocalhostCallbackWarning, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
-import { buildGmailAutonomyState, formatIntervalMinutes, gmailSyncModeSentence } from "../conversation/gmail-autonomy.js";
+import { buildGmailAutonomyState, gmailRecommendationKindForGoal, formatIntervalMinutes, gmailSyncModeSentence, type GmailRuleKind } from "../conversation/gmail-autonomy.js";
 import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   approveEmailReviewForUser,
@@ -1223,6 +1223,18 @@ export async function executeOperation(
         const state = await buildGmailAutonomyState(userId);
         const connection = state.primaryConnection;
         const settings = await getOrCreateNotificationSettings(userId);
+        // Only offered when Gmail is genuinely connected (not disconnected/archived) — a
+        // proposal to enable a rule makes no sense before there's even a connection to attach
+        // it to; that case already gets its own "connect Gmail" instruction above.
+        const proposal = connection && connection.status !== "archived" ? buildGmailRuleProposal(state) : undefined;
+        // A real reported bug: Gmail help hijacked a pending action.create proposal's confirm
+        // slot entirely. The line above is always safe to show (it's just text), but the
+        // CONFIRMABLE side of the proposal must never install itself as a second pendingOperation
+        // while a different one (an action confirmation, another Gmail rule proposal, anything)
+        // is already active — only one pendingOperation can exist at a time, and the existing one
+        // always wins. Informational-only in that case; the user can still ask again once free.
+        const existingPending = context.session.pendingOperation;
+        const canProposeRuleNow = !existingPending || existingPending.topic === "gmail_rule_proposal";
         return {
           tool: operation.tool,
           status: "executed",
@@ -1232,9 +1244,11 @@ export async function executeOperation(
             state.activeRules,
             settings.timezone,
             args.includeLink === true,
-            state.lastSyncedAt
+            state.lastSyncedAt,
+            proposal?.line
           ),
-          result: connection
+          result: connection,
+          ...(proposal?.pendingOperationUpdate && canProposeRuleNow ? { pendingOperationUpdate: proposal.pendingOperationUpdate } : {})
         };
       }
 
@@ -3841,7 +3855,15 @@ function formatGmailConnectionStatusForChat(
   rules: EmailSignalRule[],
   timezone: string,
   includeLink: boolean,
-  lastSyncedAt?: Date
+  lastSyncedAt?: Date,
+  // fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: a real reported gap — Gmail
+  // connected with no active rule always got the same generic "you can say enable job search
+  // rule..." line, even when an active goal's own real signals (job/career/recruiter/CV wording)
+  // clearly call for exactly one of those rules. When set (by buildGmailRuleProposal, using the
+  // SAME goal-relevance data buildGmailAutonomyState already computes but the chat reply never
+  // surfaced), this REPLACES that generic line with a specific, actionable proposal instead of
+  // appending alongside it — showing both would be redundant.
+  ruleProposalLine?: string
 ): string {
   const oauthUrl = gmailOAuthUrlForUser(userId);
   const activeRules = rules.filter((rule) => rule.status === "active");
@@ -3890,11 +3912,132 @@ function formatGmailConnectionStatusForChat(
     oauthUrl && includeLink ? `Reconnect Gmail here if you need to refresh access:\n${oauthUrl}` : undefined,
     `Last synced: ${lastSyncedLabel}.`,
     activeRules.length === 0
-      ? "No email tracking rules are active yet. You can say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\"."
+      ? (ruleProposalLine ??
+        "No email tracking rules are active yet. You can say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\".")
       : undefined,
     ...ruleLines,
     "Sync only runs when you say \"sync Gmail\" or when scheduled Gmail checks are enabled."
   ].filter(Boolean).join("\n");
+}
+
+/**
+ * fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: buildGmailAutonomyState already
+ * computes state.recommendedRules (goal-relevance matching against real active goals' own
+ * title/category wording, via gmailRecommendationKindForGoal) — this was already correct, tested
+ * infrastructure, just never actually surfaced anywhere in the V3 chat path (only the legacy
+ * slash-command flow's formatGmailRecommendations used it, as a passive "Recommended:" listing,
+ * never an active, confirmable proposal). This turns the SAME top recommendation into a real,
+ * user-facing proposal: a line worth showing, and — for job_search/work_action specifically,
+ * where enabling really is just one confirmable gmail.rule.enable_builtin call — a real
+ * pendingOperationUpdate a caller MAY choose to attach. "custom" recommendations need the user's
+ * own sender/keyword input first, so they only ever get the informational line, never a
+ * confirmable operation.
+ */
+export interface GmailRuleProposal {
+  line: string;
+  pendingOperationUpdate?: { topic: string; summary: string; operations: ValidatedOperation[] };
+}
+
+export function buildGmailRuleProposal(state: Awaited<ReturnType<typeof buildGmailAutonomyState>>): GmailRuleProposal | undefined {
+  const top = state.recommendedRules[0];
+  if (!top) {
+    return undefined;
+  }
+
+  if (top.kind === "custom") {
+    return { line: `Recommended: ${top.reason} Say "track <sender or keyword>" to set up a readonly custom rule.` };
+  }
+
+  const kind = top.kind;
+  const label = kind === "job_search" ? "job-search" : "work-action";
+  const watches = kind === "job_search" ? "recruiter replies and application updates" : "work-related email activity";
+
+  return {
+    line: `Gmail is connected, but no ${label} tracking rule is active yet. Want me to enable a readonly rule to watch ${watches} for this goal?`,
+    pendingOperationUpdate: {
+      topic: "gmail_rule_proposal",
+      summary: `enable the ${label} Gmail rule`,
+      operations: [
+        {
+          tool: "gmail.rule.enable_builtin",
+          args: { kind },
+          status: "valid",
+          requiresConfirmation: false
+        }
+      ]
+    }
+  };
+}
+
+const GMAIL_RULE_KIND_LABEL: Record<Exclude<GmailRuleKind, "other">, string> = {
+  job_search: "job-search",
+  work_action: "work-action",
+  custom: "custom"
+};
+const GMAIL_RULE_KIND_WATCHES: Record<Exclude<GmailRuleKind, "other">, string> = {
+  job_search: "recruiter replies and application updates",
+  work_action: "work-related email activity",
+  custom: "the sender/keyword you set up"
+};
+const GMAIL_RULE_KIND_ADAPTER_ID: Record<Exclude<GmailRuleKind, "other">, string> = {
+  job_search: "job_search_email",
+  work_action: "work_action_email",
+  custom: "custom_email_review"
+};
+
+/**
+ * fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: a real reported gap — "do you
+ * use my mail for my goal?" got the exact same generic connection/rule status text as any other
+ * Gmail question, technically true (Gmail connected, no rules active, therefore not in use) but
+ * incomplete — it never said plainly that Gmail isn't being used FOR THE GOAL yet, and never
+ * proposed the one obviously-relevant rule. This composes a direct yes/no answer instead, reusing
+ * the exact same goal-relevance data (buildGmailAutonomyState/gmailRecommendationKindForGoal) the
+ * rest of this file already computes — never a second, separate classification.
+ */
+export async function composeGmailGoalUsageStatusReply(
+  userId: string,
+  context: ContextBundle
+): Promise<{ text: string; pendingOperationUpdate?: ExecutedOperation["pendingOperationUpdate"] }> {
+  const state = await buildGmailAutonomyState(userId);
+  const connection = state.primaryConnection;
+  const oauthUrl = gmailOAuthUrlForUser(userId);
+
+  if (!connection || connection.status === "archived") {
+    return { text: ["No — Gmail is not connected yet.", ...gmailOAuthActionLines("Connect it here", oauthUrl)].join("\n") };
+  }
+
+  if (connection.status === "error") {
+    return { text: ["No — " + gmailConnectionProblemLine(connection), ...gmailOAuthActionLines("Reconnect Gmail here", oauthUrl)].join("\n") };
+  }
+
+  if (connection.status === "paused") {
+    return { text: "No — Gmail is paused right now, so I'm not using it for this goal. Reconnect it to pick tracking back up." };
+  }
+
+  const relevantKinds = new Set(
+    context.activeGoals
+      .map((goal) => gmailRecommendationKindForGoal(goal))
+      .filter((kind): kind is Exclude<GmailRuleKind, "other"> => Boolean(kind) && kind !== "other")
+  );
+  const activeAdapterIds = new Set(state.activeRules.map((rule) => rule.adapterId));
+  const coveredKind = [...relevantKinds].find((kind) => activeAdapterIds.has(GMAIL_RULE_KIND_ADAPTER_ID[kind]));
+
+  if (coveredKind) {
+    return {
+      text: `Yes — Gmail is connected and the ${GMAIL_RULE_KIND_LABEL[coveredKind]} rule is active. I can use readonly email signals like ${GMAIL_RULE_KIND_WATCHES[coveredKind]}.`
+    };
+  }
+
+  const proposal = buildGmailRuleProposal(state);
+  return {
+    text: [
+      "No — Gmail is connected, but I'm not using it for this goal yet because no matching email tracking rule is active.",
+      proposal ? `\n${proposal.line}` : undefined
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    pendingOperationUpdate: proposal?.pendingOperationUpdate
+  };
 }
 
 function noActiveGmailRulesForAgent(): string {
