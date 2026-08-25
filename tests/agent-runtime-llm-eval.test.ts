@@ -6300,3 +6300,214 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-temporal-action-copy-and-dedup: a real Telegram transcript found "2 action
+ * for tomorrows" (grammar, now fixed deterministically), "what should I do today?" answered about
+ * tomorrow, and a resume-update suggestion minutes after the user said their resume and web CV
+ * were already current. The grammar/copy fixes are deterministic and covered elsewhere; these
+ * scenarios cover what's inherently LLM-judgment: today- vs. tomorrow-framing when a similar
+ * action is deferred, and honoring an already-stated setup fact.
+ */
+
+test(
+  "195. the exact live transcript end to end: later-this-week ask -> tomorrow -> ok do it -> tomorrow query -> today question answers today",
+  { ...llmEvalOptions(["action-temporal-semantics", "date-scoped-actions", "next-action-deferred-awareness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-copydedup-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("195-copydedup-transcript", ["action-temporal-semantics", "date-scoped-actions", "next-action-deferred-awareness"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles today", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.record("move it later this week", await sendAgentMessage(server, userId, "move it later this week"));
+        trace.record("tomorrow", await sendAgentMessage(server, userId, "tomorrow"));
+        trace.record("ok do it", await sendAgentMessage(server, userId, "ok do it"));
+
+        const tomorrowReply = trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        assertNoGenericAgentError(tomorrowReply, "tomorrow query");
+        trace.checkpoint("correct grammar, no 'tomorrows'", !/tomorrows/i.test(tomorrowReply.reply), tomorrowReply.reply);
+        assert.doesNotMatch(tomorrowReply.reply, /tomorrows/i, `expected correct grammar — got: ${tomorrowReply.reply}`);
+        trace.checkpoint("no leaked 'snoozed'", !/snoozed/i.test(tomorrowReply.reply), tomorrowReply.reply);
+        assert.doesNotMatch(tomorrowReply.reply, /snoozed/i, `'snoozed' must never leak into user-facing copy — got: ${tomorrowReply.reply}`);
+
+        const beforeCount = await prisma.actionItem.count({ where: { userId } });
+        const todayReply = trace.record("what should I do today?", await sendAgentMessage(server, userId, "what should I do today?"));
+        assertNoGenericAgentError(todayReply, "today question after a tomorrow deferral");
+        trace.checkpoint("does not lead with tomorrow framing", !/use the time you have tomorrow/i.test(todayReply.reply), todayReply.reply);
+        assert.doesNotMatch(todayReply.reply, /use the time you have tomorrow/i, `must answer the TODAY question about today — got: ${todayReply.reply}`);
+        const afterCount = await prisma.actionItem.count({ where: { userId } });
+        assert.equal(afterCount, beforeCount, "must not silently create a duplicate action");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "196. 'what should I do today?' with a similar action deferred to tomorrow recommends today's prep, not tomorrow's",
+  { ...llmEvalOptions(["next-action-deferred-awareness", "next-action-recommendation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-copydedup-today-${randomUUID()}`;
+    const trace = new EvalTrace("196-copydedup-today", ["next-action-deferred-awareness", "next-action-recommendation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do today?", await sendAgentMessage(server, userId, "what should I do today?"));
+        assertNoGenericAgentError(reply, "today question with a deferred similar action");
+        trace.checkpoint("does not open with tomorrow as the main answer", !/^(next,? )?i recommend using the time you have tomorrow/i.test(reply.reply.trim()), reply.reply);
+        assert.doesNotMatch(
+          reply.reply.trim(),
+          /^(next,? )?i recommend using the time you have tomorrow/i,
+          `tomorrow must not be the MAIN recommendation to a today question — got: ${reply.reply}`
+        );
+        trace.checkpoint("mentions today or a concrete prep step", /today|shortlist|prep/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /today|shortlist|prep/i, `expected a today-focused prep suggestion — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "197. no near-duplicate action is created when 'what should I do today?' finds a similar action already deferred",
+  { ...llmEvalOptions(["next-action-deferred-awareness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-copydedup-noduplicate-${randomUUID()}`;
+    const trace = new EvalTrace("197-copydedup-noduplicate", ["next-action-deferred-awareness"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const beforeCount = await prisma.actionItem.count({ where: { userId } });
+        const reply = trace.record("what should I do today?", await sendAgentMessage(server, userId, "what should I do today?"));
+        assertNoGenericAgentError(reply, "no-duplicate check");
+        const afterCount = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no silent duplicate creation", afterCount === beforeCount, `before: ${beforeCount}, after: ${afterCount}`);
+        assert.equal(afterCount, beforeCount, `must never silently create a duplicate action — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "198. 'what should I do next?' never suggests updating the resume once the user has said it's already current",
+  { ...llmEvalOptions(["next-action-recommendation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-copydedup-resume-current-${randomUUID()}`;
+    const trace = new EvalTrace("198-copydedup-resume-current", ["next-action-recommendation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to remote roles", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record(
+          "My resume and web CV are already up to date, just so you know.",
+          await sendAgentMessage(server, userId, "My resume and web CV are already up to date, just so you know.")
+        );
+
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "next-action honoring resume-already-current");
+        assertNoBannedPhrases(reply.reply, ["update your resume", "customize your resume", "update the resume", "tailor your resume"], "resume-already-current", trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "199. without any resume-related context, the reply stays honest — never claims the resume is already handled",
+  { ...llmEvalOptions(["next-action-recommendation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-copydedup-resume-none-${randomUUID()}`;
+    const trace = new EvalTrace("199-copydedup-resume-none", ["next-action-recommendation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to remote roles", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "next-action with no resume context stated");
+        trace.checkpoint("never fabricates that the resume was already confirmed current", !/your resume is already (up to date|current)/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /your resume is already (up to date|current)/i, `must never invent a fact that was never stated — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "200. Web3/remote domain preference is preserved alongside honoring the resume-already-current fact",
+  { ...llmEvalOptions(["next-action-recommendation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-copydedup-preference-${randomUUID()}`;
+    const trace = new EvalTrace("200-copydedup-preference", ["next-action-recommendation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to remote roles", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record(
+          "My resume and web CV are already up to date. I only want fully remote Web3 roles.",
+          await sendAgentMessage(server, userId, "My resume and web CV are already up to date. I only want fully remote Web3 roles.")
+        );
+
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "preference preservation alongside resume suppression");
+        assertNoBannedPhrases(reply.reply, ["update your resume", "customize your resume", "tailor your resume"], "resume-already-current", trace);
+        trace.checkpoint("keeps honoring the remote/Web3 preference", /remote|web3/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /remote|web3/i, `expected the stated domain preference to still be reflected — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
