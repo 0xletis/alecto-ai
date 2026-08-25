@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createActionItem, createEvent, createGoal, snoozeActionItem } from "../packages/db/src/index.ts";
+import { createActionItem, createEvent, createGoal, snoozeActionItem, updateNotificationSettings } from "../packages/db/src/index.ts";
 import { assertNoGenericAgentError, buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertActionCreated,
@@ -6770,6 +6770,292 @@ test(
         assertNoGenericAgentError(reply, "unrelated scheduled actions");
         trace.checkpoint("no duplicate-merge suggestion for unrelated actions", reply.debug.pendingOperation !== true, reply.reply);
         assert.notEqual(reply.debug.pendingOperation, true, `must never propose merging genuinely unrelated actions — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * fix/private-alpha-goal-context-and-evening-coaching: a real Telegram transcript found "customize
+ * your resume for remote Web3 positions" proposed in direct answer to "what should I do today?",
+ * well after the user had said (during goal setup) that their resume and web CV were already up to
+ * date. Root cause: the fact was only ever visible in the session's own short recent-message
+ * window (MAX_MESSAGES=20 in conversation-session.ts) and was never durably saved — see this
+ * branch's own report for the full audit. The fix teaches the planner to ALSO memory.create this
+ * kind of durable goal-setup fact, widens the deterministic resume/CV/portfolio veto's own
+ * vocabulary, and exposes a real local-time-of-day signal to the planner for evening realism.
+ * These scenarios cover what's inherently LLM-judgment: persistence across many turns (the
+ * deterministic backstop alone was already proven in
+ * tests/agent-runtime-goal-context-and-evening-coaching.test.ts, using a memory row seeded
+ * directly rather than a real multi-turn conversation), the prompt-level veto on the model's own
+ * free-text recommendation, and evening-appropriate coaching.
+ */
+
+/** Picks a fixed-offset IANA zone (Etc/GMT has an inverted sign vs. real UTC offsets) so that
+ * "local time" in that zone is `targetHour` right now, regardless of when this suite actually
+ * runs — avoids a flaky scenario that only reflects evening/afternoon framing correctly for a few
+ * hours a day if it depended on the real host wall-clock time. */
+function timezoneForLocalHour(targetHour: number): string {
+  const utcHour = new Date().getUTCHours();
+  let offset = targetHour - utcHour;
+  while (offset > 12) offset -= 24;
+  while (offset < -13) offset += 24;
+  const sign = offset >= 0 ? "-" : "+";
+  return `Etc/GMT${sign}${Math.abs(offset)}`;
+}
+
+test(
+  "209. exact live transcript: resume/web CV stated up to date during goal setup, many turns later 'what should I do today?' never suggests resume work",
+  { ...llmEvalOptions(["goal-context-persistence", "resume-current-veto"]), timeout: 180_000 },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalctx-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("209-goalctx-transcript", ["goal-context-persistence", "resume-current-veto"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("My resume and web CV are already up to date.", await sendAgentMessage(server, userId, "My resume and web CV are already up to date."));
+
+        // Seven filler turns (14 messages) plus the tomorrow-block sequence below are enough to
+        // push the resume statement's own USER message out of the session's own MAX_MESSAGES=20
+        // recent-message window before the real question below — recentlyStatedResumeUpToDate
+        // (executor.ts) only ever rescans role==="user" entries, so only that one message actually
+        // needs to be evicted. The actual reported bug only ever reproduced once genuinely aged
+        // out, never on the very next turn, so a same-turn check alone would not have caught it.
+        // A longer per-test timeout (180s, not the shared EVAL_TIMEOUT_MS) accounts for this
+        // scenario's unusually high turn count — every other scenario in this file stays well
+        // under 120s.
+        const filler = ["ok, thanks", "sounds good", "got it", "cool", "alright", "makes sense", "thanks for the update"];
+        for (const message of filler) {
+          trace.record(message, await sendAgentMessage(server, userId, message));
+        }
+
+        const first = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles today", goalId: goalResult.goal.id });
+        await snoozeActionItem(userId, first.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+        const second = await createActionItem(userId, {
+          source: "manual",
+          title: "Apply to 3 more remote Web3 roles by the end of the week",
+          goalId: goalResult.goal.id
+        });
+        await snoozeActionItem(userId, second.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+        trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.record("show me what i gota do tomorrow", await sendAgentMessage(server, userId, "show me what i gota do tomorrow"));
+        const reply = trace.record("what should i do today?", await sendAgentMessage(server, userId, "what should i do today?"));
+
+        assertNoGenericAgentError(reply, "today question after goal-setup resume fact aged out");
+        const suggestsResumeWork = /\b(customize|update|tailor|polish|revise|prepare)\b[\s\S]{0,25}\b(resume|cv|web cv)\b/i.test(reply.reply);
+        trace.checkpoint("no resume/CV work suggested after it aged out of recent messages", !suggestsResumeWork, reply.reply);
+        assert.ok(!suggestsResumeWork, `must never suggest resume/CV work once already stated current, even many turns later — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "210. resume already up to date stated during setup, several turns later 'what should I do next?' still never proposes resume work",
+  { ...llmEvalOptions(["goal-context-persistence", "resume-current-veto"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalctx-nextaction-${randomUUID()}`;
+    const trace = new EvalTrace("210-goalctx-nextaction", ["goal-context-persistence", "resume-current-veto"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote Web3 job. My resume and web CV are already up to date, no need to touch those.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote Web3 job. My resume and web CV are already up to date, no need to touch those.")
+        );
+
+        const filler = ["thanks", "ok", "got it", "sounds good", "cool", "noted", "great"];
+        for (const message of filler) {
+          trace.record(message, await sendAgentMessage(server, userId, message));
+        }
+
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+
+        assertNoGenericAgentError(reply, "next-action recommendation several turns after resume-current statement");
+        const suggestsResumeWork = /\b(customize|update|tailor|polish|revise|prepare)\b[\s\S]{0,25}\b(resume|cv|web cv)\b/i.test(reply.reply);
+        trace.checkpoint("recommendation never proposes resume/CV work", !suggestsResumeWork, reply.reply);
+        assert.ok(!suggestsResumeWork, `must never propose resume/CV work — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "211. the model's own free-text recommendation avoids resume/CV work on the very next turn after the fact is stated, not just the deterministic backstop",
+  { ...llmEvalOptions(["resume-current-veto"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalctx-immediate-${randomUUID()}`;
+    const trace = new EvalTrace("211-goalctx-immediate", ["resume-current-veto"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("My resume and web CV are already up to date.", await sendAgentMessage(server, userId, "My resume and web CV are already up to date."));
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+
+        assertNoGenericAgentError(reply, "immediate next-turn recommendation after resume-current statement");
+        const suggestsResumeWork = /\b(customize|update|tailor|polish|revise|prepare)\b[\s\S]{0,25}\b(resume|cv|web cv)\b/i.test(reply.reply);
+        trace.checkpoint("no resume/CV work proposed on the immediate next turn", !suggestsResumeWork, reply.reply);
+        assert.ok(!suggestsResumeWork, `must never propose resume/CV work right after it was said to be current — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "212. evening 'what should I do today?' after deferring the application block to tomorrow suggests something light, never a duplicate or resume work",
+  { ...llmEvalOptions(["evening-today-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-evening-today-${randomUUID()}`;
+    const trace = new EvalTrace("212-evening-today", ["evening-today-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: timezoneForLocalHour(21) });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const deferred = await createActionItem(userId, {
+        source: "manual",
+        title: "Apply to 3 more remote Web3 roles",
+        goalId: goalResult.goal.id
+      });
+      await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do today?", await sendAgentMessage(server, userId, "what should I do today?"));
+
+        assertNoGenericAgentError(reply, "evening today question with an application block already deferred to tomorrow");
+        trace.checkpoint("today answer, not framed as tomorrow's plan", !/^(tomorrow|use the time you have tomorrow)/i.test(reply.reply.trim()), reply.reply);
+        const proposesDuplicate = /apply to 3 more remote web3 roles/i.test(reply.reply) && reply.debug.pendingOperation === true;
+        trace.checkpoint("no duplicate application task proposed tonight", !proposesDuplicate, reply.reply);
+        assert.ok(!proposesDuplicate, `must not propose the same application task again tonight — got: ${reply.reply}`);
+        const suggestsResumeWork = /\b(customize|update|tailor|polish|revise|prepare)\b[\s\S]{0,25}\b(resume|cv|web cv)\b/i.test(reply.reply);
+        trace.checkpoint("no resume/CV work suggested as the evening move", !suggestsResumeWork, reply.reply);
+        assert.ok(!suggestsResumeWork, `evening realism must not default to resume/CV work — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "213. with no resume-current fact ever stated, the veto never falsely suppresses everything — a normal recommendation still opens a real confirmation",
+  { ...llmEvalOptions(["resume-current-veto"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalctx-nofalse-${randomUUID()}`;
+    const trace = new EvalTrace("213-goalctx-nofalse", ["resume-current-veto"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+
+        assertNoGenericAgentError(reply, "next-action recommendation with no prior resume statement");
+        trace.checkpoint("no false 'skipping resume/CV work' backstop text with nothing to veto", !/skipping resume\/cv work/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /skipping resume\/cv work/i, `must not falsely trigger the veto's own backstop line — got: ${reply.reply}`);
+        trace.checkpoint("recommendation is non-empty, real coaching content", reply.reply.trim().length > 0, reply.reply);
+        assert.ok(reply.reply.trim().length > 0, "expected a real recommendation");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "214. Spanish 'mi CV ya está actualizado' during setup is honored on a later recommendation",
+  { ...llmEvalOptions(["goal-context-persistence", "resume-current-veto"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalctx-es-${randomUUID()}`;
+    const trace = new EvalTrace("214-goalctx-es", ["goal-context-persistence", "resume-current-veto"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("Mi CV ya está actualizado.", await sendAgentMessage(server, userId, "Mi CV ya está actualizado."));
+        const filler = ["vale, gracias", "genial", "entendido", "perfecto", "de acuerdo"];
+        for (const message of filler) {
+          trace.record(message, await sendAgentMessage(server, userId, message));
+        }
+        const reply = trace.record("¿qué debería hacer ahora?", await sendAgentMessage(server, userId, "¿qué debería hacer ahora?"));
+
+        assertNoGenericAgentError(reply, "Spanish CV-current statement honored later");
+        const suggestsResumeWork = /\b(actualiza|actualizar|mejora|adapta|personaliza|revisa|prepara)\b[\s\S]{0,25}\b(cv|curr[ií]culum|resume)\b/i.test(reply.reply);
+        trace.checkpoint("no CV update suggested after it was said to be current, in Spanish", !suggestsResumeWork, reply.reply);
+        assert.ok(!suggestsResumeWork, `must not suggest updating the CV — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "215. Catalan 'el meu CV ja està actualitzat' during setup is honored on a later recommendation",
+  { ...llmEvalOptions(["goal-context-persistence", "resume-current-veto"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalctx-ca-${randomUUID()}`;
+    const trace = new EvalTrace("215-goalctx-ca", ["goal-context-persistence", "resume-current-veto"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("El meu CV ja està actualitzat.", await sendAgentMessage(server, userId, "El meu CV ja està actualitzat."));
+        const filler = ["d'acord, gràcies", "genial", "entès", "perfecte", "molt bé"];
+        for (const message of filler) {
+          trace.record(message, await sendAgentMessage(server, userId, message));
+        }
+        const reply = trace.record("què hauria de fer ara?", await sendAgentMessage(server, userId, "què hauria de fer ara?"));
+
+        assertNoGenericAgentError(reply, "Catalan CV-current statement honored later");
+        const suggestsResumeWork = /\b(actualitza|actualitzar|millora|adapta|personalitza|revisa|prepara)\b[\s\S]{0,25}\b(cv|curr[ií]culum|resume)\b/i.test(reply.reply);
+        trace.checkpoint("no CV update suggested after it was said to be current, in Catalan", !suggestsResumeWork, reply.reply);
+        assert.ok(!suggestsResumeWork, `must not suggest updating the CV — got: ${reply.reply}`);
       });
     } finally {
       await server.close();
