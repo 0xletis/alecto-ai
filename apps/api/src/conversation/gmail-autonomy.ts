@@ -420,7 +420,10 @@ function pushUniqueRecommendation(recommendations: GmailRuleRecommendation[], re
   recommendations.push(recommendation);
 }
 
-function gmailRecommendationKindForGoal(goal: Goal): GmailRuleKind | undefined {
+/** Exported for fix/private-alpha-pending-action-refinement-and-gmail-rule-ux — reused directly
+ * by the agent-runtime's own Gmail-usage-status composer (executor.ts) rather than re-deriving
+ * the same job/career/recruiter-wording classification a second time. */
+export function gmailRecommendationKindForGoal(goal: Goal): GmailRuleKind | undefined {
   if (goal.status !== "active") {
     return undefined;
   }

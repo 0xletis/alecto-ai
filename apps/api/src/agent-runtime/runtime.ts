@@ -3,7 +3,7 @@ import { loadContext } from "./context-loader.js";
 import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetime.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, removeVisibleEntities, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
-import { executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
+import { composeGmailGoalUsageStatusReply, executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
@@ -642,6 +642,19 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       toolValidationPassed: true,
       topic: "gmail_unsupported_action"
     });
+  }
+
+  // Checked before EVERY Gmail-domain shortcut below (see this function's own doc comment for the
+  // real reported bug) — a pending action.create proposal's own refinement always wins; Gmail
+  // help is folded into the SAME reply when relevant, never left to hijack the whole turn.
+  const pendingActionRefinement = await pendingActionRefinementResponse(context, message);
+  if (pendingActionRefinement) {
+    return pendingActionRefinement;
+  }
+
+  const gmailGoalUsageStatus = await gmailGoalUsageStatusResponse(context, message);
+  if (gmailGoalUsageStatus) {
+    return gmailGoalUsageStatus;
   }
 
   const gmailSyncDebugShortcut = gmailSyncDebugShortcutOperation(message);
@@ -2239,7 +2252,13 @@ function gmailAutonomyCompoundShortcutOperations(message: string, context: Conte
   return [...reviewOps, autonomyOp];
 }
 
-function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+/**
+ * Extracted out of gmailConnectionShortcutOperation (fix/private-alpha-pending-action-refinement-
+ * and-gmail-rule-ux) so the SAME "does this message ask for Gmail connection/status help"
+ * detection can also be reused by the pending-action-refinement mixed-intent handler below,
+ * rather than a second, potentially drifting copy of the same regex set.
+ */
+function detectGmailConnectionIntent(message: string, context: ContextBundle): { includeLink: boolean } | undefined {
   const text = normalizeIntentText(message);
   if (!text || /\bsync\b/.test(text)) {
     return undefined;
@@ -2257,10 +2276,165 @@ function gmailConnectionShortcutOperation(message: string, context: ContextBundl
 
   if ((mentionsGmailOrEmail && (asksConnectionAction || asksForLink || asksStatus)) || mentionsAuthProblem || contextualReconnectLink) {
     const includeLink = asksConnectionAction || asksForLink || mentionsAuthProblem || contextualReconnectLink;
-    return { tool: "gmail.status", args: { includeLink }, rationale: "user asked for Gmail connection or reconnect help" };
+    return { includeLink };
   }
 
   return undefined;
+}
+
+function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const detected = detectGmailConnectionIntent(message, context);
+  return detected ? { tool: "gmail.status", args: { includeLink: detected.includeLink }, rationale: "user asked for Gmail connection or reconnect help" } : undefined;
+}
+
+// fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: a real Telegram transcript had a
+// pending action.create proposal ("Research 5 new remote Web3 job postings today") completely
+// ignored — "change it to send 5 CVs its more direct and i wanna connect my mail so u can use it
+// for updates" only ever got a Gmail-connection reply, because gmailConnectionShortcutOperation
+// (unlike its sibling shortcuts, e.g. bulkActionCleanupShortcutOperation/
+// gmailNudgeSettingsShortcutOperation, both explicitly gated on `!pending`) runs unconditionally
+// and hijacks the ENTIRE turn before the planner — which is the only place a "change it to X"
+// revision could otherwise be understood — ever gets a chance to run. Action refinement must win
+// first; see ACTION_REFINEMENT_TRIGGER_RE's own call site in processAgentMessageInner for the
+// deterministic, non-LLM-dependent guarantee of that ordering.
+const ACTION_REFINEMENT_TRIGGER_RE =
+  /\b(?:change|update)\s+it\s+to\b\s*|\bmake\s+it\b\s*|\binstead\s+do\b\s*|\bdo\s+instead\b\s*|\bcanvia-?ho\s+a\b\s*|\bc[aá]mbialo\s+a\b\s*/i;
+
+// Cuts the extracted tail before a justification/continuation clause the user tacked on — "its
+// more direct and i wanna connect my mail..." is the REASON and a SEPARATE request, not part of
+// the new action text itself. Deliberately narrow (not a general clause splitter): only the
+// specific connector words a real reported message actually used, so a legitimately longer
+// refinement ("change it to send 5 CVs and call 2 recruiters") is never truncated by accident —
+// none of "and i"/"its"/"because"/"since" appear in that phrasing.
+const REFINEMENT_TAIL_CUTOFF_RE = /\b(its|it's|because|since|and i\b|and I\b|so u\b|so you\b|ya que|porque|perque|perquè)\b/i;
+const ORIGINAL_TITLE_TRAILING_TEMPORAL_RE = /\s+(today|tomorrow|tonight|this week)\.?\s*$/i;
+const REFINED_TEXT_HAS_TEMPORAL_RE = /\b(today|tomorrow|tonight|this week|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/i;
+
+/** Returns the new title if `message` matches a refinement trigger, otherwise undefined. Carries
+ * over the ORIGINAL proposed action's own temporal framing ("...today") when the user's new text
+ * doesn't specify its own timing — refining WHAT to do shouldn't silently drop WHEN, matching the
+ * real reported expectation ("change it to send 5 CVs" -> "Send 5 CVs today", not just "Send 5
+ * CVs", carried over from "Research 5 new remote Web3 job postings today"). */
+function extractRefinedActionTitle(message: string, originalTitle: string): string | undefined {
+  const match = ACTION_REFINEMENT_TRIGGER_RE.exec(message.toLowerCase());
+  if (!match) {
+    return undefined;
+  }
+
+  let tail = message.slice(match.index + match[0].length);
+  const boundary = REFINEMENT_TAIL_CUTOFF_RE.exec(tail);
+  if (boundary) {
+    tail = tail.slice(0, boundary.index);
+  }
+  tail = tail.trim().replace(/[.,;:!?]+$/, "").trim();
+  if (!tail) {
+    return undefined;
+  }
+
+  const capitalized = tail.charAt(0).toUpperCase() + tail.slice(1);
+  if (REFINED_TEXT_HAS_TEMPORAL_RE.test(capitalized)) {
+    return capitalized;
+  }
+  const temporalSuffix = ORIGINAL_TITLE_TRAILING_TEMPORAL_RE.exec(originalTitle)?.[0];
+  return temporalSuffix ? `${capitalized}${temporalSuffix.replace(/\.$/, "")}` : capitalized;
+}
+
+const PENDING_ACTION_REMINDER_LINE = "You still have the proposed action pending. Reply yes to create it or cancel.";
+
+/**
+ * Runs BEFORE any Gmail-domain shortcut, exactly when session.pendingOperation is a not-yet-
+ * confirmed action.create proposal (topic "action_creation"). Handles three cases, per the
+ * product rule that action refinement always wins and Gmail help must never clear or replace the
+ * pending action:
+ *   1. Refinement text present (with or without Gmail mention) -> update the pending proposal's
+ *      title in place, keep it pending, optionally append Gmail connect/status help.
+ *   2. Gmail mention only, no refinement -> show Gmail help, remind the user the action proposal
+ *      is still waiting, leave it completely untouched.
+ *   3. Neither -> undefined, falls through to the existing planner/shortcut flow unchanged.
+ */
+async function pendingActionRefinementResponse(context: ContextBundle, message: string): Promise<AgentMessageResponse | undefined> {
+  const pending = context.session.pendingOperation;
+  if (pending?.topic !== "action_creation") {
+    return undefined;
+  }
+
+  const originalOp = pending.operations.find((op) => op.tool === "action.create");
+  const originalTitle = typeof originalOp?.args.title === "string" ? originalOp.args.title : undefined;
+  const refinedTitle = originalTitle ? extractRefinedActionTitle(message, originalTitle) : undefined;
+  const gmailIntent = detectGmailConnectionIntent(message, context);
+
+  if (!refinedTitle && !gmailIntent) {
+    return undefined;
+  }
+
+  // Computed BEFORE the pending operation is touched, so gmail.status's own pendingOperationUpdate
+  // safety check (executor.ts's `canProposeRuleNow`) still sees the action proposal as the current
+  // pending operation and correctly declines to install a second, competing one — see this
+  // function's own doc comment and executor.ts's gmail.status case for the full reasoning.
+  const gmailStatusOp: ValidatedOperation = { tool: "gmail.status", args: { includeLink: gmailIntent?.includeLink ?? false }, status: "valid", requiresConfirmation: false };
+  const gmailExecuted = gmailIntent ? await executeOperation(context.session.userId, gmailStatusOp, context, message) : undefined;
+
+  const replyLines: string[] = [];
+  const executedOps: ExecutedOperation[] = [];
+
+  if (refinedTitle) {
+    const refinedOp: ValidatedOperation = { ...originalOp!, args: { ...originalOp!.args, title: refinedTitle } };
+    setPendingOperation(
+      context.session,
+      createPendingOperationRecord("action_creation", `create the action "${refinedTitle}"`, [refinedOp])
+    );
+    replyLines.push(`Good — I'll change the proposed action to:\n\n${refinedTitle}.\n\nReply yes to create it or cancel.`);
+    executedOps.push({ tool: "action.refine_pending", status: "executed", summary: `Refined pending action to "${refinedTitle}"` });
+  } else {
+    // Gmail mention only — the pending action is left completely untouched (setPendingOperation
+    // is never called), so it survives byte-for-byte; only the reminder line makes that visible.
+    replyLines.push(PENDING_ACTION_REMINDER_LINE);
+  }
+
+  if (gmailExecuted) {
+    replyLines.push(gmailExecuted.summary);
+    executedOps.push(gmailExecuted);
+  }
+
+  return finalize(context, {
+    reply: replyLines.join("\n\n"),
+    operationsPlanned: [],
+    executedOps,
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: "action_creation"
+  });
+}
+
+// fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: "do u use my mail now for my
+// goal?" got the same generic connection/rule status text as any other Gmail question — see
+// composeGmailGoalUsageStatusReply's own doc comment for the real reported gap this closes.
+// Deliberately narrow: only a genuine "do you use/are you using Gmail/mail FOR [my] GOAL"
+// question, in English/Spanish/Catalan, not a general "is Gmail connected?" (that stays
+// gmailConnectionShortcutOperation's job, unchanged).
+const GMAIL_GOAL_USAGE_QUESTION_RE =
+  /\b(do|does|are)\b[\s\S]{0,15}\b(you|u)\b[\s\S]{0,20}\b(use|using|uses|update|updates|updating)\b[\s\S]{0,30}\b(gmail|mail|email)\b[\s\S]{0,30}\bgoal\b|\b(usas|usa|utilizas)\b[\s\S]{0,20}\b(mi|el)\s+(mail|correo|gmail)\b[\s\S]{0,20}\bobjetivo\b|\b(fas servir|uses)\b[\s\S]{0,20}\b(el meu|mail|correu|gmail)\b[\s\S]{0,20}\bobjectiu\b/i;
+
+async function gmailGoalUsageStatusResponse(context: ContextBundle, message: string): Promise<AgentMessageResponse | undefined> {
+  if (!GMAIL_GOAL_USAGE_QUESTION_RE.test(message)) {
+    return undefined;
+  }
+
+  const { text, pendingOperationUpdate } = await composeGmailGoalUsageStatusReply(context.session.userId, context);
+  if (pendingOperationUpdate) {
+    setPendingOperation(context.session, createPendingOperationRecord(pendingOperationUpdate.topic, pendingOperationUpdate.summary, pendingOperationUpdate.operations));
+  }
+
+  return finalize(context, {
+    reply: text,
+    operationsPlanned: [],
+    executedOps: [{ tool: "gmail.status", status: "executed", summary: text, ...(pendingOperationUpdate ? { pendingOperationUpdate } : {}) }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: "gmail_status"
+  });
 }
 
 function gmailSyncShortcutOperation(message: string): PlannedOperation | undefined {
