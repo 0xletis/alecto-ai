@@ -7,6 +7,15 @@ export interface ToolDefinition {
   mutates: boolean;
   /** Mutating tools that don't need a human confirmation round-trip (low blast radius, easily undone). */
   requiresConfirmation: boolean;
+  /** True for a tool whose executor case installs a NEW session.pendingOperation via
+   * pendingOperationUpdate (goal.create_propose, proactive.settings_propose_update, etc.) — the
+   * "propose" half of a propose/apply pair, plus the few one-shot draft-openers (planning.next_week_
+   * start/_edit, weekly_review.start) that work the same way. Only one such tool may actually be
+   * EXECUTED per turn (runtime.ts's compound-proposal guard) — session.pendingOperation is a single
+   * field, so a second one in the same turn would silently overwrite the first's confirmability
+   * rather than genuinely offering both. Keep this flag in sync with executor.ts's own
+   * pendingOperationUpdate call sites — it's the single source of truth the guard reads from. */
+  opensPendingProposal?: boolean;
 }
 
 const actionIdField = z.string().min(1).optional().describe(
@@ -163,6 +172,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Build and show a draft next-week (or this-week) action plan based on the user's goals, stale actions, and recent activity. Use for 'plan next week', 'help me plan next week', 'make a plan for next week based on my goals', 'plan this week'.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       windowKind: z.enum(["next_week", "current_week"]).optional().describe("Which week to plan. Defaults to next week if omitted or ambiguous.")
     })
@@ -173,6 +183,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Edit the currently open next-week plan draft (from planning.next_week_start) before it's confirmed. Supports removing/changing items by their 1-based number OR by a natural description of the item (its own title/topic wording), plus a deterministic 'lighter' request that drops lower-priority items. Use for 'remove 2', 'remove the YouTube one', 'change 1 to Tuesday', 'move the gym one to Friday', 'keep job applications and remove the rest', 'make it lighter'. Only works while a plan draft is open.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       removeIndexes: z
         .array(z.number().int().positive())
@@ -236,6 +247,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Build and show a grounded weekly review of the user's actual goals/actions/events/email activity this week — wins, stalls, guardrail activity, and up to 3 recommended next-week focuses, all computed from real data, never invented. Use for 'review my week', 'give me my weekly review', 'how did this week go?', 'what changed this week?' (week-scoped — NOT the same as a bare 'what changed?'/'what did you do?', which means operator.recent_changes instead), 'what should I improve next week?'. Safe to use again to re-show the review — it always reflects real current data.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({})
   },
   {
@@ -343,6 +355,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose changing HOW OFTEN Alecto checks Gmail in the background — manual-only (only when the user says 'sync Gmail') or scheduled on a real interval via the existing worker poll. Use for 'check Gmail every hour', 'check my email every 1h', 'review my emails every 30 minutes', 'check email sync every 1h', 'make Gmail manual only', 'stop checking Gmail automatically', 'turn off scheduled Gmail sync' (English); 'revisa mi correo cada hora', 'revisa mi email cada 30 minutos', 'pon el correo en manual' (Spanish). This is a GLOBAL Gmail-checking-frequency setting, never a specific named rule — do NOT use gmail.rule.propose_update for this, even though the wording ('check emails', 'review my emails', 'revisa mi correo') sounds similar; gmail.rule.propose_update is only for pausing/resuming/removing ONE specific, already-named tracking rule (e.g. 'pause Work action emails', 'stop tracking Endesa bills'), and the reverse is also true — never use this tool when the user names a specific rule. Opens a pending confirmation; does not mutate anything until confirmed. Never claims instant/webhook delivery — scheduled checks still run on the existing worker's periodic poll.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       syncMode: z.enum(["manual_only", "scheduled"]),
       intervalMinutes: z
@@ -427,6 +440,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose pausing, resuming, or removing an existing Gmail tracking rule (built-in or custom) — resolves the target by name against the user's real rules (a fresh lookup; the user does not need to have listed rules first) and opens a pending confirmation. Use ONLY when the user clearly names a specific existing rule: 'turn off X', 'pause the X rule', 'resume X', 'delete/remove the X rule', 'stop tracking Endesa bills'. Never use this for a general Gmail-checking-frequency request that doesn't name a rule ('check Gmail every hour', 'review my emails every 1h', 'check email sync every 1h') — that always means gmail.autonomy.propose_update instead, even though both mention 'emails'/'review'. Does NOT support changing an existing rule's review/auto-log behavior — that's fixed when a rule is created and can't be changed afterward; if asked, explain that honestly instead of planning this.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       ref: z.string().min(1).describe("The rule's name or a distinctive part of it, exactly as the user referred to it (e.g. 'Endesa', 'Naturgy', 'job search'). Never invent an id."),
       operation: z.enum(["pause", "resume", "archive"]).describe("archive means fully remove/delete the rule.")
@@ -568,6 +582,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose a full custom operating plan for a NEW goal the user just expressed — never applies anything until the user confirms. Works for ANY goal, not from a fixed list: 'I want to drink more tea', 'I want to call my grandmother every Sunday', 'I want to stop scrolling in bed', 'I want to keep up with Endesa/admin emails', 'I want to build Alecto every day' are all equally valid. You (the planner) choose: a short title, a category (free text, e.g. 'health', 'family', 'admin', 'habit', 'career' — never limited to a fixed enum), why if the user said one, optional successCriteria in the user's own terms (e.g. '2 cups/day, 5 days/week'), 1-3 trackable signals (each a short stable snake_case key like 'tea_cups_drunk' plus a human label — invent a REASONABLE key/label from the goal, never leave this empty), an optional single check-in suggestion, an optional integration hint (e.g. 'Gmail: Endesa emails' — only when genuinely relevant, e.g. an admin/bills goal), and 0-3 first actions genuinely implied by the goal. If the goal is too vague to propose anything concrete (e.g. just 'I want to be better'), do NOT call this — use clarification.ask instead to find out what they actually mean. Never create the goal directly; this only proposes, and only proactive.settings_propose_update-style confirmation (an exact 'yes') can turn it into a real goal via the internal goal.create_apply.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       title: z.string().min(1),
       category: z.string().min(1),
@@ -624,6 +639,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose archiving (making inactive, history kept) or pausing (temporarily inactive, resumable) one active goal — opens a pending confirmation, never applies until an exact 'yes'. Use for 'archive this goal', 'stop tracking this goal', 'delete this goal', 'remove this goal', 'I don't want to track Meditations anymore' (English); 'deja de seguir este objetivo', 'elimina este objetivo' (Spanish, operation archive); 'pausa este objetivo', 'pause this goal' (operation pause). 'Delete'/'remove'/'elimina' wording is honored as intent to archive (Alecto never permanently deletes goal history) — the tool's own response corrects the framing honestly, never silently reinterprets it as something else. goalRef is the goal's own wording as the user referred to it (a title, or a bare pronoun like 'this goal' right after it was shown/discussed) — matched the same way goal.status matches it, including 'this goal' resolving to whichever goal the conversation is currently focused on. If it could plausibly mean more than one active goal, or matches none, this asks/says so instead of guessing — never plan goal.archive_apply directly to force a target.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       goalRef: z.string().min(1).optional().describe("The goal's own wording, e.g. 'Meditations', 'this goal', 'my reading goal'. Never an invented id."),
       operation: z.enum(["archive", "pause"]).describe("archive = inactive, history kept, not resumable through chat today. pause = temporarily inactive, resumable via 'resume this goal'.")
@@ -654,6 +670,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose turning the morning brief / evening check-in / Gmail alerts on or off, and/or changing the morning-brief or evening-check-in time — shows what would change and opens a pending confirmation. Use for 'turn on morning briefs', 'stop morning briefs', 'check in every evening', 'stop evening check-ins', 'turn on Gmail alerts', 'stop Gmail alerts', 'tell me when important emails arrive', 'avísame de correos importantes'. For a combined request like 'set up a morning brief at 9am', 'schedule morning brief at 9', 'can you set a morning brief for 8am', set BOTH morningBriefEnabled: true AND morningTimeText — this turns it on AND sets the time in one proposal. For a time-only request like 'move morning brief to 9', 'change morning brief time to 9', set ONLY morningTimeText — do not also set morningBriefEnabled unless the user is actually asking to turn it on/off. Set only the field(s) actually being changed. Never enables anything by itself — the user must still confirm.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       morningBriefEnabled: z.boolean().optional().describe("Set true to turn the proactive morning brief on, false to turn it off."),
       eveningCheckinEnabled: z.boolean().optional().describe("Set true to turn the proactive evening check-in on, false to turn it off."),
@@ -682,6 +699,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose a change to the user's stored coaching-style preferences (communication directness, motivational approach, accountability strictness) — shows what would change and opens a pending confirmation. Use when the user states a coaching-style preference: 'be blunt with me', 'I want you to be direct', 'go easy on me', 'be gentle', 'push me harder', 'be strict about accountability', 'I like tough love', 'be more encouraging' — including as part of an onboarding/setup flow. Set only the field(s) the user actually expressed a preference for. Never applies anything by itself — the user must still confirm.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       directness: z.enum(["gentle", "balanced", "blunt"]).optional().describe("Overall communication directness: gentle (soft, encouraging), balanced (default), or blunt (direct, no sugar-coating)."),
       motivationalStyle: z.string().optional().describe("Free-text motivational approach in the user's own words, e.g. 'tough love', 'strategic', 'cheerleader', 'encouraging'."),
@@ -744,6 +762,7 @@ export const toolCatalog: ToolDefinition[] = [
       "Propose turning the LEGACY daily loop on/off and/or changing its start-day or end-day time — shows what would change and opens a pending confirmation. This is the older daily-loop feature, distinct from the V3 proactive morning brief (proactive.settings_propose_update) — only use this tool for explicit daily-loop language: 'turn off daily review', 'turn daily check-ins back on', 'set my daily review to mornings', 'remind me every evening to review the day', 'change my daily loop start time to 9am'. Plain 'morning brief' language ('set up a morning brief at 9', 'move my morning brief to 9', 'turn on morning briefs') always means the V3 proactive moment — use proactive.settings_propose_update for that instead, even if the wording resembles a time change. Set only the field(s) the user is actually asking to change. Does NOT support anything beyond on/off + the two times (e.g. delivery channel, default action reminder time, weekly insight day) — those aren't supported; explain that honestly instead of planning this.",
     mutates: false,
     requiresConfirmation: false,
+    opensPendingProposal: true,
     argsSchema: z.object({
       enabled: z.boolean().optional().describe("Set true to turn the legacy daily loop on, false to turn it off."),
       morningTimeText: z.string().optional().describe("New natural-language start-day time for the LEGACY daily loop, e.g. '9am', '09:00'. Do not use this for plain 'morning brief' requests — those mean the V3 proactive moment (proactive.settings_propose_update's morningTimeText) instead."),

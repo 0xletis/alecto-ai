@@ -53,6 +53,27 @@ const CONFIRM_WHITELIST = new Set([
 ]);
 const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget it", "cancelar", "cancela"]);
 
+// A real Telegram smoke test found "yes create it" rejected — only the bare CONFIRM_WHITELIST
+// phrases above matched, so a clear, unambiguous affirmative got no special handling and fell
+// through to the LLM planner instead of confirming deterministically. This covers the natural
+// "yes/sí/vale + short affirming tail" shape WITHOUT widening what counts as a confirmation: it
+// requires the whole (trimmed, lowercased) message to be JUST an affirmative opener optionally
+// followed by one of a small fixed set of affirming continuations — anything else after the
+// opener (a hedge, a change request, an unlisted continuation) fails the match, since the pattern
+// is anchored end-to-end with $. "yes but change the target," "yes not that," "maybe create it,"
+// and "create something else" all correctly fail to match this.
+// No \b after the opener group: JS regex's default (non-unicode) \b is defined against \w
+// ([A-Za-z0-9_]), which does NOT include accented letters like "í" — a \b right after "sí" (a
+// non-word char followed by another non-word char, the space) would never actually match, silently
+// breaking every accented opener. The end-to-end ^...$ anchor plus the explicit [\s,]* separator
+// already fully constrain the match, so \b here would only add a real bug, not real safety.
+const EXTENDED_CONFIRM_PHRASE_RE =
+  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord)[\s,]*(create it|do it|go ahead|make it|cr[eé]alo|h[aá]zlo|crea-?ho)?$/i;
+
+function looksLikeExtendedConfirmPhrase(normalized: string): boolean {
+  return EXTENDED_CONFIRM_PHRASE_RE.test(normalized);
+}
+
 const NO_PENDING_REPLY = "I don't have anything pending to confirm.";
 
 // Marks session.pendingOperation as "an ambiguous action-completion clarification is open" —
@@ -491,7 +512,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // operation exists — so a bare "yes"/"no" with nothing pending gets the deterministic
   // "nothing pending" reply instead of falling through to the LLM planner, which has been
   // observed to invent an unrelated action (e.g. listing Gmail rules) for a lone "yes".
-  if (CONFIRM_WHITELIST.has(normalized)) {
+  if (CONFIRM_WHITELIST.has(normalized) || looksLikeExtendedConfirmPhrase(normalized)) {
     if (pending) {
       return finalizeDeterministicConfirmation(context, message);
     }
@@ -810,7 +831,32 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const referenceClarifications = validatedOps.filter((op) => op.status === "needs_clarification");
   const pendingConfirmationOps = validatedOps.filter((op) => op.status === "needs_confirmation");
   const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
-  const executableOps = validatedOps.filter((op) => op.status === "valid" && !META_TOOLS.has(op.tool));
+  let executableOps = validatedOps.filter((op) => op.status === "valid" && !META_TOOLS.has(op.tool));
+
+  // Compound-proposal guard: session.pendingOperation is a single field, so if the planner plans
+  // TWO proposal-shaped tools in one turn (e.g. goal.create_propose alongside proactive.settings_
+  // propose_update — a real Telegram smoke test found the planner doing exactly this for "I want
+  // daily checking and motivation" arriving in the same message as a new goal), executing both
+  // would silently overwrite the first's confirmability with the second's, while the reply still
+  // shows both "Want me to...?" questions — a confusing double confirmation the runtime can't
+  // actually honor. Only the first is executed; goal.create_propose wins when it's one of the
+  // two, since creating the goal is the primary intent of a message shaped like this. The other
+  // is dropped from THIS turn entirely (never executed, never shown as a pending confirmation)
+  // and a short note is appended to the reply instead, so the user's second request is
+  // acknowledged, not silently lost — see deferredProposalNote below.
+  const proposalOps = executableOps.filter((op) => getToolDefinition(op.tool)?.opensPendingProposal === true);
+  let deferredProposalNote: string | undefined;
+  if (proposalOps.length > 1) {
+    const kept = proposalOps.find((op) => op.tool === "goal.create_propose") ?? proposalOps[0];
+    const dropped = proposalOps.filter((op) => op !== kept);
+    executableOps = executableOps.filter((op) => !dropped.includes(op));
+    deferredProposalNote = "I'll ask you about that next, once this is confirmed.";
+    logAgentRuntimeDiagnostics({
+      phase: "compound_proposal_deferred",
+      userId,
+      note: `kept ${kept.tool}, deferred ${dropped.map((op) => op.tool).join(", ")}`
+    });
+  }
 
   const topic = resolveTopic(reconciledOperations, plan.topic, context.session.topic);
 
@@ -865,13 +911,18 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
 
   const reply = untrustedConfirmOrCancelOnly
     ? `That didn't match an exact yes/no, so nothing changed. You still have a pending confirmation for ${pending!.summary}. Reply with an exact "yes"/"cancel" to confirm or cancel it.`
-    : composeReply({
-        replyDraft: plan.replyDraft,
-        clarificationQuestion,
-        pendingConfirmationOps,
-        executedOps,
-        problemOps
-      });
+    : [
+        composeReply({
+          replyDraft: plan.replyDraft,
+          clarificationQuestion,
+          pendingConfirmationOps,
+          executedOps,
+          problemOps
+        }),
+        deferredProposalNote
+      ]
+        .filter(Boolean)
+        .join("\n\n");
   logCompoundTurnDiagnostics(userId, reconciledOperations, executedOps, context.session.pendingOperation !== null, reply);
 
   const plannedPlanningOp = reconciledOperations.find((op) => isPlanningTool(op.tool));
