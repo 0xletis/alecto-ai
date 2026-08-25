@@ -261,7 +261,10 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
   };
 }
 
-function rankOpenActions(actions: ActionItem[]): ActionItem[] {
+/** Exported so goal.recommend_next_action (agent-runtime/executor.ts) can rank a goal's own open
+ * actions the exact same way the morning brief already does — one ranking rule, not a second one
+ * that could drift out of sync. */
+export function rankOpenActions(actions: ActionItem[]): ActionItem[] {
   const priorityRank: Record<ActionItem["priority"], number> = { high: 0, medium: 1, low: 2 };
   return [...actions].sort((a, b) => {
     const rankDiff = priorityRank[a.priority] - priorityRank[b.priority];

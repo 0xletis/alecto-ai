@@ -92,7 +92,7 @@ import {
   getEveningCheckinDeliveryStatus,
   getProactiveDeliveryStatus
 } from "../operator/proactive-eligibility.js";
-import { EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
+import { EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY, rankOpenActions } from "../operator/proactive.js";
 import {
   actionInputFromPlanSuggestion,
   buildNextWeekPlanContext,
@@ -245,13 +245,18 @@ export async function executeOperation(
         const parsedDate = dueText ? parseActionDueDate(dueText) : undefined;
         const title = args.title as string;
         const description = args.notes as string | undefined;
+        const explicitGoalId = args.goalId as string | undefined;
         // Generic goal linkage (Goal Evidence Loop MVP, docs/10-v3-readiness-audit.md §20) —
         // the exact same keyword/confidence-scored matcher gmail.review.to_action already uses
         // for email-derived actions, now also applied to manually created ones, so "need to
         // follow up with recruiter tomorrow" links to an active job-search goal exactly the same
         // way a bill-paying action would link to an active bills goal. Never invents a link below
-        // the matcher's own confidence threshold.
-        const goalLink = await inferActionGoalLink(userId, title, description);
+        // the matcher's own confidence threshold. An explicit goalId (only ever set internally, by
+        // goal.recommend_next_action's own proposed action) skips the inference entirely — the
+        // goal is already known for certain, no need to re-guess it from the title.
+        const goalLink = explicitGoalId
+          ? { goalId: explicitGoalId, goalSlug: undefined, matchedGoalTitle: context.activeGoals.find((goal) => goal.id === explicitGoalId)?.title }
+          : await inferActionGoalLink(userId, title, description);
         const created = await createActionItem(userId, {
           source: "manual",
           title,
@@ -1614,6 +1619,93 @@ export async function executeOperation(
         };
       }
 
+      case "goal.recommend_next_action": {
+        const goalRef = args.goalRef as string | undefined;
+        const recommendation = args.recommendation as string;
+        const proposedAction = args.proposedAction as string | undefined;
+
+        const outcome = resolveGoalForRecommendation(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
+
+        if (outcome.status === "no_match") {
+          if (context.activeGoals.length === 0) {
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: "You don't have any active goals yet. Tell me what you want to work on and I can propose a plan to track it.",
+              result: []
+            };
+          }
+          return failed(operation.tool, `I couldn't find an active goal matching "${goalRef}". Say "show me all my goals" to see what's active.`);
+        }
+
+        if (outcome.status === "ambiguous") {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: describeAmbiguousGoalChoice(outcome.goals),
+            result: outcome.goals
+          };
+        }
+
+        const goal = outcome.goals[0];
+        const timezone = await getUserTimezone(userId);
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const recentEvents = await getEventsSince(userId, sevenDaysAgo);
+        const todayLocalDate = formatDateInTimezone(new Date(), timezone);
+        const todayEvents = recentEvents.filter((event) => formatDateInTimezone(event.timestamp, timezone) === todayLocalDate);
+
+        const metrics = goal.targetMetrics ?? [];
+        const weekCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, recentEvents) })).filter((entry) => entry.count > 0);
+        const todayCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, todayEvents) })).filter((entry) => entry.count > 0);
+
+        const linkedOpenActions = rankOpenActions(context.openActions.filter((action) => action.goalId === goal.id && action.status === "open"));
+
+        const lines = [`"${goal.title}":`];
+        if (weekCounts.length > 0) {
+          lines.push(`This week: ${weekCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`);
+        }
+        if (todayCounts.length > 0) {
+          lines.push(`Today: ${todayCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`);
+        } else if (weekCounts.length === 0) {
+          lines.push("No logged progress in the last 7 days.");
+        }
+
+        lines.push("", recommendation.trim());
+
+        // Recommending an EXISTING open action always wins over proposing a new one — the
+        // deterministic guard against ever duplicating a task the user already has open, no
+        // matter what the planner set in proposedAction. Only when nothing is already open does a
+        // genuinely new action (if any) get proposed, and even then only with a real confirmation.
+        let pendingOperationUpdate: ExecutedOperation["pendingOperationUpdate"];
+        if (linkedOpenActions.length > 0) {
+          const top = linkedOpenActions.slice(0, 2);
+          lines.push("", `Existing open action${top.length === 1 ? "" : "s"} you can use: ${top.map((action) => `"${action.title}"`).join(", ")}.`);
+        } else if (proposedAction && proposedAction.trim()) {
+          lines.push("", `Want me to create this action?\n${proposedAction.trim()}`, "", "Reply yes to confirm or cancel.");
+          pendingOperationUpdate = {
+            topic: "action_creation",
+            summary: `create the action "${proposedAction.trim()}"`,
+            operations: [
+              {
+                tool: "action.create",
+                args: { title: proposedAction.trim(), priority: "medium", goalId: goal.id },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: lines.join("\n"),
+          result: goal,
+          entities: [goalToEntity(goal), ...linkedOpenActions.map((action, index) => actionToEntity(action, index + 1))],
+          ...(pendingOperationUpdate ? { pendingOperationUpdate } : {})
+        };
+      }
+
       case "goal.create_propose": {
         const title = args.title as string;
         const category = args.category as string;
@@ -1671,6 +1763,7 @@ export async function executeOperation(
         const targetMetrics: GoalMetric[] = signals.map((signal) => ({
           key: signal.key,
           label: signal.label,
+          labelSingular: signal.labelSingular,
           signalKey: signal.key,
           aggregation: "count",
           window: signal.cadence ?? "daily",
@@ -2969,6 +3062,34 @@ function resolveGoalReferenceTargets(goalRef: string | undefined, activeGoals: G
  * only an explicit title match or the conversation's own currentFocus (e.g. right after
  * goal.status showed exactly one goal) can resolve a lifecycle target.
  */
+/**
+ * Goal resolution for goal.recommend_next_action — deliberately its own middle ground between
+ * resolveGoalReferenceTargets (a bare/empty ref falls back to "all goals," fine for a read-only
+ * status recap but wrong here: coaching only ever targets ONE goal at a time) and
+ * resolveGoalForLifecycleAction (a bare/empty ref with no established focus is "no_match," too
+ * strict for a single-goal user with nothing yet "focused" in conversation — asking "which goal?"
+ * when there's obviously only one to mean is not what "identify the focused goal if obvious"
+ * means). With no goalRef: the established conversation focus wins if there is one; otherwise a
+ * single active goal is unambiguous and resolves on its own; two or more with no focus is a real
+ * ambiguity and asks, never guesses. A named ref still goes through the same fuzzy title matching
+ * resolveGoalForLifecycleAction already uses.
+ */
+function resolveGoalForRecommendation(goalRef: string | undefined, activeGoals: Goal[], currentFocus?: Goal): GoalReferenceOutcome {
+  if (activeGoals.length === 0) {
+    return { status: "no_match", goals: [] };
+  }
+  if (!goalRef || !goalRef.trim()) {
+    if (currentFocus) {
+      return { status: "matched", goals: [currentFocus] };
+    }
+    if (activeGoals.length === 1) {
+      return { status: "matched", goals: activeGoals };
+    }
+    return { status: "ambiguous", goals: activeGoals };
+  }
+  return resolveGoalForLifecycleAction(goalRef, activeGoals, currentFocus);
+}
+
 function resolveGoalForLifecycleAction(goalRef: string | undefined, activeGoals: Goal[], currentFocus?: Goal): GoalReferenceOutcome {
   if (activeGoals.length === 0) {
     return { status: "no_match", goals: [] };
@@ -3004,6 +3125,15 @@ function describeAmbiguousGoalChoice(candidates: Goal[]): string {
   return `Do you mean ${names.length > 0 ? `${names.join(", ")} or ${last}` : last}?`;
 }
 
+/** "1 CVs sent" reads as a typo, not a real number — a real private-alpha transcript hit exactly
+ * this. No general pluralization heuristic can reliably guess a label's singular form (the
+ * countable noun isn't always the first or last word — "recruiter replies" vs "CVs sent"), so
+ * this only ever uses the metric's own labelSingular when the count is exactly 1, falling back to
+ * the plural label whenever a goal was created before that field existed. */
+function countLabel(metric: GoalMetric, count: number): string {
+  return count === 1 && metric.labelSingular ? metric.labelSingular : metric.label;
+}
+
 /**
  * Grounded per-goal status line: real linked open actions, real evidence events counted this
  * week/today via the goal's own declared targetMetrics (goal-evidence.ts's
@@ -3030,9 +3160,9 @@ function formatGoalStatusForChat(
   const lines = [`"${goal.title}" (${goal.category}):`];
 
   if (weekCounts.length > 0) {
-    lines.push(`This week: ${weekCounts.map((entry) => `${entry.count} ${entry.metric.label}`).join(", ")}.`);
+    lines.push(`This week: ${weekCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`);
     if (todayCounts.length > 0) {
-      lines.push(`Today: ${todayCounts.map((entry) => `${entry.count} ${entry.metric.label}`).join(", ")}.`);
+      lines.push(`Today: ${todayCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`);
     }
   } else {
     lines.push("No logged progress in the last 7 days.");
@@ -3052,6 +3182,7 @@ function formatGoalStatusForChat(
 interface GoalPlanSignal {
   key: string;
   label: string;
+  labelSingular?: string;
   unit?: string;
   cadence?: "daily" | "weekly";
 }

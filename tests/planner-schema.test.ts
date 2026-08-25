@@ -206,14 +206,14 @@ test("E2. an unknown tool name satisfies no branch", () => {
 // --- F: existing valid planner outputs for real, common tools still validate -------------------
 
 const validOperationsByTool: Record<string, Record<string, unknown>> = {
-  "action.create": { title: "Apply to jobs", notes: null, priority: "high", dueText: "tomorrow" },
+  "action.create": { title: "Apply to jobs", notes: null, priority: "high", dueText: "tomorrow", goalId: null },
   "action.complete": { actionId: null },
   "goal.create_propose": {
     title: "Drink more tea",
     category: "health",
     why: null,
     successCriteria: null,
-    signals: [{ key: "tea_cups_drunk", label: "cups of tea drunk", unit: null, cadence: null }],
+    signals: [{ key: "tea_cups_drunk", label: "cups of tea drunk", labelSingular: null, unit: null, cadence: null }],
     checkIn: null,
     integrationHint: null,
     firstActions: null,

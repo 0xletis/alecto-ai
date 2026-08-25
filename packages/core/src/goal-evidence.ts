@@ -144,6 +144,7 @@ export function looksLikeBookOrReadingGoal(goal: Pick<Goal, "title" | "category"
 interface ProposedSignal {
   key: string;
   label: string;
+  labelSingular?: string;
   unit?: string;
   cadence?: "daily" | "weekly";
 }
@@ -182,7 +183,10 @@ export function ensureBookGoalProgressSignal<T extends Pick<Goal, "title" | "cat
   // whenever a user's message doesn't specify one, exactly the kind of cross-goal mixup this
   // whole pass exists to prevent. Always ends in "_reading_minutes" so callers/tests can still
   // recognize it generically without needing the exact per-goal prefix.
-  return [{ key: `${slugifyForSignalKey(input.title)}_reading_minutes`, label: "reading minutes", unit: "minutes", cadence: "daily" }, ...input.signals];
+  return [
+    { key: `${slugifyForSignalKey(input.title)}_reading_minutes`, label: "reading minutes", labelSingular: "reading minute", unit: "minutes", cadence: "daily" },
+    ...input.signals
+  ];
 }
 
 function slugifyForSignalKey(text: string): string {
