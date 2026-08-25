@@ -39,13 +39,14 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.list",
     description:
-      "List the user's real action items — never a 'remind me before' reminder companion row, which is shown as a short metadata line on its parent action instead, not as its own list entry. Optionally filtered by status, and by overdueOnly for 'do i have any overdue actions', 'what tasks are overdue?' (open, past due only — never future or already-handled items).",
+      "List the user's real action items — never a 'remind me before' reminder companion row, which is shown as a short metadata line on its parent action instead, not as its own list entry. Optionally filtered by status, and by overdueOnly for 'do i have any overdue actions', 'what tasks are overdue?' (open, past due only — never future or already-handled items). For a DATE-SCOPED query, set `when` instead of (or alongside) status — 'do i have actions for tomorrow?', 'what actions do i have tomorrow?', 'show tomorrow's actions', 'any actions tomorrow?', 'what do i have scheduled tomorrow?' -> when 'tomorrow'; 'actions today', 'what do i have today?' -> when 'today'; 'actions for later this week', 'what's coming up this week?' -> when 'this_week'. Same in Spanish ('tengo acciones para mañana?', 'qué acciones tengo mañana?', 'acciones de hoy') and Catalan ('tinc accions per demà?', 'quines accions tinc demà?', 'accions d'avui'). `when` automatically looks at BOTH currently-open actions and ones already moved/deferred to a later date (it answers 'what's coming back tomorrow', not just 'what's due tomorrow') — never plan a plain status:'open' list for a date-scoped question, that would miss anything already moved there.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       status: z.enum(["open", "completed", "snoozed", "archived", "all"]).optional(),
       limit: z.number().int().positive().max(50).optional(),
-      overdueOnly: z.boolean().optional()
+      overdueOnly: z.boolean().optional(),
+      when: z.enum(["today", "tomorrow", "this_week"]).optional()
     })
   },
   {
@@ -69,12 +70,12 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.snooze",
     description:
-      "Snooze an action item to a later date — dismisses it from view without completing OR archiving it; it comes back as open on the given date. Use for 'snooze it tomorrow', 'snooze 2 tomorrow', 'remind me tomorrow', 'push it to tomorrow', 'not today', 'not now' (English); 'recuérdamelo mañana', 'mañana' (Spanish); 'recorda-m'ho demà', 'demà' (Catalan) — a bare phrase like these refers to whichever task is currently in view or was just mentioned (omit actionId, same resolution as action.complete below). 'not today'/'not now' on their own (no explicit date) mean tomorrow, the natural default — set untilText to 'tomorrow' unless the user actually named a different day.",
+      "Defer/move an action item to a later date — dismisses it from view without completing OR archiving it; it comes back as open on the given date (this is a DEFERRAL, not a calendar event — Alecto still has no calendar). Use for 'snooze it tomorrow', 'snooze 2 tomorrow', 'move it to tomorrow', 'move it back', 'bring it back tomorrow', 'park it until Friday', 'push it to tomorrow', 'push it back', 'defer it', 'remind me tomorrow', 'not today', 'not now' (English) — NOT 'postpone it'/'reschedule it', which belong to action.reschedule instead (it changes the due date while keeping the action OPEN; this tool moves it out of view as 'snoozed' until it comes back — a real but different distinction, so route those two verbs there even though they sound similar); 'muévelo a mañana', 'recuérdamelo mañana', 'mañana', 'pásalo a mañana' (Spanish); 'mou-ho a demà', 'recorda-m'ho demà', 'demà', 'passa-ho a demà' (Catalan) — a bare phrase like these refers to whichever task is currently in view or was just mentioned (omit actionId, same resolution as action.complete below). 'not today'/'not now' on their own (no explicit date) mean tomorrow, the natural default — set untilText to 'tomorrow' unless the user actually named a different day. For a genuinely vague target ('later this week', 'more adelante esta semana', 'més endavant aquesta setmana') with no specific day named, do NOT guess a day yourself — this is handled deterministically before you ever see it (a real weekday clarification is asked), so if you do see concrete text like 'thursday' or 'friday' here it's because the user (or the clarification's own answer) already named a real day; use it as given.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
       actionId: actionIdField,
-      untilText: z.string().min(1).describe("Natural language snooze target, e.g. 'tomorrow', 'next monday'.")
+      untilText: z.string().min(1).describe("Natural language deferral target, e.g. 'tomorrow', 'next monday', 'friday'.")
     })
   },
   {
@@ -120,7 +121,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.reschedule",
     description:
-      "Change an existing action item's due date/time without completing it and without creating a duplicate. Use for corrections like 'brainstorm meeting means 12pm not 12am, change it' or 'move the YouTube task to tomorrow afternoon'. Prefer actionId from visible context; otherwise pass ref using the task's visible wording.",
+      "Change an existing action item's due date/time without completing it and without creating a duplicate. Use for corrections like 'brainstorm meeting means 12pm not 12am, change it' or 'move the YouTube task to tomorrow afternoon' — also the right tool for pulling a DEFERRED/snoozed action back to an earlier date: 'move it back to today', 'pull it forward', 'actually let's do it today' -> dueText 'today' (never action.snooze for a pull-BACK — action.snooze is only for pushing something LATER). Prefer actionId from visible context; otherwise pass ref using the task's visible wording.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({

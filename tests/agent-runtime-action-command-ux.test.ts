@@ -62,7 +62,7 @@ test("1B: two open actions' footer only references 1 and 2, never 3", async () =
     const reply = await sendAgentMessage(server, userId, "show me my actions");
 
     assert.match(reply.reply, /complete 1/i);
-    assert.match(reply.reply, /snooze 2 tomorrow/i);
+    assert.match(reply.reply, /move 2 to tomorrow/i);
     assert.doesNotMatch(reply.reply, /archive 3/i);
     assert.doesNotMatch(reply.reply, /\b3\b/);
   } finally {
@@ -81,7 +81,7 @@ test("1C: three+ open actions' footer can reference 1, 2, and 3", async () => {
     const reply = await sendAgentMessage(server, userId, "show me my actions");
 
     assert.match(reply.reply, /complete 1/i);
-    assert.match(reply.reply, /snooze 2 tomorrow/i);
+    assert.match(reply.reply, /move 2 to tomorrow/i);
     assert.match(reply.reply, /archive 3/i);
   } finally {
     clearAgentRuntimeMocks();

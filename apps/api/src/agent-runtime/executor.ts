@@ -92,7 +92,14 @@ import {
   getEveningCheckinDeliveryStatus,
   getProactiveDeliveryStatus
 } from "../operator/proactive-eligibility.js";
-import { EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY, rankOpenActions } from "../operator/proactive.js";
+import {
+  assessTemporalHealth,
+  EVENING_CHECKIN_DEDUPE_KEY,
+  formatTemporalHealthLabel,
+  MORNING_BRIEF_DEDUPE_KEY,
+  rankOpenActions,
+  type TemporalHealth
+} from "../operator/proactive.js";
 import {
   actionInputFromPlanSuggestion,
   buildNextWeekPlanContext,
@@ -110,7 +117,7 @@ import {
   generateAndSaveWeeklyReview,
   generateDeterministicWeeklyReview
 } from "../weekly-review/review.js";
-import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime } from "../utils/datetime.js";
+import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime, startOfLocalWeek } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
@@ -130,6 +137,7 @@ export async function executeOperation(
         const status = (args.status as ActionItem["status"] | "all" | undefined) ?? "open";
         const limit = (args.limit as number | undefined) ?? 10;
         const overdueOnly = Boolean(args.overdueOnly);
+        const when = args.when as "today" | "tomorrow" | "this_week" | undefined;
         const settings = await getOrCreateNotificationSettings(userId);
         const now = new Date();
 
@@ -150,10 +158,27 @@ export async function executeOperation(
         // deliberate, documented tradeoff for a personal-operator product's realistic scale, not
         // a claim of exactness at unbounded scale.
         const ACTION_LIST_POOL_CAP = 500;
-        const pool = await getActionItems(userId, { status, limit: ACTION_LIST_POOL_CAP });
-        const realActions = pool
+        // A date-scoped query ("actions for tomorrow") means something categorically different
+        // from a status filter — a snoozed action IS the answer to "what's coming back tomorrow,"
+        // even though it's invisible to a plain status:"open" list. `when` therefore always widens
+        // the pool to open+snoozed regardless of whatever `status` the planner also sent, rather
+        // than layering on top of it — private-alpha's real reported bug was exactly this: "do i
+        // have actions for tomorrow?" silently ran the default open-only list and could never see
+        // the very action that had just been moved there.
+        const pool = when
+          ? (await getActionItems(userId, { status: "all", limit: ACTION_LIST_POOL_CAP })).filter(
+              (item) => item.status === "open" || item.status === "snoozed"
+            )
+          : await getActionItems(userId, { status, limit: ACTION_LIST_POOL_CAP });
+        let realActions = pool
           .filter((item) => !isReminderCompanionAction(item))
-          .filter((item) => !overdueOnly || (item.status === "open" && Boolean(item.dueAt) && item.dueAt! < now));
+          .filter((item) => !overdueOnly || (item.status === "open" && Boolean(item.dueAt) && item.dueAt! < now))
+          .filter((item) => !when || actionMatchesWhenWindow(item, when, now, settings.timezone));
+        // Only a date-scoped query reorders by date — the plain list's own existing order
+        // (status, then dueAt, then most-recently-touched) is unrelated and untouched otherwise.
+        if (when) {
+          realActions = [...realActions].sort((a, b) => (actionEffectiveDate(a)?.getTime() ?? 0) - (actionEffectiveDate(b)?.getTime() ?? 0));
+        }
         const items = realActions.slice(0, limit);
         const truncated = realActions.length > items.length;
 
@@ -210,7 +235,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatActionListForChat(items, realActions.length, status, overdueOnly, reminderByParentId, settings.timezone),
+          summary: formatActionListForChat(items, realActions.length, status, overdueOnly, reminderByParentId, settings.timezone, when),
           result: items,
           entities: items.map((item, index) => actionToEntity(item, index + 1))
         };
@@ -242,8 +267,17 @@ export async function executeOperation(
 
       case "action.create": {
         const dueText = args.dueText as string | undefined;
-        const parsedDate = dueText ? parseActionDueDate(dueText) : undefined;
         const title = args.title as string;
+        // fix/private-alpha-action-temporal-coaching: a real audit found a title like "Apply to
+        // 3 more remote Web3 roles today" could be created with NO dueAt at all whenever the
+        // planner set the temporal word only in the title and forgot to also set dueText — the
+        // title said "today" but the row had nothing to ever become overdue against. This is a
+        // narrow, deliberately-safe fallback ONLY: dueText (an explicit, separate field) always
+        // wins when present; the title is parsed with the exact same deterministic parser only
+        // when dueText is absent, and only its OWN found match is ever used — never a guessed or
+        // invented date. A title with no temporal words at all (the common case) still gets no
+        // dueAt, exactly as before.
+        const parsedDate = dueText ? parseActionDueDate(dueText) : parseActionDueDate(title);
         const description = args.notes as string | undefined;
         const explicitGoalId = args.goalId as string | undefined;
         // Generic goal linkage (Goal Evidence Loop MVP, docs/10-v3-readiness-audit.md §20) —
@@ -293,10 +327,23 @@ export async function executeOperation(
         // "due " prefix, which only makes sense next to a task title, not a person.
         const whenLabel = updated.snoozedUntil ? formatDueLabelForChat(updated.snoozedUntil, settings.timezone).replace(/^due /, "") : "later";
         const foundNote = operation.actionOutsideVisiblePage ? "Found it outside your last shown list (an exact title match). " : "";
+        // Repeated-postponement coaching (fix/private-alpha-action-temporal-coaching): the FIRST
+        // move of any action is completely ordinary rescheduling, never challenged. The second
+        // gets a genuine, non-accusatory question — real life does sometimes need two moves — and
+        // only the third-plus gets stronger, concrete coaching. Grounded entirely in
+        // postponeCount (packages/db's own persistent counter, incremented by snoozeActionItem
+        // itself), never guessed from conversation history, and never blocks the move itself —
+        // the action is always actually moved first, this is only ever appended after.
+        const coachingNote =
+          updated.postponeCount === 2
+            ? " I can move it, but this is the second time. Is today genuinely blocked, or are you avoiding this?"
+            : updated.postponeCount >= 3
+              ? " You've moved this several times. We should either shrink it, do a 10-minute version, or archive it."
+              : "";
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${foundNote}Okay — I'll bring "${updated.title}" back ${whenLabel}.`,
+          summary: `${foundNote}Okay — I'll bring "${updated.title}" back ${whenLabel}.${coachingNote}`,
           result: updated
         };
       }
@@ -1686,6 +1733,19 @@ export async function executeOperation(
         const todayCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, todayEvents) })).filter((entry) => entry.count > 0);
 
         const linkedOpenActions = rankOpenActions(context.openActions.filter((action) => action.goalId === goal.id && action.status === "open"));
+        // fix/private-alpha-action-temporal-coaching: a real transcript found "what should I do
+        // next?" right after moving "Apply to 3 more remote Web3 roles" to tomorrow proposing a
+        // near-duplicate ("Apply to 3 more remote Web3 roles today") — proposedAction is LLM-
+        // authored and the planner has no deterministic guarantee of checking deferred actions
+        // itself, so this is the same kind of ground-truth veto linkedOpenActions already is for
+        // open ones, just for snoozed ones. Only vetoes when the proposal is actually SIMILAR to
+        // something already deferred — a genuinely different complementary task (e.g. "shortlist
+        // 10 roles") still opens a real confirmation normally below.
+        const linkedDeferredActions = context.deferredActions.filter((action) => action.goalId === goal.id);
+        const similarDeferred =
+          proposedAction && proposedAction.trim()
+            ? linkedDeferredActions.find((action) => titlesLookSimilar(action.title, proposedAction))
+            : undefined;
 
         const lines = [`"${goal.title}":`];
         if (weekCounts.length > 0) {
@@ -1704,9 +1764,46 @@ export async function executeOperation(
         // matter what the planner set in proposedAction. Only when nothing is already open does a
         // genuinely new action (if any) get proposed, and even then only with a real confirmation.
         let pendingOperationUpdate: ExecutedOperation["pendingOperationUpdate"];
-        if (linkedOpenActions.length > 0) {
+        // fix/private-alpha-action-temporal-coaching: an OVERDUE linked action outranks a merely
+        // "existing open" one — the real reported concern was that a stale/overdue action just
+        // sat there worded like any other open task, never flagged, while the coach kept talking
+        // about creating something new. Never invents "overdue" from vibes — assessTemporalHealth
+        // is the exact same grounded dueAt-vs-now (or createdAt-staleness) judgment action.list's
+        // own per-item line uses, so the two surfaces can never disagree about what's overdue.
+        const overdueLinked = linkedOpenActions
+          .map((action) => ({ action, health: assessTemporalHealth(action, new Date(), timezone) }))
+          .filter((entry): entry is { action: ActionItem; health: Extract<TemporalHealth, { kind: "overdue" }> } => entry.health.kind === "overdue")
+          .sort((a, b) => b.health.daysOverdue - a.health.daysOverdue)[0];
+
+        if (overdueLinked) {
+          const { action: overdueAction, health } = overdueLinked;
+          const label = formatTemporalHealthLabel(health)!;
+          // First miss (1 day overdue): an honest, non-judgmental mention plus a shrink offer —
+          // no challenge question yet, real life runs a day behind sometimes. 2-3 days: a genuine
+          // question, not an accusation. 4+ days: concrete options, since a question alone hasn't
+          // helped by this point.
+          const tone =
+            health.daysOverdue <= 1
+              ? "I'd handle that first, but shrink it if needed — a smaller first step still counts. Want me to update the action?"
+              : health.daysOverdue <= 3
+                ? `Is it still the right action, or are you avoiding it? Either way, want me to update it?`
+                : "Want to shrink it, move it, or archive it? Whatever keeps it honest is fine.";
+          lines.push(
+            "",
+            `You have an overdue action — ${label}: "${overdueAction.title}". ${tone}`
+          );
+        } else if (linkedOpenActions.length > 0) {
           const top = linkedOpenActions.slice(0, 2);
           lines.push("", `Existing open action${top.length === 1 ? "" : "s"} you can use: ${top.map((action) => `"${action.title}"`).join(", ")}.`);
+        } else if (similarDeferred) {
+          const settings = await getOrCreateNotificationSettings(userId);
+          const whenLabel = similarDeferred.snoozedUntil
+            ? formatDueLabelForChat(similarDeferred.snoozedUntil, settings.timezone).replace(/^due /, "")
+            : "later";
+          lines.push(
+            "",
+            `You already moved "${similarDeferred.title}" to ${whenLabel} — I won't create another one for today. Say "move it back to today" if you'd rather pull it forward.`
+          );
         } else if (proposedAction && proposedAction.trim()) {
           lines.push("", `Want me to create this action?\n${proposedAction.trim()}`, "", "Reply yes to confirm or cancel.");
           pendingOperationUpdate = {
@@ -1723,12 +1820,21 @@ export async function executeOperation(
           };
         }
 
+        // similarDeferred is included here specifically so a follow-up "move it back to today"
+        // can resolve it — action.reschedule's own ref resolver (validator.ts's resolveActionRef)
+        // only ever looks at session.visibleEntities/context.openActions, never
+        // context.deferredActions directly, so without this a snoozed action mentioned in the
+        // reply text would otherwise be unreferenceable by a bare "it"/"that" on the next turn.
+        const entities = similarDeferred
+          ? [goalToEntity(goal), actionToEntity(similarDeferred)]
+          : [goalToEntity(goal), ...linkedOpenActions.map((action, index) => actionToEntity(action, index + 1))];
+
         return {
           tool: operation.tool,
           status: "executed",
           summary: lines.join("\n"),
           result: goal,
-          entities: [goalToEntity(goal), ...linkedOpenActions.map((action, index) => actionToEntity(action, index + 1))],
+          entities,
           ...(pendingOperationUpdate ? { pendingOperationUpdate } : {})
         };
       }
@@ -2653,37 +2759,111 @@ function actionSourceLabel(action: ActionItem): string | undefined {
   return action.sourceProvider === "gmail" ? "(from Gmail)" : "(from email review)";
 }
 
+/** The date that actually matters for THIS item right now — snoozedUntil for a deferred action
+ * (dueAt is stale/irrelevant once something is snoozed), dueAt for everything else. Both the
+ * per-item date label and date-scoped ("actions for tomorrow") filtering key off this, not off
+ * dueAt alone — a real Telegram smoke test found a snoozed item's line showing no date at all,
+ * since the old dueLine only ever read item.dueAt. */
+function actionEffectiveDate(item: ActionItem): Date | undefined {
+  return item.status === "snoozed" ? item.snoozedUntil : item.dueAt;
+}
+
+/** "actions for today/tomorrow" (task fix/private-alpha-action-temporal-coaching) — a date-scoped
+ * query is answered from BOTH open and snoozed items (see the action.list case's own pool-widening
+ * comment), matched against each item's own actionEffectiveDate in the user's real timezone. */
+function actionMatchesWhenWindow(item: ActionItem, when: "today" | "tomorrow" | "this_week", now: Date, timezone: string): boolean {
+  const todayLocal = formatDateInTimezone(now, timezone);
+  const effective = actionEffectiveDate(item);
+
+  if (when === "today") {
+    // An open action with no due date at all is still part of "today" — it's actionable right
+    // now, same as a plain "show me my actions" would treat it. A snoozed one only counts if it's
+    // actually coming back today.
+    if (item.status === "open" && !item.dueAt) {
+      return true;
+    }
+    return effective ? formatDateInTimezone(effective, timezone) === todayLocal : false;
+  }
+
+  if (when === "tomorrow") {
+    if (!effective) {
+      return false;
+    }
+    return formatDateInTimezone(effective, timezone) === addDaysToLocalDateString(todayLocal, 1);
+  }
+
+  // this_week: today through this week's Sunday, inclusive — an undated open action is trivially
+  // "this week" too (same reasoning as "today" above), but a dated item must actually fall inside
+  // the window, not just exist.
+  if (item.status === "open" && !item.dueAt) {
+    return true;
+  }
+  if (!effective) {
+    return false;
+  }
+  const effectiveLocal = formatDateInTimezone(effective, timezone);
+  const weekEnd = addDaysToLocalDateString(startOfLocalWeek(todayLocal), 6);
+  return effectiveLocal >= todayLocal && effectiveLocal <= weekEnd;
+}
+
+const WHEN_NOUN: Record<"today" | "tomorrow" | "this_week", string> = {
+  today: "today",
+  tomorrow: "tomorrow",
+  this_week: "later this week"
+};
+
 function formatActionListForChat(
   items: ActionItem[],
   totalMatching: number,
   status: ActionItem["status"] | "all",
   overdueOnly: boolean,
   reminderByParentId: Map<string, ActionItem>,
-  timezone: string
+  timezone: string,
+  when?: "today" | "tomorrow" | "this_week"
 ): string {
   const statusNoun = status === "all" ? "action" : `${status} action`;
   const noun = overdueOnly ? "overdue action" : statusNoun;
 
   if (items.length === 0) {
-    return `You don't have any ${noun}s right now.`;
+    return when
+      ? `You don't have any actions scheduled for ${WHEN_NOUN[when]}.`
+      : `You don't have any ${noun}s right now.`;
   }
 
   // Real Telegram smoke test: "You have 10 open actions" when 12 actually existed — never claim
   // a total that's actually just the page size. Only the exact count when everything is shown;
   // "Showing N of M" the moment the real total is larger than what's displayed.
+  const listNoun = when ? `action for ${WHEN_NOUN[when]}` : noun;
   const header =
     totalMatching > items.length
-      ? `Showing ${items.length} of ${totalMatching} ${noun}s:`
-      : `You have ${items.length} ${noun}${items.length === 1 ? "" : "s"}:`;
+      ? `Showing ${items.length} of ${totalMatching} ${listNoun}s:`
+      : `You have ${items.length} ${listNoun}${items.length === 1 ? "" : "s"}:`;
 
+  const now = new Date();
   const lines = [header];
   items.forEach((item, index) => {
-    const dueLine = item.dueAt ? ` — ${formatDueLabelForChat(item.dueAt, timezone)}` : "";
+    const effectiveDate = actionEffectiveDate(item);
+    const health = assessTemporalHealth(item, now, timezone);
+    // Temporal health (fix/private-alpha-action-temporal-coaching) wins over the plain date line
+    // for an overdue item — "due Mon 18 Aug" for something 4 days late reads as a normal
+    // upcoming task, not a problem; "overdue by 4 days" is the honest version. A stale (no-dueAt)
+    // item has no date line to replace, so its label is simply added.
+    const dueLine =
+      health.kind === "overdue"
+        ? ` — ${formatTemporalHealthLabel(health)}`
+        : effectiveDate
+          ? ` — ${formatDueLabelForChat(effectiveDate, timezone)}`
+          : health.kind === "stale"
+            ? ` — ${formatTemporalHealthLabel(health)}`
+            : "";
     // A real Telegram smoke test found archived actions re-listed with no status label at all —
     // indistinguishable from a genuinely open task. Only needed when the pool is mixed (status
     // "all"): a single-status query ("show me archived actions") already says so in the header
-    // noun above, so repeating it on every line would be redundant, not clearer.
-    const statusLine = status === "all" && item.status !== "open" ? ` — ${item.status}` : "";
+    // noun above, so repeating it on every line would be redundant, not clearer. A date-scoped
+    // query mixes open+snoozed by design (see action.list's own comment), so it gets the same
+    // treatment as status "all" here — "snoozed" is still worth labeling even though the date
+    // line already implies it, since "archive"/"complete" only ever apply to the open ones.
+    const statusLine = (status === "all" || when) && item.status !== "open" ? ` — ${item.status}` : "";
     lines.push(`${index + 1}. ${item.title}${dueLine}${statusLine}`);
     const sourceLine = actionSourceLabel(item);
     if (sourceLine) {
@@ -2710,20 +2890,24 @@ function formatActionListForChat(
 
 /** Never references a numbered index that isn't actually visible — the whole reason this exists.
  * One open action gets purely natural phrasing (no number to get wrong); two or more use the
- * REAL indexes shown, never a hardcoded 1/2/3 regardless of how many actions actually exist. */
+ * REAL indexes shown, never a hardcoded 1/2/3 regardless of how many actions actually exist.
+ * Says "move"/"bring back," never "snooze," in this user-facing copy (fix/private-alpha-action-
+ * temporal-coaching task 2) — "snooze" reads as a phone-alarm command, not something a coach
+ * says; it's still accepted as an input word (tool-catalog.ts's action.snooze description), just
+ * never the word Alecto itself uses back to the user. */
 function buildActionListFooter(openIndexes: number[]): string | undefined {
   if (openIndexes.length === 0) {
     return undefined;
   }
   if (openIndexes.length === 1) {
-    return "You can say: \"done\", \"snooze this to tomorrow\", or \"archive it\".";
+    return "You can say: \"done\", \"move it to tomorrow\", or \"archive it\".";
   }
   if (openIndexes.length === 2) {
     const [first, second] = openIndexes;
-    return `You can say: "complete ${first}", "snooze ${second} tomorrow", or "archive ${first}".`;
+    return `You can say: "complete ${first}", "move ${second} to tomorrow", or "archive ${first}".`;
   }
   const [first, second, third] = openIndexes;
-  return `You can say: "complete ${first}", "snooze ${second} tomorrow", or "archive ${third}".`;
+  return `You can say: "complete ${first}", "move ${second} to tomorrow", or "archive ${third}".`;
 }
 
 /** "due today 14:30" / "due tomorrow 09:00" / a full date+time fallback further out — generic
@@ -3166,6 +3350,54 @@ function resolveGoalForLifecycleAction(goalRef: string | undefined, activeGoals:
 export function resolveCurrentFocusGoal(context: ContextBundle): Goal | undefined {
   const focusedGoalEntity = context.session.focusedEntities?.goal;
   return focusedGoalEntity ? context.activeGoals.find((goal) => goal.id === focusedGoalEntity.id) : undefined;
+}
+
+const TITLE_SIMILARITY_STOPWORDS = new Set([
+  "a",
+  "an",
+  "the",
+  "to",
+  "for",
+  "of",
+  "in",
+  "on",
+  "at",
+  "by",
+  "and",
+  "or",
+  "this",
+  "that",
+  "more",
+  "today",
+  "tomorrow",
+  "week",
+  "end",
+  "next",
+  "some"
+]);
+
+/** Same underlying task, worded differently — "Apply to 3 more remote Web3 roles by the end of
+ * the week" vs "Apply to 3 more remote Web3 roles today" share every real content word once
+ * generic filler/temporal words (today, tomorrow, by, the, end, week) are stripped out; only
+ * those two titles differing in exactly the temporal framing is precisely the shape
+ * goal.recommend_next_action's deferred-action check needs to catch. Deliberately a plain
+ * significant-word-overlap heuristic, not fuzzy/typo-tolerant — a real but different task
+ * ("Update resume" vs "Update LinkedIn") must never be treated as the same one. */
+function titlesLookSimilar(a: string, b: string): boolean {
+  const words = (text: string) =>
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 2 && !TITLE_SIMILARITY_STOPWORDS.has(word));
+
+  const wordsA = new Set(words(a));
+  const wordsB = words(b);
+  if (wordsA.size === 0 || wordsB.length === 0) {
+    return false;
+  }
+  const overlap = wordsB.filter((word) => wordsA.has(word)).length;
+  return overlap / Math.max(wordsA.size, wordsB.length) >= 0.6;
 }
 
 function describeAmbiguousGoalChoice(candidates: Goal[]): string {

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createActionItem, createEvent, createGoal } from "../packages/db/src/index.ts";
+import { createActionItem, createEvent, createGoal, snoozeActionItem } from "../packages/db/src/index.ts";
 import { assertNoGenericAgentError, buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertActionCreated,
@@ -5818,6 +5818,481 @@ test(
         const wrongPlural = /1 cvs sent/i.test(reply.reply);
         trace.checkpoint("does not say '1 CVs sent' for a freshly created goal", !wrongPlural, reply.reply);
         assert.ok(!wrongPlural, `a goal created just now must set labelSingular correctly — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * fix/private-alpha-action-temporal-coaching: a real Telegram transcript found "snooze it for
+ * later this week" hit the goal-avoidance guardrail, a moved action vanished from the next
+ * closed-loop recommendation's own duplicate check, "do i have actions for tomorrow?" silently
+ * ran the default open-only list, and "ok do it" right after a real mutation got "I don't have
+ * anything pending to confirm." Scenarios 181-190 cover the real planner recognizing deferral
+ * vocabulary and ambiguous-week clarification, date-scoped queries, post-mutation acknowledgement,
+ * deferred-aware next-action recommendations, repeated-postponement coaching, and the action/event
+ * boundary — against the exact live transcript that reported this.
+ */
+
+test(
+  "181. the exact live transcript: snooze later this week -> asks day -> tomorrow -> ok do it -> what next (no duplicate) -> tomorrow query shows it",
+  { ...llmEvalOptions(["action-temporal-semantics", "action-deferral-coaching", "date-scoped-actions", "next-action-deferred-awareness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("181-temporal-transcript", ["action-temporal-semantics", "action-deferral-coaching", "date-scoped-actions", "next-action-deferred-awareness"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+
+        const t2 = trace.record("snooze it for later this week", await sendAgentMessage(server, userId, "snooze it for later this week"));
+        assertNoGenericAgentError(t2, "vague-week deferral");
+        trace.checkpoint("never hits the guardrail for a vague-week deferral", t2.debug.conversationTopic !== "guardrail", t2.reply);
+        assert.notEqual(t2.debug.conversationTopic, "guardrail", `expected this to be routed as action deferral, not avoidance — got: ${t2.reply}`);
+        assert.equal(t2.debug.mutationExecuted, false, "no day was named yet, nothing should have moved");
+
+        const t3 = trace.record("no its fine, snooze it for tomorrow", await sendAgentMessage(server, userId, "no its fine, snooze it for tomorrow"));
+        assert.equal(t3.debug.mutationExecuted, true, `expected the action to actually move to tomorrow — got: ${t3.reply}`);
+
+        const t4 = trace.record("ok do it", await sendAgentMessage(server, userId, "ok do it"));
+        trace.checkpoint("does not say nothing pending after a real mutation", !/don't have anything pending/i.test(t4.reply), t4.reply);
+        assert.doesNotMatch(t4.reply, /don't have anything pending/i, `expected an "already done"-shaped reply — got: ${t4.reply}`);
+        assert.equal(t4.debug.mutationExecuted, false, "must not re-run the mutation");
+
+        const beforeNextCount = await prisma.actionItem.count({ where: { userId } });
+        const t5 = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(t5, "next-action after deferral");
+        const afterNextCount = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no near-duplicate action created for today", afterNextCount === beforeNextCount, `before: ${beforeNextCount}, after: ${afterNextCount}`);
+        assert.equal(afterNextCount, beforeNextCount, `expected no duplicate action creation — got: ${t5.reply}`);
+
+        const t6 = trace.record("do i have actions for tomorrow?", await sendAgentMessage(server, userId, "do i have actions for tomorrow?"));
+        assertNoGenericAgentError(t6, "tomorrow query");
+        trace.checkpoint("tomorrow query shows the moved action", /remote web3 roles/i.test(t6.reply), t6.reply);
+        assert.match(t6.reply, /remote web3 roles/i, `expected the deferred action to show up for tomorrow — got: ${t6.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "182. 'move it later this week' with no day named asks which day, never guesses",
+  { ...llmEvalOptions(["action-deferral-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-ask-day-${randomUUID()}`;
+    const trace = new EvalTrace("182-temporal-ask-day", ["action-deferral-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("move it later this week", await sendAgentMessage(server, userId, "move it later this week"));
+        assertNoGenericAgentError(reply, "vague-week deferral, no day named");
+        assert.equal(reply.debug.mutationExecuted, false, `expected a clarifying question, not a guessed day — got: ${reply.reply}`);
+        trace.checkpoint("asks which day rather than guessing", /which day|what day/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /which day|what day/i, `expected a "which day" question — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "183. 'move it to tomorrow' applies directly and a tomorrow query then shows it",
+  { ...llmEvalOptions(["action-deferral-coaching", "date-scoped-actions"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-tomorrow-direct-${randomUUID()}`;
+    const trace = new EvalTrace("183-temporal-tomorrow-direct", ["action-deferral-coaching", "date-scoped-actions"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const moveReply = trace.record("move it to tomorrow", await sendAgentMessage(server, userId, "move it to tomorrow"));
+        assert.equal(moveReply.debug.mutationExecuted, true, `expected a direct move, no clarification — got: ${moveReply.reply}`);
+
+        const tomorrowReply = trace.record("show tomorrow's actions", await sendAgentMessage(server, userId, "show tomorrow's actions"));
+        assertNoGenericAgentError(tomorrowReply, "tomorrow query after direct move");
+        trace.checkpoint("tomorrow query shows the moved action", /renew passport/i.test(tomorrowReply.reply), tomorrowReply.reply);
+        assert.match(tomorrowReply.reply, /renew passport/i, `expected the moved action to show up for tomorrow — got: ${tomorrowReply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "184. 'ok do it' right after a real move says already done, no re-mutation, no fake pending state",
+  { ...llmEvalOptions(["action-deferral-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-already-done-${randomUUID()}`;
+    const trace = new EvalTrace("184-temporal-already-done", ["action-deferral-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.record("move it to tomorrow", await sendAgentMessage(server, userId, "move it to tomorrow"));
+
+        const reply = trace.record("ok do it", await sendAgentMessage(server, userId, "ok do it"));
+        assertNoGenericAgentError(reply, "post-mutation acknowledgement");
+        assert.doesNotMatch(reply.reply, /don't have anything pending/i, `expected an acknowledgement, not a confusing "nothing pending" — got: ${reply.reply}`);
+        assert.equal(reply.debug.mutationExecuted, false, "must not silently re-run the mutation");
+        assert.equal(reply.debug.pendingOperation, false, "must never invent a fake pending confirmation either");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "185. 'what should I do next?' after deferring a similar action never proposes a near-duplicate",
+  { ...llmEvalOptions(["next-action-deferred-awareness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-no-duplicate-${randomUUID()}`;
+    const trace = new EvalTrace("185-temporal-no-duplicate", ["next-action-deferred-awareness"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const beforeCount = await prisma.actionItem.count({ where: { userId } });
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "next-action with a deferred similar action");
+        const afterCount = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no near-duplicate action created", afterCount === beforeCount, `before: ${beforeCount}, after: ${afterCount}`);
+        assert.equal(afterCount, beforeCount, `expected no duplicate creation for the already-deferred task — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "186. a second deferral of the same action gets a mild, non-accusatory challenge",
+  { ...llmEvalOptions(["action-deferral-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-second-defer-${randomUUID()}`;
+    const trace = new EvalTrace("186-temporal-second-defer", ["action-deferral-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to remote roles" });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        // Names the action directly rather than "show all actions" + a bare "it" — a plain
+        // "show me all my actions" is itself genuinely ambiguous for the real planner between
+        // status 'open' and 'all' (a separate, unrelated recognition question from what this
+        // scenario is actually testing), and a bare pronoun with nothing currently in view is
+        // correctly asked about rather than guessed, by design. Naming the task removes that
+        // dependency so this scenario tests exactly one thing: repeated-deferral coaching.
+        const reply = trace.record(
+          "move the remote roles task to tomorrow again",
+          await sendAgentMessage(server, userId, "move the remote roles task to tomorrow again")
+        );
+        assertNoGenericAgentError(reply, "second deferral");
+        assert.equal(reply.debug.mutationExecuted, true, "the move itself must never be blocked");
+        trace.checkpoint("asks a genuine question about the second move", /second time/i.test(reply.reply) && /\?/.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /second time/i, `expected a mild challenge noting this is the second move — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "187. a third deferral of the same action gets stronger, concrete coaching",
+  { ...llmEvalOptions(["action-deferral-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-third-defer-${randomUUID()}`;
+    const trace = new EvalTrace("187-temporal-third-defer", ["action-deferral-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to remote roles" });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 48 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        // See 186's own comment: names the action directly, no dependency on a plain "show all
+        // actions" request happening to choose status 'all' for the real planner.
+        const reply = trace.record(
+          "move the remote roles task to tomorrow yet again",
+          await sendAgentMessage(server, userId, "move the remote roles task to tomorrow yet again")
+        );
+        assertNoGenericAgentError(reply, "third deferral");
+        assert.equal(reply.debug.mutationExecuted, true, "the move itself must never be blocked");
+        trace.checkpoint("offers concrete options instead of just noting the pattern", /10-minute|shrink|archive/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /several times/i, `expected stronger coaching noting the repeated pattern — got: ${reply.reply}`);
+        assert.match(reply.reply, /10-minute|shrink|archive/i, `expected a concrete option (shrink/10-minute version/archive) — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "188. Spanish 'tengo acciones para mañana?' shows a deferred action",
+  { ...llmEvalOptions(["date-scoped-actions"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-es-tomorrow-${randomUUID()}`;
+    const trace = new EvalTrace("188-temporal-es-tomorrow", ["date-scoped-actions"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Renovar el pasaporte" });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("tengo acciones para mañana?", await sendAgentMessage(server, userId, "tengo acciones para mañana?"));
+        assertNoGenericAgentError(reply, "Spanish tomorrow query");
+        trace.checkpoint("shows the deferred action", /pasaporte/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /pasaporte/i, `expected the deferred action to show up — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "189. Catalan 'tinc accions per demà?' shows a deferred action",
+  { ...llmEvalOptions(["date-scoped-actions"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-ca-tomorrow-${randomUUID()}`;
+    const trace = new EvalTrace("189-temporal-ca-tomorrow", ["date-scoped-actions"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Renovar el passaport" });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("tinc accions per demà?", await sendAgentMessage(server, userId, "tinc accions per demà?"));
+        assertNoGenericAgentError(reply, "Catalan tomorrow query");
+        trace.checkpoint("shows the deferred action", /passaport/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /passaport/i, `expected the deferred action to show up — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "190. 'I have an interview tomorrow at 16:00' creates a prep action, never claims a calendar event",
+  { ...llmEvalOptions(["goal-avoidance-deferral-boundary"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-temporal-event-boundary-${randomUUID()}`;
+    const trace = new EvalTrace("190-temporal-event-boundary", ["goal-avoidance-deferral-boundary"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("I have an interview tomorrow at 16:00", await sendAgentMessage(server, userId, "I have an interview tomorrow at 16:00"));
+        assertNoGenericAgentError(reply, "interview event/action boundary");
+        assertNoBannedPhrases(reply.reply, ["added it to your calendar", "scheduled it on your calendar", "i'll alert you at 16:00", "calendar event"], "event boundary", trace);
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        trace.checkpoint("a real prep action was created, not a bare calendar-style entry", actions.length > 0, JSON.stringify(actions.map((a) => a.title)));
+        assert.ok(actions.length > 0, `expected a prep action to be created — got reply: ${reply.reply}`);
+        const noRawClockTitle = !actions.some((a) => /16:00/.test(a.title));
+        trace.checkpoint("action title doesn't itself claim a tracked clock time", noRawClockTitle, JSON.stringify(actions.map((a) => a.title)));
+        assert.ok(noRawClockTitle, `an action title must not claim to track the event's own clock time — got: ${JSON.stringify(actions.map((a) => a.title))}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * Temporal-health follow-up to feat/private-alpha-action-temporal-coaching: an open action's
+ * status alone never said whether it was fine, overdue, or had just been sitting untouched — a
+ * task created "for today" kept saying "today" days later with nothing ever flagging it.
+ * assessTemporalHealth (apps/api/src/operator/proactive.ts) is the one grounded source of truth
+ * every surface reads from; the LLM's only real job here is choosing the right tool and never
+ * inventing its own competing overdue/stale language on top of the tool's own grounded summary.
+ */
+
+test(
+  "191. an overdue goal-linked action is addressed before 'what should I do next?' proposes anything new",
+  { ...llmEvalOptions(["action-overdue-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-overdue-next-${randomUUID()}`;
+    const trace = new EvalTrace("191-overdue-next", ["action-overdue-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, {
+        source: "manual",
+        title: "Apply to 3 more remote Web3 roles",
+        goalId: goalResult.goal.id,
+        dueAt: new Date(Date.now() - 24 * 60 * 60 * 1000)
+      });
+
+      await trace.guard(async () => {
+        const beforeCount = await prisma.actionItem.count({ where: { userId } });
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "overdue-aware next-action");
+        trace.checkpoint("mentions the overdue action", /overdue/i.test(reply.reply) && /remote web3 roles/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /overdue/i, `expected the overdue action to be surfaced — got: ${reply.reply}`);
+        const afterCount = await prisma.actionItem.count({ where: { userId } });
+        assert.equal(afterCount, beforeCount, "must not create a new action while an overdue one exists");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "192. a stale action with no due date is called 'sitting', never 'overdue'",
+  { ...llmEvalOptions(["action-overdue-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-overdue-stale-${randomUUID()}`;
+    const trace = new EvalTrace("192-overdue-stale", ["action-overdue-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Organize old photos" });
+      await prisma.actionItem.update({ where: { id: action.id }, data: { createdAt: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000) } });
+
+      await trace.guard(async () => {
+        const reply = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        assertNoGenericAgentError(reply, "stale action listing");
+        trace.checkpoint("says 'sitting', never 'overdue', for a no-dueAt action", /sitting for/i.test(reply.reply) && !/overdue/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /sitting for/i, `expected staleness wording — got: ${reply.reply}`);
+        assert.doesNotMatch(reply.reply, /overdue/i, `must never claim 'overdue' for an action with no real due date — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "193. an action overdue by several days gets stronger, concrete coaching (shrink/move/archive)",
+  { ...llmEvalOptions(["action-overdue-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-overdue-strong-${randomUUID()}`;
+    const trace = new EvalTrace("193-overdue-strong", ["action-overdue-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, {
+        source: "manual",
+        title: "Apply to remote roles",
+        goalId: goalResult.goal.id,
+        dueAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000)
+      });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "several-days-overdue coaching");
+        trace.checkpoint("offers concrete options for a several-days-overdue action", /shrink|archive|move/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /shrink|archive|move/i, `expected concrete options (shrink/move/archive) — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "194. 'be stricter with me' proposes a preference update, never applies it silently",
+  { ...llmEvalOptions(["action-overdue-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-overdue-stricter-${randomUUID()}`;
+    const trace = new EvalTrace("194-overdue-stricter", ["action-overdue-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+
+      await trace.guard(async () => {
+        // A clean preference request, deliberately NOT framed as a self-admitted lapse ("I keep
+        // letting myself slide") — that shape legitimately (and correctly) triggers the
+        // guardrail's own separate lapse_admission handling first, which isn't what this
+        // scenario is testing; this is specifically about the propose/apply confirmation gate.
+        const reply = trace.record(
+          "Can you be stricter with me about this goal going forward?",
+          await sendAgentMessage(server, userId, "Can you be stricter with me about this goal going forward?")
+        );
+        assertNoGenericAgentError(reply, "stricter-coaching preference request");
+        trace.checkpoint("opens a real pending confirmation, does not apply immediately", reply.debug.pendingOperation === true, reply.reply);
+        assert.equal(reply.debug.pendingOperation, true, `expected a confirmation-backed proposal, not a silent change — got: ${reply.reply}`);
+        assert.equal(reply.debug.mutationExecuted, false, "must not change the permanent profile before the user confirms");
       });
     } finally {
       await server.close();

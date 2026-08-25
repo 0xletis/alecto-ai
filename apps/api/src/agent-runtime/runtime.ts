@@ -1,5 +1,6 @@
-import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, rejectPendingAction, type PendingAction } from "@operator-agent/db";
+import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, getOrCreateNotificationSettings, rejectPendingAction, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
+import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetime.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
@@ -14,6 +15,7 @@ import type {
   AgentEntity,
   AgentMessageRequest,
   AgentMessageResponse,
+  AgentMutationRecord,
   AgentPendingOperation,
   AgentSessionState,
   ContextBundle,
@@ -85,6 +87,39 @@ function looksLikeExtendedConfirmPhrase(normalized: string): boolean {
 }
 
 const NO_PENDING_REPLY = "I don't have anything pending to confirm.";
+const ALREADY_DONE_REPLY = "Already done.";
+
+/**
+ * Whether the assistant's own IMMEDIATELY PRECEDING turn really was reporting a mutation that
+ * just executed — the ground truth task fix/private-alpha-action-temporal-coaching's "ok do it"
+ * acknowledgement relies on, so a bare confirm phrase with nothing pending doesn't read as if
+ * the previous, already-successful action never happened. Every fully-processed turn appends
+ * EXACTLY one user message (processAgentMessageInner, right at the start) then EXACTLY one
+ * assistant message (finalize, at the end) — so messages strictly alternates
+ * [...,assistantN-1, userN, ...]. By the time this runs, THIS turn's own user message ("ok do
+ * it") is already the last entry, so the previous turn's reply is deterministically the
+ * second-to-last entry.
+ *
+ * Correlated against recentMutations by EXACT TEXT, not by timestamp proximity — an earlier
+ * version compared `at` timestamps and was wrong: two turns processed back-to-back in a fast
+ * test run (or just a fast exchange) land within the same few-hundred-ms window regardless of
+ * whether the second one mutated anything, so an unrelated READ-ONLY turn right after a real
+ * mutation could still "pass" a loose time-gap check. For any turn whose reply is a single
+ * ground-truth-only mutation summary (composeReply's own groundTruthOnly branch, action.
+ * complete/snooze/archive's own case — see response-composer.ts), the assistant's reply text IS
+ * exactly that op's own `summary`, the same string recordMutation stored — so an exact match is
+ * real proof, and a genuinely different reply (a list, a question, a different tool's summary)
+ * can never accidentally match. A multi-op turn's joined reply won't exact-match any single
+ * mutation's summary either, so this simply declines for that rarer shape rather than guessing.
+ */
+function mostRecentTurnWasAMutation(session: AgentSessionState): AgentMutationRecord | undefined {
+  const mutation = session.recentMutations[0];
+  const previousAssistantMessage = session.messages[session.messages.length - 2];
+  if (!mutation || !previousAssistantMessage || previousAssistantMessage.role !== "assistant") {
+    return undefined;
+  }
+  return previousAssistantMessage.text === mutation.summary ? mutation : undefined;
+}
 
 // Marks session.pendingOperation as "an ambiguous action-completion clarification is open" —
 // there is nothing here to actually confirm, so the mutation firewall below (which exempts this
@@ -526,9 +561,28 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     if (pending) {
       return finalizeDeterministicConfirmation(context, message);
     }
-    return context.legacyPendingAction
-      ? finalizeLegacyPendingActionConfirm(context)
-      : finalizeNoPendingReply(context, "confirmation.confirm");
+    if (context.legacyPendingAction) {
+      return finalizeLegacyPendingActionConfirm(context);
+    }
+    // A real Telegram transcript found "ok do it" right after a real mutation (e.g. moving an
+    // action to tomorrow) got "I don't have anything pending to confirm." — technically true
+    // (there was never a CONFIRMATION pending for that already-deterministic move) but reads as
+    // if nothing happened at all. mostRecentTurnWasAMutation only fires when the assistant's own
+    // immediately preceding reply really was reporting a mutation that just executed — never for
+    // an older one, and never invents or re-runs anything.
+    const recentMutation = mostRecentTurnWasAMutation(context.session);
+    if (recentMutation) {
+      return finalize(context, {
+        reply: ALREADY_DONE_REPLY,
+        operationsPlanned: [],
+        executedOps: [{ tool: "confirmation.confirm", status: "skipped", summary: ALREADY_DONE_REPLY }],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: context.session.topic ?? "actions"
+      });
+    }
+    return finalizeNoPendingReply(context, "confirmation.confirm");
   }
   if (CANCEL_WHITELIST.has(normalized)) {
     if (pending) {
@@ -639,6 +693,26 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   }
 
   if (!pending) {
+    // Checked before actionCompletionShortcutOperation below: "move it later this week"/"bring it
+    // back later this week"-shaped messages have a real deferral verb but NO actual day named, so
+    // extractNaturalDueTextFromMessage can't produce an untilText for them — the concrete-date
+    // shortcut below would just decline and let the message fall all the way through to the
+    // goal-avoidance guardrail (the exact reported bug: "snooze it for later this week" read as
+    // avoidance). Asking which day, deterministically, keeps this out of the guardrail entirely
+    // AND out of the LLM planner (which has no reliable way to guess a specific day either).
+    const actionDeferralWeekClarification = await actionDeferralAmbiguousWeekClarification(message, context);
+    if (actionDeferralWeekClarification) {
+      return finalize(context, {
+        reply: actionDeferralWeekClarification,
+        operationsPlanned: [],
+        executedOps: [],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: "actions"
+      });
+    }
+
     // Checked FIRST, ahead of every Gmail-review shortcut: a bare "complete it"/"done"/"archive
     // it"/"snooze it tomorrow" right after the worker sends a due-action notification is a real,
     // reported failure mode otherwise — the real LLM planner has nothing but session.visibleEntities
@@ -1555,12 +1629,86 @@ const ACTION_COMPLETION_PATTERN = /\b(complete(d)?|finish(ed)?|mark(ed)? (?:it |
 // the simple leading-word case).
 const ACTION_DONE_PATTERN = /^(done|finished|hecho|terminado|listo|fet|llest)\b|\bja\s+(esta|ho he)\s+fet\b/;
 const ACTION_ARCHIVE_PATTERN = /\b(archive|dismiss)\b/;
-const ACTION_SNOOZE_PATTERN = /\bsnooze\b/;
+// Broadened for fix/private-alpha-action-temporal-coaching — a real Telegram transcript found
+// "snooze it for later this week" hit the goal-avoidance guardrail purely because the OLD pattern
+// (literal "snooze" only) is a small subset of how a coach would actually phrase task deferral;
+// "move it," "bring it back," "park it," "push it," "defer," and "remind me" (+ Spanish/Catalan
+// equivalents, matched post-accent-stripping via normalizeIntentText) are all real reported/
+// expected phrasings for the exact same operation (action.snooze) — deferring something later.
+// Deliberately does NOT include "postpone"/"reschedule": those two are action.reschedule's own
+// established vocabulary (changing/correcting a due date while the action stays OPEN, a genuinely
+// different DB effect than snoozing it), and a bare "reschedule it to tomorrow" must still reach
+// that tool, not get silently redirected into a deferral. Still just a keyword shortcut, not full
+// NLP — a phrase this doesn't catch simply falls through to the real LLM planner (whose
+// tool-catalog.ts guidance covers the same vocabulary) rather than silently failing; this only
+// ever WIDENS what resolves deterministically before the guardrail.
+const ACTION_SNOOZE_PATTERN =
+  /\bsnooze\b|\bmove (it|this|that)\b|\bbring (it|this|that) back\b|\bpark (it|this|that)\b|\bpush (it|this|that)\b|\bdefer\b|\bremind me\b|\bmuevelo\b|\bpasalo\b|\brecuerdamelo\b|\bmou-ho\b|\bpassa-ho\b|\brecorda-m['’]ho\b/;
 /** Generic pronoun/bare-acknowledgement reference only — a message that names something by its
  * own specific words ("complete the Nietzsche book goal") should still go through the normal
  * planner/validator resolution path, not this shortcut, which exists only for the truly ambiguous
  * "it"/"that"/bare-word case a worker notification leaves the user replying to. */
 const GENERIC_ACTION_REFERENCE_PATTERN = /\b(it|that one|that|this one|this)\b/;
+
+// A deferral verb (ACTION_SNOOZE_PATTERN, defined below) paired with a genuinely vague "some day
+// this week" phrase and NO actual day named — "later this week"/"this week"/"later in the week"
+// (English), "mas adelante esta semana" (Spanish), "mes endavant aquesta setmana" (Catalan), all
+// post-accent-stripping via normalizeIntentText.
+const VAGUE_WEEK_PATTERN = /\b(later this week|later in the week|this week)\b|\bmas adelante esta semana\b|\bmes endavant aquesta setmana\b/;
+const WEEKDAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+/** The 1-2 weekdays worth naming back to the user for "later this week" — deliberately excludes
+ * tomorrow itself ("later" reads as "not the very next day") and caps at two so the question
+ * stays short, matching the real reported transcript's own phrasing ("Thursday or Friday?").
+ * Treats the work week as ending Friday (stops at the weekend) — empty once today IS Friday or
+ * later, since "later this week" genuinely has no good answer by then. */
+function laterThisWeekCandidateDays(todayLocalDate: string): string[] {
+  const remaining: string[] = [];
+  for (let offset = 1; offset <= 6; offset++) {
+    const dateStr = addDaysToLocalDateString(todayLocalDate, offset);
+    const dow = new Date(`${dateStr}T12:00:00Z`).getUTCDay();
+    if (dow === 0 || dow === 6) {
+      break;
+    }
+    remaining.push(WEEKDAY_NAMES[dow]!);
+  }
+  const afterTomorrow = remaining.slice(1);
+  const candidates = afterTomorrow.length > 0 ? afterTomorrow : remaining;
+  return candidates.slice(-2);
+}
+
+/**
+ * "snooze it for later this week" / "move it later this week" — a real deferral verb with no
+ * concrete day at all. extractNaturalDueTextFromMessage can't build an untilText for this (by
+ * design — it only ever recognizes real, concrete dates), so left alone this shape used to fall
+ * all the way through actionCompletionShortcutOperation's decline straight to the goal-avoidance
+ * guardrail, which had no way to know it was looking at ordinary task scheduling — the exact
+ * reported bug. Only fires when a concrete day genuinely isn't already present (a message like
+ * "later this week, actually thursday" already has a real answer and is left to the normal
+ * concrete-date shortcut below), and only when exactly one action is currently resolvable, the
+ * same single-target safety bar every other bare-reference shortcut in this file uses.
+ */
+async function actionDeferralAmbiguousWeekClarification(message: string, context: ContextBundle): Promise<string | undefined> {
+  const text = normalizeIntentText(message);
+  if (!text || /\d/.test(text) || !ACTION_SNOOZE_PATTERN.test(text) || !VAGUE_WEEK_PATTERN.test(text) || extractNaturalDueTextFromMessage(text)) {
+    return undefined;
+  }
+
+  const resolved = await resolveMostRecentlyNotifiedOrVisibleActionId(context);
+  if (!resolved) {
+    return undefined;
+  }
+
+  const settings = await getOrCreateNotificationSettings(context.session.userId);
+  const todayLocal = formatDateInTimezone(new Date(), settings.timezone);
+  const candidates = laterThisWeekCandidateDays(todayLocal);
+
+  if (candidates.length === 0) {
+    return "Which day would you like to move it to?";
+  }
+  const dayPhrase = candidates.length === 1 ? candidates[0]! : `${candidates.slice(0, -1).join(", ")} or ${candidates[candidates.length - 1]}`;
+  return `Which day later this week — ${dayPhrase}?`;
+}
 
 /**
  * Deterministic resolution for a generic "complete it"/"done"/"archive it"/"snooze it tomorrow"
@@ -1588,6 +1736,17 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
     // action.snooze's untilText is required — without one to extract, fall through rather than
     // plan an operation the validator can only reject.
     if (!untilText) {
+      return undefined;
+    }
+    // "move it back to today"/"bring it back today" is a real reported case where this pattern's
+    // OWN vocabulary ("move"/"bring back") collides with its own extracted date — deferring
+    // something UNTIL today is a contradiction (a snooze is always meant to push something
+    // LATER), and doing it anyway would set status "snoozed" with snoozedUntil=today, which is
+    // invisible to a plain "show me my actions" until some later reminder notices it's due — the
+    // opposite of what "pull it back to today" actually means. That phrase is action.reschedule's
+    // job (dueText 'today', keeps the action OPEN) — falls through to the real planner here,
+    // whose tool-catalog.ts guidance already covers exactly this "pull it back to today" phrasing.
+    if (/^today\b/i.test(untilText)) {
       return undefined;
     }
     tool = "action.snooze";
