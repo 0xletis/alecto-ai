@@ -115,6 +115,7 @@ export interface AgentSessionRow {
   pendingOperation: unknown;
   visibleEntities: unknown;
   focusedEntities: unknown;
+  recentMutations: unknown;
 }
 
 export async function getAgentSession(userId: string, channel = "telegram"): Promise<AgentSessionRow | null> {

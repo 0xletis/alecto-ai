@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createActionItem, createEvent, createGoal, snoozeActionItem, updateNotificationSettings } from "../packages/db/src/index.ts";
+import { archiveActionItem, createActionItem, createEvent, createGoal, setGoalStatus, snoozeActionItem, updateNotificationSettings } from "../packages/db/src/index.ts";
 import { assertNoGenericAgentError, buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertActionCreated,
@@ -7060,6 +7060,289 @@ test(
     } finally {
       await server.close();
       await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * fix/private-alpha-action-state-consistency: a real Telegram transcript found two related state-
+ * leakage bugs. (1) "remove my actions" answered "you don't have any open or scheduled actions to
+ * archive" while a real snoozed/deferred action for tomorrow still existed — action.archive_all_
+ * propose's scope "all" candidate pool was status "open" only, now fixed to open+snoozed. (2)
+ * "what should I do today?" referenced an action ("...moved to tomorrow 11:00") that had ALREADY
+ * been archived a turn earlier — the model's own free-text recommendation drew on stale assistant
+ * prose in conversation.recentMessages instead of the correctly-empty backgroundDeferredActions.
+ * The deterministic mechanics (widened bulk-scope query, archiveActionItem/completeActionItem
+ * idempotency, visible-entity pruning) are covered by tests/agent-runtime-action-state-
+ * consistency.test.ts; these scenarios cover what's inherently LLM judgment: the real planner
+ * actually preferring fresh background state and recentStateChanges over old chat text.
+ */
+
+test(
+  "216. the exact live transcript: 'remove my actions' finds a real deferred action (not a false no-op), and an archived action is never later referenced as still scheduled",
+  { ...llmEvalOptions(["action-state-consistency", "remove-actions-includes-deferred", "state-beats-recent-transcript"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("216-state-transcript", ["action-state-consistency", "remove-actions-includes-deferred", "state-beats-recent-transcript"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const deferred = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const removeReply = trace.record("remove my actions", await sendAgentMessage(server, userId, "remove my actions"));
+        assertNoGenericAgentError(removeReply, "remove my actions with a real deferred action existing");
+        trace.checkpoint("finds the real deferred action, not a false no-op", !/don't have any open or scheduled actions/i.test(removeReply.reply), removeReply.reply);
+        assert.doesNotMatch(removeReply.reply, /don't have any open or scheduled actions/i, `must find the real deferred action — got: ${removeReply.reply}`);
+
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const tomorrowReply = trace.record("what actions do i have tomorrow?", await sendAgentMessage(server, userId, "what actions do i have tomorrow?"));
+        assert.doesNotMatch(tomorrowReply.reply, /apply to 3 more remote web3 roles/i, "the archived action must not still show up as scheduled for tomorrow");
+
+        const todayReply = trace.record("what should I do today?", await sendAgentMessage(server, userId, "what should I do today?"));
+        assertNoGenericAgentError(todayReply, "today recommendation after the deferred action was archived");
+        const referencesStaleAction = /apply to 3 more remote web3 roles/i.test(todayReply.reply) && /(moved to|scheduled for|tomorrow)/i.test(todayReply.reply);
+        trace.checkpoint("the archived action is never referenced as still moved/scheduled", !referencesStaleAction, todayReply.reply);
+        assert.ok(!referencesStaleAction, `must never reference the archived action as still scheduled — got: ${todayReply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "217. archiving a deferred action then recreating the goal: 'what should I do today?' is grounded in the NEW goal only",
+  { ...llmEvalOptions(["action-state-consistency", "post-mutation-fresh-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-regoal-${randomUUID()}`;
+    const trace = new EvalTrace("217-state-regoal", ["action-state-consistency", "post-mutation-fresh-state"], userId);
+
+    try {
+      await seedUser(userId);
+      // Pre-archived directly via the DB layer (not a chat turn) — matches this file's own
+      // established convention of seeding PRIOR state directly rather than mocking a planner
+      // response, so every turn actually exercised below runs against the real LLM end to end.
+      const oldGoal = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (oldGoal.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const oldAction = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: oldGoal.goal.id });
+      await archiveActionItem(userId, oldAction.id);
+      await setGoalStatus(userId, oldGoal.goal.id, "archived");
+
+      await trace.guard(async () => {
+        trace.record("I want to read one book a month this year", await sendAgentMessage(server, userId, "I want to read one book a month this year"));
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const reply = trace.record("what should I do today?", await sendAgentMessage(server, userId, "what should I do today?"));
+        assertNoGenericAgentError(reply, "recommendation after the old goal/action were archived and a new one was created");
+        trace.checkpoint("no longer references the old Web3/job-search action", !/apply to 3 more remote web3 roles/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /apply to 3 more remote web3 roles/i, `must not reference the old archived action — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "218. an action mentioned as scheduled in the assistant's own recent message, but archived before the next turn, is not repeated as still scheduled",
+  { ...llmEvalOptions(["state-beats-recent-transcript"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-recent-${randomUUID()}`;
+    const trace = new EvalTrace("218-state-recent", ["state-beats-recent-transcript"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const deferred = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const tomorrowReply = trace.record("what actions do i have tomorrow?", await sendAgentMessage(server, userId, "what actions do i have tomorrow?"));
+        assert.match(tomorrowReply.reply, /apply to 3 more remote web3 roles/i, "sanity check: the deferred action is genuinely visible first");
+
+        // A real LLM-driven turn, deliberately: the just-shown deferred action is now a real
+        // visible entity, so a bare "archive it" resolves deterministically against it
+        // regardless of which tool name the model itself picks.
+        const archiveReply = trace.record("actually archive it", await sendAgentMessage(server, userId, "actually archive it"));
+        assertNoGenericAgentError(archiveReply, "archiving the just-shown deferred action");
+
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "next-action recommendation right after archiving what recentMessages still describes as scheduled");
+        const treatsAsStillScheduled = /apply to 3 more remote web3 roles/i.test(reply.reply) && /(moved to|scheduled|tomorrow)/i.test(reply.reply);
+        trace.checkpoint("does not repeat the now-stale 'scheduled for tomorrow' claim from its own earlier message", !treatsAsStillScheduled, reply.reply);
+        assert.ok(!treatsAsStillScheduled, `must not repeat stale scheduled-for-tomorrow text after archiving it — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "219. a paraphrased 'wipe my task list clean' (not the literal deterministic-shortcut phrasing) still finds and includes a deferred action",
+  { ...llmEvalOptions(["remove-actions-includes-deferred"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-paraphrase-${randomUUID()}`;
+    const trace = new EvalTrace("219-state-paraphrase", ["remove-actions-includes-deferred"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Review 10 remote roles" });
+      const deferred = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("I want to wipe my task list clean, start fresh", await sendAgentMessage(server, userId, "I want to wipe my task list clean, start fresh"));
+        assertNoGenericAgentError(reply, "paraphrased bulk-clear request");
+        trace.checkpoint("includes the deferred action, not just the open one", /apply to 3 more remote web3 roles/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /apply to 3 more remote web3 roles/i, `must include the deferred action too — got: ${reply.reply}`);
+        trace.checkpoint("opens a real confirmation, never silently clears", reply.debug.pendingOperation === true, reply.reply);
+        assert.equal(reply.debug.pendingOperation, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "220. double-archiving the same action via natural language never produces a fraudulent second success",
+  { ...llmEvalOptions(["action-state-consistency", "post-mutation-fresh-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-doublearchive-${randomUUID()}`;
+    const trace = new EvalTrace("220-state-doublearchive", ["action-state-consistency", "post-mutation-fresh-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+
+      await trace.guard(async () => {
+        const first = trace.record("show my actions", await sendAgentMessage(server, userId, "show my actions"));
+        assert.match(first.reply, /apply to 3 more remote web3 roles/i);
+
+        const archived = trace.record("archive 1", await sendAgentMessage(server, userId, "archive 1"));
+        assertNoGenericAgentError(archived, "first archive");
+        assert.equal(archived.debug.mutationExecuted, true);
+
+        const second = trace.record("archive it again", await sendAgentMessage(server, userId, "archive it again"));
+        assertNoGenericAgentError(second, "second archive attempt on the same action");
+        trace.checkpoint("never claims a fresh archive succeeded a second time", !/^archived/i.test(second.reply.trim()), second.reply);
+        assert.doesNotMatch(second.reply, /^archived/i, `must not claim a fresh second success — got: ${second.reply}`);
+        assert.equal(second.debug.mutationExecuted, false, "nothing real was actually re-archived");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "221. completing an action, then asking 'what should I do next?', never recommends the just-completed action again",
+  { ...llmEvalOptions(["post-mutation-fresh-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-completenext-${randomUUID()}`;
+    const trace = new EvalTrace("221-state-completenext", ["post-mutation-fresh-state"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record("show my actions", await sendAgentMessage(server, userId, "show my actions"));
+        const completed = trace.record("done with the first one", await sendAgentMessage(server, userId, "done with the first one"));
+        assertNoGenericAgentError(completed, "completing the action");
+
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "recommendation right after completing the only open action");
+        const recommendsCompletedAsOpen = /existing open actions?[^.]*apply to 3 more remote web3 roles/i.test(reply.reply);
+        trace.checkpoint("does not recommend the just-completed action as if still open", !recommendsCompletedAsOpen, reply.reply);
+        assert.ok(!recommendsCompletedAsOpen, `must not recommend the completed action as an existing open one — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "222. snoozing an action to tomorrow, then 'show my open actions', hides it from the open-now list",
+  { ...llmEvalOptions(["post-mutation-fresh-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-state-snoozehide-${randomUUID()}`;
+    const trace = new EvalTrace("222-state-snoozehide", ["post-mutation-fresh-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+
+      await trace.guard(async () => {
+        trace.record("show my actions", await sendAgentMessage(server, userId, "show my actions"));
+        const snoozed = trace.record("move it to tomorrow", await sendAgentMessage(server, userId, "move it to tomorrow"));
+        assertNoGenericAgentError(snoozed, "snoozing the action");
+
+        const reply = trace.record("show my open actions", await sendAgentMessage(server, userId, "show my open actions"));
+        trace.checkpoint("the snoozed action no longer shows up as open-now", !/apply to 3 more remote web3 roles/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /apply to 3 more remote web3 roles/i, `must not list a snoozed action as open-now — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "223. Spanish 'elimina todas mis acciones' and Catalan 'esborra totes les meves accions' both find a deferred action",
+  { ...llmEvalOptions(["remove-actions-includes-deferred"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userIdEs = `llm-eval-state-es-${randomUUID()}`;
+    const userIdCa = `llm-eval-state-ca-${randomUUID()}`;
+    const trace = new EvalTrace("223-state-i18n", ["remove-actions-includes-deferred"], userIdEs);
+
+    try {
+      await seedUser(userIdEs);
+      const esAction = await createActionItem(userIdEs, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userIdEs, esAction.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await seedUser(userIdCa);
+      const caAction = await createActionItem(userIdCa, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userIdCa, caAction.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const esReply = trace.record("elimina todas mis acciones", await sendAgentMessage(server, userIdEs, "elimina todas mis acciones"));
+        assertNoGenericAgentError(esReply, "Spanish remove-all-actions");
+        assert.match(esReply.reply, /apply to 3 more remote web3 roles/i, `Spanish must find the deferred action — got: ${esReply.reply}`);
+
+        const caReply = trace.record("esborra totes les meves accions", await sendAgentMessage(server, userIdCa, "esborra totes les meves accions"));
+        assertNoGenericAgentError(caReply, "Catalan remove-all-actions");
+        assert.match(caReply.reply, /apply to 3 more remote web3 roles/i, `Catalan must find the deferred action — got: ${caReply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userIdEs } });
+      await prisma.user.deleteMany({ where: { id: userIdCa } });
     }
   }
 );

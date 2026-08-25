@@ -416,7 +416,10 @@ export async function executeOperation(
         }
 
         const updated = await completeActionItem(userId, actionId);
-        if (!updated) return failed(operation.tool, "That task no longer exists or is archived.");
+        // completeActionItem now also treats "already completed" as a no-op (same
+        // fraudulent-second-success fix as action.archive) — this can't tell the three
+        // undefined cases apart, so the reply stays honestly broad rather than guessing which.
+        if (!updated) return failed(operation.tool, "That task no longer exists, or is already archived or completed.");
 
         // Lightweight post-completion coaching (fix/private-alpha-action-command-ux): a bare
         // "Completed action." was purely transactional. Now: acknowledge it, connect it to its
@@ -445,13 +448,24 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: `${foundNote}Nice — marked "${updated.title}" complete${goalNote}.${followUp}`,
-          result: updated
+          result: updated,
+          // fix/private-alpha-action-state-consistency: a completed action is terminal — leaving
+          // it in session.visibleEntities let a stale "done"/"complete it" bare-pronoun reference
+          // resolve back to the SAME id on a later turn. See action.archive's own matching comment
+          // right below for the full reasoning; removeVisibleEntities does a targeted removal, not
+          // a wholesale replace, so the rest of a still-relevant numbered list stays intact.
+          removedEntityIds: [updated.id]
         };
       }
 
       case "action.archive": {
         const updated = await archiveActionItem(userId, args.actionId as string);
-        if (!updated) return failed(operation.tool, "That task no longer exists.");
+        // archiveActionItem now itself distinguishes "doesn't exist" from "already archived" (both
+        // return undefined) — this reply can't tell which occurred, so it uses the same honest,
+        // slightly-broader phrasing action.complete/action.snooze/action.reschedule already use
+        // for the identical ambiguity, rather than claiming "no longer exists" for an action that
+        // is actually still there, just already archived.
+        if (!updated) return failed(operation.tool, "That task no longer exists or is archived.");
         const foundNote = operation.actionOutsideVisiblePage ? "Found it outside your last shown list (an exact title match). " : "";
         // Deliberately never phrased anywhere near "done"/"complete" — archiving is dismissal,
         // not completion, and a real product rule exists specifically so these two never blur.
@@ -459,7 +473,16 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: `${foundNote}Archived "${updated.title}" — I'll stop treating it as active.`,
-          result: updated
+          result: updated,
+          // fix/private-alpha-action-state-consistency: a real reported bug found a bare "archive
+          // it"/"remove it" right after an archive resolving to the SAME now-archived action again
+          // (session.visibleEntities was never pruned post-mutation) — combined with
+          // archiveActionItem previously having no "already archived" guard at all, this produced
+          // a fraudulent second "Archived ..." success reply for a mutation that never actually
+          // happened a second time. Removing the id here means a later bare "it" with nothing else
+          // visible correctly falls through to "which task do you mean? I don't have one in view
+          // right now" instead of silently re-targeting stale state.
+          removedEntityIds: [updated.id]
         };
       }
 
@@ -472,10 +495,18 @@ export async function executeOperation(
         // actions from a "tomorrow" list) answered "You don't have any open actions to archive" —
         // both id-based paths below filtered candidates to status "open" only, so a visible but
         // DEFERRED action could never be archived this way, even though action.archive (the
-        // single-item tool) never had that restriction. "visible"/explicit-id archiving is about
-        // what's actually IN VIEW, open or deferred; only scope "all" below stays open-only, since
-        // a bare "archive all my actions" with nothing else specified is reasonably read as "all
-        // my ACTIVE ones," not everything I've ever deferred.
+        // single-item tool) never had that restriction.
+        //
+        // fix/private-alpha-action-state-consistency: scope "all" used to stay open-only on
+        // purpose (a bare "archive all my actions" was read as "all my ACTIVE ones," not
+        // everything ever deferred) — a real transcript then showed exactly why that reading
+        // fails in practice: "remove my actions" answered "you don't have any open or scheduled
+        // actions to archive" while a real snoozed/deferred action for tomorrow still existed, the
+        // very thing the reply text itself claimed to have checked. The updated product rule is
+        // explicit: "remove/clear/archive/delete my actions" means every action the user could
+        // still reasonably call theirs to deal with — open OR scheduled/deferred — never just
+        // completed or already-archived history. All three scopes now agree on that same
+        // open-or-snoozed definition of "your actions."
         let targets: ActionItem[];
         if (explicitIds && explicitIds.length > 0) {
           // Already-resolved real ids (either from runtime.ts's own multi-archive collapse of
@@ -489,20 +520,27 @@ export async function executeOperation(
           const items = await Promise.all(visibleActionIds.map((id) => getActionItem(userId, id)));
           targets = items.filter((item): item is ActionItem => item !== undefined && (item.status === "open" || item.status === "snoozed"));
         } else {
-          // scope "all" (or omitted, defensively) — the FULL real open-action pool, not
+          // scope "all" (or omitted, defensively) — the FULL real open-AND-snoozed pool, not
           // context.openActions' own 20-item context-loader cap, so "archive all my actions" is
           // honest about how many actions actually exist, matching action.list's own
           // ACTION_LIST_POOL_CAP reasoning for the same "don't silently truncate what 'all' means"
-          // problem.
-          const pool = await getActionItems(userId, { status: "open", limit: 500 });
-          targets = pool.filter((item) => !isReminderCompanionAction(item));
+          // problem. Fetched as "all" and filtered client-side (same shape action.list's own
+          // `when` branch already uses) rather than two separate queries.
+          const pool = await getActionItems(userId, { status: "all", limit: 500 });
+          targets = pool.filter((item) => (item.status === "open" || item.status === "snoozed") && !isReminderCompanionAction(item));
         }
 
         if (targets.length === 0) {
           return { tool: operation.tool, status: "executed", summary: "You don't have any open or scheduled actions to archive." };
         }
 
-        const list = targets.map((item, i) => `${i + 1}. ${item.title}`).join("\n");
+        const settingsForList = await getOrCreateNotificationSettings(userId);
+        const list = targets
+          .map((item, i) => {
+            const deferredNote = item.status === "snoozed" && item.snoozedUntil ? ` — ${formatDeferredLabelForChat(item.snoozedUntil, settingsForList.timezone)}` : "";
+            return `${i + 1}. ${cleanedTitleForDateDisplay(item.title)}${deferredNote}`;
+          })
+          .join("\n");
         const countLabel = targets.length === 1 ? "this action" : `these ${targets.length} actions`;
         return {
           tool: operation.tool,
@@ -535,7 +573,13 @@ export async function executeOperation(
           status: "executed",
           summary: archived.length > 0 ? `Archived ${archived.length} action${archived.length === 1 ? "" : "s"}.` : "Nothing was archived — those actions no longer exist.",
           result: archived,
-          entities: archived.map(actionToEntity)
+          // fix/private-alpha-action-state-consistency: this used to set `entities` here, which
+          // (via setVisibleEntities' wholesale replace) turned session.visibleEntities into ONLY
+          // these now-archived, terminal items — the same staleness risk as action.archive's own
+          // single-item case, just for every bulk-archived action at once. removedEntityIds prunes
+          // them out of whatever was visible instead, so a later bare "it"/index reference can
+          // never resolve back to something this operation just archived.
+          removedEntityIds: actionIds
         };
       }
 

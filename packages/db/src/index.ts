@@ -1643,7 +1643,12 @@ export async function completeActionItem(userId: string, actionItemId: string): 
 
   const existing = await getActionItem(userId, actionItemId);
 
-  if (!existing || existing.status === "archived") {
+  // fix/private-alpha-action-state-consistency: previously only guarded against "archived" —
+  // completing an ALREADY-completed action silently "succeeded" again (a fresh completedAt
+  // timestamp, same fraudulent-second-success shape archiveActionItem's own matching fix just
+  // closed), producing a real "Nice — marked ... complete" reply for a mutation that already
+  // happened. "completed" is just as terminal as "archived" here.
+  if (!existing || existing.status === "archived" || existing.status === "completed") {
     return undefined;
   }
 
@@ -1664,7 +1669,12 @@ export async function archiveActionItem(userId: string, actionItemId: string): P
 
   const existing = await getActionItem(userId, actionItemId);
 
-  if (!existing) {
+  // fix/private-alpha-action-state-consistency: unlike completeActionItem/snoozeActionItem right
+  // above and below, this used to have no "already archived" guard at all — a second archive of
+  // the same action (e.g. a stale visible-entity reference resolving to an already-archived id)
+  // silently "succeeded" again, producing a fraudulent second "Archived ..." reply for a mutation
+  // that never actually happened. Matches the other two functions' own existing idempotency check.
+  if (!existing || existing.status === "archived") {
     return undefined;
   }
 
