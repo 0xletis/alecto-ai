@@ -9,6 +9,14 @@ export const CheckInAnswerTypeSchema = z.enum(["text", "number", "scale_1_10", "
 export const GoalMetricSchema = z.object({
   key: z.string().min(1),
   label: z.string().min(1),
+  /** Singular form of `label`, e.g. label "CVs sent" -> labelSingular "CV sent" — used whenever a
+   * count of exactly 1 is shown ("1 CV sent" instead of the grammatically wrong "1 CVs sent"). No
+   * general pluralization heuristic can reliably guess this from `label` alone (the countable noun
+   * isn't always the first or last word — "recruiter replies" vs "CVs sent"), so it's supplied
+   * directly at proposal time instead. Optional and additive (stored as JSON, no migration needed)
+   * — a goal created before this field existed just falls back to `label` at count 1, unchanged
+   * prior behavior. */
+  labelSingular: z.string().optional(),
   eventType: z.string().optional(),
   /** Adaptive Goal Creation MVP (docs/10-v3-readiness-audit.md §21): a free-form per-goal signal
    * discriminator (e.g. "tea_cups_drunk", "called_grandmother") for a metric that ISN'T backed by

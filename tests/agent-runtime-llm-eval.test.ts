@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createActionItem, createGoal } from "../packages/db/src/index.ts";
+import { createActionItem, createEvent, createGoal } from "../packages/db/src/index.ts";
 import { assertNoGenericAgentError, buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertActionCreated,
@@ -5112,6 +5112,377 @@ test(
 
         const mentionsRealSignals = /cv|application/i.test(reply.reply) && /interview/i.test(reply.reply);
         assert.ok(mentionsRealSignals, `expected the real underlying signals still shown — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * feat/private-alpha-closed-loop-coaching: the first closed-loop coaching behavior — "what should
+ * I do next?" previously repeated the same progress stats goal.status already shows. Scenarios
+ * 161-170 cover the new goal.recommend_next_action tool against the real planner: it must
+ * genuinely recommend (not just recap), ground itself in real evidence/open-action data, respect
+ * existing-action-vs-new-action logic, respect recent conversation context, and never overpromise
+ * unsupported Gmail sending.
+ */
+
+const ALECTO_DUTY_RECOMMENDED_ACTION_RE =
+  /send (a |me )?a? ?motivational message|create action items|check in with me daily|watch gmail replies|remind me daily|notify me when recruiters reply/i;
+
+test(
+  "161. private-alpha regression: the exact live transcript — 1 CV logged -> show progress -> what should I do next actually recommends",
+  { ...llmEvalOptions(["closed-loop-coaching", "next-action-recommendation", "progress-vs-next-step", "evidence-pluralization"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-closed-loop-transcript-${randomUUID()}`;
+    const trace = new EvalTrace(
+      "161-closed-loop-transcript",
+      ["closed-loop-coaching", "next-action-recommendation", "progress-vs-next-step", "evidence-pluralization"],
+      userId
+    );
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("I sent 1 CV today", await sendAgentMessage(server, userId, "I sent 1 CV today"));
+
+        const t2 = trace.record("Show my progress on my job search", await sendAgentMessage(server, userId, "Show my progress on my job search"));
+        const t2IsStatsOnly = /1 cv sent/i.test(t2.reply);
+        trace.checkpoint("progress reply shows real evidence", t2IsStatsOnly, t2.reply);
+        assert.ok(t2IsStatsOnly, `expected the real logged evidence shown — got: ${t2.reply}`);
+        assert.doesNotMatch(t2.reply, /1 cvs sent/i, "must not say '1 CVs sent'");
+
+        const t3 = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        const notJustStats = t3.reply.trim() !== t2.reply.trim();
+        trace.checkpoint("next-step reply differs from the bare progress recap", notJustStats, t3.reply);
+        assert.ok(notJustStats, `expected a real recommendation, not the same stats reply repeated — got: ${t3.reply}`);
+
+        const hasRecommendationLanguage = /\b(next|apply|focus|recommend|suggest|would|i'd|let's)\b/i.test(t3.reply);
+        trace.checkpoint("reply reads like a recommendation", hasRecommendationLanguage, t3.reply);
+        assert.ok(hasRecommendationLanguage, `expected coaching/recommendation language — got: ${t3.reply}`);
+
+        const noAlectoDutyAction = !ALECTO_DUTY_RECOMMENDED_ACTION_RE.test(t3.reply);
+        assert.ok(noAlectoDutyAction, `must never recommend an Alecto-duty as if it were a user action — got: ${t3.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "162. no open actions + low evidence -> proposes ONE concrete next action, confirmation-backed",
+  { ...llmEvalOptions(["closed-loop-coaching", "next-action-recommendation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-propose-next-action-${randomUUID()}`;
+    const trace = new EvalTrace("162-propose-next-action", ["closed-loop-coaching", "next-action-recommendation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const t1 = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        trace.checkpoint("opens a real pending confirmation for a new action", t1.debug.pendingOperation === true, t1.reply);
+        assert.equal(t1.debug.pendingOperation, true, `expected a confirmation-backed action proposal — got: ${t1.reply}`);
+        assert.equal(t1.debug.mutationExecuted, false, "must never create the action silently");
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assert.equal(t2.debug.mutationExecuted, true);
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        trace.checkpoint("exactly one real action created", actions.length === 1, `count: ${actions.length}`);
+        assert.equal(actions.length, 1);
+        assert.equal(actions[0]!.goalId, goalResult.goal.id, "the created action must be linked to the real goal");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "163. an existing open action is recommended, never duplicated",
+  { ...llmEvalOptions(["closed-loop-coaching", "next-action-recommendation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-recommend-existing-${randomUUID()}`;
+    const trace = new EvalTrace("163-recommend-existing", ["closed-loop-coaching", "next-action-recommendation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, {
+        source: "manual",
+        title: "Apply to 5 fully remote Web3 roles today",
+        priority: "medium",
+        goalId: goalResult.goal.id,
+        goalTitleSnapshot: goalResult.goal.title
+      });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        trace.checkpoint("no confirmation opened (nothing new to create)", reply.debug.pendingOperation === false, reply.reply);
+        assert.equal(reply.debug.pendingOperation, false, `must recommend the existing action, not propose a duplicate — got: ${reply.reply}`);
+        assert.match(reply.reply, /apply to 5 fully remote web3 roles today/i);
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        assert.equal(actions.length, 1, "no duplicate action must exist");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "164. 'resume already updated' earlier in the conversation is honored — no recommendation to update it again",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-resume-context-${randomUUID()}`;
+    const trace = new EvalTrace("164-resume-context", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a remote Web3 developer job. My resume and web CV are already up to date.",
+          await sendAgentMessage(server, userId, "I want to find a remote Web3 developer job. My resume and web CV are already up to date.")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const t3 = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        const suggestsResumeUpdate = /update (your |my )?resume|update.*cv\b/i.test(t3.reply);
+        trace.checkpoint("does not recommend updating the resume again", !suggestsResumeUpdate, t3.reply);
+        assert.ok(!suggestsResumeUpdate, `must not recommend updating a resume already said to be done — got: ${t3.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "165. many CVs already sent today -> advice shifts toward quality/follow-up, not blind extra volume",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-high-volume-${randomUUID()}`;
+    const trace = new EvalTrace("165-high-volume", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      for (let i = 0; i < 12; i++) {
+        await createEvent(userId, { type: "career.application_sent", source: "manual", confidence: 1, data: {} });
+      }
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assert.match(reply.reply, /12 cvs sent/i, "the real high count must be shown honestly");
+
+        const pushesBlindMoreVolume = /apply to \d+ more/i.test(reply.reply) && !/quality|follow.?up|review|reply|repl(y|ies)|rest|burn ?out|break/i.test(reply.reply);
+        trace.checkpoint("does not push blind extra volume without any quality/follow-up framing", !pushesBlindMoreVolume, reply.reply);
+        assert.ok(!pushesBlindMoreVolume, `expected quality/follow-up/rest framing at high volume, not blind more-volume pressure — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "166. a recruiter-reply signal recommends reviewing/replying manually, never claims Alecto can send email",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-recruiter-reply-signal-${randomUUID()}`;
+    const trace = new EvalTrace("166-recruiter-reply-signal", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [
+          { key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" },
+          {
+            key: "recruiter_replies",
+            label: "recruiter replies",
+            labelSingular: "recruiter reply",
+            eventType: "career.recruiter_reply_received",
+            aggregation: "count",
+            window: "daily"
+          }
+        ]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createEvent(userId, { type: "career.recruiter_reply_received", source: "manual", confidence: 1, data: {} });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assert.match(reply.reply, /1 recruiter reply/i);
+
+        const claimsAutoSend = /i (can|will|'ll) (reply|send|respond)/i.test(reply.reply);
+        trace.checkpoint("never claims Alecto can send/reply to email", !claimsAutoSend, reply.reply);
+        assert.ok(!claimsAutoSend, `must never claim Alecto can send/reply to email — got: ${reply.reply}`);
+
+        const mentionsManualReview = /reply|respond|review/i.test(reply.reply);
+        assert.ok(mentionsManualReview, `expected advice to review/respond to the recruiter reply manually — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "167. Spanish: 'qué hago ahora' triggers real coaching, not a bare stats recap",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-que-hago-ahora-${randomUUID()}`;
+    const trace = new EvalTrace("167-es-que-hago-ahora", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("qué hago ahora", await sendAgentMessage(server, userId, "qué hago ahora"));
+        assertNoGenericAgentError(reply, "Spanish next-step request");
+        const looksLikeBareStatsOnly = /^"find a fully remote web3 developer job":?\s*(this week|today)?/i.test(reply.reply.trim()) && reply.reply.split("\n").length <= 2;
+        trace.checkpoint("not a bare one/two-line stats recap", !looksLikeBareStatsOnly, reply.reply);
+        assert.ok(!looksLikeBareStatsOnly, `expected real coaching, not a bare recap — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "168. Catalan: 'què faig ara' triggers real coaching, not a bare stats recap",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-ca-que-faig-ara-${randomUUID()}`;
+    const trace = new EvalTrace("168-ca-que-faig-ara", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("què faig ara", await sendAgentMessage(server, userId, "què faig ara"));
+        assertNoGenericAgentError(reply, "Catalan next-step request");
+        const looksLikeBareStatsOnly = /^"find a fully remote web3 developer job":?\s*(this week|today)?/i.test(reply.reply.trim()) && reply.reply.split("\n").length <= 2;
+        trace.checkpoint("not a bare one/two-line stats recap", !looksLikeBareStatsOnly, reply.reply);
+        assert.ok(!looksLikeBareStatsOnly, `expected real coaching, not a bare recap — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "169. no goals at all -> honest setup nudge, never fabricated coaching",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-no-goals-next-${randomUUID()}`;
+    const trace = new EvalTrace("169-no-goals-next", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assert.equal(reply.debug.pendingOperation, false);
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("no fabricated goal created", goalCount === 0, `count: ${goalCount}`);
+        assert.equal(goalCount, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "170. multiple active goals with none focused -> asks which goal instead of guessing",
+  { ...llmEvalOptions(["closed-loop-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-multi-goal-next-${randomUUID()}`;
+    const trace = new EvalTrace("170-multi-goal-next", ["closed-loop-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const jobGoal = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (jobGoal.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const fitnessGoal = await createGoal(userId, { title: "Train for a marathon", category: "fitness", priority: "medium" });
+      if (fitnessGoal.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assert.equal(reply.debug.pendingOperation, false);
+        const mentionsBoth = /web3/i.test(reply.reply) && /marathon/i.test(reply.reply);
+        trace.checkpoint("asks which goal, naming both real candidates", mentionsBoth, reply.reply);
+        assert.ok(mentionsBoth, `expected a clarifying question naming both real goals — got: ${reply.reply}`);
       });
     } finally {
       await server.close();

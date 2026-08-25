@@ -57,7 +57,13 @@ export const toolCatalog: ToolDefinition[] = [
       title: z.string().min(1),
       notes: z.string().optional(),
       priority: z.enum(["low", "medium", "high"]).optional(),
-      dueText: z.string().optional().describe("Natural language due date/time, e.g. 'tomorrow', 'friday at 5pm'.")
+      dueText: z.string().optional().describe("Natural language due date/time, e.g. 'tomorrow', 'friday at 5pm'."),
+      goalId: z
+        .string()
+        .optional()
+        .describe(
+          "Internal only — a specific goal id already resolved elsewhere (e.g. goal.recommend_next_action's own proposed action). Never set this yourself for a normal 'create a task'/'remind me to' request; the automatic goal-matching this tool already does handles that."
+        )
     })
   },
   {
@@ -601,6 +607,29 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "goal.recommend_next_action",
+    description:
+      "Closed-loop coaching: for 'what should I do next?', 'what now?', 'next?', 'what should I focus on?', 'give me the next action', 'help me decide what to do today' (English); 'qué hago ahora', 'qué debería hacer ahora' (Spanish); 'què faig ara', 'què hauria de fer ara' (Catalan) — NEVER plan goal.status for these, a bare progress recap is not coaching. Resolves the target goal the same way goal.status does (asks if genuinely ambiguous, says so honestly if there are no active goals). The tool itself shows the REAL grounded evidence/open-actions data — never restate specific counts yourself in `recommendation`; that's the one thing you must never guess or repeat, since the tool's own numbers are always what's actually shown. You only ever write the coaching JUDGMENT: `recommendation` is your direct, human, useful advice sentence(s) grounded in the real context already visible to you (this goal's declared signals, today/week evidence counts, open actions, operatingProfile's directness/motivationalStyle, and anything relevant said earlier in this conversation, e.g. 'resume already updated' or 'no fixed target') — acknowledge real progress, push gently if evidence is thin, suggest a stretch or a rest if it's already strong, and if it's late evening lean toward review/tomorrow-planning rather than a heavy new task. If — and only if — no open action already covers what you're recommending, also set `proposedAction` to ONE concrete, one-off, user-owned next step (never one of Alecto's own responsibilities — same boundary as goal.create_propose's firstActions); the tool opens a real pending confirmation for it, never creates it silently. If the goal already has open actions, the tool recommends one of those instead and `proposedAction` is ignored (never propose a duplicate of something already open) — you can still write `recommendation` as if you were recommending an existing task by name; the tool's own display already shows which one.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({
+      goalRef: z.string().min(1).optional().describe("The goal's own wording, same matching as goal.status's goalRef. Omit if the user didn't name a specific goal and none is obviously focused."),
+      recommendation: z
+        .string()
+        .min(1)
+        .describe(
+          "Your coaching-voice advice — direct, human, useful, grounded in the real data already visible in context. NEVER restate a specific count yourself (the tool shows the real numbers separately); this is judgment/advice only, not a data recap."
+        ),
+      proposedAction: z
+        .string()
+        .optional()
+        .describe(
+          "A NEW concrete, one-off, user-owned next action to propose creating, e.g. 'Apply to 4 more fully remote Web3 roles today' — only when genuinely warranted and no existing open action already covers it. Omit when an existing open action fits, or when the right advice is just to review/rest/wait, not to create a new task."
+        )
+    })
+  },
+  {
     name: "goal.create_propose",
     description:
       "Propose a full custom operating plan for a NEW goal the user just expressed — never applies anything until the user confirms. Works for ANY goal, not from a fixed list: 'I want to drink more tea', 'I want to call my grandmother every Sunday', 'I want to stop scrolling in bed', 'I want to keep up with Endesa/admin emails', 'I want to build Alecto every day' are all equally valid. You (the planner) choose: a short title (preserve every qualifier/detail the user actually gave, e.g. 'remote', 'Web3', a location — never quietly drop one; 'I want to find a fully remote developer job, ideally in Web3' must become a title like 'Find a fully remote developer job, ideally in Web3' or 'Find a fully remote Web3 developer job', NEVER just 'Find a fully remote developer job' with Web3 silently dropped — a real private-alpha user hit exactly this), a category (free text, e.g. 'health', 'family', 'admin', 'habit', 'career' — never limited to a fixed enum), why if the user said one, optional successCriteria in the user's own terms (e.g. '2 cups/day, 5 days/week'), 1-3 trackable signals (each a short stable snake_case key like 'tea_cups_drunk' plus a human label — invent a REASONABLE key/label from the goal, never leave this empty), an optional single check-in suggestion, an optional integration hint (e.g. 'Gmail: Endesa emails' — only when genuinely relevant, e.g. an admin/bills goal), dailyCoachingInterest for a morning-motivation/daily-planning request (see its own field description — never firstActions for this), and 0-3 first actions genuinely implied by the goal AND genuinely owned by the user (never one of Alecto's own responsibilities — see firstActions' own field description). If the goal is too vague to propose anything concrete (e.g. just 'I want to be better'), do NOT call this — use clarification.ask instead to find out what they actually mean. Never create the goal directly; this only proposes, and only proactive.settings_propose_update-style confirmation (an exact 'yes') can turn it into a real goal via the internal goal.create_apply.",
@@ -616,7 +645,13 @@ export const toolCatalog: ToolDefinition[] = [
         .array(
           z.object({
             key: z.string().min(1).describe("Short, stable snake_case identifier, e.g. 'tea_cups_drunk'. Must be unique to this goal."),
-            label: z.string().min(1).describe("Human label, e.g. 'cups of tea drunk'."),
+            label: z.string().min(1).describe("Human label used for counts other than exactly 1, e.g. 'cups of tea drunk', 'CVs sent', 'interviews'."),
+            labelSingular: z
+              .string()
+              .optional()
+              .describe(
+                "The label's own singular form, shown only when the count is exactly 1 (e.g. label 'CVs sent' -> labelSingular 'CV sent'; label 'interviews' -> labelSingular 'interview'). Always set this whenever label is grammatically plural — 'CVs sent'/'interviews'/'recruiter replies' all need one; omit only for a label that's already singular-neutral either way (e.g. 'reading time')."
+              ),
             unit: z.string().optional(),
             cadence: z.enum(["daily", "weekly"]).optional()
           })
@@ -654,7 +689,7 @@ export const toolCatalog: ToolDefinition[] = [
       title: z.string().min(1),
       category: z.string().min(1),
       why: z.string().optional(),
-      signals: z.array(z.object({ key: z.string().min(1), label: z.string().min(1), unit: z.string().optional(), cadence: z.enum(["daily", "weekly"]).optional() })),
+      signals: z.array(z.object({ key: z.string().min(1), label: z.string().min(1), labelSingular: z.string().optional(), unit: z.string().optional(), cadence: z.enum(["daily", "weekly"]).optional() })),
       checkIn: z.object({ cadence: z.string().min(1), question: z.string().min(1) }).optional(),
       firstActions: z.array(z.string().min(1)).optional(),
       dailyCoachingInterest: z.boolean().optional()
