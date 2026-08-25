@@ -2309,8 +2309,19 @@ async function finalizeDeterministicConfirmation(context: ContextBundle, message
   const brokenOps = revalidated.filter((op) => op.status !== "valid");
 
   const executedOps = await Promise.all(readyOps.map((op) => executeOperation(userId, op, context, `[confirmed] ${pending.summary}`)));
+  // A real Telegram smoke test found the post-goal-creation daily-coaching follow-up asking a
+  // confirmation-shaped question with nothing actually pending behind it — the CAUSE turned out to
+  // be right here: applyExecutionSideEffects had already installed a genuine NEW pendingOperation
+  // (goal.create_apply's own pendingOperationUpdate, proposing to turn on proactive settings next),
+  // but the very next line unconditionally cleared it back to null regardless. Confirming one
+  // operation is allowed to hand off to a real, new one of its own (goal creation -> proactive
+  // settings) — only clear to null when nothing new was installed, exactly the prior behavior for
+  // every other confirm flow (none of which install a pendingOperationUpdate on their own apply step).
+  const installedNewPendingOperation = executedOps.some((op) => op.pendingOperationUpdate !== undefined && op.pendingOperationUpdate !== null);
   applyExecutionSideEffects(context.session, executedOps);
-  setPendingOperation(context.session, null);
+  if (!installedNewPendingOperation) {
+    setPendingOperation(context.session, null);
+  }
 
   const reply = composeReply({
     replyDraft: "",

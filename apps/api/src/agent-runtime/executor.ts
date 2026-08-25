@@ -1704,31 +1704,67 @@ export async function executeOperation(
         const signalNames = signals.map((signal) => signal.label).join(", ");
         const checkInNote = checkIn ? ` and ${checkIn.cadence} check-ins` : "";
         const actionsNote = createdActions.length > 0 ? ` Created ${createdActions.length} first action${createdActions.length === 1 ? "" : "s"}.` : "";
+        const doneLine = `Done — I'll track "${result.goal.title}" with ${signalNames}${checkInNote}.${actionsNote}`;
 
-        // Task 6 of fix/private-alpha-proactive-daily-planning-semantics: a real Telegram smoke
-        // test found a daily-coaching request made DURING goal creation silently dropped — the
-        // compound-proposal guard correctly keeps goal.create_propose over proactive.settings_
-        // propose_update in the SAME turn (only one pending confirmation can exist), but nothing
-        // followed up afterward. This asks, honestly, once the goal itself is safely created —
-        // never mutates settings itself, always a separate, later confirmation.
-        let dailyCoachingFollowUp = "";
-        if (dailyCoachingInterest) {
-          const settings = await getOrCreateNotificationSettings(userId);
-          dailyCoachingFollowUp =
-            settings.morningBriefEnabled && settings.eveningCheckinEnabled
-              ? " Morning/evening coaching is already on."
-              : " Want me to turn on the morning brief and evening check-in for this?";
+        // fix/private-alpha-post-goal-coaching-confirmation: a real Telegram smoke test found the
+        // prior version of this follow-up asked "Want me to turn on the morning brief and evening
+        // check-in for this?" as plain text, with NO real pendingOperation behind it — the user's
+        // next "yes" then had nothing to confirm ("I don't have anything pending to confirm").
+        // Fixed by installing a REAL proactive.settings_apply_update pendingOperationUpdate here,
+        // the exact same mechanism the standalone "turn on morning brief and evening check-in"
+        // request already uses successfully — never a confirmation-shaped question with nothing
+        // behind it. Only proposes the moment(s) actually still off; if both are already on, this
+        // says so honestly and opens no pending operation at all.
+        if (!dailyCoachingInterest) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: doneLine,
+            result: result.goal,
+            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)]
+          };
+        }
+
+        const settings = await getOrCreateNotificationSettings(userId);
+        const toEnable: string[] = [];
+        if (!settings.morningBriefEnabled) {
+          toEnable.push(`Morning brief at ${formatMinutesOfDay(settings.morningTimeMinutes)}`);
+        }
+        if (!settings.eveningCheckinEnabled) {
+          toEnable.push(`Evening check-in at ${formatMinutesOfDay(settings.eveningTimeMinutes)}`);
+        }
+
+        if (toEnable.length === 0) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `${doneLine} Morning/evening coaching is already on.`,
+            result: result.goal,
+            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)]
+          };
         }
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Done — I'll track "${result.goal.title}" with ${signalNames}${checkInNote}.${actionsNote}${dailyCoachingFollowUp}`,
+          summary: `${doneLine}\n\nNext: you're about to turn on:\n${toEnable.map((line) => `- ${line}`).join("\n")}\n\nReply yes to confirm or cancel.`,
           result: result.goal,
-          // The new goal itself is included here (not just its first actions) so an immediate
-          // follow-up like "show tracking for it" / "how is that goal going?" has a real,
-          // just-created entity to resolve against, not only its actions.
-          entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)]
+          entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)],
+          pendingOperationUpdate: {
+            topic: "proactive_settings",
+            summary: toEnable.map((line) => line.toLowerCase()).join(" and "),
+            operations: [
+              {
+                tool: "proactive.settings_apply_update",
+                args: {
+                  morningBriefEnabled: settings.morningBriefEnabled ? undefined : true,
+                  eveningCheckinEnabled: settings.eveningCheckinEnabled ? undefined : true
+                },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
         };
       }
 

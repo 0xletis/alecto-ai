@@ -191,7 +191,12 @@ test("6: after goal creation with dailyCoachingInterest, Alecto offers to enable
 
     const confirmed = await sendAgentMessage(server, userId, "yes");
     assert.equal(confirmed.debug.mutationExecuted, true);
-    assert.match(confirmed.reply, /morning brief and evening check-in/i);
+    // fix/private-alpha-post-goal-coaching-confirmation: the follow-up now opens a REAL pending
+    // proactive-settings confirmation (not a copy-only question with nothing behind it).
+    assert.equal(confirmed.debug.pendingOperation, true, "the follow-up must open a real pending operation, not just ask a question");
+    assert.match(confirmed.reply, /morning brief/i);
+    assert.match(confirmed.reply, /evening check-in/i);
+    assert.match(confirmed.reply, /reply yes to confirm or cancel/i);
 
     const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
     assert.ok(
