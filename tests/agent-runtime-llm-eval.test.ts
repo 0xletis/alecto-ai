@@ -4286,3 +4286,264 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-action-bulk-archive: a real Railway smoke test found "delete all my actions" /
+ * "archive all of them" treated as literal action TITLES to search for, "archive 1 and 2" replying
+ * as if it succeeded while both actions stayed open, "yes create this" rejected as a confirmation,
+ * and archiving a goal leaving its linked open actions silently open. Scenarios 137-144 cover the
+ * fix end to end against the real planner.
+ */
+
+test(
+  "137. private-alpha regression: 'delete all my actions' never title-matches, even against the real planner",
+  { ...llmEvalOptions(["action-bulk-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-delete-all-actions-${randomUUID()}`;
+    const trace = new EvalTrace("137-delete-all-actions", ["action-bulk-cleanup"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Network with industry contacts", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Search job boards", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("delete all my actions", await sendAgentMessage(server, userId, "delete all my actions"));
+
+        const titleMatchFailure = /i don't see an open action called/i.test(reply.reply);
+        trace.checkpoint("never title-matched 'all my actions' as a literal action name", !titleMatchFailure, reply.reply);
+        assert.ok(!titleMatchFailure, `must never treat 'all my actions' as a literal action title — got: ${reply.reply}`);
+        assert.equal(reply.debug.pendingOperation, true, "must open a real bulk-archive confirmation");
+
+        const stillOpen = await prisma.actionItem.count({ where: { userId, status: "open" } });
+        trace.checkpoint("nothing archived before confirmation", stillOpen === 2, `open count: ${stillOpen}`);
+        assert.equal(stillOpen, 2);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "138. action.list -> 'archive all of them' -> confirmation -> yes -> no actions left",
+  { ...llmEvalOptions(["action-bulk-cleanup", "action-archive-mutation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-archive-all-of-them-${randomUUID()}`;
+    const trace = new EvalTrace("138-archive-all-of-them", ["action-bulk-cleanup", "action-archive-mutation"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Network with industry contacts", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Search job boards", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const t2 = trace.record("archive all of them", await sendAgentMessage(server, userId, "archive all of them"));
+        trace.checkpoint("opened a confirmation", t2.debug.pendingOperation === true, String(t2.debug.pendingOperation));
+        assert.equal(t2.debug.pendingOperation, true);
+
+        const t3 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assert.equal(t3.debug.mutationExecuted, true);
+
+        const t4 = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const noActionsLeft = !/network with industry contacts/i.test(t4.reply) && !/search job boards/i.test(t4.reply);
+        trace.checkpoint("no open actions remain", noActionsLeft, t4.reply);
+        assert.ok(noActionsLeft, `expected both actions archived and excluded from the list — got: ${t4.reply}`);
+
+        const openCount = await prisma.actionItem.count({ where: { userId, status: "open" } });
+        assert.equal(openCount, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "139. 'I mean all actions' resolves to a real bulk-archive confirmation",
+  { ...llmEvalOptions(["action-bulk-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-i-mean-all-actions-${randomUUID()}`;
+    const trace = new EvalTrace("139-i-mean-all-actions", ["action-bulk-cleanup"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Network with industry contacts", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Search job boards", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("I mean all actions", await sendAgentMessage(server, userId, "I mean all actions"));
+        trace.checkpoint("opened a bulk-archive confirmation", reply.debug.pendingOperation === true, reply.reply);
+        assert.equal(reply.debug.pendingOperation, true);
+        assert.ok(!/i don't see an open action called/i.test(reply.reply));
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "140. 'archive 1 and 2' is a real mutation — both actions actually archived, action.list excludes them",
+  { ...llmEvalOptions(["action-archive-mutation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-archive-1-and-2-${randomUUID()}`;
+    const trace = new EvalTrace("140-archive-1-and-2", ["action-archive-mutation"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Network with industry contacts", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Search job boards", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const t2 = trace.record("archive 1 and 2", await sendAgentMessage(server, userId, "archive 1 and 2"));
+        // Whether this needs an explicit confirmation or executes right away is an internal
+        // implementation detail; what matters is grounded in real DB state either way, never a
+        // reply that overclaims before the mutation actually happened.
+        if (t2.debug.pendingOperation) {
+          trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        }
+
+        const archivedCount = await prisma.actionItem.count({ where: { userId, status: "archived" } });
+        trace.checkpoint("both actions actually archived", archivedCount === 2, `archived count: ${archivedCount}`);
+        assert.equal(archivedCount, 2, "both actions must actually be archived, not just claimed");
+
+        const t3 = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        assert.ok(!/network with industry contacts/i.test(t3.reply) && !/search job boards/i.test(t3.reply), `action.list must exclude archived actions — got: ${t3.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "141. archiving a goal 'as I want to start fresh' cleans up its linked open actions too",
+  { ...llmEvalOptions(["goal-archive-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-start-fresh-${randomUUID()}`;
+    const trace = new EvalTrace("141-start-fresh", ["goal-archive-cleanup"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Job search", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const goal = goalResult.goal;
+      const linkedAction = await createActionItem(userId, { source: "manual", title: "Apply to 5 roles today", priority: "medium", goalId: goal.id, goalTitleSnapshot: goal.title });
+      const unrelatedAction = await createActionItem(userId, { source: "manual", title: "Buy groceries", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record(
+          "delete my job search goal, I want to start fresh",
+          await sendAgentMessage(server, userId, "delete my job search goal, I want to start fresh")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const [goalRow, linkedRow, unrelatedRow] = await Promise.all([
+          prisma.goal.findUnique({ where: { id: goal.id } }),
+          prisma.actionItem.findUnique({ where: { id: linkedAction.id } }),
+          prisma.actionItem.findUnique({ where: { id: unrelatedAction.id } })
+        ]);
+        trace.checkpoint("goal archived", goalRow?.status === "archived", goalRow?.status ?? "missing");
+        trace.checkpoint("linked action archived", linkedRow?.status === "archived", linkedRow?.status ?? "missing");
+        trace.checkpoint("unrelated action untouched", unrelatedRow?.status === "open", unrelatedRow?.status ?? "missing");
+        assert.equal(goalRow?.status, "archived");
+        assert.equal(linkedRow?.status, "archived", "the linked open action must be cleaned up as part of 'start fresh'");
+        assert.equal(unrelatedRow?.status, "open", "an unrelated action must never be silently archived");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "142. 'yes create this' confirms a pending goal creation",
+  { ...llmEvalOptions(["confirmation-this"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-yes-create-this-${randomUUID()}`;
+    const trace = new EvalTrace("142-yes-create-this", ["confirmation-this"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to drink more tea", await sendAgentMessage(server, userId, "I want to drink more tea"));
+        const confirmed = trace.record("yes create this", await sendAgentMessage(server, userId, "yes create this"));
+
+        trace.checkpoint("confirmed deterministically", confirmed.debug.llmPlannerAttempted === false, String(confirmed.debug.llmPlannerAttempted));
+        assert.equal(confirmed.debug.llmPlannerAttempted, false);
+        assert.equal(confirmed.debug.mutationExecuted, true);
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        assert.equal(goalCount, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "143. Spanish bulk cleanup: 'borra todas mis acciones' opens a real confirmation, never a title mismatch",
+  { ...llmEvalOptions(["action-bulk-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-bulk-cleanup-${randomUUID()}`;
+    const trace = new EvalTrace("143-es-bulk-cleanup", ["action-bulk-cleanup"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Buscar ofertas de trabajo", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Actualizar el currículum", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("borra todas mis acciones", await sendAgentMessage(server, userId, "borra todas mis acciones"));
+        trace.checkpoint("opened a real bulk-archive confirmation", reply.debug.pendingOperation === true, reply.reply);
+        assert.equal(reply.debug.pendingOperation, true);
+        assert.ok(!/no veo ninguna acci[oó]n abierta llamada/i.test(reply.reply) && !/i don't see an open action called/i.test(reply.reply));
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "144. Catalan bulk cleanup: 'arxiva totes les accions' opens a real confirmation, never a title mismatch",
+  { ...llmEvalOptions(["action-bulk-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-ca-bulk-cleanup-${randomUUID()}`;
+    const trace = new EvalTrace("144-ca-bulk-cleanup", ["action-bulk-cleanup"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Buscar ofertes de feina", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Actualitzar el currículum", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("arxiva totes les accions", await sendAgentMessage(server, userId, "arxiva totes les accions"));
+        trace.checkpoint("opened a real bulk-archive confirmation", reply.debug.pendingOperation === true, reply.reply);
+        assert.equal(reply.debug.pendingOperation, true);
+        assert.ok(!/no veig cap acci[oó]/i.test(reply.reply) && !/i don't see an open action called/i.test(reply.reply));
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

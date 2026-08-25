@@ -346,6 +346,73 @@ export async function executeOperation(
         };
       }
 
+      case "action.archive_all_propose": {
+        const explicitIds = args.actionIds as string[] | undefined;
+        const scope = args.scope as "visible" | "all" | undefined;
+
+        let targets: ActionItem[];
+        if (explicitIds && explicitIds.length > 0) {
+          // Already-resolved real ids (either from runtime.ts's own multi-archive collapse of
+          // explicit numbers like "archive 1 and 2", or a rare direct planner call) — re-fetch
+          // fresh rather than trusting the caller's snapshot, so a since-archived/completed item
+          // never gets re-listed in the confirmation as if it were still open.
+          const items = await Promise.all(explicitIds.map((id) => getActionItem(userId, id)));
+          targets = items.filter((item): item is ActionItem => item !== undefined && item.status === "open");
+        } else if (scope === "visible") {
+          const visibleActionIds = context.session.visibleEntities.filter((entity) => entity.type === "action").map((entity) => entity.id);
+          const items = await Promise.all(visibleActionIds.map((id) => getActionItem(userId, id)));
+          targets = items.filter((item): item is ActionItem => item !== undefined && item.status === "open");
+        } else {
+          // scope "all" (or omitted, defensively) — the FULL real open-action pool, not
+          // context.openActions' own 20-item context-loader cap, so "archive all my actions" is
+          // honest about how many actions actually exist, matching action.list's own
+          // ACTION_LIST_POOL_CAP reasoning for the same "don't silently truncate what 'all' means"
+          // problem.
+          const pool = await getActionItems(userId, { status: "open", limit: 500 });
+          targets = pool.filter((item) => !isReminderCompanionAction(item));
+        }
+
+        if (targets.length === 0) {
+          return { tool: operation.tool, status: "executed", summary: "You don't have any open actions to archive." };
+        }
+
+        const list = targets.map((item, i) => `${i + 1}. ${item.title}`).join("\n");
+        const countLabel = targets.length === 1 ? "this action" : `these ${targets.length} actions`;
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Archive ${countLabel}?\n${list}\nReply yes to confirm or cancel.`,
+          pendingOperationUpdate: {
+            topic: "action_bulk_archive",
+            summary: `archive ${targets.length} action${targets.length === 1 ? "" : "s"}`,
+            operations: [
+              {
+                tool: "action.archive_all_apply",
+                args: { actionIds: targets.map((item) => item.id) },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "action.archive_all_apply": {
+        const actionIds = args.actionIds as string[];
+        const archived: ActionItem[] = [];
+        for (const id of actionIds) {
+          const updated = await archiveActionItem(userId, id);
+          if (updated) archived.push(updated);
+        }
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: archived.length > 0 ? `Archived ${archived.length} action${archived.length === 1 ? "" : "s"}.` : "Nothing was archived — those actions no longer exist.",
+          result: archived,
+          entities: archived.map(actionToEntity)
+        };
+      }
+
       case "action.reschedule": {
         const actionId = args.actionId as string;
         const action = await getActionItem(userId, actionId);
@@ -1722,14 +1789,44 @@ export async function executeOperation(
         // important goal is never silently archived without the user noticing its weight.
         const usedDeleteWording = /\b(delete|remove|elimina[r]?|borra[r]?)\b/i.test(message);
         const isCriticalArchive = lifecycleOperation === "archive" && goal.priority === "critical";
+
+        // Only for a real archive (never a pause — a paused goal is still resumable, so its open
+        // actions should stay untouched too) — a real Telegram smoke test found archiving a goal
+        // left its linked open actions silently open forever, breaking "start fresh." Only actions
+        // with a REAL goalId link are ever auto-included; a title-only resemblance is reported
+        // honestly, never silently swept in, since that could catch an unrelated action that just
+        // happens to share a word with the goal's title.
+        let linkedOpenActions: ActionItem[] = [];
+        let unlinkedTitleMatches: ActionItem[] = [];
+        if (lifecycleOperation === "archive") {
+          const openPool = await getActionItems(userId, { status: "open", limit: 500 });
+          linkedOpenActions = openPool.filter((item) => item.goalId === goal.id && !isReminderCompanionAction(item));
+          const goalTitleWords = goal.title.toLowerCase().split(/\s+/).filter((word) => word.length > 3);
+          unlinkedTitleMatches = openPool.filter(
+            (item) =>
+              item.goalId !== goal.id &&
+              !isReminderCompanionAction(item) &&
+              goalTitleWords.some((word) => item.title.toLowerCase().includes(word))
+          );
+        }
+
+        const linkedActionsNote =
+          linkedOpenActions.length > 0
+            ? ` and its ${linkedOpenActions.length} open action${linkedOpenActions.length === 1 ? "" : "s"}:\n${linkedOpenActions.map((item, i) => `${i + 1}. ${item.title}`).join("\n")}`
+            : "";
+        const unlinkedNote =
+          unlinkedTitleMatches.length > 0
+            ? ` Note: ${unlinkedTitleMatches.length} other open action${unlinkedTitleMatches.length === 1 ? "" : "s"} mention${unlinkedTitleMatches.length === 1 ? "s" : ""} this goal by name but aren't formally linked, so I won't touch ${unlinkedTitleMatches.length === 1 ? "it" : "them"} automatically — say "archive all my actions" if you want to clean those up too.`
+            : "";
+
         const summaryText =
           lifecycleOperation === "pause"
             ? `You're about to pause "${goal.title}". It will stop appearing as active, but history stays. Reply yes to confirm or cancel.`
             : isCriticalArchive
-              ? `This is marked critical, so I won't archive it silently. If you really want to stop tracking it, reply yes to confirm or cancel.`
+              ? `This is marked critical, so I won't archive it silently. If you really want to stop tracking it${linkedActionsNote}, reply yes to confirm or cancel.${unlinkedNote}`
               : usedDeleteWording
-                ? `I won't permanently delete the history. I can archive "${goal.title}" so it stops being active. Reply yes to confirm or cancel.`
-                : `You're about to archive "${goal.title}". It will stop appearing as active, but history stays. Reply yes to confirm or cancel.`;
+                ? `I won't permanently delete the history. I can archive "${goal.title}"${linkedActionsNote} so it stops being active. Reply yes to confirm or cancel.${unlinkedNote}`
+                : `You're about to archive "${goal.title}"${linkedActionsNote}. It will stop appearing as active, but history stays. Reply yes to confirm or cancel.${unlinkedNote}`;
 
         return {
           tool: operation.tool,
@@ -1738,14 +1835,24 @@ export async function executeOperation(
           entities: [goalToEntity(goal)],
           pendingOperationUpdate: {
             topic: "goal_lifecycle",
-            summary: `${lifecycleOperation} "${goal.title}"`,
+            summary: linkedOpenActions.length > 0 ? `${lifecycleOperation} "${goal.title}" and its ${linkedOpenActions.length} open action${linkedOpenActions.length === 1 ? "" : "s"}` : `${lifecycleOperation} "${goal.title}"`,
             operations: [
               {
                 tool: "goal.archive_apply",
                 args: { goalId: goal.id, goalTitle: goal.title, operation: lifecycleOperation },
                 status: "valid",
                 requiresConfirmation: false
-              }
+              },
+              ...(linkedOpenActions.length > 0
+                ? [
+                    {
+                      tool: "action.archive_all_apply",
+                      args: { actionIds: linkedOpenActions.map((item) => item.id) },
+                      status: "valid" as const,
+                      requiresConfirmation: false
+                    }
+                  ]
+                : [])
             ]
           }
         };

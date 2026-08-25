@@ -67,8 +67,11 @@ const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget 
 // non-word char followed by another non-word char, the space) would never actually match, silently
 // breaking every accented opener. The end-to-end ^...$ anchor plus the explicit [\s,]* separator
 // already fully constrain the match, so \b here would only add a real bug, not real safety.
+// Extended again for "yes create this" / "yes create the goal" — live traffic showed a pending
+// GOAL creation specifically prompts "create this"/"create the goal" phrasing more than the
+// generic "create it" this pattern already covered, and that exact new phrasing was rejected.
 const EXTENDED_CONFIRM_PHRASE_RE =
-  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord)[\s,]*(create it|do it|go ahead|make it|cr[eé]alo|h[aá]zlo|crea-?ho)?$/i;
+  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord)[\s,]*(create it|create this|create the goal|do it|go ahead|make it|make this|confirm this|cr[eé]alo|h[aá]zlo|crea-?ho|crea esto|crea aquest|crea aix[oò])?$/i;
 
 function looksLikeExtendedConfirmPhrase(normalized: string): boolean {
   return EXTENDED_CONFIRM_PHRASE_RE.test(normalized);
@@ -591,6 +594,16 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, meetingListShortcut, "actions");
   }
 
+  // Deterministic, not left to the planner's judgment — a real Telegram smoke test found "delete
+  // all my actions" and "archive all of them" BOTH treated as a literal action TITLE to search
+  // for ("I don't see an open action called 'Delete all my actions'"), three turns in a row. This
+  // never touches the actual archive; it only recognizes the INTENT and opens the same
+  // action.archive_all_propose confirmation flow a direct planner call would.
+  const bulkActionCleanupShortcut = !pending ? bulkActionCleanupShortcutOperation(message, context) : undefined;
+  if (bulkActionCleanupShortcut) {
+    return finalizeDeterministicOperation(context, message, bulkActionCleanupShortcut, "actions");
+  }
+
   const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
   if (gmailConnectionShortcut) {
     return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
@@ -832,6 +845,29 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const pendingConfirmationOps = validatedOps.filter((op) => op.status === "needs_confirmation");
   const problemOps = validatedOps.filter((op) => op.status === "invalid" || op.status === "unsupported");
   let executableOps = validatedOps.filter((op) => op.status === "valid" && !META_TOOLS.has(op.tool));
+
+  // Multi-action archive guard: a real Telegram smoke test found "archive 1 and 2" replying
+  // "Archiving the actions X and Y" (the planner's own optimistic replyDraft) while both actions
+  // stayed open afterward — a single action.archive still runs immediately (unconfirmed, matching
+  // existing UX for the common case), but TWO OR MORE in the same turn — whether from explicit
+  // numbers ("archive 1 and 2", already resolved to real ids by resolveExplicitActionIndexReferences
+  // above) or the bulk-cleanup shortcut below — are collapsed into a single action.archive_all_propose
+  // op instead, which shows the real numbered list and requires an explicit confirmation before
+  // anything is archived. This also sidesteps the overclaim risk structurally: action.archive_all_
+  // propose/apply are both GROUND_TRUTH_ONLY_TOOLS, so their reply always reflects real execution.
+  const validArchiveOps = executableOps.filter((op) => op.tool === "action.archive");
+  if (validArchiveOps.length > 1) {
+    const actionIds = validArchiveOps.map((op) => String(op.args.actionId));
+    executableOps = [
+      ...executableOps.filter((op) => op.tool !== "action.archive"),
+      { tool: "action.archive_all_propose", args: { actionIds }, status: "valid", requiresConfirmation: false }
+    ];
+    logAgentRuntimeDiagnostics({
+      phase: "multi_archive_collapsed_to_confirmation",
+      userId,
+      note: `collapsed ${validArchiveOps.length} action.archive ops into action.archive_all_propose`
+    });
+  }
 
   // Compound-proposal guard: session.pendingOperation is a single field, so if the planner plans
   // TWO proposal-shaped tools in one turn (e.g. goal.create_propose alongside proactive.settings_
@@ -1683,6 +1719,42 @@ function actionMeetingListShortcutOperation(message: string): PlannedOperation |
     return undefined;
   }
   return { tool: "action.meeting_list", args: {}, rationale: "user asked for scheduled meetings" };
+}
+
+// Matches an explicit verb ("delete"/"archive"/"clear"/"remove", or their Spanish/Catalan
+// equivalents) combined with a bulk-scope phrase ("all my actions", "all of them", "these
+// actions/tasks", "todas", "totes") — deliberately requires BOTH a verb and a scope word so a
+// message like "these" alone (ambiguous without a verb) doesn't match here; see
+// BARE_BULK_ACTION_SCOPE_RE below for that case, gated on an actual visible action list. No bare
+// "all of them" alternative here (deliberately, unlike the verb+scope phrases) — that phrase is
+// ALSO used unrelated to actions (e.g. Gmail review triage's "keep all of them pending"), so
+// matching it without a verb here previously mis-fired on exactly that kind of message; a bare
+// "all of them" is only ever safe to treat as bulk-archive scope in BARE_BULK_ACTION_SCOPE_RE
+// below, which requires the ENTIRE message to be just that phrase AND a visible action list.
+const BULK_ACTION_CLEANUP_VERB_SCOPE_RE =
+  /\b(delete|archive|clear|remove)\b[\s\S]{0,20}\b(all( of)? (them|my actions|my tasks|these actions|these tasks)|these (actions|tasks))\b|\bi mean all actions\b|\b(borra|archiva|elimina|limpia)\b[\s\S]{0,20}\btodas\b|\blimpia mis acciones\b|\b(arxiva|elimina|esborra)\b[\s\S]{0,20}\btotes\b/;
+
+// A bare, unqualified scope reply ("these", "all", "them", "all of them", "todas", "totes") with
+// NO verb at all — only meaningful as a reply to Alecto's own numbered action list (or a failed
+// title-match clarification about one), so this is checked separately and ONLY when the session
+// actually has visible action entities right now; see the call site below.
+const BARE_BULK_ACTION_SCOPE_RE = /^(these|all( of them)?|them|todas|totes)$/;
+
+function bulkActionCleanupShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  const hasVisibleActions = context.session.visibleEntities.some((entity) => entity.type === "action");
+
+  const matchesVerbScope = BULK_ACTION_CLEANUP_VERB_SCOPE_RE.test(text);
+  const matchesBareScope = hasVisibleActions && BARE_BULK_ACTION_SCOPE_RE.test(text);
+  if (!matchesVerbScope && !matchesBareScope) {
+    return undefined;
+  }
+
+  return {
+    tool: "action.archive_all_propose",
+    args: { scope: hasVisibleActions ? "visible" : "all" },
+    rationale: "user asked to archive/delete/clear multiple or all actions at once, never a literal action title"
+  };
 }
 
 function extractVisibleIndexesFromReviewActionMessage(text: string, visibleReviews: AgentEntity[]): number[] {

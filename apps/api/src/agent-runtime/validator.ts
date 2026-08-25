@@ -844,6 +844,20 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     };
   }
 
+  // Same reasoning again: action.archive_all_apply is never planned by the LLM directly, only
+  // ever reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by action.archive_all_propose (or runtime.ts's own multi-archive guard).
+  if (tool.name === "action.archive_all_apply") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending bulk action archive",
+      rationale: operation.rationale
+    };
+  }
+
   // Same reasoning again: goal.create_apply is never planned by the LLM directly, only ever
   // reached via the deterministic confirm whitelist re-executing an already-stored
   // pendingOperation set by goal.create_propose. This is the one place an LLM-proposed goal
