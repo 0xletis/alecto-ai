@@ -25,6 +25,7 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
   const [
     activeGoals,
     openActions,
+    deferredActions,
     recentEvents,
     memories,
     integrationConnections,
@@ -36,6 +37,14 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
   ] = await Promise.all([
     getActiveGoals(userId),
     getActionItems(userId, { status: "open", limit: 20 }),
+    // Snoozed/deferred actions are deliberately NOT part of openActions (that field means
+    // "actionable right now," used throughout — morning brief, "existing open action wins"
+    // duplicate-suppression, the planner's own backgroundOpenActions) — but goal.recommend_next_
+    // action needs to see them too, or it has no way to know "the user already moved this to
+    // tomorrow" and ends up proposing a near-duplicate for today (the exact reported bug this
+    // exists to fix). A separate field, not a broadened openActions, so every existing "is this
+    // actionable now" consumer keeps its current, correct meaning unchanged.
+    getActionItems(userId, { status: "snoozed", limit: 20 }),
     getRecentEvents(userId, 15),
     getRelevantMemories(userId, { limit: 15 }),
     getIntegrationConnections(userId),
@@ -64,6 +73,7 @@ export async function loadContext(userId: string, channel: string): Promise<Cont
     user,
     activeGoals,
     openActions,
+    deferredActions,
     recentEvents,
     memories,
     gmailConnection,

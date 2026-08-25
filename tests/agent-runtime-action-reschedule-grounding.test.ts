@@ -207,7 +207,12 @@ test("F: a bare pronoun reschedules the one visible action, but asks when more t
       clarificationQuestion: null,
       replyDraft: ""
     });
-    const reply = await sendAgentMessage(serverSingle, userIdSingle, "move it to tomorrow");
+    // "reschedule it," not "move it" — fix/private-alpha-action-temporal-coaching's own new
+    // ACTION_SNOOZE_PATTERN deterministic shortcut now intercepts a bare "move it to tomorrow"
+    // as a DEFERRAL (action.snooze) by deliberate design, ahead of the mocked planner entirely;
+    // this test is specifically about action.reschedule's OWN bare-pronoun resolution, so it
+    // needs wording that doesn't collide with that newer, more specific shortcut.
+    const reply = await sendAgentMessage(serverSingle, userIdSingle, "reschedule it to tomorrow");
 
     assert.equal(reply.debug.mutationExecuted, true);
     assert.match(reply.reply, /Action rescheduled: Brainstorm meeting/i);

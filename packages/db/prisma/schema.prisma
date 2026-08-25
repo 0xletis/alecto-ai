@@ -362,6 +362,7 @@ model ActionItem {
   updatedAt      DateTime  @updatedAt
   completedAt    DateTime?
   snoozedUntil   DateTime?
+  postponeCount  Int       @default(0)
 
   user         User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   reminderLogs ActionItemReminderLog[]

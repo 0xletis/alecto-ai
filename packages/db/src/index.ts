@@ -259,6 +259,11 @@ export interface ActionItem {
   updatedAt: Date;
   completedAt?: Date;
   snoozedUntil?: Date;
+  /** How many times this action has been snoozed (via snoozeActionItem), ever — never reset by
+   * completing/archiving/rescheduling, only by a fresh action.create. Powers the repeated-
+   * postponement coaching in the agent runtime (accept the first move silently, a mild challenge
+   * on the second, stronger coaching on the third+) without needing a separate history table. */
+  postponeCount: number;
 }
 
 export interface CreateActionItemInput {
@@ -1688,7 +1693,11 @@ export async function snoozeActionItem(userId: string, actionItemId: string, sno
     data: {
       status: "snoozed",
       snoozedUntil,
-      completedAt: null
+      completedAt: null,
+      // Every real snooze counts, including a second/third move of the SAME already-snoozed
+      // action — that repetition is exactly the pattern the deferral-coaching feature exists to
+      // notice. Never reset here; only a brand-new action.create starts a fresh count.
+      postponeCount: { increment: 1 }
     }
   });
 
@@ -3178,7 +3187,8 @@ function toActionItem(item: Prisma.ActionItemGetPayload<object>): ActionItem {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     completedAt: item.completedAt ?? undefined,
-    snoozedUntil: item.snoozedUntil ?? undefined
+    snoozedUntil: item.snoozedUntil ?? undefined,
+    postponeCount: item.postponeCount
   };
 }
 

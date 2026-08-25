@@ -3,7 +3,7 @@ import type { NotificationSettings } from "@operator-agent/core";
 import { GOAL_ANCHOR_NUDGE_REPLY } from "../agent-runtime/runtime.js";
 import type { AgentEntity, ContextBundle } from "../agent-runtime/types.js";
 import { gmailReviewChatDescription, gmailReviewChatLabel } from "../email-reviews/email-review-service.js";
-import { formatDateInTimezone } from "../utils/datetime.js";
+import { daysBetweenLocalDates, formatDateInTimezone } from "../utils/datetime.js";
 
 /**
  * V3 Proactive Operator MVP — a pure, callable decision layer, deliberately NOT wired to
@@ -127,19 +127,60 @@ function buildMorningBrief(
     };
   }
 
-  const rankedActions = rankOpenActions(context.openActions);
+  // Temporal health (fix/private-alpha-action-temporal-coaching): an overdue action gets its own
+  // explicit callout, separate from the plain "today I'd focus on" numbered list — burying it in
+  // an ordinary-looking list item was the real reported gap (stale "today" wording with nothing
+  // ever flagging that today had already passed). Excluded from topActions below so it's never
+  // shown twice; still counts toward whether there's anything to lead with at all.
+  const overdueActions = context.openActions
+    .map((action) => ({ action, health: assessTemporalHealth(action, now, settings.timezone) }))
+    .filter((entry): entry is { action: ActionItem; health: Extract<TemporalHealth, { kind: "overdue" }> } => entry.health.kind === "overdue")
+    .sort((a, b) => b.health.daysOverdue - a.health.daysOverdue);
+  const overdueIds = new Set(overdueActions.map((entry) => entry.action.id));
+
+  const rankedActions = rankOpenActions(context.openActions.filter((action) => !overdueIds.has(action.id)));
   const topActions = rankedActions.slice(0, 3);
 
-  if (topActions.length === 0) {
+  // Deferred actions coming back TODAY (status "snoozed", snoozedUntil is today's local date) —
+  // invisible to context.openActions by design (see context-loader.ts), so without this the
+  // morning brief would never mention the one thing the user explicitly asked to be reminded
+  // about today.
+  const todayLocalDate = formatDateInTimezone(now, settings.timezone);
+  const deferredReturningToday = context.deferredActions.filter(
+    (action) => action.snoozedUntil && formatDateInTimezone(action.snoozedUntil, settings.timezone) === todayLocalDate
+  );
+
+  if (topActions.length === 0 && overdueActions.length === 0 && deferredReturningToday.length === 0) {
     // Has goals, but nothing concretely actionable today — nothing grounded to lead with.
     return null;
   }
 
-  const lines = ["Morning. Today I'd focus on:", ...topActions.map((action, index) => `${index + 1}. ${action.title}.`)];
+  const lines = ["Morning."];
+
+  if (overdueActions.length > 0) {
+    lines.push(
+      ...overdueActions.map((entry) => `Overdue — ${formatTemporalHealthLabel(entry.health)}: "${entry.action.title}".`)
+    );
+  }
+  if (deferredReturningToday.length > 0) {
+    lines.push(...deferredReturningToday.map((action) => `Back today, as planned: "${action.title}".`));
+  }
+  if (topActions.length > 0) {
+    lines.push("Today I'd focus on:", ...topActions.map((action, index) => `${index + 1}. ${action.title}.`));
+  }
 
   const deferCandidate = rankedActions.find((action) => action.priority === "low" && !topActions.includes(action));
   if (deferCandidate) {
     lines.push(`Skip "${deferCandidate.title}" today — low priority.`);
+  }
+
+  // Repeated postponement pattern (fix/private-alpha-action-temporal-coaching) — a light,
+  // observational mention, not a lecture; the per-move coaching question already lives on
+  // action.snooze's own reply (executor.ts), this is only ever a summary note for the morning.
+  const repeatedlyMoved = [...context.openActions, ...context.deferredActions].filter((action) => action.postponeCount >= 2);
+  if (repeatedlyMoved.length > 0) {
+    const first = repeatedlyMoved[0]!;
+    lines.push(`"${first.title}" has been moved ${first.postponeCount} times — worth shrinking it or deciding it's not happening.`);
   }
 
   // Goal Evidence Loop MVP (docs/10-v3-readiness-audit.md §20) — generic across every goal
@@ -158,7 +199,6 @@ function buildMorningBrief(
     );
   }
 
-  const todayLocalDate = formatDateInTimezone(now, settings.timezone);
   const riskToday = context.memories.find((memory) => memory.type === "risk_pattern" && formatDateInTimezone(memory.createdAt, settings.timezone) === todayLocalDate);
   if (riskToday) {
     lines.push(`Watch out: ${riskToday.summary}`);
@@ -171,7 +211,11 @@ function buildMorningBrief(
     type: "morning_brief",
     title: "Morning brief",
     message: lines.join("\n"),
-    reasons: topActions.map((action) => `open action: "${action.title}" (${action.priority})`),
+    reasons: [
+      ...overdueActions.map((entry) => `overdue action: "${entry.action.title}" (${formatTemporalHealthLabel(entry.health)})`),
+      ...deferredReturningToday.map((action) => `deferred action returning today: "${action.title}"`),
+      ...topActions.map((action) => `open action: "${action.title}" (${action.priority})`)
+    ],
     suggestedReplies: ["mark 1 done", "move 2 to tomorrow"],
     dedupeKey: MORNING_BRIEF_DEDUPE_KEY,
     priority: 1,
@@ -207,20 +251,43 @@ function buildEveningCheckin(
     })
     .slice(0, 2);
 
-  if (untrackedGoals.length === 0) {
+  // fix/private-alpha-action-temporal-coaching: an action due TODAY that's still open by evening
+  // check-in time is exactly the "plan didn't match execution" case the task asked for — the
+  // evening check-in previously only ever looked at goal evidence signals, never at whether the
+  // day's own actions actually got done. Deliberately dueAt-based, not overdue-by-days (that's
+  // the morning brief's job) — "still open, was due today" is itself already the honest fact
+  // worth surfacing at this specific moment.
+  const missedDueTodayActions = context.openActions
+    .filter((action) => action.dueAt && formatDateInTimezone(action.dueAt, settings.timezone) === todayLocalDate)
+    .slice(0, 2);
+
+  if (untrackedGoals.length === 0 && missedDueTodayActions.length === 0) {
     return null;
   }
 
-  const goalPhrases = untrackedGoals.map((goal) => goal.title.toLowerCase());
-  const message = `Quick check-in: did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "gym 45m and sent 2 CVs" is enough.`;
+  const parts: string[] = [];
+  if (missedDueTodayActions.length > 0) {
+    const names = missedDueTodayActions.map((action) => `"${action.title}"`).join(" and ");
+    parts.push(
+      `${names} ${missedDueTodayActions.length === 1 ? "was" : "were"} due today and still open — want to shrink it, move it to tomorrow, or archive it if it's not happening?`
+    );
+  }
+  if (untrackedGoals.length > 0) {
+    const goalPhrases = untrackedGoals.map((goal) => goal.title.toLowerCase());
+    parts.push(`Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "gym 45m and sent 2 CVs" is enough.`);
+  }
+  const message = `Evening check-in: ${parts.join(" ")}`;
 
   return {
     decision: "proposed_message",
     type: "evening_checkin",
     title: "Evening check-in",
     message,
-    reasons: untrackedGoals.map((goal) => `no tracked signal logged today for goal: "${goal.title}"`),
-    suggestedReplies: ["gym 45m and sent 2 CVs", "nothing today"],
+    reasons: [
+      ...missedDueTodayActions.map((action) => `still-open action due today: "${action.title}"`),
+      ...untrackedGoals.map((goal) => `no tracked signal logged today for goal: "${goal.title}"`)
+    ],
+    suggestedReplies: missedDueTodayActions.length > 0 ? ["move it to tomorrow", "archive it", "gym 45m and sent 2 CVs"] : ["gym 45m and sent 2 CVs", "nothing today"],
     dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
     priority: 2,
     safeToSend: true
@@ -273,6 +340,58 @@ export function rankOpenActions(actions: ActionItem[]): ActionItem[] {
     const bDue = b.dueAt?.getTime() ?? Number.POSITIVE_INFINITY;
     return aDue - bDue;
   });
+}
+
+/**
+ * Temporal health (fix/private-alpha-action-temporal-coaching): status alone doesn't say whether
+ * an open action is fine, overdue, or has just been sitting untouched — this is the single
+ * source of truth for that judgment, exported so action.list's per-item line, goal.recommend_
+ * next_action, the morning brief, and the evening check-in (agent-runtime/executor.ts and this
+ * file) always agree on what counts as overdue/stale rather than each guessing independently —
+ * same reasoning as rankOpenActions living here.
+ */
+export type TemporalHealth =
+  | { kind: "on_track" }
+  | { kind: "overdue"; daysOverdue: number }
+  | { kind: "stale"; daysSitting: number };
+
+const STALE_THRESHOLD_DAYS = 3;
+
+export function assessTemporalHealth(action: ActionItem, now: Date, timezone: string): TemporalHealth {
+  if (action.status !== "open") {
+    return { kind: "on_track" };
+  }
+  const todayLocal = formatDateInTimezone(now, timezone);
+  if (action.dueAt) {
+    if (action.dueAt >= now) {
+      return { kind: "on_track" };
+    }
+    const dueLocal = formatDateInTimezone(action.dueAt, timezone);
+    // A same-day-but-earlier-time due date (due today 09:00, now 14:00) is technically already
+    // past, but "overdue by 0 days" reads oddly — still today, so still on_track for THIS
+    // purpose; formatDueLabelForChat's own "due today HH:mm" already says enough.
+    const daysOverdue = daysBetweenLocalDates(dueLocal, todayLocal);
+    return daysOverdue > 0 ? { kind: "overdue", daysOverdue } : { kind: "on_track" };
+  }
+  // No dueAt at all — never "overdue" (nothing to be overdue AGAINST), only ever "stale," and
+  // only past a real threshold; a two-day-old undated action is completely normal.
+  const createdLocal = formatDateInTimezone(action.createdAt, timezone);
+  const daysSitting = daysBetweenLocalDates(createdLocal, todayLocal);
+  return daysSitting >= STALE_THRESHOLD_DAYS ? { kind: "stale", daysSitting } : { kind: "on_track" };
+}
+
+/** "overdue since yesterday" / "overdue by 4 days" / "sitting for 3 days" — never "overdue" for
+ * a stale (no-dueAt) action, per the explicit product rule: staleness is a real but WEAKER,
+ * different signal than a missed real due date, and conflating the two words would overclaim
+ * what Alecto actually knows for an action that was never given a due date in the first place. */
+export function formatTemporalHealthLabel(health: TemporalHealth): string | undefined {
+  if (health.kind === "overdue") {
+    return health.daysOverdue === 1 ? "overdue since yesterday" : `overdue by ${health.daysOverdue} days`;
+  }
+  if (health.kind === "stale") {
+    return `sitting for ${health.daysSitting} days`;
+  }
+  return undefined;
 }
 
 /** Exported so proactive-eligibility.ts's diagnostic status check uses the exact same time math the decision module itself uses — no separate reimplementation to drift out of sync. */

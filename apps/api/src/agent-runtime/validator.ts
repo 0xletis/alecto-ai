@@ -429,7 +429,14 @@ function applyDirectActionIdTrust(
     // the normal ambiguity clarification instead. A trusted match is flagged
     // (actionOutsideVisiblePage) so the executor's own reply can say plainly that it was found
     // outside the visible page, rather than silently acting on something never actually shown.
-    const candidate = context.openActions.find((item) => item.id === args.actionId);
+    // Searches deferredActions too, not just openActions — a currently-snoozed action is a
+    // completely legitimate target for a follow-up "move it again"/"actually archive it"/
+    // "complete it early" (fix/private-alpha-action-temporal-coaching), and the planner is now
+    // explicitly told about deferred actions (planner.ts's own backgroundDeferredActions) so it
+    // can reference one by id even when it was never the single visible entity this turn. Without
+    // this, an id sourced from THAT pool always came back "not even in the wider open-actions
+    // pool" and got silently discarded regardless of how specific the message was.
+    const candidate = [...context.openActions, ...context.deferredActions].find((item) => item.id === args.actionId);
     const tier = candidate ? actionTitleMatchTier(message, candidate.title) : "none";
     const trusted = tier === "exact" || tier === "word_exact";
     logActionGroundingDiagnostics(context.session.userId, {

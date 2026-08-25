@@ -221,6 +221,11 @@ export interface ContextBundle {
   user: AgentUser;
   activeGoals: Goal[];
   openActions: ActionItem[];
+  /** Actions currently snoozed/deferred (status "snoozed") — NOT actionable right now, distinct
+   * from openActions on purpose (see context-loader.ts's own comment on why this is a separate
+   * field rather than a broadened openActions). Used by goal.recommend_next_action to avoid
+   * proposing a near-duplicate of something the user already moved to a later date. */
+  deferredActions: ActionItem[];
   recentEvents: StoredEvent[];
   memories: MemoryEntry[];
   gmailConnection: IntegrationConnection | undefined;

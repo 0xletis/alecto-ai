@@ -83,6 +83,21 @@ export async function checkGoalGuardrail(message: string, context: ContextBundle
     return { ...ALLOW, reason: "progress_report_shape" };
   }
 
+  // fix/private-alpha-action-temporal-coaching: a real Telegram transcript found "snooze it for
+  // later this week" classified as goal avoidance — the LLM tier below has no visibility into
+  // WHAT the user is actually looking at, so a deferral verb next to a real, singular, currently-
+  // visible action read as skipping something rather than rescheduling it. Deliberately gated on
+  // exactly one visible action (the same bar runtime.ts's own bare-reference shortcuts use) —
+  // this is deliberately NOT the primary fix (runtime.ts's own actionDeferralAmbiguousWeekClarification
+  // and the broadened ACTION_SNOOZE_PATTERN shortcut intercept the common cases before the
+  // guardrail is ever reached at all), just a second, independent layer for phrasing outside that
+  // shortcut's own vocabulary. Only ever widens what's allowed through, same as the progress-
+  // report shape check above; genuinely vague avoidance ("I don't want to do this goal anymore")
+  // matches neither pattern and still reaches the LLM tier below unchanged.
+  if (looksLikeActionSchedulingLanguage(message, context)) {
+    return { ...ALLOW, reason: "action_scheduling_shape" };
+  }
+
   const classification = await classifyGoalConflict(message, context.activeGoals);
   if (!classification) {
     return { ...ALLOW, llmAttempted: true };
@@ -163,6 +178,22 @@ const LOG_INTENT_PATTERN = /\blog(ged|ging)\b|\blog\s+(it|that|this)\b/i;
 
 function looksLikeProgressReport(message: string): boolean {
   return QUANTIFIED_ACTIVITY_PATTERN.test(message) || LOG_INTENT_PATTERN.test(message);
+}
+
+// Mirrors runtime.ts's own ACTION_SNOOZE_PATTERN vocabulary (kept as a separate, independent
+// pattern rather than a shared import — this module has no other dependency on runtime.ts, and
+// duplicating a small, stable keyword list is safer here than introducing one purely for this).
+// Deliberately excludes bare "not today"/"not now" — those two are genuinely ambiguous between
+// "move this task" and "I'm skipping my actual commitment today," and are already handled with
+// proper context (a real single visible action, via the LLM prompt/validator) at the tool layer;
+// this guardrail-level check only ever allows through phrasing unambiguous enough to be safe
+// without that extra context.
+const ACTION_SCHEDULING_LANGUAGE_PATTERN =
+  /\b(snooze|move (it|this|that)|bring (it|this|that) back|park (it|this|that)|push (it|this|that)|defer|remind me)\b|\bmu[eé]velo\b|\bp[aá]salo\b|\brecu[eé]rdamelo\b|\bmou-ho\b|\bpassa-ho\b|\brecorda-m['’]ho\b/i;
+
+function looksLikeActionSchedulingLanguage(message: string, context: ContextBundle): boolean {
+  const singleVisibleAction = context.session.visibleEntities.filter((entity) => entity.type === "action").length === 1;
+  return singleVisibleAction && ACTION_SCHEDULING_LANGUAGE_PATTERN.test(message);
 }
 
 function significantWords(text: string): string[] {
