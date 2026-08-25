@@ -115,7 +115,11 @@ test("2D: 'all actions' labels deferred (with date), completed, and archived ite
     mockPlan({ topic: "actions", intent: "list_all", operations: [op("action.list", { status: "all" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "show me all my actions");
 
-    assert.match(reply.reply, /book flights[^\n]*tomorrow[^\n]*snoozed/i);
+    // fix/private-alpha-temporal-action-copy-and-dedup: "snoozed" must never leak into
+    // user-facing copy — a deferred item's line now says "moved to <date>" instead of
+    // "due <date> — snoozed".
+    assert.match(reply.reply, /book flights[^\n]*moved to tomorrow/i);
+    assert.doesNotMatch(reply.reply, /snoozed/i);
     assert.match(reply.reply, /send invoice[^\n]*completed/i);
     assert.match(reply.reply, /old idea[^\n]*archived/i);
   } finally {

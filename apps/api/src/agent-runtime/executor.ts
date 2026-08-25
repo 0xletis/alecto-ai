@@ -340,10 +340,14 @@ export async function executeOperation(
             : updated.postponeCount >= 3
               ? " You've moved this several times. We should either shrink it, do a 10-minute version, or archive it."
               : "";
+        // fix/private-alpha-temporal-action-copy-and-dedup: a real transcript found this reply
+        // saying '...bring "Apply to 3 more remote Web3 roles today" back tomorrow' — the
+        // title's own stale "today" contradicting the "tomorrow" right next to it. Same display-
+        // only cleanup as action.list's per-item line, never the stored title.
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${foundNote}Okay — I'll bring "${updated.title}" back ${whenLabel}.${coachingNote}`,
+          summary: `${foundNote}Okay — I'll bring "${cleanedTitleForDateDisplay(updated.title)}" back ${whenLabel}.${coachingNote}`,
           result: updated
         };
       }
@@ -1790,7 +1794,7 @@ export async function executeOperation(
                 : "Want to shrink it, move it, or archive it? Whatever keeps it honest is fine.";
           lines.push(
             "",
-            `You have an overdue action — ${label}: "${overdueAction.title}". ${tone}`
+            `You have an overdue action — ${label}: "${cleanedTitleForDateDisplay(overdueAction.title)}". ${tone}`
           );
         } else if (linkedOpenActions.length > 0) {
           const top = linkedOpenActions.slice(0, 2);
@@ -1802,7 +1806,7 @@ export async function executeOperation(
             : "later";
           lines.push(
             "",
-            `You already moved "${similarDeferred.title}" to ${whenLabel} — I won't create another one for today. Say "move it back to today" if you'd rather pull it forward.`
+            `You already moved "${cleanedTitleForDateDisplay(similarDeferred.title)}" to ${whenLabel} — I won't create another one for today. Say "move it back to today" if you'd rather pull it forward.`
           );
         } else if (proposedAction && proposedAction.trim()) {
           lines.push("", `Want me to create this action?\n${proposedAction.trim()}`, "", "Reply yes to confirm or cancel.");
@@ -2821,50 +2825,60 @@ function formatActionListForChat(
   timezone: string,
   when?: "today" | "tomorrow" | "this_week"
 ): string {
-  const statusNoun = status === "all" ? "action" : `${status} action`;
-  const noun = overdueOnly ? "overdue action" : statusNoun;
+  const baseNoun = when ? "action" : overdueOnly ? "overdue action" : status === "all" ? "action" : `${status} action`;
 
   if (items.length === 0) {
     return when
       ? `You don't have any actions scheduled for ${WHEN_NOUN[when]}.`
-      : `You don't have any ${noun}s right now.`;
+      : `You don't have any ${baseNoun}s right now.`;
   }
 
-  // Real Telegram smoke test: "You have 10 open actions" when 12 actually existed — never claim
-  // a total that's actually just the page size. Only the exact count when everything is shown;
-  // "Showing N of M" the moment the real total is larger than what's displayed.
-  const listNoun = when ? `action for ${WHEN_NOUN[when]}` : noun;
-  const header =
-    totalMatching > items.length
-      ? `Showing ${items.length} of ${totalMatching} ${listNoun}s:`
-      : `You have ${items.length} ${listNoun}${items.length === 1 ? "" : "s"}:`;
+  // Real Telegram smoke test: "2 action for tomorrows" — pluralizing the WHOLE phrase ("action
+  // for tomorrow" + "s") puts the "s" after the wrong word. The noun itself is pluralized first,
+  // THEN "for <when>" is appended after — the only way "actions for tomorrow" ever comes out
+  // right. Also: "You have 10 open actions" when 12 actually existed — never claim a total that's
+  // actually just the page size; "Showing N of M" the moment the real total is larger than what's
+  // displayed.
+  const pluralNoun = `${baseNoun}${items.length === 1 ? "" : "s"}`;
+  const listPhrase = when ? `${pluralNoun} for ${WHEN_NOUN[when]}` : pluralNoun;
+  const header = totalMatching > items.length ? `Showing ${items.length} of ${totalMatching} ${listPhrase}:` : `You have ${items.length} ${listPhrase}:`;
 
   const now = new Date();
   const lines = [header];
   items.forEach((item, index) => {
     const effectiveDate = actionEffectiveDate(item);
     const health = assessTemporalHealth(item, now, timezone);
+    // A snoozed/overdue item's OWN title can carry a now-stale temporal word ("...roles today"
+    // moved to tomorrow, or now overdue) — cleanedTitleForDateDisplay strips only a recognized
+    // TRAILING phrase for display, never touching the stored row or anything mid-title. Left
+    // completely alone for a normal on-track item, where the title's own wording is still true.
+    const displayTitle = health.kind === "overdue" || item.status === "snoozed" ? cleanedTitleForDateDisplay(item.title) : item.title;
     // Temporal health (fix/private-alpha-action-temporal-coaching) wins over the plain date line
     // for an overdue item — "due Mon 18 Aug" for something 4 days late reads as a normal
-    // upcoming task, not a problem; "overdue by 4 days" is the honest version. A stale (no-dueAt)
-    // item has no date line to replace, so its label is simply added.
+    // upcoming task, not a problem; "overdue by 4 days" is the honest version. A snoozed item
+    // says "moved to X," never "due X — snoozed" (fix/private-alpha-temporal-action-copy-and-
+    // dedup: "snoozed" must never leak into user-facing copy, and "due" is simply the wrong verb
+    // for something that was actively moved). A stale (no-dueAt) item has no date line to
+    // replace, so its label is simply added.
     const dueLine =
       health.kind === "overdue"
         ? ` — ${formatTemporalHealthLabel(health)}`
-        : effectiveDate
-          ? ` — ${formatDueLabelForChat(effectiveDate, timezone)}`
-          : health.kind === "stale"
-            ? ` — ${formatTemporalHealthLabel(health)}`
-            : "";
+        : item.status === "snoozed" && effectiveDate
+          ? ` — ${formatDeferredLabelForChat(effectiveDate, timezone)}`
+          : effectiveDate
+            ? ` — ${formatDueLabelForChat(effectiveDate, timezone)}`
+            : health.kind === "stale"
+              ? ` — ${formatTemporalHealthLabel(health)}`
+              : "";
     // A real Telegram smoke test found archived actions re-listed with no status label at all —
     // indistinguishable from a genuinely open task. Only needed when the pool is mixed (status
     // "all"): a single-status query ("show me archived actions") already says so in the header
-    // noun above, so repeating it on every line would be redundant, not clearer. A date-scoped
-    // query mixes open+snoozed by design (see action.list's own comment), so it gets the same
-    // treatment as status "all" here — "snoozed" is still worth labeling even though the date
-    // line already implies it, since "archive"/"complete" only ever apply to the open ones.
-    const statusLine = (status === "all" || when) && item.status !== "open" ? ` — ${item.status}` : "";
-    lines.push(`${index + 1}. ${item.title}${dueLine}${statusLine}`);
+    // noun above, so repeating it on every line would be redundant, not clearer. Never for
+    // "snoozed" specifically — its dueLine above already says "moved to X," which both identifies
+    // it AND avoids the forbidden raw status word; repeating "— snoozed" after that would be both
+    // redundant and exactly the leak this task exists to close.
+    const statusLine = (status === "all" || when) && item.status !== "open" && item.status !== "snoozed" ? ` — ${item.status}` : "";
+    lines.push(`${index + 1}. ${displayTitle}${dueLine}${statusLine}`);
     const sourceLine = actionSourceLabel(item);
     if (sourceLine) {
       lines.push(`   ${sourceLine}`);
@@ -2883,6 +2897,19 @@ function formatActionListForChat(
   const footer = buildActionListFooter(openIndexes);
   if (footer) {
     lines.push("", footer);
+  }
+
+  // Similar-deferred-action cleanup suggestion (fix/private-alpha-temporal-action-copy-and-dedup,
+  // task 3) — ONLY for a date-scoped query, where two near-identical actions both landing on the
+  // same day is exactly the shape worth flagging (a plain "show me my actions" can have several
+  // genuinely different open tasks; that's normal, not a duplicate). Detection reuses the same
+  // content-word-overlap heuristic goal.recommend_next_action's own deferred-duplicate veto uses
+  // (titlesLookSimilar) — never auto-merges or archives anything, only ever suggests.
+  if (when) {
+    const similarPair = findSimilarActionPair(items);
+    if (similarPair) {
+      lines.push("", "You have two similar actions scheduled. Want me to help merge or archive one?");
+    }
   }
 
   return lines.join("\n");
@@ -2925,6 +2952,33 @@ function formatDueLabelForChat(dueAt: Date, timezone: string): string {
     return `due tomorrow ${time}`;
   }
   return `due ${formatLocalDateTime(dueAt, timezone)}`;
+}
+
+/** "moved to tomorrow 11:00" — the SAME today/tomorrow/full-date-fallback shape as
+ * formatDueLabelForChat, just for a deferred (snoozed) item specifically. fix/private-alpha-
+ * temporal-action-copy-and-dedup: a real Telegram smoke test found a snoozed item's line reading
+ * "... — due tomorrow 11:00 — snoozed", both leaking the user-facing-forbidden word "snoozed" AND
+ * saying "due" for something that was actively MOVED, not originally due there. One line, one
+ * honest verb, never the word "snooze"/"snoozed" back to the user. */
+function formatDeferredLabelForChat(snoozedUntil: Date, timezone: string): string {
+  return formatDueLabelForChat(snoozedUntil, timezone).replace(/^due /, "moved to ");
+}
+
+// Trailing temporal phrases safe to strip when a title is shown ALONGSIDE its own real date/
+// status label — "Apply to roles today" next to "moved to tomorrow 11:00" reads as a flat
+// contradiction otherwise. Deliberately a small, explicit, English-only set of phrases that only
+// ever match at the very END of the title (never mid-title, never touching unrelated words) —
+// this is a display-only cleanup, the STORED title is never rewritten, so nothing is lost and a
+// phrase this doesn't recognize is safely left exactly as written rather than guessed at.
+const TRAILING_TEMPORAL_PHRASE_RE = /\s*[-–—]?\s*(today|tomorrow|tonight|this (morning|afternoon|evening)|by (the end of (the )?week|end of week))\.?$/i;
+
+/** Strips a recognized trailing temporal phrase for DISPLAY purposes only — the real ActionItem
+ * row and its title are never modified. Falls back to the original title untouched whenever
+ * stripping would leave nothing meaningful (e.g. a title that IS just "today"), so this can never
+ * turn a real title into an empty or confusing fragment. */
+function cleanedTitleForDateDisplay(title: string): string {
+  const cleaned = title.replace(TRAILING_TEMPORAL_PHRASE_RE, "").trim();
+  return cleaned.length >= 3 ? cleaned : title;
 }
 
 /** Short parent-action metadata line for a linked pre-due reminder — "Reminder: 30 minutes
@@ -3398,6 +3452,21 @@ function titlesLookSimilar(a: string, b: string): boolean {
   }
   const overlap = wordsB.filter((word) => wordsA.has(word)).length;
   return overlap / Math.max(wordsA.size, wordsB.length) >= 0.6;
+}
+
+/** First pair of genuinely similar items in a (usually short, date-scoped) list — reuses
+ * titlesLookSimilar so "similar" always means the same thing everywhere it's checked. Only
+ * called on a small `when`-scoped result set, so the naive pairwise scan is cheap; never called
+ * on the full unbounded action pool. */
+function findSimilarActionPair(items: ActionItem[]): [ActionItem, ActionItem] | undefined {
+  for (let i = 0; i < items.length; i++) {
+    for (let j = i + 1; j < items.length; j++) {
+      if (titlesLookSimilar(items[i]!.title, items[j]!.title)) {
+        return [items[i]!, items[j]!];
+      }
+    }
+  }
+  return undefined;
 }
 
 function describeAmbiguousGoalChoice(candidates: Goal[]): string {
