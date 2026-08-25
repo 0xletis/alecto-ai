@@ -111,6 +111,22 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "gmail.sync.debug",
   "gmail.rule.create",
   "gmail.rule.enable_builtin",
+  // A real Telegram smoke test found "archive 1 and 2" replying "Archiving the actions X and Y"
+  // (the planner's own pre-execution replyDraft, present tense, sounds confident either way) while
+  // both actions stayed open afterward — action.archive is a mutates:true tool, so without this
+  // entry its reply defaults to whatever the LLM guessed would happen, never checked against
+  // whether archiveActionItem actually found and updated a real row. Grouped with its bulk siblings
+  // for the same reason: "Archived N actions" must only ever be said after the archive really ran.
+  "action.archive",
+  "action.archive_all_propose",
+  "action.archive_all_apply",
+  // Bundled together with action.archive_all_apply when a goal-archive confirmation also
+  // includes its linked open actions (goal.archive_propose's own pendingOperationUpdate) — both
+  // must land in the SAME bucket (groundTruthOnly, joined with "\n\n") or one silently drops: the
+  // "mutates:true, no replyDraft" fallback path only ever fires when NOTHING landed in
+  // groundTruthOnly/informationalSummaries first, so a bundle where only one sibling is ground-
+  // truth-only would show that one's real outcome and lose the other's entirely.
+  "goal.archive_apply",
   "action.hygiene_apply",
   "planning.next_week_apply",
   "weekly_review.save",

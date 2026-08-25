@@ -80,10 +80,34 @@ export const toolCatalog: ToolDefinition[] = [
   },
   {
     name: "action.archive",
-    description: "Archive an action item (dismiss without completing).",
+    description: "Archive a SINGLE, specifically-named or specifically-numbered action item (dismiss without completing). Never use this for 'all'/'these'/'them' — see action.archive_all_propose for that.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({ actionId: actionIdField })
+  },
+  {
+    name: "action.archive_all_propose",
+    description:
+      "Propose archiving MULTIPLE open actions at once — shows the real numbered list and opens a pending confirmation; never archives anything by itself. Use for 'delete all my actions', 'archive all my actions', 'clear all my actions', 'remove all my actions', 'archive all of them', 'delete all of them', 'clear these actions', 'remove these tasks', 'I mean all actions' (English); 'borra todas mis acciones', 'archiva todas mis acciones', 'elimina todas las acciones', 'limpia mis acciones' (Spanish); 'arxiva totes les accions', 'elimina totes les accions', 'esborra totes les accions' (Catalan) — and the bare 'all of them'/'these'/'todas'/'totes' right after action.list showed a numbered action list. NEVER treat 'all'/'these'/'them'/'all my actions' as a literal action title to search for — that is the exact mistake this tool exists to prevent. Set scope 'visible' when the user is referring to actions just shown by action.list (or a similarly recently-shown numbered list) — resolves to exactly those, never more; set scope 'all' when the user says 'all my actions'/'all my tasks' with no list currently shown — resolves to every real open action, not just what happens to be in view. Never sets actionIds yourself; that field is populated internally only, for explicit-number cases like 'archive 1 and 2' which are resolved deterministically before you are ever asked to plan.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({
+      scope: z.enum(["visible", "all"]).optional().describe("'visible' = only the actions just shown in a numbered list; 'all' = every real open action. Omit only when actionIds is set internally."),
+      actionIds: z
+        .array(z.string().min(1))
+        .optional()
+        .describe("Internal only — already-resolved specific action ids for an explicit-number request. Never populate this yourself; use scope instead.")
+    })
+  },
+  {
+    name: "action.archive_all_apply",
+    description: "Internal: applies the confirmed bulk action archive. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      actionIds: z.array(z.string().min(1)).min(1)
+    })
   },
   {
     name: "action.reschedule",
