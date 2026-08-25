@@ -300,7 +300,7 @@ test("agent/message: action cleanup golden transcript resolves 'it'", async () =
     const turn2 = await send(server, userId, "snooze it to tomorrow");
     assert.equal(turn2.operationsExecuted.length, 1);
     assert.equal(turn2.operationsExecuted[0].status, "executed");
-    assert.match(turn2.reply, /Snoozed/i);
+    assert.match(turn2.reply, /bring "write youtube script" back/i);
 
     const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
     assert.equal(updated?.status, "snoozed");

@@ -136,7 +136,7 @@ test("C. completing the parent hides/archives its reminder from later normal-act
 
     mockPlan({ topic: "actions", intent: "complete", operations: [op("action.complete", { actionId: parentId })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const completeReply = await sendAgentMessage(server, userId, "complete branding direction meeting");
-    assert.match(completeReply.reply, /completed "branding direction meeting"/i);
+    assert.match(completeReply.reply, /marked "branding direction meeting" complete/i);
 
     const secondList = await listActions(server, userId);
     assert.doesNotMatch(secondList.reply, /branding direction meeting/i);
@@ -233,7 +233,7 @@ test("F. an exact/named target still completes directly, no clarification needed
     const reply = await sendAgentMessage(server, userId, "complete branding direction meeting");
 
     assert.equal(reply.debug.mutationExecuted, true);
-    assert.match(reply.reply, /completed "branding direction meeting"/i);
+    assert.match(reply.reply, /marked "branding direction meeting" complete/i);
 
     const row = await prisma.actionItem.findUnique({ where: { id: branding.id } });
     assert.equal(row?.status, "completed");

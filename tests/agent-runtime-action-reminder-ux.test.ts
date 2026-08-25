@@ -139,7 +139,7 @@ test("D. completing the parent action hides its reminder companion from later no
 
     mockPlan({ topic: "actions", intent: "complete", operations: [op("action.complete", { actionId: parentId })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const completeReply = await sendAgentMessage(server, userId, "complete brainstorm meeting");
-    assert.match(completeReply.reply, /completed "brainstorm meeting"/i);
+    assert.match(completeReply.reply, /marked "brainstorm meeting" complete/i);
 
     mockPlan({ topic: "actions", intent: "list_actions", operations: [op("action.list", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const secondList = await sendAgentMessage(server, userId, "show me my actions again");

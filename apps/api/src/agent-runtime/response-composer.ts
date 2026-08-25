@@ -127,6 +127,14 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   // groundTruthOnly/informationalSummaries first, so a bundle where only one sibling is ground-
   // truth-only would show that one's real outcome and lose the other's entirely.
   "goal.archive_apply",
+  // A real Telegram smoke test found action.complete/action.snooze replies could be overridden by
+  // the planner's own pre-execution replyDraft — mutates:true tools not in this set fall back to
+  // whatever the LLM guessed would happen, never checked against whether the mutation actually
+  // succeeded, what the action's real title is, or whether it's linked to a goal. The human,
+  // coach-like phrasing for these two now lives entirely in their own executor cases below, using
+  // only verified post-execution facts — never the model's own unverified claim.
+  "action.complete",
+  "action.snooze",
   "action.hygiene_apply",
   "planning.next_week_apply",
   "weekly_review.save",
