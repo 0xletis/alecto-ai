@@ -1623,6 +1623,7 @@ export async function executeOperation(
         const checkIn = args.checkIn as GoalPlanCheckIn | undefined;
         const integrationHint = args.integrationHint as string | undefined;
         const firstActions = (args.firstActions as string[] | undefined) ?? [];
+        const dailyCoachingInterest = Boolean(args.dailyCoachingInterest);
 
         if (rawSignals.length === 0) {
           return failed(operation.tool, "I need at least one trackable signal to propose a plan for this goal.");
@@ -1637,14 +1638,14 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatGoalPlanProposal({ title, successCriteria, signals, checkIn, integrationHint, firstActions }),
+          summary: formatGoalPlanProposal({ title, successCriteria, signals, checkIn, integrationHint, firstActions, dailyCoachingInterest }),
           pendingOperationUpdate: {
             topic: "goal_creation",
             summary: `create the "${title}" goal`,
             operations: [
               {
                 tool: "goal.create_apply",
-                args: { title, category, why, signals, checkIn, firstActions },
+                args: { title, category, why, signals, checkIn, firstActions, dailyCoachingInterest },
                 status: "valid",
                 requiresConfirmation: false
               }
@@ -1660,6 +1661,7 @@ export async function executeOperation(
         const rawSignals = (args.signals as GoalPlanSignal[] | undefined) ?? [];
         const checkIn = args.checkIn as GoalPlanCheckIn | undefined;
         const firstActions = (args.firstActions as string[] | undefined) ?? [];
+        const dailyCoachingInterest = Boolean(args.dailyCoachingInterest);
 
         // Defensive/idempotent — goal.create_apply is normally only reached with signals already
         // augmented by goal.create_propose above (the confirm whitelist re-executes the exact
@@ -1703,10 +1705,25 @@ export async function executeOperation(
         const checkInNote = checkIn ? ` and ${checkIn.cadence} check-ins` : "";
         const actionsNote = createdActions.length > 0 ? ` Created ${createdActions.length} first action${createdActions.length === 1 ? "" : "s"}.` : "";
 
+        // Task 6 of fix/private-alpha-proactive-daily-planning-semantics: a real Telegram smoke
+        // test found a daily-coaching request made DURING goal creation silently dropped — the
+        // compound-proposal guard correctly keeps goal.create_propose over proactive.settings_
+        // propose_update in the SAME turn (only one pending confirmation can exist), but nothing
+        // followed up afterward. This asks, honestly, once the goal itself is safely created —
+        // never mutates settings itself, always a separate, later confirmation.
+        let dailyCoachingFollowUp = "";
+        if (dailyCoachingInterest) {
+          const settings = await getOrCreateNotificationSettings(userId);
+          dailyCoachingFollowUp =
+            settings.morningBriefEnabled && settings.eveningCheckinEnabled
+              ? " Morning/evening coaching is already on."
+              : " Want me to turn on the morning brief and evening check-in for this?";
+        }
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Done — I'll track "${result.goal.title}" with ${signalNames}${checkInNote}.${actionsNote}`,
+          summary: `Done — I'll track "${result.goal.title}" with ${signalNames}${checkInNote}.${actionsNote}${dailyCoachingFollowUp}`,
           result: result.goal,
           // The new goal itself is included here (not just its first actions) so an immediate
           // follow-up like "show tracking for it" / "how is that goal going?" has a real,
@@ -2506,7 +2523,12 @@ function formatActionListForChat(
   const lines = [header];
   items.forEach((item, index) => {
     const dueLine = item.dueAt ? ` — ${formatDueLabelForChat(item.dueAt, timezone)}` : "";
-    lines.push(`${index + 1}. ${item.title}${dueLine}`);
+    // A real Telegram smoke test found archived actions re-listed with no status label at all —
+    // indistinguishable from a genuinely open task. Only needed when the pool is mixed (status
+    // "all"): a single-status query ("show me archived actions") already says so in the header
+    // noun above, so repeating it on every line would be redundant, not clearer.
+    const statusLine = status === "all" && item.status !== "open" ? ` — ${item.status}` : "";
+    lines.push(`${index + 1}. ${item.title}${dueLine}${statusLine}`);
     const sourceLine = actionSourceLabel(item);
     if (sourceLine) {
       lines.push(`   ${sourceLine}`);
@@ -2516,7 +2538,12 @@ function formatActionListForChat(
       lines.push(`   ${formatReminderMetadataForChat(reminder)}`);
     }
   });
-  lines.push("", "Reply: complete 1, snooze 2 tomorrow, archive 3.");
+  // "Complete/snooze/archive" only ever applies to an OPEN action — showing it under a list of
+  // archived/completed items reads as an instruction that would just fail if followed. Shown only
+  // when at least one visible item is actually open.
+  if (items.some((item) => item.status === "open")) {
+    lines.push("", "Reply: complete 1, snooze 2 tomorrow, archive 3.");
+  }
 
   return lines.join("\n");
 }
@@ -3009,6 +3036,7 @@ function formatGoalPlanProposal(input: {
   checkIn?: GoalPlanCheckIn;
   integrationHint?: string;
   firstActions: string[];
+  dailyCoachingInterest?: boolean;
 }): string {
   const lines = [`Good — I can track "${input.title}" like this:`, "", `Goal: ${input.title}`];
 
@@ -3025,20 +3053,35 @@ function formatGoalPlanProposal(input: {
     lines.push(`${cadenceLabel} check-in:`, `- "${input.checkIn.question}"`);
   }
 
+  // A real Telegram smoke test found "add a morning message to motivate me and create some
+  // actions every morning" turned into TWO fake firstActions ("Send a motivational message each
+  // morning", "Create action items for the day") — those are Alecto's own proactive
+  // responsibilities, never a user todo. dailyCoachingInterest routes that request here instead,
+  // grounded in what the morning brief/evening check-in actually do today (rank/surface real open
+  // actions and progress — never invent or auto-create new ones without a separate confirmation).
+  if (input.dailyCoachingInterest) {
+    lines.push(
+      "Daily coaching:",
+      "- Morning brief: motivation plus a look at this goal and your open actions, so I can suggest which ones to focus on today — I won't create new actions automatically without asking first.",
+      "- Evening check-in: a quick review of today's progress on this goal."
+    );
+  }
+
   if (input.integrationHint) {
     // The disclaimer is appended here, deterministically, rather than left to the planner's own
     // integrationHint wording — every Gmail-adjacent proposal must say the same honest thing about
     // what Gmail integration actually does, regardless of how the LLM phrased the hint itself.
-    const gmailDisclaimer = /gmail/i.test(input.integrationHint)
-      ? " I can notify you about matching Gmail reviews; I cannot send or reply to emails."
-      : "";
-    lines.push("Integration:", `- ${input.integrationHint}${gmailDisclaimer}`);
+    if (/gmail/i.test(input.integrationHint)) {
+      lines.push("Gmail:", `- ${input.integrationHint}`, "- I cannot send or reply to emails.");
+    } else {
+      lines.push("Integration:", `- ${input.integrationHint}`);
+    }
   }
 
   // "Concrete" in the label itself, not just in the planner's own selection criteria — this line
-  // never appears at all unless there's a genuinely concrete, one-off action to show (per the
-  // firstActions-concreteness prompt rule, an empty list here is a normal, honest outcome, not a
-  // gap the morning brief will fill in later).
+  // never appears at all unless there's a genuinely concrete, one-off, USER-owned action to show
+  // (per the firstActions-concreteness AND Alecto-responsibility prompt rules, an empty list here
+  // is a normal, honest outcome, not a gap — the morning brief covers the rest, per dailyCoachingInterest above).
   if (input.firstActions.length > 0) {
     lines.push("First concrete actions:", ...input.firstActions.map((action) => `- ${action}`));
   }
