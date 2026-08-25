@@ -33,6 +33,7 @@ export const goalTemplates = [
       {
         key: "applications_sent_weekly",
         label: "Applications sent",
+        labelSingular: "Application sent",
         eventType: "career.application_sent",
         aggregation: "count",
         window: "weekly"
@@ -40,6 +41,7 @@ export const goalTemplates = [
       {
         key: "recruiter_replies_weekly",
         label: "Recruiter replies",
+        labelSingular: "Recruiter reply",
         eventType: "career.recruiter_reply_received",
         aggregation: "count",
         window: "weekly"
@@ -70,6 +72,7 @@ export const goalTemplates = [
       {
         key: "deep_work_sessions_weekly",
         label: "Deep work sessions",
+        labelSingular: "Deep work session",
         eventType: "work.deep_work_session_completed",
         aggregation: "count",
         window: "weekly"
@@ -100,6 +103,7 @@ export const goalTemplates = [
       {
         key: "training_minutes_weekly",
         label: "Training minutes",
+        labelSingular: "Training minute",
         eventType: "health.workout_completed",
         aggregation: "sum",
         window: "weekly"
@@ -136,6 +140,7 @@ export const goalTemplates = [
       {
         key: "sleep_hours_daily",
         label: "Sleep hours",
+        labelSingular: "Sleep hour",
         eventType: "health.sleep_logged",
         aggregation: "latest",
         window: "daily"
@@ -165,6 +170,7 @@ export const goalTemplates = [
       {
         key: "reading_minutes_weekly",
         label: "Reading minutes",
+        labelSingular: "Reading minute",
         eventType: "learning.reading_session_completed",
         aggregation: "sum",
         window: "weekly"
@@ -194,6 +200,7 @@ export const goalTemplates = [
       {
         key: "practice_sessions_weekly",
         label: "Practice sessions",
+        labelSingular: "Practice session",
         eventType: "learning.practice_session_completed",
         aggregation: "count",
         window: "weekly"
@@ -231,6 +238,7 @@ export const goalTemplates = [
       {
         key: "cooldowns_weekly",
         label: "Cooldowns triggered",
+        labelSingular: "Cooldown triggered",
         eventType: "finance.betting.cooldown_triggered",
         aggregation: "count",
         window: "weekly"
@@ -256,6 +264,7 @@ export const goalTemplates = [
       {
         key: "project_tasks_weekly",
         label: "Project tasks completed",
+        labelSingular: "Project task completed",
         eventType: "work.task_completed",
         aggregation: "count",
         window: "weekly"
@@ -286,6 +295,7 @@ export const goalTemplates = [
       {
         key: "meaningful_connections_weekly",
         label: "Meaningful connections",
+        labelSingular: "Meaningful connection",
         eventType: "social.meaningful_conversation_logged",
         aggregation: "count",
         window: "weekly"

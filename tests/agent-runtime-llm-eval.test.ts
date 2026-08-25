@@ -5490,3 +5490,338 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-action-command-ux: a real Telegram transcript found the action-list footer
+ * referencing invalid indexes on a short list, and action.complete/snooze/archive replies that
+ * read like a robotic command menu rather than a coach. Scenarios 171-180 cover the real planner
+ * recognizing natural completion/snooze/archive phrases (English/Spanish/Catalan), the grounded
+ * human mutation-reply copy, lightweight post-completion coaching, and the tightened today-
+ * focused next-action recommendation copy — against the exact live transcript that reported this.
+ */
+
+test(
+  "171. the exact live transcript: 'what should I do next?' -> yes -> 'show me ma actions' has a valid, human footer",
+  { ...llmEvalOptions(["action-command-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-action-ux-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("171-action-ux-transcript", ["action-command-ux"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const t1 = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        trace.checkpoint("opens a real pending confirmation for a new action", t1.debug.pendingOperation === true, t1.reply);
+        assert.equal(t1.debug.pendingOperation, true, `expected a pending action-creation confirmation — got: ${t1.reply}`);
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assert.equal(t2.debug.mutationExecuted, true, "the action must actually be created on this turn");
+        assertMentionsGoal(t2.reply, "Find a fully remote developer job, ideally in Web3", "action-creation reply", trace);
+
+        const t3 = trace.record("show me ma actions", await sendAgentMessage(server, userId, "show me ma actions"));
+        assertNoGenericAgentError(t3, "typo'd action list");
+        const singleActionFooter = /you can say/i.test(t3.reply);
+        trace.checkpoint("footer present for the single open action", singleActionFooter, t3.reply);
+        assert.ok(singleActionFooter, `expected a natural footer for the one open action — got: ${t3.reply}`);
+        const noInvalidIndex = !/(snooze|archive|complete)\s*2/i.test(t3.reply) && !/(snooze|archive|complete)\s*3/i.test(t3.reply);
+        trace.checkpoint("footer never references index 2 or 3 with only one action shown", noInvalidIndex, t3.reply);
+        assert.ok(noInvalidIndex, `footer must never reference an index that isn't shown — got: ${t3.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "172. single visible action + 'done' completes it with grounded, human copy",
+  { ...llmEvalOptions(["natural-action-phrases", "action-mutation-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-natural-done-${randomUUID()}`;
+    const trace = new EvalTrace("172-natural-done", ["natural-action-phrases", "action-mutation-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("done", await sendAgentMessage(server, userId, "done"));
+        assertNoGenericAgentError(reply, "'done' against a single visible action");
+        trace.checkpoint("mutation actually executed", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'done' to complete the single visible action — got: ${reply.reply}`);
+        assert.match(reply.reply, /renew passport/i);
+
+        const item = await prisma.actionItem.findFirst({ where: { userId } });
+        assert.equal(item?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "173. single visible action + 'remind me tomorrow' snoozes it, never completes it",
+  { ...llmEvalOptions(["natural-action-phrases", "action-mutation-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-natural-remindme-${randomUUID()}`;
+    const trace = new EvalTrace("173-natural-remindme", ["natural-action-phrases", "action-mutation-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("remind me tomorrow", await sendAgentMessage(server, userId, "remind me tomorrow"));
+        assertNoGenericAgentError(reply, "'remind me tomorrow' against a single visible action");
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'remind me tomorrow' to snooze the single visible action — got: ${reply.reply}`);
+
+        const item = await prisma.actionItem.findFirst({ where: { userId } });
+        trace.checkpoint("action snoozed, not completed", item?.status === "snoozed", `status: ${item?.status}`);
+        assert.equal(item?.status, "snoozed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "174. single visible action + 'drop it' archives it, never implying it was completed",
+  { ...llmEvalOptions(["natural-action-phrases", "action-mutation-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-natural-dropit-${randomUUID()}`;
+    const trace = new EvalTrace("174-natural-dropit", ["natural-action-phrases", "action-mutation-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("drop it", await sendAgentMessage(server, userId, "drop it"));
+        assertNoGenericAgentError(reply, "'drop it' against a single visible action");
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'drop it' to archive the single visible action — got: ${reply.reply}`);
+
+        const item = await prisma.actionItem.findFirst({ where: { userId } });
+        trace.checkpoint("action archived, not completed", item?.status === "archived", `status: ${item?.status}`);
+        assert.equal(item?.status, "archived");
+        const impliesCompletion = /\bcompleted\b|\bdone\b/i.test(reply.reply);
+        trace.checkpoint("reply never implies completion", !impliesCompletion, reply.reply);
+        assert.ok(!impliesCompletion, `archiving must never read as completion — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "175. multiple visible actions + 'done' asks which one, never guesses",
+  { ...llmEvalOptions(["natural-action-phrases"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-natural-ambiguous-${randomUUID()}`;
+    const trace = new EvalTrace("175-natural-ambiguous", ["natural-action-phrases"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renew passport", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Book dentist appointment", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("done", await sendAgentMessage(server, userId, "done"));
+        assertNoGenericAgentError(reply, "'done' against two visible actions");
+        trace.checkpoint("no mutation executed against an ambiguous bare 'done'", reply.debug.mutationExecuted !== true, reply.reply);
+        assert.notEqual(reply.debug.mutationExecuted, true, `expected 'done' with two visible actions to ask which one — got: ${reply.reply}`);
+
+        const openCount = await prisma.actionItem.count({ where: { userId, status: "open" } });
+        assert.equal(openCount, 2, "neither action may be mutated while genuinely ambiguous");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "176. completing the last goal-linked open action offers next-step help, no silent new action",
+  { ...llmEvalOptions(["action-mutation-coaching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-coaching-last-${randomUUID()}`;
+    const trace = new EvalTrace("176-coaching-last", ["action-mutation-coaching"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to more remote developer roles", goalId: goalResult.goal.id, priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("done", await sendAgentMessage(server, userId, "done"));
+        assertNoGenericAgentError(reply, "completing the last goal-linked action");
+        assert.equal(reply.debug.mutationExecuted, true);
+
+        const offersNextStep = /suggest the next|next action|next block/i.test(reply.reply);
+        trace.checkpoint("offers next-step help now that no open actions remain", offersNextStep, reply.reply);
+        assert.ok(offersNextStep, `expected a next-step offer once no open actions remain — got: ${reply.reply}`);
+
+        const actionCount = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no silent new action created", actionCount === 1, `count: ${actionCount}`);
+        assert.equal(actionCount, 1, "a completion must never silently create a new action");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "177. Spanish 'hecho' completes the single visible action",
+  { ...llmEvalOptions(["natural-action-phrases"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-natural-es-hecho-${randomUUID()}`;
+    const trace = new EvalTrace("177-natural-es-hecho", ["natural-action-phrases"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renovar el pasaporte", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("muéstrame mis tareas", await sendAgentMessage(server, userId, "muéstrame mis tareas"));
+        const reply = trace.record("hecho", await sendAgentMessage(server, userId, "hecho"));
+        assertNoGenericAgentError(reply, "Spanish 'hecho'");
+        trace.checkpoint("mutation actually executed", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'hecho' to complete the single visible action — got: ${reply.reply}`);
+
+        const item = await prisma.actionItem.findFirst({ where: { userId } });
+        assert.equal(item?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "178. Catalan 'fet' completes the single visible action",
+  { ...llmEvalOptions(["natural-action-phrases"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-natural-ca-fet-${randomUUID()}`;
+    const trace = new EvalTrace("178-natural-ca-fet", ["natural-action-phrases"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Renovar el passaport", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("mostra'm les meves tasques", await sendAgentMessage(server, userId, "mostra'm les meves tasques"));
+        const reply = trace.record("fet", await sendAgentMessage(server, userId, "fet"));
+        assertNoGenericAgentError(reply, "Catalan 'fet'");
+        trace.checkpoint("mutation actually executed", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'fet' to complete the single visible action — got: ${reply.reply}`);
+
+        const item = await prisma.actionItem.findFirst({ where: { userId } });
+        assert.equal(item?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "179. 'what should I do next?' with low evidence proposes a today-focused action, not weak 'consider...by end of week' hedging",
+  { ...llmEvalOptions(["next-action-copy-polish"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-next-action-copy-${randomUUID()}`;
+    const trace = new EvalTrace("179-next-action-copy", ["next-action-copy-polish"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote Web3 developer job",
+        category: "career",
+        priority: "medium",
+        targetMetrics: [{ key: "applications_sent", label: "CVs sent", labelSingular: "CV sent", eventType: "career.application_sent", aggregation: "count", window: "daily" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createEvent(userId, { type: "career.application_sent", source: "manual", confidence: 1, data: {} });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "low-evidence next-action request");
+        assertNoBannedPhrases(reply.reply, ["consider applying", "you might want to", "maybe try"], "next-action copy", trace);
+
+        const byEndOfWeek = /by the end of the week/i.test(reply.reply);
+        trace.checkpoint("does not default to 'by the end of the week' framing", !byEndOfWeek, reply.reply);
+        assert.ok(!byEndOfWeek, `expected today/next-block framing, not weekly framing — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "180. a new goal's CVs-shaped custom signal pluralizes correctly at count 1 ('1 CV sent', never '1 CVs sent')",
+  { ...llmEvalOptions(["action-command-ux", "next-action-copy-polish"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-plural-new-goal-${randomUUID()}`;
+    const trace = new EvalTrace("180-plural-new-goal", ["action-command-ux", "next-action-copy-polish"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote Web3 developer job. Track how many CVs I send.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote Web3 developer job. Track how many CVs I send.")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const goal = await prisma.goal.findFirst({ where: { userId } });
+        assert.ok(goal, "the goal must have been created");
+        await createEvent(userId, { type: "career.application_sent", source: "manual", confidence: 1, data: {} });
+
+        const reply = trace.record("show my progress", await sendAgentMessage(server, userId, "show my progress"));
+        assertNoGenericAgentError(reply, "new-goal pluralization check");
+        const wrongPlural = /1 cvs sent/i.test(reply.reply);
+        trace.checkpoint("does not say '1 CVs sent' for a freshly created goal", !wrongPlural, reply.reply);
+        assert.ok(!wrongPlural, `a goal created just now must set labelSingular correctly — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

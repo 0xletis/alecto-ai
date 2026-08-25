@@ -68,7 +68,8 @@ export const toolCatalog: ToolDefinition[] = [
   },
   {
     name: "action.snooze",
-    description: "Snooze an action item to a later date.",
+    description:
+      "Snooze an action item to a later date — dismisses it from view without completing OR archiving it; it comes back as open on the given date. Use for 'snooze it tomorrow', 'snooze 2 tomorrow', 'remind me tomorrow', 'push it to tomorrow', 'not today', 'not now' (English); 'recuérdamelo mañana', 'mañana' (Spanish); 'recorda-m'ho demà', 'demà' (Catalan) — a bare phrase like these refers to whichever task is currently in view or was just mentioned (omit actionId, same resolution as action.complete below). 'not today'/'not now' on their own (no explicit date) mean tomorrow, the natural default — set untilText to 'tomorrow' unless the user actually named a different day.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -79,14 +80,15 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.complete",
     description:
-      "Mark an action item as completed. Use for 'complete it', 'done', 'finished', 'mark it done' (English), 'hecho', 'terminado', 'listo', 'ya lo hice' (Spanish), or 'fet', 'ja està fet', 'ja ho he fet' (Catalan). A bare acknowledgement like this refers to whichever task is currently in view or was just mentioned — omit actionId and let the validator resolve it.",
+      "Mark an action item as completed. Use for 'complete it', 'done', 'done with it', 'I did it', 'completed it', 'finished', 'mark it done' (English), 'hecho', 'ya está', 'lo hice', 'terminado', 'completado', 'listo', 'ya lo hice' (Spanish), or 'fet', 'ja està', 'ja està fet', 'ho he fet', 'ja ho he fet' (Catalan). A bare acknowledgement like this refers to whichever task is currently in view or was just mentioned — omit actionId and let the validator resolve it: with exactly one action visible it resolves on its own, with none it asks honestly, and with two-or-more it asks which one rather than guessing.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({ actionId: actionIdField })
   },
   {
     name: "action.archive",
-    description: "Archive a SINGLE, specifically-named or specifically-numbered action item (dismiss without completing). Never use this for 'all'/'these'/'them' — see action.archive_all_propose for that.",
+    description:
+      "Archive a SINGLE, specifically-named or specifically-numbered action item (dismiss without completing — never imply it was finished). Use for 'archive it', 'drop it', 'remove it', 'no longer needed', 'not needed anymore' (English); 'archívalo', 'bórralo', 'ya no hace falta', 'elimínalo' (Spanish); 'arxiva-ho', 'ja no cal', 'esborra-ho' (Catalan) — a bare phrase like these refers to whichever task is currently in view, same resolution as action.complete above (omit actionId). Never use this for 'all'/'these'/'them' — see action.archive_all_propose for that.",
     mutates: true,
     requiresConfirmation: false,
     argsSchema: z.object({ actionId: actionIdField })

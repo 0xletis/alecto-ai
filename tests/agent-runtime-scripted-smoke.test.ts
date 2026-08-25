@@ -850,7 +850,7 @@ test("scripted smoke 11: create a task to apply tomorrow -> what should I do tod
           plan: { topic: "action_cleanup", intent: "complete_action", operations: [op("action.complete", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
           assert: (turn) => {
             assertNoGenericError(turn);
-            assert.match(turn.reply, /completed "apply to jobs"/i);
+            assert.match(turn.reply, /marked "apply to jobs" complete/i);
             assert.equal(turn.mutationExecuted, true);
           }
         }

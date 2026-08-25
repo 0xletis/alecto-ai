@@ -287,12 +287,16 @@ export async function executeOperation(
         if (!updated) {
           return failed(operation.tool, "That task no longer exists or is archived.");
         }
+        const settings = await getOrCreateNotificationSettings(userId);
+        // "bring it back tomorrow" reads like a coach, not a scheduler — reuses the exact same
+        // today/tomorrow/full-date phrasing action.list's own due lines already use, minus the
+        // "due " prefix, which only makes sense next to a task title, not a person.
+        const whenLabel = updated.snoozedUntil ? formatDueLabelForChat(updated.snoozedUntil, settings.timezone).replace(/^due /, "") : "later";
+        const foundNote = operation.actionOutsideVisiblePage ? "Found it outside your last shown list (an exact title match). " : "";
         return {
           tool: operation.tool,
           status: "executed",
-          summary: operation.actionOutsideVisiblePage
-            ? `Found "${updated.title}" outside your last shown list (an exact title match) and snoozed it to ${updated.snoozedUntil?.toDateString()}.`
-            : `Snoozed "${updated.title}" to ${updated.snoozedUntil?.toDateString()}.`,
+          summary: `${foundNote}Okay — I'll bring "${updated.title}" back ${whenLabel}.`,
           result: updated
         };
       }
@@ -328,12 +332,34 @@ export async function executeOperation(
 
         const updated = await completeActionItem(userId, actionId);
         if (!updated) return failed(operation.tool, "That task no longer exists or is archived.");
+
+        // Lightweight post-completion coaching (fix/private-alpha-action-command-ux): a bare
+        // "Completed action." was purely transactional. Now: acknowledge it, connect it to its
+        // goal if it has one, then either point at the next real open action for that goal or —
+        // if none remain — offer to suggest one. Never invents evidence/progress numbers that
+        // weren't already logged elsewhere, and never creates anything on its own; this is only
+        // ever a question, answered on the user's own next turn like any other proposal.
+        const foundNote = operation.actionOutsideVisiblePage ? "Found it outside your last shown list (an exact title match). " : "";
+        const linkedGoal = updated.goalId ? context.activeGoals.find((goal) => goal.id === updated.goalId) : undefined;
+        const goalNote = linkedGoal ? ` for your "${linkedGoal.title}" goal` : "";
+
+        let followUp = "";
+        if (linkedGoal) {
+          const remainingOpen = context.openActions.filter(
+            (action) => action.goalId === linkedGoal.id && action.id !== updated.id && action.status === "open" && !isReminderCompanionAction(action)
+          );
+          if (remainingOpen.length === 0) {
+            followUp = " You have no open actions left. Want me to suggest the next action?";
+          } else {
+            const next = rankOpenActions(remainingOpen)[0]!;
+            followUp = ` Next up: "${next.title}".`;
+          }
+        }
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: operation.actionOutsideVisiblePage
-            ? `Found "${updated.title}" outside your last shown list (an exact title match) and completed it.`
-            : `Completed "${updated.title}".`,
+          summary: `${foundNote}Nice — marked "${updated.title}" complete${goalNote}.${followUp}`,
           result: updated
         };
       }
@@ -341,12 +367,13 @@ export async function executeOperation(
       case "action.archive": {
         const updated = await archiveActionItem(userId, args.actionId as string);
         if (!updated) return failed(operation.tool, "That task no longer exists.");
+        const foundNote = operation.actionOutsideVisiblePage ? "Found it outside your last shown list (an exact title match). " : "";
+        // Deliberately never phrased anywhere near "done"/"complete" — archiving is dismissal,
+        // not completion, and a real product rule exists specifically so these two never blur.
         return {
           tool: operation.tool,
           status: "executed",
-          summary: operation.actionOutsideVisiblePage
-            ? `Found "${updated.title}" outside your last shown list (an exact title match) and archived it.`
-            : `Archived "${updated.title}".`,
+          summary: `${foundNote}Archived "${updated.title}" — I'll stop treating it as active.`,
           result: updated
         };
       }
@@ -2669,12 +2696,34 @@ function formatActionListForChat(
   });
   // "Complete/snooze/archive" only ever applies to an OPEN action — showing it under a list of
   // archived/completed items reads as an instruction that would just fail if followed. Shown only
-  // when at least one visible item is actually open.
-  if (items.some((item) => item.status === "open")) {
-    lines.push("", "Reply: complete 1, snooze 2 tomorrow, archive 3.");
+  // when at least one visible item is actually open. A real Telegram smoke test found the OLD
+  // fixed "Reply: complete 1, snooze 2 tomorrow, archive 3." footer referencing index 3 even when
+  // only one action was shown — this always reflects the REAL open indexes actually on screen.
+  const openIndexes = items.map((item, index) => (item.status === "open" ? index + 1 : null)).filter((index): index is number => index !== null);
+  const footer = buildActionListFooter(openIndexes);
+  if (footer) {
+    lines.push("", footer);
   }
 
   return lines.join("\n");
+}
+
+/** Never references a numbered index that isn't actually visible — the whole reason this exists.
+ * One open action gets purely natural phrasing (no number to get wrong); two or more use the
+ * REAL indexes shown, never a hardcoded 1/2/3 regardless of how many actions actually exist. */
+function buildActionListFooter(openIndexes: number[]): string | undefined {
+  if (openIndexes.length === 0) {
+    return undefined;
+  }
+  if (openIndexes.length === 1) {
+    return "You can say: \"done\", \"snooze this to tomorrow\", or \"archive it\".";
+  }
+  if (openIndexes.length === 2) {
+    const [first, second] = openIndexes;
+    return `You can say: "complete ${first}", "snooze ${second} tomorrow", or "archive ${first}".`;
+  }
+  const [first, second, third] = openIndexes;
+  return `You can say: "complete ${first}", "snooze ${second} tomorrow", or "archive ${third}".`;
 }
 
 /** "due today 14:30" / "due tomorrow 09:00" / a full date+time fallback further out — generic
