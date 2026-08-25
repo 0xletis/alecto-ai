@@ -232,12 +232,46 @@ export async function executeOperation(
           };
         }
 
+        const baseSummary = formatActionListForChat(items, realActions.length, status, overdueOnly, reminderByParentId, settings.timezone, when);
+
+        // Similar-deferred-action cleanup (fix/private-alpha-deferred-action-dedupe-and-today-
+        // coaching, task 2) — ONLY for a date-scoped query, where two near-identical actions both
+        // landing on the same day is exactly the shape worth flagging (a plain "show me my
+        // actions" can have several genuinely different open tasks; that's normal, not a
+        // duplicate). A real Telegram smoke test found the OLD text-only version of this
+        // suggestion ("Want me to help merge or archive one?") had nothing behind it — "merge
+        // them yes" had no real proposal to confirm and fell through to an unrelated, confusing
+        // reply. This now opens a REAL pending confirmation: keep the first, archive the second —
+        // never a vague question with no mechanism, and never a silent merge either.
+        let duplicateCleanupUpdate: ExecutedOperation["pendingOperationUpdate"];
+        let summary = baseSummary;
+        if (when) {
+          const similarPair = findSimilarActionPair(items);
+          if (similarPair) {
+            const [keep, archiveTarget] = similarPair;
+            summary = `${baseSummary}\n\nYou have two similar actions scheduled. Keep "${cleanedTitleForDateDisplay(keep.title)}" and archive the duplicate?\n\nReply yes to confirm or cancel.`;
+            duplicateCleanupUpdate = {
+              topic: "action_duplicate_cleanup",
+              summary: `keep "${keep.title}" and archive the duplicate "${archiveTarget.title}"`,
+              operations: [
+                {
+                  tool: "action.archive",
+                  args: { actionId: archiveTarget.id },
+                  status: "valid",
+                  requiresConfirmation: false
+                }
+              ]
+            };
+          }
+        }
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatActionListForChat(items, realActions.length, status, overdueOnly, reminderByParentId, settings.timezone, when),
+          summary,
           result: items,
-          entities: items.map((item, index) => actionToEntity(item, index + 1))
+          entities: items.map((item, index) => actionToEntity(item, index + 1)),
+          ...(duplicateCleanupUpdate ? { pendingOperationUpdate: duplicateCleanupUpdate } : {})
         };
       }
 
@@ -433,6 +467,15 @@ export async function executeOperation(
         const explicitIds = args.actionIds as string[] | undefined;
         const scope = args.scope as "visible" | "all" | undefined;
 
+        // fix/private-alpha-deferred-action-dedupe-and-today-coaching: a real transcript found
+        // "merge them yes" (right after Alecto's OWN duplicate-cleanup CTA, about two SNOOZED
+        // actions from a "tomorrow" list) answered "You don't have any open actions to archive" —
+        // both id-based paths below filtered candidates to status "open" only, so a visible but
+        // DEFERRED action could never be archived this way, even though action.archive (the
+        // single-item tool) never had that restriction. "visible"/explicit-id archiving is about
+        // what's actually IN VIEW, open or deferred; only scope "all" below stays open-only, since
+        // a bare "archive all my actions" with nothing else specified is reasonably read as "all
+        // my ACTIVE ones," not everything I've ever deferred.
         let targets: ActionItem[];
         if (explicitIds && explicitIds.length > 0) {
           // Already-resolved real ids (either from runtime.ts's own multi-archive collapse of
@@ -440,11 +483,11 @@ export async function executeOperation(
           // fresh rather than trusting the caller's snapshot, so a since-archived/completed item
           // never gets re-listed in the confirmation as if it were still open.
           const items = await Promise.all(explicitIds.map((id) => getActionItem(userId, id)));
-          targets = items.filter((item): item is ActionItem => item !== undefined && item.status === "open");
+          targets = items.filter((item): item is ActionItem => item !== undefined && (item.status === "open" || item.status === "snoozed"));
         } else if (scope === "visible") {
           const visibleActionIds = context.session.visibleEntities.filter((entity) => entity.type === "action").map((entity) => entity.id);
           const items = await Promise.all(visibleActionIds.map((id) => getActionItem(userId, id)));
-          targets = items.filter((item): item is ActionItem => item !== undefined && item.status === "open");
+          targets = items.filter((item): item is ActionItem => item !== undefined && (item.status === "open" || item.status === "snoozed"));
         } else {
           // scope "all" (or omitted, defensively) — the FULL real open-action pool, not
           // context.openActions' own 20-item context-loader cap, so "archive all my actions" is
@@ -456,7 +499,7 @@ export async function executeOperation(
         }
 
         if (targets.length === 0) {
-          return { tool: operation.tool, status: "executed", summary: "You don't have any open actions to archive." };
+          return { tool: operation.tool, status: "executed", summary: "You don't have any open or scheduled actions to archive." };
         }
 
         const list = targets.map((item, i) => `${i + 1}. ${item.title}`).join("\n");
@@ -1808,6 +1851,17 @@ export async function executeOperation(
             "",
             `You already moved "${cleanedTitleForDateDisplay(similarDeferred.title)}" to ${whenLabel} — I won't create another one for today. Say "move it back to today" if you'd rather pull it forward.`
           );
+        } else if (proposedAction && proposedAction.trim() && mentionsResumeUpdate(proposedAction) && recentlyStatedResumeUpToDate(context)) {
+          // fix/private-alpha-deferred-action-dedupe-and-today-coaching: a real transcript found
+          // "Customize your resume for remote Web3 roles" proposed minutes after the user had
+          // said their resume and web CV were already current — the prompt guidance asking the
+          // model not to do this was, in practice, not reliable enough on its own. This is a
+          // deterministic backstop on the one part of this with real consequences (the STRUCTURED
+          // proposedAction, which becomes a real ActionItem title if confirmed) — never edits the
+          // model's own free-text `recommendation` sentence above, since safely removing a clause
+          // from arbitrary prose without breaking its grammar isn't reliably possible; the
+          // strengthened prompt guidance is what keeps that sentence itself clean.
+          lines.push("", "Skipping resume/CV work — you already said it's up to date. Let me know if you'd like a different next step.");
         } else if (proposedAction && proposedAction.trim()) {
           lines.push("", `Want me to create this action?\n${proposedAction.trim()}`, "", "Reply yes to confirm or cancel.");
           pendingOperationUpdate = {
@@ -2899,19 +2953,6 @@ function formatActionListForChat(
     lines.push("", footer);
   }
 
-  // Similar-deferred-action cleanup suggestion (fix/private-alpha-temporal-action-copy-and-dedup,
-  // task 3) — ONLY for a date-scoped query, where two near-identical actions both landing on the
-  // same day is exactly the shape worth flagging (a plain "show me my actions" can have several
-  // genuinely different open tasks; that's normal, not a duplicate). Detection reuses the same
-  // content-word-overlap heuristic goal.recommend_next_action's own deferred-duplicate veto uses
-  // (titlesLookSimilar) — never auto-merges or archives anything, only ever suggests.
-  if (when) {
-    const similarPair = findSimilarActionPair(items);
-    if (similarPair) {
-      lines.push("", "You have two similar actions scheduled. Want me to help merge or archive one?");
-    }
-  }
-
   return lines.join("\n");
 }
 
@@ -3452,6 +3493,30 @@ function titlesLookSimilar(a: string, b: string): boolean {
   }
   const overlap = wordsB.filter((word) => wordsA.has(word)).length;
   return overlap / Math.max(wordsA.size, wordsB.length) >= 0.6;
+}
+
+// A real transcript reported this exact fact getting contradicted twice — checked against BOTH
+// the visible recent conversation (this session's own messages) AND context.memories' summaries
+// (durable facts, possibly saved in an earlier session), since either one is a real, honest
+// source for "the user already told Alecto this." Deliberately scoped to resume/CV specifically
+// (the two real reported instances), not a generic "any stated fact" detector — that would be a
+// much bigger, riskier feature than this focused pass calls for.
+const RESUME_UP_TO_DATE_RE = /\b(resume|cv|web cv)\b[\s\S]{0,50}\b(already )?(up.?to.?date|current|updated)\b|\b(already )?(up.?to.?date|current|updated)\b[\s\S]{0,50}\b(resume|cv|web cv)\b/i;
+const RESUME_UPDATE_SUGGESTION_RE = /\b(update|customize|tailor|revise|polish|refresh)\b[\s\S]{0,25}\b(resume|cv|web cv)\b|\b(resume|cv|web cv)\b[\s\S]{0,25}\b(update|customize|tailor|revise|polish|refresh)\b/i;
+
+function recentlyStatedResumeUpToDate(context: ContextBundle): boolean {
+  const recentUserText = context.session.messages
+    .filter((entry) => entry.role === "user")
+    .map((entry) => entry.text)
+    .join(" \n ");
+  if (RESUME_UP_TO_DATE_RE.test(recentUserText)) {
+    return true;
+  }
+  return context.memories.some((memory) => RESUME_UP_TO_DATE_RE.test(memory.summary));
+}
+
+function mentionsResumeUpdate(text: string): boolean {
+  return RESUME_UPDATE_SUGGESTION_RE.test(text);
 }
 
 /** First pair of genuinely similar items in a (usually short, date-scoped) list — reuses
