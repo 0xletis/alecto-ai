@@ -2905,22 +2905,35 @@ function formatGoalPlanProposal(input: {
 }): string {
   const lines = [`Good — I can track "${input.title}" like this:`, "", `Goal: ${input.title}`];
 
-  if (input.successCriteria) {
-    lines.push(`Target: ${input.successCriteria}`);
-  }
+  // Explicit even when there's no target, not just a silently-omitted line — a real private-alpha
+  // user asked for "no fixed target, just track how much I send," and a proposal that just leaves
+  // the Target line out reads as an oversight rather than a deliberate choice honoring what they
+  // asked for.
+  lines.push(input.successCriteria ? `Target: ${input.successCriteria}` : "No fixed target yet — I'll show the count and trend.");
 
-  lines.push("Signals:", ...input.signals.map((signal) => `- ${signal.label}`));
+  lines.push("Tracking:", ...input.signals.map((signal) => `- ${signal.label}`));
 
   if (input.checkIn) {
-    lines.push("Check-in:", `- ${input.checkIn.cadence}: "${input.checkIn.question}"`);
+    const cadenceLabel = input.checkIn.cadence.charAt(0).toUpperCase() + input.checkIn.cadence.slice(1);
+    lines.push(`${cadenceLabel} check-in:`, `- "${input.checkIn.question}"`);
   }
 
   if (input.integrationHint) {
-    lines.push("Integration:", `- ${input.integrationHint}`);
+    // The disclaimer is appended here, deterministically, rather than left to the planner's own
+    // integrationHint wording — every Gmail-adjacent proposal must say the same honest thing about
+    // what Gmail integration actually does, regardless of how the LLM phrased the hint itself.
+    const gmailDisclaimer = /gmail/i.test(input.integrationHint)
+      ? " I can notify you about matching Gmail reviews; I cannot send or reply to emails."
+      : "";
+    lines.push("Integration:", `- ${input.integrationHint}${gmailDisclaimer}`);
   }
 
+  // "Concrete" in the label itself, not just in the planner's own selection criteria — this line
+  // never appears at all unless there's a genuinely concrete, one-off action to show (per the
+  // firstActions-concreteness prompt rule, an empty list here is a normal, honest outcome, not a
+  // gap the morning brief will fill in later).
   if (input.firstActions.length > 0) {
-    lines.push("First actions:", ...input.firstActions.map((action) => `- ${action}`));
+    lines.push("First concrete actions:", ...input.firstActions.map((action) => `- ${action}`));
   }
 
   lines.push("", "Want me to create this goal?");

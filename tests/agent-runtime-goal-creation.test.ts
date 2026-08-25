@@ -43,7 +43,7 @@ test("1. 'I want to drink more tea' proposes a full custom operating plan and cr
     assert.match(reply.reply, /goal: drink more tea/i);
     assert.match(reply.reply, /target: 2 cups\/day, 5 days\/week/i);
     assert.match(reply.reply, /cups of tea drunk/i);
-    assert.match(reply.reply, /evening.*how many cups today/i);
+    assert.match(reply.reply, /evening check-in[\s\S]*how many cups today/i);
     assert.match(reply.reply, /buy tea/i);
     assert.match(reply.reply, /want me to create this goal/i);
     assert.equal(reply.debug.mutationExecuted, false);

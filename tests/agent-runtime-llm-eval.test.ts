@@ -3969,3 +3969,320 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-goal-action-semantics: a real Railway smoke test found three more issues
+ * after the onboarding-flow fix — goal proposals still produced vague, evergreen firstActions
+ * ("Search job boards", "Network with industry contacts"), a single turn could plan BOTH
+ * goal.create_propose and proactive.settings_propose_update (only one can be the real
+ * pendingOperation), and "yes create it" was rejected as a confirmation. Scenarios 127-136 cover
+ * the fix end to end against the real planner.
+ */
+
+const VAGUE_ACTION_RE = /\b(search job boards?|network with industry contacts?|apply to jobs\b(?! before| today)|improve fitness|read more\b(?! than| minutes| pages))\b/i;
+
+test(
+  "127. private-alpha regression: the exact live Railway transcript — no vague firstActions, no compound confirmation, daily coaching not lost",
+  { ...llmEvalOptions(["goal-action-semantics", "compound-confirmation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-railway-t2-${randomUUID()}`;
+    const trace = new EvalTrace("127-railway-transcript-2", ["goal-action-semantics", "compound-confirmation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        trace.record("no fixed 3/week target, just track how much I send", await sendAgentMessage(server, userId, "no fixed 3/week target, just track how much I send"));
+        trace.record(
+          "fully remote developer job, ideally Web3",
+          await sendAgentMessage(server, userId, "fully remote developer job, ideally Web3")
+        );
+        trace.record("resume already updated, so no resume action needed", await sendAgentMessage(server, userId, "resume already updated, so no resume action needed"));
+        const t5 = trace.record(
+          "track interviews and application-to-interview conversion, and Gmail should watch recruiter replies and application acknowledgements",
+          await sendAgentMessage(
+            server,
+            userId,
+            "track interviews and application-to-interview conversion, and Gmail should watch recruiter replies and application acknowledgements"
+          )
+        );
+        const t6 = trace.record(
+          "I'd also like daily checking and motivation",
+          await sendAgentMessage(server, userId, "I'd also like daily checking and motivation")
+        );
+
+        for (const [label, turn] of [["turn 5", t5], ["turn 6", t6]] as const) {
+          const noVague = !VAGUE_ACTION_RE.test(turn.reply);
+          trace.checkpoint(`${label}: no vague evergreen firstActions`, noVague, turn.reply);
+          assert.ok(noVague, `${label}: expected no vague/evergreen firstActions — got: ${turn.reply}`);
+          const singleConfirmation = (turn.reply.match(/want me to create this goal\?/gi) ?? []).length <= 1;
+          trace.checkpoint(`${label}: at most one goal confirmation question`, singleConfirmation, turn.reply);
+          assert.ok(singleConfirmation, `${label}: expected at most one confirmation question — got: ${turn.reply}`);
+        }
+
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("no goal created before confirmation", goalCount === 0, `count: ${goalCount}`);
+        assert.equal(goalCount, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "128. 'resume already updated, no need for that action' removes the resume action from the proposal",
+  { ...llmEvalOptions(["goal-action-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-resume-done-${randomUUID()}`;
+    const trace = new EvalTrace("128-resume-already-updated", ["goal-action-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        const t2 = trace.record(
+          "resume already updated, no need for that action",
+          await sendAgentMessage(server, userId, "resume already updated, no need for that action")
+        );
+
+        const mentionsResumeAction = /update (your |my )?resume|update.*cv\b/i.test(t2.reply);
+        trace.checkpoint("no resume-update action proposed", !mentionsResumeAction, t2.reply);
+        assert.ok(!mentionsResumeAction, `expected no resume-update firstAction after being told it's already done — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "129. 'track conversion from CVs sent to interviews' includes both the application and interview signals",
+  { ...llmEvalOptions(["goal-action-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-conversion-${randomUUID()}`;
+    const trace = new EvalTrace("129-cv-to-interview-conversion", ["goal-action-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        const t2 = trace.record(
+          "track conversion from CVs sent to interviews",
+          await sendAgentMessage(server, userId, "track conversion from CVs sent to interviews")
+        );
+
+        const mentionsApplications = /application|cv/i.test(t2.reply);
+        const mentionsInterviews = /interview/i.test(t2.reply);
+        trace.checkpoint("mentions applications/CVs signal", mentionsApplications, t2.reply);
+        trace.checkpoint("mentions interviews signal", mentionsInterviews, t2.reply);
+        assert.ok(mentionsApplications, `expected the applications/CVs signal to be shown — got: ${t2.reply}`);
+        assert.ok(mentionsInterviews, `expected the interviews signal to be shown — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "130. 'no fixed target, just track how much I send' creates no forced numeric target",
+  { ...llmEvalOptions(["goal-action-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-no-target-2-${randomUUID()}`;
+    const trace = new EvalTrace("130-no-fixed-target", ["goal-action-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        const t2 = trace.record(
+          "no fixed target, just track how much I send",
+          await sendAgentMessage(server, userId, "no fixed target, just track how much I send")
+        );
+
+        const noHardNumber = !/\btarget: \d+/i.test(t2.reply);
+        trace.checkpoint("no forced 'Target: N' line", noHardNumber, t2.reply);
+        assert.ok(noHardNumber, `expected no forced numeric target line — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "131. 'daily checking and motivation' bundled with a goal is proposed once, settings offered after",
+  { ...llmEvalOptions(["compound-confirmation", "goal-action-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-daily-checking-2-${randomUUID()}`;
+    const trace = new EvalTrace("131-daily-checking-motivation", ["compound-confirmation", "goal-action-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to find a new developer job and I'd like daily checking and motivation",
+          await sendAgentMessage(server, userId, "I want to find a new developer job and I'd like daily checking and motivation")
+        );
+
+        const singleConfirmation = (reply.reply.match(/want me to create this goal\?/gi) ?? []).length <= 1;
+        trace.checkpoint("at most one confirmation question", singleConfirmation, reply.reply);
+        assert.ok(singleConfirmation, `expected at most one confirmation question — got: ${reply.reply}`);
+
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        trace.checkpoint("no settings mutated before confirmation", settings === null || (!settings.morningBriefEnabled && !settings.eveningCheckinEnabled), JSON.stringify(settings));
+        assert.ok(settings === null || (!settings.morningBriefEnabled && !settings.eveningCheckinEnabled), "proactive settings must not be mutated without their own confirmation");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "132. natural confirmation: 'yes create it' actually creates the pending goal",
+  { ...llmEvalOptions(["confirmation-naturalness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-yes-create-it-${randomUUID()}`;
+    const trace = new EvalTrace("132-yes-create-it", ["confirmation-naturalness"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to read more books", await sendAgentMessage(server, userId, "I want to read more books"));
+        const confirmed = trace.record("yes create it", await sendAgentMessage(server, userId, "yes create it"));
+
+        trace.checkpoint("confirmed deterministically", confirmed.debug.llmPlannerAttempted === false, String(confirmed.debug.llmPlannerAttempted));
+        assert.equal(confirmed.debug.llmPlannerAttempted, false);
+        assert.equal(confirmed.debug.mutationExecuted, true);
+
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        trace.checkpoint("a goal was actually created", goalCount === 1, `count: ${goalCount}`);
+        assert.equal(goalCount, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "133. Spanish natural confirmation: 'sí créalo' confirms a pending goal creation",
+  { ...llmEvalOptions(["confirmation-naturalness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-si-crealo-${randomUUID()}`;
+    const trace = new EvalTrace("133-si-crealo", ["confirmation-naturalness"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("quiero leer más libros", await sendAgentMessage(server, userId, "quiero leer más libros"));
+        const confirmed = trace.record("sí créalo", await sendAgentMessage(server, userId, "sí créalo"));
+
+        trace.checkpoint("confirmed deterministically", confirmed.debug.llmPlannerAttempted === false, String(confirmed.debug.llmPlannerAttempted));
+        assert.equal(confirmed.debug.mutationExecuted, true);
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        assert.equal(goalCount, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "134. Catalan natural confirmation: 'd'acord, crea-ho' confirms a pending goal creation",
+  { ...llmEvalOptions(["confirmation-naturalness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-dacord-crea-ho-${randomUUID()}`;
+    const trace = new EvalTrace("134-dacord-crea-ho", ["confirmation-naturalness"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("vull llegir més llibres", await sendAgentMessage(server, userId, "vull llegir més llibres"));
+        const confirmed = trace.record("d'acord, crea-ho", await sendAgentMessage(server, userId, "d'acord, crea-ho"));
+
+        trace.checkpoint("confirmed deterministically", confirmed.debug.llmPlannerAttempted === false, String(confirmed.debug.llmPlannerAttempted));
+        assert.equal(confirmed.debug.mutationExecuted, true);
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        assert.equal(goalCount, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "135. Endesa/bill goal gets real tracking signals, never vague evergreen firstActions",
+  { ...llmEvalOptions(["goal-action-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-endesa-${randomUUID()}`;
+    const trace = new EvalTrace("135-endesa-goal", ["goal-action-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to keep my Endesa electricity bill under 50 euros",
+          await sendAgentMessage(server, userId, "I want to keep my Endesa electricity bill under 50 euros")
+        );
+
+        assert.match(reply.reply, /tracking:/i);
+        const noVague = !VAGUE_ACTION_RE.test(reply.reply);
+        trace.checkpoint("no vague evergreen firstActions", noVague, reply.reply);
+        assert.ok(noVague, `expected no vague firstActions for a bill-tracking goal — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "136. invoice goal only gets a firstAction when genuinely concrete, otherwise none at all",
+  { ...llmEvalOptions(["goal-action-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-invoice-goal-${randomUUID()}`;
+    const trace = new EvalTrace("136-invoice-goal", ["goal-action-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to keep on top of client invoices — track what's received, paid, and overdue",
+          await sendAgentMessage(server, userId, "I want to keep on top of client invoices — track what's received, paid, and overdue")
+        );
+
+        assert.match(reply.reply, /tracking:/i);
+        const noVague = !VAGUE_ACTION_RE.test(reply.reply);
+        trace.checkpoint("no vague evergreen firstActions", noVague, reply.reply);
+        assert.ok(noVague, `expected no vague firstActions unless genuinely concrete — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
