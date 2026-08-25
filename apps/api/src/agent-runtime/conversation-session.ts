@@ -84,6 +84,23 @@ export function setVisibleEntities(session: AgentSessionState, entities: AgentEn
   session.visibleEntities = entities;
 }
 
+/**
+ * Targeted removal, deliberately NOT a setVisibleEntities wholesale replace — a single archived
+ * or completed action shouldn't blow away the rest of an otherwise-still-valid numbered list (a
+ * fresh action.list already replaces the whole set correctly when that's actually what happened).
+ * fix/private-alpha-action-state-consistency: without this, a mutated action's own entity stayed
+ * in session.visibleEntities untouched, so a later bare "it"/index reference could resolve back to
+ * an action that was already archived/completed — see executor.ts's action.archive/action.complete
+ * cases (which set ExecutedOperation.removedEntityIds) for the real reported bug this closes.
+ */
+export function removeVisibleEntities(session: AgentSessionState, ids: readonly string[]): void {
+  if (ids.length === 0) {
+    return;
+  }
+  const idSet = new Set(ids);
+  session.visibleEntities = session.visibleEntities.filter((entity) => !idSet.has(entity.id));
+}
+
 export function recordMutation(session: AgentSessionState, summary: string): void {
   session.recentMutations.unshift({ summary, at: new Date().toISOString() });
 

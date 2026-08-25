@@ -111,6 +111,7 @@ export function buildSystemPrompt(): string {
     "You only PLAN operations as structured JSON. You never write to any database and your reply text is only a draft.",
     "Deterministic code will validate every operation against a fixed tool catalog, resolve ambiguous references, enforce policy, and execute allowed operations.",
     "Propose intent and raw references only — code resolves every id. A number in the user's message always refers to its position in conversation.visibleEntities, never to context.backgroundOpenActions or any count. Never substitute an id from context.backgroundOpenActions/activeGoals for an out-of-range or unclear visible reference — that array is background context only, not a numbered or user-visible list. If you're unsure which real item is meant, omit the id field (or use ref/title text instead) or use clarification.ask; a wrong guess is worse than asking.",
+    "CURRENT STATE ALWAYS BEATS RECENT CHAT TEXT (fix/private-alpha-action-state-consistency): context.activeGoals, backgroundOpenActions, backgroundDeferredActions, and recentStateChanges are re-read fresh from the real database on EVERY turn — they are ground truth. conversation.recentMessages is only a record of what was SAID, in this conversation, possibly several turns ago; it is never re-verified and can go stale the instant something gets archived, completed, or moved. A real reported bug had 'what should I do today?' answered with 'since your action to apply to roles got moved to tomorrow...' — that action had ALREADY been archived a turn earlier, backgroundDeferredActions no longer contained it, but the assistant's own prior message (still sitting in recentMessages) said it was scheduled, and that stale text got repeated as if still true. Before treating anything about an action's status/existence as still current, check it against backgroundOpenActions/backgroundDeferredActions — if a specific action recentMessages describes as open/scheduled/active is NOT there, do not describe it that way again; check recentStateChanges (real mutation history, most recent first, e.g. 'Archived \"Apply to 3 more remote Web3 roles today.\"') for what actually happened to it. If it shows up there as archived/completed, it is fine — even good — to mention that fact plainly as HISTORY ('you already archived that') if the user is asking about it, but never imply it's still active, still scheduled, or still something to plan around. The same rule applies to a goal: if the user archived a goal and started a new one, a recommendation must be grounded in the CURRENT active goal's own real state, never in an old goal's actions that recentMessages happens to still mention.",
     "",
     "Tool catalog (use only these tool names, and match args exactly to the given shape):",
     toolCatalogPromptSummary(),
@@ -274,7 +275,18 @@ export function buildUserPayload(message: string, context: ContextBundle, localT
         .filter((rule) => rule.status === "active")
         .map((rule) => ({ id: rule.id, name: rule.name, query: rule.query })),
       pendingGmailReviewCount: context.gmailReviews.length,
-      recentMemorySummaries: context.memories.slice(0, 10).map((memory) => memory.summary)
+      recentMemorySummaries: context.memories.slice(0, 10).map((memory) => memory.summary),
+      // fix/private-alpha-action-state-consistency: a real reported bug had "what should I do
+      // today?" reference an action ("...moved to tomorrow 11:00") that had ALREADY been
+      // archived a turn earlier — backgroundOpenActions/backgroundDeferredActions above were
+      // already correctly empty of it, but conversation.recentMessages below still contained the
+      // assistant's OWN earlier turn saying it was scheduled, and nothing told the model that
+      // background state, not old chat text, is what's actually authoritative. session.
+      // recentMutations already records exactly this ("Archived \"...\"", "Marked \"...\"
+      // complete", etc.) as a side effect of every real mutation — surfaced here (most recent
+      // first, capped) as explicit, structured ground truth the model can cite directly ("you
+      // already archived that") instead of only ever inferring state from its own prior prose.
+      recentStateChanges: context.session.recentMutations.slice(0, 5).map((mutation) => mutation.summary)
     }
   });
 }

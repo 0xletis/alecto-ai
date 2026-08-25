@@ -148,6 +148,17 @@ export interface ExecutedOperation {
   /** Entities this operation surfaced, to become the session's new visible-entities set (e.g. after action.list). */
   entities?: AgentEntity[];
   /**
+   * Ids to prune out of session.visibleEntities as a side effect of this operation — distinct
+   * from `entities` above, which REPLACES the whole visible set wholesale (right for a fresh
+   * numbered list, wrong for "one item in an existing list just became terminal"). Set by a
+   * single-item mutation that makes an entity no longer a valid target for a later bare
+   * pronoun/index reference (action.archive, action.complete, action.archive_all_apply) — see
+   * conversation-session.ts's removeVisibleEntities and its own fix/private-alpha-action-state-
+   * consistency doc comment for the real bug this closes (a stale visible entity resolving back
+   * to an already-archived/completed action on a later turn).
+   */
+  removedEntityIds?: string[];
+  /**
    * Lets a "valid"-status (not requiresConfirmation) executed operation directly install,
    * replace, or clear the session's pendingOperation as a side effect of running — used by
    * multi-turn propose/edit/confirm flows (e.g. next-week planning) where the tool that

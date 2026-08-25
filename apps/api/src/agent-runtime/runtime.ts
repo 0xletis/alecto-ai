@@ -2,7 +2,7 @@ import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, getOrCr
 import { loadContext } from "./context-loader.js";
 import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetime.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
-import { appendMessage, createPendingOperationRecord, recordMutation, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
+import { appendMessage, createPendingOperationRecord, recordMutation, removeVisibleEntities, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
 import { executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
@@ -1918,11 +1918,11 @@ function actionMeetingListShortcutOperation(message: string): PlannedOperation |
 
 // Matches an explicit verb ("delete"/"archive"/"clear"/"remove", or their Spanish/Catalan
 // equivalents) combined with a bulk-scope phrase ("all my actions", "all of them", "these
-// actions/tasks", "todas", "totes") — deliberately requires BOTH a verb and a scope word so a
-// message like "these" alone (ambiguous without a verb) doesn't match here; see
-// BARE_BULK_ACTION_SCOPE_RE below for that case, gated on an actual visible action list. No bare
-// "all of them" alternative here (deliberately, unlike the verb+scope phrases) — that phrase is
-// ALSO used unrelated to actions (e.g. Gmail review triage's "keep all of them pending"), so
+// actions/tasks", "my actions", "my tasks", "todas", "totes") — deliberately requires BOTH a verb
+// and a scope word so a message like "these" alone (ambiguous without a verb) doesn't match here;
+// see BARE_BULK_ACTION_SCOPE_RE below for that case, gated on an actual visible action list. No
+// bare "all of them" alternative here (deliberately, unlike the verb+scope phrases) — that phrase
+// is ALSO used unrelated to actions (e.g. Gmail review triage's "keep all of them pending"), so
 // matching it without a verb here previously mis-fired on exactly that kind of message; a bare
 // "all of them" is only ever safe to treat as bulk-archive scope in BARE_BULK_ACTION_SCOPE_RE
 // below, which requires the ENTIRE message to be just that phrase AND a visible action list.
@@ -1932,8 +1932,15 @@ function actionMeetingListShortcutOperation(message: string): PlannedOperation |
 // "all" alone, right after delete/archive/clear/remove, is already unambiguous bulk intent; "all of
 // them"/"all my actions"/"these actions"/"these tasks" remain covered as substrings of the same
 // widened match, not as separate required alternatives anymore.
+//
+// fix/private-alpha-action-state-consistency: "my actions"/"my tasks" (plural, no "all"/"these")
+// added as their own accepted scope phrase — a real reported transcript used exactly "remove my
+// actions", which this regex previously did NOT match (only "all"/"these actions/tasks" counted),
+// so it fell through to the real LLM planner to infer bulk intent on its own every time, with no
+// deterministic guarantee it always would. "my task"/"mi tarea" (singular) is deliberately NOT
+// matched here — that reads as a specific, single item, not a bulk-scope request.
 const BULK_ACTION_CLEANUP_VERB_SCOPE_RE =
-  /\b(delete|archive|clear|remove)\b[\s\S]{0,20}\b(all|these (actions|tasks))\b|\bi mean all actions\b|\b(borra|archiva|elimina|limpia)\b[\s\S]{0,20}\btodas\b|\blimpia mis acciones\b|\b(arxiva|elimina|esborra)\b[\s\S]{0,20}\btotes\b/;
+  /\b(delete|archive|clear|remove)\b[\s\S]{0,20}\b(all|my (actions|tasks)|these (actions|tasks))\b|\bi mean all actions\b|\b(borra|archiva|elimina|limpia)\b[\s\S]{0,20}\b(todas|mis (acciones|tareas))\b|\blimpia mis acciones\b|\b(arxiva|elimina|esborra)\b[\s\S]{0,20}\b(totes|meves (accions|tasques))\b/;
 
 // A bare, unqualified scope reply ("these", "all", "them", "all of them", "todas", "totes") with
 // NO verb at all — only meaningful as a reply to Alecto's own numbered action list (or a failed
@@ -2751,6 +2758,7 @@ async function logGuardrailIncident(userId: string, message: string, guardrail: 
 
 function applyExecutionSideEffects(session: AgentSessionState, executedOps: ExecutedOperation[]): void {
   const entities: AgentEntity[] = [];
+  const removedEntityIds: string[] = [];
 
   for (const op of executedOps) {
     // Only tools that actually mutate belong in recentMutations. Recording read-only
@@ -2761,6 +2769,9 @@ function applyExecutionSideEffects(session: AgentSessionState, executedOps: Exec
     }
     if (op.entities) {
       entities.push(...op.entities);
+    }
+    if (op.removedEntityIds) {
+      removedEntityIds.push(...op.removedEntityIds);
     }
     // See ExecutedOperation.pendingOperationUpdate — a multi-turn propose/edit/confirm tool
     // (e.g. planning.next_week_start/_edit) installs or replaces the session's pending
@@ -2778,6 +2789,13 @@ function applyExecutionSideEffects(session: AgentSessionState, executedOps: Exec
   if (entities.length > 0) {
     setVisibleEntities(session, dedupeEntities(entities));
     updateFocusedEntities(session, entities);
+  }
+  // Applied AFTER the wholesale replace above, on whatever visibleEntities ends up being this
+  // turn — a turn could in principle both surface fresh entities (e.g. a duplicate-cleanup
+  // action.list) and separately archive something else; pruning last means removedEntityIds
+  // always wins for the specific ids it names, regardless of ordering within this turn's ops.
+  if (removedEntityIds.length > 0) {
+    removeVisibleEntities(session, removedEntityIds);
   }
 }
 
