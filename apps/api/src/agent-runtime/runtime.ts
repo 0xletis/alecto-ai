@@ -128,6 +128,16 @@ function mostRecentTurnWasAMutation(session: AgentSessionState): AgentMutationRe
 const ACTION_CLARIFICATION_TOPIC = "action_clarification";
 const ACTION_CLARIFICATION_CANCEL_REPLY = "Okay — I won't complete anything.";
 
+// Topic used by action.list's own duplicate-cleanup pendingOperationUpdate (executor.ts) — "keep
+// the first, archive the duplicate?" always resolves to exactly ONE already-fully-resolved
+// action.archive operation, so a fairly wide natural vocabulary is safe here in a way it wouldn't
+// be for an arbitrary pending mutation. Deliberately includes a bare "yes" too — CONFIRM_WHITELIST
+// already covers that case on its own, but keeping this pattern self-contained (rather than
+// relying on two separate checks agreeing) makes it easier to reason about in isolation.
+const ACTION_DUPLICATE_CLEANUP_TOPIC = "action_duplicate_cleanup";
+const ACTION_DUPLICATE_CLEANUP_CONFIRM_RE = /\byes\b|\bmerge (them|it)\b|\barchive (the duplicate|one|it|2|two)\b|\bkeep (the )?(first|1|one)\b|\bremove (2|two)\b/i;
+const ACTION_DUPLICATE_CLEANUP_CANCEL_RE = /\bshow both\b|\bkeep both\b|\bdon['’]?t (merge|archive)\b/i;
+
 /**
  * "none," "no action," "nothing," "never mind," "cancel," "i mean NO ACTION" — a direct answer
  * to Alecto's own "Which action do you mean?" clarification that means "don't do anything,"
@@ -551,6 +561,25 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       toolValidationPassed: true,
       topic: ACTION_CLARIFICATION_TOPIC
     });
+  }
+
+  // fix/private-alpha-deferred-action-dedupe-and-today-coaching: a real Telegram transcript found
+  // "merge them yes" — a real, natural confirmation of the duplicate-cleanup proposal below —
+  // fell straight through to the general planner instead of confirming, since the general
+  // CONFIRM_WHITELIST/EXTENDED_CONFIRM_PHRASE_RE only ever recognize an affirmative OPENER
+  // ("yes ...", never "... yes"). Rather than widen that shared, safety-sensitive pattern for
+  // every pending operation in the product, this is scoped to exactly the one topic it's about —
+  // the duplicate-cleanup proposal (action.list's own "keep the first, archive the duplicate?")
+  // has an unusually large natural vocabulary for "yes" ("merge them", "archive the duplicate",
+  // "keep the first", "keep 1", "remove 2" are all just different ways of confirming the SAME
+  // single already-resolved operation), so it gets its own small, topic-scoped recognizer instead.
+  if (pending?.topic === ACTION_DUPLICATE_CLEANUP_TOPIC) {
+    if (ACTION_DUPLICATE_CLEANUP_CANCEL_RE.test(message)) {
+      return finalizeDeterministicCancellation(context, message);
+    }
+    if (ACTION_DUPLICATE_CLEANUP_CONFIRM_RE.test(message)) {
+      return finalizeDeterministicConfirmation(context, message);
+    }
   }
 
   // Exact confirm/cancel is checked FIRST and ALWAYS — regardless of whether a pending

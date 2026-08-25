@@ -6511,3 +6511,269 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-deferred-action-dedupe-and-today-coaching: a real Telegram transcript found
+ * "merge them yes" (replying to Alecto's OWN duplicate-cleanup CTA) answered "You don't have any
+ * open actions to archive" — the cleanup CTA had no real mechanism behind it, and archiving
+ * candidates were wrongly scoped to open-only actions when the whole point was cleaning up
+ * SCHEDULED/deferred ones. The CTA is now a real pending confirmation; these scenarios cover the
+ * real planner's own handling of that flow plus today-coaching/resume-context, both inherently
+ * LLM-judgment concerns for their free-text framing.
+ */
+
+test(
+  "201. the exact live transcript: tomorrow list with a duplicate -> 'merge them yes' actually archives it",
+  { ...llmEvalOptions(["deferred-action-dedupe", "visible-deferred-archive"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-dedupe-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("201-dedupe-transcript", ["deferred-action-dedupe", "visible-deferred-archive"], userId);
+
+    try {
+      await seedUser(userId);
+      const first = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, first.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      const second = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, second.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const listReply = trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        assertNoGenericAgentError(listReply, "tomorrow list with a duplicate");
+        trace.checkpoint("a real cleanup proposal is opened, not just a bare question", listReply.debug.pendingOperation === true, listReply.reply);
+        assert.equal(listReply.debug.pendingOperation, true, `expected a real pending cleanup proposal — got: ${listReply.reply}`);
+
+        const mergeReply = trace.record("merge them yes", await sendAgentMessage(server, userId, "merge them yes"));
+        assertNoGenericAgentError(mergeReply, "merge them yes");
+        trace.checkpoint("never says 'no open actions'", !/don't have any open actions/i.test(mergeReply.reply), mergeReply.reply);
+        assert.doesNotMatch(mergeReply.reply, /don't have any open actions/i, `must never claim there's nothing to archive — got: ${mergeReply.reply}`);
+        assert.equal(mergeReply.debug.mutationExecuted, true, `expected 'merge them yes' to actually archive the duplicate — got: ${mergeReply.reply}`);
+
+        const remaining = await prisma.actionItem.count({ where: { userId, status: { in: ["open", "snoozed"] } } });
+        trace.checkpoint("exactly one duplicate remains active", remaining === 1, `remaining: ${remaining}`);
+        assert.equal(remaining, 1, "exactly one of the two duplicates should still be active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "202. 'archive 2' works on a visible deferred (not yet open) action from a tomorrow list",
+  { ...llmEvalOptions(["visible-deferred-archive"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-dedupe-archive2-${randomUUID()}`;
+    const trace = new EvalTrace("202-dedupe-archive2", ["visible-deferred-archive"], userId);
+
+    try {
+      await seedUser(userId);
+      const first = await createActionItem(userId, { source: "manual", title: "Apply to remote roles" });
+      await snoozeActionItem(userId, first.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      const second = await createActionItem(userId, { source: "manual", title: "Book dentist appointment" });
+      await snoozeActionItem(userId, second.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        const reply = trace.record("archive 2", await sendAgentMessage(server, userId, "archive 2"));
+        assertNoGenericAgentError(reply, "archive 2 on a deferred action");
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'archive 2' to actually archive the second deferred action — got: ${reply.reply}`);
+
+        const item = await prisma.actionItem.findUnique({ where: { id: second.id } });
+        trace.checkpoint("the deferred action was actually archived", item?.status === "archived", `status: ${item?.status}`);
+        assert.equal(item?.status, "archived");
+        const untouched = await prisma.actionItem.findUnique({ where: { id: first.id } });
+        assert.equal(untouched?.status, "snoozed", "the other deferred action must be untouched");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "203. 'keep first' on a duplicate tomorrow list archives the duplicate, keeps the first",
+  { ...llmEvalOptions(["deferred-action-dedupe", "visible-deferred-archive"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-dedupe-keepfirst-${randomUUID()}`;
+    const trace = new EvalTrace("203-dedupe-keepfirst", ["deferred-action-dedupe", "visible-deferred-archive"], userId);
+
+    try {
+      await seedUser(userId);
+      const first = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, first.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      const second = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, second.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        const reply = trace.record("keep first", await sendAgentMessage(server, userId, "keep first"));
+        assertNoGenericAgentError(reply, "keep first on a duplicate list");
+        assert.equal(reply.debug.mutationExecuted, true, `expected 'keep first' to archive the duplicate — got: ${reply.reply}`);
+
+        const remaining = await prisma.actionItem.count({ where: { userId, status: { in: ["open", "snoozed"] } } });
+        trace.checkpoint("exactly one duplicate remains active", remaining === 1, `remaining: ${remaining}`);
+        assert.equal(remaining, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "204. the tomorrow list after cleanup shows exactly one action",
+  { ...llmEvalOptions(["deferred-action-dedupe"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-dedupe-after-cleanup-${randomUUID()}`;
+    const trace = new EvalTrace("204-dedupe-after-cleanup", ["deferred-action-dedupe"], userId);
+
+    try {
+      await seedUser(userId);
+      const first = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, first.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      const second = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles" });
+      await snoozeActionItem(userId, second.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        trace.record("merge them yes", await sendAgentMessage(server, userId, "merge them yes"));
+
+        const reply = trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        assertNoGenericAgentError(reply, "tomorrow list after cleanup");
+        trace.checkpoint("exactly one action shown for tomorrow", /you have 1 action for tomorrow/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /you have 1 action for tomorrow/i, `expected exactly one remaining action — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "205. 'what should I do today?' after moving the application block to tomorrow gives a today-focused answer, no duplicate",
+  { ...llmEvalOptions(["today-coaching-after-deferral"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-today-after-defer-${randomUUID()}`;
+    const trace = new EvalTrace("205-today-after-defer", ["today-coaching-after-deferral"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const beforeCount = await prisma.actionItem.count({ where: { userId } });
+        const reply = trace.record("what should i to today", await sendAgentMessage(server, userId, "what should i to today"));
+        assertNoGenericAgentError(reply, "today question after deferral, with a typo like the real transcript");
+        trace.checkpoint("does not lead with tomorrow framing", !/use the time you have tomorrow/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /use the time you have tomorrow/i, `must answer about today — got: ${reply.reply}`);
+        const afterCount = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no duplicate action created", afterCount === beforeCount, `before: ${beforeCount}, after: ${afterCount}`);
+        assert.equal(afterCount, beforeCount, "must not silently create a near-duplicate action");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "206. an evening 'what should I do today?' after a deferral gives a realistic, lighter suggestion",
+  { ...llmEvalOptions(["today-coaching-after-deferral"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-today-evening-${randomUUID()}`;
+    const trace = new EvalTrace("206-today-evening", ["today-coaching-after-deferral"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "It's the evening now — what should I do today?",
+          await sendAgentMessage(server, userId, "It's the evening now — what should I do today?")
+        );
+        assertNoGenericAgentError(reply, "evening today question after deferral");
+        trace.checkpoint("offers a lighter/realistic option, not a big new block", /shortlist|lighter|leave it|stop here|review|prep/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /shortlist|lighter|leave it|stop here|review|prep/i, `expected a realistic evening-appropriate suggestion — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "207. resume already up to date -> no resume customization suggested",
+  { ...llmEvalOptions(["resume-context-respect"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-resume-respect-${randomUUID()}`;
+    const trace = new EvalTrace("207-resume-respect", ["resume-context-respect"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to remote roles", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record(
+          "Just so you know, my resume and web CV are already up to date.",
+          await sendAgentMessage(server, userId, "Just so you know, my resume and web CV are already up to date.")
+        );
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "resume-already-current respected");
+        assertNoBannedPhrases(reply.reply, ["update your resume", "customize your resume", "update the resume", "tailor your resume"], "resume-respect", trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "208. two unrelated scheduled actions never trigger a duplicate-merge suggestion",
+  { ...llmEvalOptions(["deferred-action-dedupe"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-dedupe-unrelated-${randomUUID()}`;
+    const trace = new EvalTrace("208-dedupe-unrelated", ["deferred-action-dedupe"], userId);
+
+    try {
+      await seedUser(userId);
+      const a = await createActionItem(userId, { source: "manual", title: "Apply to remote roles" });
+      await snoozeActionItem(userId, a.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      const b = await createActionItem(userId, { source: "manual", title: "Book dentist appointment" });
+      await snoozeActionItem(userId, b.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        assertNoGenericAgentError(reply, "unrelated scheduled actions");
+        trace.checkpoint("no duplicate-merge suggestion for unrelated actions", reply.debug.pendingOperation !== true, reply.reply);
+        assert.notEqual(reply.debug.pendingOperation, true, `must never propose merging genuinely unrelated actions — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

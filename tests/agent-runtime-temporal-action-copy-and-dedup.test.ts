@@ -198,8 +198,12 @@ test("3A: two similar deferred actions for tomorrow trigger a cleanup suggestion
     mockPlan(actionListPlan({ when: "tomorrow" }));
     const reply = await sendAgentMessage(server, userId, "do i have something to do tomorrow?");
 
+    // fix/private-alpha-deferred-action-dedupe-and-today-coaching: the text-only CTA became a
+    // real pending confirmation ("keep the first and archive the duplicate?") — updated wording,
+    // same underlying detection.
     assert.match(reply.reply, /similar actions scheduled/i);
-    assert.match(reply.reply, /merge or archive/i);
+    assert.match(reply.reply, /keep .* and archive the duplicate/i);
+    assert.equal(reply.debug.pendingOperation, true);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

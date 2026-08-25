@@ -128,7 +128,10 @@ test("2E: zero open actions gives a clean no-op response, no confirmation opened
 
     assert.equal(reply.debug.pendingOperation, false);
     assert.equal(reply.debug.mutationExecuted, false);
-    assert.match(reply.reply, /don't have any open actions/i);
+    // fix/private-alpha-deferred-action-dedupe-and-today-coaching: this reply now also covers
+    // scheduled/deferred candidates (a "visible" or explicit-id archive can target those too, not
+    // just open ones) — updated wording, same "genuinely nothing to archive" meaning.
+    assert.match(reply.reply, /don't have any open or scheduled actions/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
