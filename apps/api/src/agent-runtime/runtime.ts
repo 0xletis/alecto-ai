@@ -70,8 +70,15 @@ const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget 
 // Extended again for "yes create this" / "yes create the goal" — live traffic showed a pending
 // GOAL creation specifically prompts "create this"/"create the goal" phrasing more than the
 // generic "create it" this pattern already covered, and that exact new phrasing was rejected.
+//
+// Extended again for the "proceed" family — "okay proceed"/"ok proceed" add "okay"/"ok" as new
+// openers, and "proceed"/"go ahead"/"adelante"/"endavant" are also recognized fully standalone
+// (no opener needed at all), since a real Telegram smoke test found a bare "Okay proceed" got the
+// whole proposal repeated back instead of confirming. Still end-to-end anchored either way, so
+// "okay proceed but change the target," "proceed with another goal," and "maybe proceed" all
+// correctly fail to match and fall through to the planner instead.
 const EXTENDED_CONFIRM_PHRASE_RE =
-  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord)[\s,]*(create it|create this|create the goal|do it|go ahead|make it|make this|confirm this|cr[eé]alo|h[aá]zlo|crea-?ho|crea esto|crea aquest|crea aix[oò])?$/i;
+  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord|ok|okay)[\s,]*(create it|create this|create the goal|do it|go ahead|make it|make this|confirm this|proceed|cr[eé]alo|h[aá]zlo|crea-?ho|crea esto|crea aquest|crea aix[oò]|procede|endavant)?$|^(proceed|go ahead|adelante|endavant)$/i;
 
 function looksLikeExtendedConfirmPhrase(normalized: string): boolean {
   return EXTENDED_CONFIRM_PHRASE_RE.test(normalized);
@@ -1731,8 +1738,14 @@ function actionMeetingListShortcutOperation(message: string): PlannedOperation |
 // matching it without a verb here previously mis-fired on exactly that kind of message; a bare
 // "all of them" is only ever safe to treat as bulk-archive scope in BARE_BULK_ACTION_SCOPE_RE
 // below, which requires the ENTIRE message to be just that phrase AND a visible action list.
+// The scope portion just requires bare "all" within reach of the verb — a real Telegram smoke
+// test found "archive all" (no trailing "of them"/"my actions") falling through both this regex
+// and the bare-reply one below, since the original pattern required a qualifier word after "all."
+// "all" alone, right after delete/archive/clear/remove, is already unambiguous bulk intent; "all of
+// them"/"all my actions"/"these actions"/"these tasks" remain covered as substrings of the same
+// widened match, not as separate required alternatives anymore.
 const BULK_ACTION_CLEANUP_VERB_SCOPE_RE =
-  /\b(delete|archive|clear|remove)\b[\s\S]{0,20}\b(all( of)? (them|my actions|my tasks|these actions|these tasks)|these (actions|tasks))\b|\bi mean all actions\b|\b(borra|archiva|elimina|limpia)\b[\s\S]{0,20}\btodas\b|\blimpia mis acciones\b|\b(arxiva|elimina|esborra)\b[\s\S]{0,20}\btotes\b/;
+  /\b(delete|archive|clear|remove)\b[\s\S]{0,20}\b(all|these (actions|tasks))\b|\bi mean all actions\b|\b(borra|archiva|elimina|limpia)\b[\s\S]{0,20}\btodas\b|\blimpia mis acciones\b|\b(arxiva|elimina|esborra)\b[\s\S]{0,20}\btotes\b/;
 
 // A bare, unqualified scope reply ("these", "all", "them", "all of them", "todas", "totes") with
 // NO verb at all — only meaningful as a reply to Alecto's own numbered action list (or a failed

@@ -61,6 +61,11 @@ function looksLikeBareEvidenceCountQuestion(message: string): boolean {
 const EVIDENCE_QUESTION_CLARIFICATION =
   "I don't want to guess — tell me plainly what you did (e.g. \"log 20 minutes of reading\") and I'll log it for real. Just asking whether something counts doesn't log anything on its own.";
 
+// Only these explicit words/phrases justify action.list showing anything beyond the default
+// "open" status — a bare "show me my actions"/"what are my tasks" must never widen to archived or
+// completed items just because the planner guessed differently or a recent turn mentioned "all".
+const EXPLICIT_NON_OPEN_ACTION_STATUS_RE = /\b(archived?|completed?|done|finished|history|every action|all (my |the )?(actions?|tasks?))\b/i;
+
 export interface ValidateOperationsOptions {
   /**
    * True when `operations` came from one of this file's own deterministic shortcuts (runtime.ts)
@@ -502,6 +507,19 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
 
   const args = parsed.data as Record<string, unknown>;
   let actionOutsideVisiblePage = false;
+
+  // A real Telegram smoke test found "show me my actions" — right after archiving two actions —
+  // came back as "Showing 2 of 4 actions" listing the just-archived items with no status label,
+  // as if they were still open. The executor's own action.list case already defaults status to
+  // "open" when the field is omitted, but nothing stopped the PLANNER from supplying some other
+  // status (or a stale one carried over from "archive all" earlier in the same conversation) for
+  // a plain request that never asked for anything but the default. Deterministic, not left to the
+  // planner's reliability: for "action.list", unless the raw message itself explicitly asks for
+  // archived/completed/history/all-status actions, status is always forced to "open" — this only
+  // ever narrows toward the safe default, never guesses a broader status the user didn't ask for.
+  if (tool.name === "action.list" && args.status !== "open" && !EXPLICIT_NON_OPEN_ACTION_STATUS_RE.test(message)) {
+    args.status = "open";
+  }
 
   if (tool.name === "goal.log_evidence" && looksLikeBareEvidenceCountQuestion(message)) {
     return {

@@ -216,7 +216,8 @@ const validOperationsByTool: Record<string, Record<string, unknown>> = {
     signals: [{ key: "tea_cups_drunk", label: "cups of tea drunk", unit: null, cadence: null }],
     checkIn: null,
     integrationHint: null,
-    firstActions: null
+    firstActions: null,
+    dailyCoachingInterest: null
   },
   "goal.log_evidence": { eventType: "career.recruiter_reply_received", signalKey: null, goalRef: null, count: 2, notes: null },
   "gmail.review.approve": { reviewId: null, index: 1, ref: null },

@@ -603,7 +603,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "goal.create_propose",
     description:
-      "Propose a full custom operating plan for a NEW goal the user just expressed — never applies anything until the user confirms. Works for ANY goal, not from a fixed list: 'I want to drink more tea', 'I want to call my grandmother every Sunday', 'I want to stop scrolling in bed', 'I want to keep up with Endesa/admin emails', 'I want to build Alecto every day' are all equally valid. You (the planner) choose: a short title, a category (free text, e.g. 'health', 'family', 'admin', 'habit', 'career' — never limited to a fixed enum), why if the user said one, optional successCriteria in the user's own terms (e.g. '2 cups/day, 5 days/week'), 1-3 trackable signals (each a short stable snake_case key like 'tea_cups_drunk' plus a human label — invent a REASONABLE key/label from the goal, never leave this empty), an optional single check-in suggestion, an optional integration hint (e.g. 'Gmail: Endesa emails' — only when genuinely relevant, e.g. an admin/bills goal), and 0-3 first actions genuinely implied by the goal. If the goal is too vague to propose anything concrete (e.g. just 'I want to be better'), do NOT call this — use clarification.ask instead to find out what they actually mean. Never create the goal directly; this only proposes, and only proactive.settings_propose_update-style confirmation (an exact 'yes') can turn it into a real goal via the internal goal.create_apply.",
+      "Propose a full custom operating plan for a NEW goal the user just expressed — never applies anything until the user confirms. Works for ANY goal, not from a fixed list: 'I want to drink more tea', 'I want to call my grandmother every Sunday', 'I want to stop scrolling in bed', 'I want to keep up with Endesa/admin emails', 'I want to build Alecto every day' are all equally valid. You (the planner) choose: a short title (preserve every qualifier/detail the user actually gave, e.g. 'remote', 'Web3', a location — never quietly drop one), a category (free text, e.g. 'health', 'family', 'admin', 'habit', 'career' — never limited to a fixed enum), why if the user said one, optional successCriteria in the user's own terms (e.g. '2 cups/day, 5 days/week'), 1-3 trackable signals (each a short stable snake_case key like 'tea_cups_drunk' plus a human label — invent a REASONABLE key/label from the goal, never leave this empty), an optional single check-in suggestion, an optional integration hint (e.g. 'Gmail: Endesa emails' — only when genuinely relevant, e.g. an admin/bills goal), dailyCoachingInterest for a morning-motivation/daily-planning request (see its own field description — never firstActions for this), and 0-3 first actions genuinely implied by the goal AND genuinely owned by the user (never one of Alecto's own responsibilities — see firstActions' own field description). If the goal is too vague to propose anything concrete (e.g. just 'I want to be better'), do NOT call this — use clarification.ask instead to find out what they actually mean. Never create the goal directly; this only proposes, and only proactive.settings_propose_update-style confirmation (an exact 'yes') can turn it into a real goal via the internal goal.create_apply.",
     mutates: false,
     requiresConfirmation: false,
     opensPendingProposal: true,
@@ -630,7 +630,19 @@ export const toolCatalog: ToolDefinition[] = [
         })
         .optional(),
       integrationHint: z.string().optional().describe("Only when a real, existing integration is genuinely relevant, e.g. 'Gmail: track Endesa emails' — never claim automatic monitoring that isn't wired up."),
-      firstActions: z.array(z.string().min(1)).max(3).optional().describe("Only actions genuinely implied by the goal itself, e.g. 'Buy tea' for a tea goal — never generic filler.")
+      firstActions: z
+        .array(z.string().min(1))
+        .max(3)
+        .optional()
+        .describe(
+          "ONLY concrete, one-off, USER-owned tasks, e.g. 'Buy tea' for a tea goal — never generic filler, and NEVER anything that is actually Alecto's own responsibility (a morning message, daily motivation, creating actions automatically, checking in, reviewing progress, watching Gmail, sending reminders) — see the dedicated Alecto-responsibility rule elsewhere in these instructions for where those really belong (dailyCoachingInterest below, or a separate proactive.settings_propose_update / gmail.rule.propose_update turn)."
+        ),
+      dailyCoachingInterest: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true only when the user asked for morning motivation, a daily message, daily check-ins, or daily/automatic action planning while creating or revising THIS goal. Shows a real 'Daily coaching' section in the proposal instead of inventing firstActions for it. Never set proactive.settings_propose_update in the same turn as goal.create_propose — this flag is how a daily-coaching request gets represented at proposal time instead."
+        )
     })
   },
   {
@@ -644,7 +656,8 @@ export const toolCatalog: ToolDefinition[] = [
       why: z.string().optional(),
       signals: z.array(z.object({ key: z.string().min(1), label: z.string().min(1), unit: z.string().optional(), cadence: z.enum(["daily", "weekly"]).optional() })),
       checkIn: z.object({ cadence: z.string().min(1), question: z.string().min(1) }).optional(),
-      firstActions: z.array(z.string().min(1)).optional()
+      firstActions: z.array(z.string().min(1)).optional(),
+      dailyCoachingInterest: z.boolean().optional()
     })
   },
   {

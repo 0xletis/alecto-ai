@@ -33,7 +33,7 @@ function goalCreatePlan(input: { title: string; category: string; signals: Array
   };
 }
 
-test("A: an integrationHint the planner supplies renders as a conditional Integration line in the proposal", async () => {
+test("A: a Gmail-related integrationHint the planner supplies renders as a conditional Gmail section in the proposal", async () => {
   const server = buildServer();
   const userId = `goal-onboarding-gmail-a-${randomUUID()}`;
 
@@ -50,8 +50,9 @@ test("A: an integrationHint the planner supplies renders as a conditional Integr
     const reply = await sendAgentMessage(server, userId, "I want to find a new developer job");
 
     assert.equal(reply.needsConfirmation, true, "a new-goal proposal must require confirmation before applying");
-    assert.match(reply.reply, /Integration:/);
+    assert.match(reply.reply, /Gmail:/);
     assert.match(reply.reply, /if you connect gmail/i);
+    assert.match(reply.reply, /i cannot send or reply to emails/i);
     const goalCount = await prisma.goal.count({ where: { userId } });
     assert.equal(goalCount, 0, "nothing may be created before confirmation");
   } finally {
@@ -191,6 +192,7 @@ test("F: a custom goal category and a fully invented signal key work with zero s
     const proposeReply = await sendAgentMessage(server, userId, "I want to call my grandmother every Sunday");
     assert.equal(proposeReply.needsConfirmation, true);
     assert.doesNotMatch(proposeReply.reply, /Integration:/, "a purely personal/family goal must never get a Gmail suggestion by default");
+    assert.doesNotMatch(proposeReply.reply, /Gmail:/, "a purely personal/family goal must never get a Gmail suggestion by default");
 
     mockPlan({
       topic: "goal_creation",

@@ -4547,3 +4547,382 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-proactive-daily-planning-semantics: a real Telegram smoke test found "add a
+ * morning message to motivate me and create some actions every morning" turned into two fake
+ * firstActions ("Send a motivational message each morning", "Create action items for the day") —
+ * Alecto's own proactive responsibilities, not user todos — and "Okay proceed" repeated the
+ * pending proposal instead of confirming it. Scenarios 145-152 cover the fix end to end against
+ * the real planner.
+ */
+
+const ALECTO_DUTY_FIRST_ACTION_RE =
+  /send (a |me )?a? ?motivational message|motivate me every|create action items|create (some )?actions? (for me )?every morning|check in with me daily|review my progress every evening|watch gmail replies|track my cvs|remind me daily|notify me when recruiters reply/i;
+
+test(
+  "145. private-alpha regression: the exact live transcript — pending job goal + daily-coaching request never becomes fake firstActions",
+  { ...llmEvalOptions(["proactive-daily-planning-semantics", "alecto-responsibility-not-action"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-daily-planning-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("145-daily-planning-transcript", ["proactive-daily-planning-semantics", "alecto-responsibility-not-action"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. I don't want a fixed weekly target yet, just track how many CVs I send, recruiter replies, interviews, and conversion from applications to interviews. My resume and web CV are already up to date. I want daily checking and motivation.",
+          await sendAgentMessage(
+            server,
+            userId,
+            "I want to find a fully remote developer job, ideally in Web3. I don't want a fixed weekly target yet, just track how many CVs I send, recruiter replies, interviews, and conversion from applications to interviews. My resume and web CV are already up to date. I want daily checking and motivation."
+          )
+        );
+        assert.equal(t1.debug.pendingOperation, true);
+        const noAlectoDutyAction1 = !ALECTO_DUTY_FIRST_ACTION_RE.test(t1.reply);
+        trace.checkpoint("turn 1: no Alecto-duty firstAction", noAlectoDutyAction1, t1.reply);
+        assert.ok(noAlectoDutyAction1, `turn 1 must not fabricate an Alecto-duty firstAction — got: ${t1.reply}`);
+
+        const t2 = trace.record(
+          "Can you also add some morning message to motivate me and create some actions every morning for that day?",
+          await sendAgentMessage(server, userId, "Can you also add some morning message to motivate me and create some actions every morning for that day?")
+        );
+
+        const noAlectoDutyAction2 = !ALECTO_DUTY_FIRST_ACTION_RE.test(t2.reply);
+        trace.checkpoint("turn 2: no Alecto-duty firstAction", noAlectoDutyAction2, t2.reply);
+        assert.ok(noAlectoDutyAction2, `turn 2 must not turn a coaching request into a firstAction — got: ${t2.reply}`);
+
+        const hasDailyCoachingCopy = /daily coaching/i.test(t2.reply);
+        trace.checkpoint("turn 2: has a real Daily coaching section", hasDailyCoachingCopy, t2.reply);
+        assert.ok(hasDailyCoachingCopy, `expected a Daily coaching section — got: ${t2.reply}`);
+
+        const singleConfirmation = (t2.reply.match(/want me to create this goal\?/gi) ?? []).length <= 1;
+        trace.checkpoint("turn 2: at most one pending confirmation", singleConfirmation, t2.reply);
+        assert.ok(singleConfirmation, `expected only one confirmation question — got: ${t2.reply}`);
+
+        const preservesWeb3 = /web3/i.test(t2.reply);
+        trace.checkpoint("turn 2: Web3 preserved", preservesWeb3, t2.reply);
+        assert.ok(preservesWeb3, `expected 'Web3' preserved in the revised proposal — got: ${t2.reply}`);
+
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        assert.equal(goalCount, 0, "nothing created before confirmation");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "146. 'send me motivation every morning' is never turned into a firstAction",
+  { ...llmEvalOptions(["alecto-responsibility-not-action"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-motivation-morning-${randomUUID()}`;
+    const trace = new EvalTrace("146-motivation-every-morning", ["alecto-responsibility-not-action"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        const t2 = trace.record(
+          "send me a motivational message every morning",
+          await sendAgentMessage(server, userId, "send me a motivational message every morning")
+        );
+
+        const noAlectoDutyAction = !ALECTO_DUTY_FIRST_ACTION_RE.test(t2.reply);
+        trace.checkpoint("no Alecto-duty firstAction", noAlectoDutyAction, t2.reply);
+        assert.ok(noAlectoDutyAction, `got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "147. 'create action items for me every morning' is never turned into a firstAction",
+  { ...llmEvalOptions(["alecto-responsibility-not-action"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-create-actions-morning-${randomUUID()}`;
+    const trace = new EvalTrace("147-create-actions-every-morning", ["alecto-responsibility-not-action"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        const t2 = trace.record(
+          "create action items for me every morning",
+          await sendAgentMessage(server, userId, "create action items for me every morning")
+        );
+
+        const noAlectoDutyAction = !ALECTO_DUTY_FIRST_ACTION_RE.test(t2.reply);
+        trace.checkpoint("no Alecto-duty firstAction", noAlectoDutyAction, t2.reply);
+        assert.ok(noAlectoDutyAction, `got: ${t2.reply}`);
+        assert.ok(!/i (will|'ll) create (new )?actions? (for you )?(automatically|without asking|silently)/i.test(t2.reply), `must not promise silent automatic action creation — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "148. 'watch Gmail replies' is never turned into a firstAction",
+  { ...llmEvalOptions(["alecto-responsibility-not-action"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-watch-gmail-replies-${randomUUID()}`;
+    const trace = new EvalTrace("148-watch-gmail-replies", ["alecto-responsibility-not-action"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to find a new developer job", await sendAgentMessage(server, userId, "I want to find a new developer job"));
+        const t2 = trace.record("watch Gmail replies", await sendAgentMessage(server, userId, "watch Gmail replies"));
+
+        const noAlectoDutyAction = !ALECTO_DUTY_FIRST_ACTION_RE.test(t2.reply);
+        trace.checkpoint("no Alecto-duty firstAction", noAlectoDutyAction, t2.reply);
+        assert.ok(noAlectoDutyAction, `got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "149. 'apply to 5 jobs today' CAN still be a real, concrete firstAction",
+  { ...llmEvalOptions(["alecto-responsibility-not-action"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-apply-5-jobs-today-${randomUUID()}`;
+    const trace = new EvalTrace("149-apply-5-jobs-today", ["alecto-responsibility-not-action"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to find a new developer job, apply to 5 jobs today",
+          await sendAgentMessage(server, userId, "I want to find a new developer job, apply to 5 jobs today")
+        );
+
+        const mentionsRealAction = /apply to 5/i.test(reply.reply);
+        trace.checkpoint("mentions the real, concrete firstAction", mentionsRealAction, reply.reply);
+        assert.ok(mentionsRealAction, `expected a real, user-owned firstAction to survive — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "150. natural confirmation: 'Okay proceed' actually confirms the pending goal creation",
+  { ...llmEvalOptions(["confirmation-proceed"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-okay-proceed-${randomUUID()}`;
+    const trace = new EvalTrace("150-okay-proceed", ["confirmation-proceed"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("I want to read more books", await sendAgentMessage(server, userId, "I want to read more books"));
+        const confirmed = trace.record("Okay proceed", await sendAgentMessage(server, userId, "Okay proceed"));
+
+        trace.checkpoint("confirmed deterministically", confirmed.debug.llmPlannerAttempted === false, String(confirmed.debug.llmPlannerAttempted));
+        assert.equal(confirmed.debug.llmPlannerAttempted, false, "'Okay proceed' must not repeat the proposal via the planner");
+        assert.equal(confirmed.debug.mutationExecuted, true);
+        const goalCount = await prisma.goal.count({ where: { userId } });
+        assert.equal(goalCount, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "151. Spanish: 'quiero que me motives cada mañana' is passive daily-coaching interest, never a firstAction",
+  { ...llmEvalOptions(["proactive-daily-planning-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-es-motivate-${randomUUID()}`;
+    const trace = new EvalTrace("151-es-motivate-cada-manana", ["proactive-daily-planning-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("quiero encontrar un trabajo remoto", await sendAgentMessage(server, userId, "quiero encontrar un trabajo remoto"));
+        const t2 = trace.record(
+          "quiero que me motives cada mañana",
+          await sendAgentMessage(server, userId, "quiero que me motives cada mañana")
+        );
+
+        const noAlectoDutyAction = !ALECTO_DUTY_FIRST_ACTION_RE.test(t2.reply);
+        trace.checkpoint("no Alecto-duty firstAction", noAlectoDutyAction, t2.reply);
+        assert.ok(noAlectoDutyAction, `got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "152. Catalan: 'vull que em facis un missatge cada matí' is passive daily-coaching interest, never a firstAction",
+  { ...llmEvalOptions(["proactive-daily-planning-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-ca-missatge-cada-mati-${randomUUID()}`;
+    const trace = new EvalTrace("152-ca-missatge-cada-mati", ["proactive-daily-planning-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record("vull trobar una feina remota", await sendAgentMessage(server, userId, "vull trobar una feina remota"));
+        const t2 = trace.record(
+          "vull que em facis un missatge cada matí",
+          await sendAgentMessage(server, userId, "vull que em facis un missatge cada matí")
+        );
+
+        const noAlectoDutyAction = !ALECTO_DUTY_FIRST_ACTION_RE.test(t2.reply);
+        trace.checkpoint("no Alecto-duty firstAction", noAlectoDutyAction, t2.reply);
+        assert.ok(noAlectoDutyAction, `got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * Additional live bug on the same branch: right after the bulk-archive fix, "show me my actions"
+ * — immediately after archiving two actions — came back as "Showing 2 of 4 actions" re-listing
+ * the just-archived items with no status label, as if they were still open. Scenarios 153-155
+ * cover the fix (a deterministic status-default guard for action.list) against the real planner.
+ */
+
+test(
+  "153. private-alpha regression: the exact live transcript — archive all -> yes -> show me my actions reports no open actions",
+  { ...llmEvalOptions(["action-list-status-default"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-action-list-status-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("153-action-list-status-transcript", ["action-list-status-default"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Create action items for the day", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Send a motivational message each morning", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const t2 = trace.record("archive all", await sendAgentMessage(server, userId, "archive all"));
+        trace.checkpoint("opened a confirmation", t2.debug.pendingOperation === true, t2.reply);
+        assert.equal(t2.debug.pendingOperation, true, `expected 'archive all' to open a bulk-archive confirmation — got: ${t2.reply}`);
+
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const t4 = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const noArchivedLeaked = !/create action items for the day/i.test(t4.reply) && !/send a motivational message each morning/i.test(t4.reply);
+        trace.checkpoint("no just-archived actions re-listed as open", noArchivedLeaked, t4.reply);
+        assert.ok(noArchivedLeaked, `expected the just-archived actions to be excluded from the default list — got: ${t4.reply}`);
+
+        const openCount = await prisma.actionItem.count({ where: { userId, status: "open" } });
+        assert.equal(openCount, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "154. 'show me my actions' defaults to open only, even shortly after an 'archive all' turn in the same conversation",
+  { ...llmEvalOptions(["action-list-status-default"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-action-list-status-default-${randomUUID()}`;
+    const trace = new EvalTrace("154-action-list-status-default", ["action-list-status-default"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Network with industry contacts", priority: "medium" });
+      await createActionItem(userId, { source: "manual", title: "Apply to 5 remote roles today", priority: "medium" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        // Which of the two ends up "1" depends on getActionItems' own dueAt/updatedAt ordering,
+        // not creation order — deliberately not asserted here; what matters is that whichever one
+        // gets archived is excluded from every later default list, and the other (whichever it
+        // is) still shows as open.
+        trace.record("archive 1", await sendAgentMessage(server, userId, "archive 1"));
+
+        const [openRow, archivedRow] = await Promise.all([
+          prisma.actionItem.findFirst({ where: { userId, status: "open" } }),
+          prisma.actionItem.findFirst({ where: { userId, status: "archived" } })
+        ]);
+        assert.ok(openRow && archivedRow, "expected exactly one action archived and one still open");
+
+        const t3 = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const mentionsStillOpen = new RegExp(openRow!.title, "i").test(t3.reply);
+        const mentionsArchived = new RegExp(archivedRow!.title, "i").test(t3.reply);
+        trace.checkpoint("shows the still-open action", mentionsStillOpen, t3.reply);
+        trace.checkpoint("does not show the archived action", !mentionsArchived, t3.reply);
+        assert.ok(mentionsStillOpen, `expected the real open action to still be listed — got: ${t3.reply}`);
+        assert.ok(!mentionsArchived, `expected the archived action excluded from the default list — got: ${t3.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "155. 'show me all my actions including archived ones' labels each item's real status",
+  { ...llmEvalOptions(["action-list-status-default"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-action-list-status-labels-${randomUUID()}`;
+    const trace = new EvalTrace("155-action-list-status-labels", ["action-list-status-default"], userId);
+
+    try {
+      await seedUser(userId);
+      const archivedOne = await createActionItem(userId, { source: "manual", title: "Network with industry contacts", priority: "medium" });
+      await prisma.actionItem.update({ where: { id: archivedOne.id }, data: { status: "archived" } });
+      await createActionItem(userId, { source: "manual", title: "Apply to 5 remote roles today", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "show me all my actions including archived ones",
+          await sendAgentMessage(server, userId, "show me all my actions including archived ones")
+        );
+
+        const bothMentioned = /network with industry contacts/i.test(reply.reply) && /apply to 5 remote roles today/i.test(reply.reply);
+        trace.checkpoint("both actions shown", bothMentioned, reply.reply);
+        assert.ok(bothMentioned, `expected both the open and archived action shown — got: ${reply.reply}`);
+
+        const archivedLabeled = /network with industry contacts[^\n]*archived/i.test(reply.reply);
+        trace.checkpoint("archived action clearly labeled", archivedLabeled, reply.reply);
+        assert.ok(archivedLabeled, `expected the archived action's status to be labeled clearly — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
