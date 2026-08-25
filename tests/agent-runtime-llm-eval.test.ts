@@ -4926,3 +4926,196 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-post-goal-coaching-confirmation: a real Telegram smoke test found the
+ * post-goal-creation daily-coaching follow-up ("Want me to turn on the morning brief and evening
+ * check-in for this?") was copy-only — no real pendingOperation behind it, so the user's next
+ * "yes" got "I don't have anything pending to confirm." Scenarios 156-160 cover the fix (a real
+ * proactive.settings_apply_update pendingOperationUpdate, installed without being clobbered by
+ * finalizeDeterministicConfirmation's own trailing clear) against the real planner.
+ */
+
+test(
+  "156. private-alpha regression: the exact live transcript — goal creation with daily coaching -> yes -> follow-up -> yes actually turns settings on",
+  { ...llmEvalOptions(["post-goal-coaching-confirmation", "daily-coaching-pending-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-post-goal-coaching-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("156-post-goal-coaching-transcript", ["post-goal-coaching-confirmation", "daily-coaching-pending-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. I don't want a fixed weekly target yet, just track how many CVs I send, recruiter replies, interviews, and conversion from applications to interviews. My resume and web CV are already up to date. I want daily checking and motivation.",
+          await sendAgentMessage(
+            server,
+            userId,
+            "I want to find a fully remote developer job, ideally in Web3. I don't want a fixed weekly target yet, just track how many CVs I send, recruiter replies, interviews, and conversion from applications to interviews. My resume and web CV are already up to date. I want daily checking and motivation."
+          )
+        );
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("goal confirmation opens a real follow-up pending operation", t2.debug.pendingOperation === true, t2.reply);
+        assert.equal(t2.debug.pendingOperation, true, `expected the daily-coaching follow-up to open a real pending operation — got: ${t2.reply}`);
+        assert.equal(t2.debug.mutationExecuted, true, "the goal itself must have been created on this turn");
+        const noCopyOnlyQuestion = !/i don't have anything pending/i.test(t2.reply);
+        assert.ok(noCopyOnlyQuestion);
+
+        const t3 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("second yes actually applies settings, no 'nothing pending' error", !/i don't have anything pending/i.test(t3.reply), t3.reply);
+        assert.doesNotMatch(t3.reply, /i don't have anything pending/i, `the second 'yes' must not see nothing pending — got: ${t3.reply}`);
+        assert.equal(t3.debug.mutationExecuted, true);
+
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        trace.checkpoint("morning brief and evening check-in actually turned on", Boolean(settings?.morningBriefEnabled && settings?.eveningCheckinEnabled), JSON.stringify(settings));
+        assert.ok(settings?.morningBriefEnabled, "morning brief must actually be enabled");
+        assert.ok(settings?.eveningCheckinEnabled, "evening check-in must actually be enabled");
+
+        const goal = await prisma.goal.findFirst({ where: { userId } });
+        assert.ok(goal, "the goal must exist");
+        const actions = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no fake actions created", actions === 0, `action count: ${actions}`);
+        assert.equal(actions, 0, "no fake Alecto-duty actions should have been created");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "157. cancelling the post-goal coaching follow-up leaves the already-created goal intact",
+  { ...llmEvalOptions(["post-goal-coaching-confirmation", "daily-coaching-pending-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-post-goal-cancel-${randomUUID()}`;
+    const trace = new EvalTrace("157-post-goal-coaching-cancel", ["post-goal-coaching-confirmation", "daily-coaching-pending-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a remote Web3 developer job, and I want daily checking and motivation",
+          await sendAgentMessage(server, userId, "I want to find a remote Web3 developer job, and I want daily checking and motivation")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        const t3 = trace.record("cancel", await sendAgentMessage(server, userId, "cancel"));
+        trace.checkpoint("cancel resolves cleanly", t3.debug.pendingOperation === false, t3.reply);
+        assert.equal(t3.debug.pendingOperation, false);
+
+        const goal = await prisma.goal.findFirst({ where: { userId } });
+        trace.checkpoint("goal still exists after cancel", Boolean(goal), goal?.title ?? "missing");
+        assert.ok(goal, "the goal must remain created after cancelling the settings follow-up");
+
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        assert.ok(settings === null || (!settings.morningBriefEnabled && !settings.eveningCheckinEnabled), "cancel must never enable settings");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "158. if morning/evening are already both on, the post-goal follow-up says so honestly and opens nothing",
+  { ...llmEvalOptions(["post-goal-coaching-confirmation", "daily-coaching-pending-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-post-goal-already-on-${randomUUID()}`;
+    const trace = new EvalTrace("158-post-goal-already-on", ["post-goal-coaching-confirmation", "daily-coaching-pending-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.notificationSettings.upsert({
+        where: { userId },
+        update: { morningBriefEnabled: true, eveningCheckinEnabled: true },
+        create: { userId, morningBriefEnabled: true, eveningCheckinEnabled: true }
+      });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a remote Web3 developer job, and I want daily checking and motivation",
+          await sendAgentMessage(server, userId, "I want to find a remote Web3 developer job, and I want daily checking and motivation")
+        );
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        trace.checkpoint("no pending operation opened when already fully on", t2.debug.pendingOperation === false, t2.reply);
+        assert.equal(t2.debug.pendingOperation, false, `expected no pending operation when settings are already on — got: ${t2.reply}`);
+        assert.match(t2.reply, /already on/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "159. 'ideally in Web3' is preserved in the goal title through to the confirmed goal",
+  { ...llmEvalOptions(["goal-title-preservation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-web3-title-preserved-${randomUUID()}`;
+    const trace = new EvalTrace("159-web3-title-preserved", ["goal-title-preservation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const t1 = trace.record(
+          "I want to find a fully remote developer job, ideally in Web3",
+          await sendAgentMessage(server, userId, "I want to find a fully remote developer job, ideally in Web3")
+        );
+        const preservesWeb3Proposal = /web3/i.test(t1.reply);
+        trace.checkpoint("Web3 preserved in the proposal", preservesWeb3Proposal, t1.reply);
+        assert.ok(preservesWeb3Proposal, `expected 'Web3' preserved in the proposal — got: ${t1.reply}`);
+
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        const goal = await prisma.goal.findFirst({ where: { userId } });
+        const preservesWeb3Goal = /web3/i.test(goal?.title ?? "");
+        trace.checkpoint("Web3 preserved in the real created goal's title", preservesWeb3Goal, goal?.title ?? "missing");
+        assert.ok(preservesWeb3Goal, `expected the real goal title to preserve 'Web3' — got: ${goal?.title}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "160. conversion wording never overpromises a computed percentage/rate",
+  { ...llmEvalOptions(["goal-title-preservation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-conversion-wording-${randomUUID()}`;
+    const trace = new EvalTrace("160-conversion-wording", ["goal-title-preservation"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I want to find a remote Web3 developer job, track how many CVs I send, recruiter replies, interviews, and conversion from applications to interviews",
+          await sendAgentMessage(
+            server,
+            userId,
+            "I want to find a remote Web3 developer job, track how many CVs I send, recruiter replies, interviews, and conversion from applications to interviews"
+          )
+        );
+
+        const noFakeConversionLabel = !/applications to interviews conversion/i.test(reply.reply) && !/\bconversion\b/i.test(reply.reply);
+        trace.checkpoint("no signal literally labeled '...Conversion'", noFakeConversionLabel, reply.reply);
+        assert.ok(noFakeConversionLabel, `expected no computed-sounding 'Conversion' label — got: ${reply.reply}`);
+
+        const mentionsRealSignals = /cv|application/i.test(reply.reply) && /interview/i.test(reply.reply);
+        assert.ok(mentionsRealSignals, `expected the real underlying signals still shown — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
