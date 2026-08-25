@@ -1135,9 +1135,24 @@ export async function executeOperation(
       }
 
       case "memory.create": {
+        const summary = args.summary as string;
+        // fix/private-alpha-goal-context-and-evening-coaching: the planner is now prompted to
+        // ALWAYS save a durable goal-setup fact via memory.create (see planner.ts's own "Durable
+        // goal-setup constraints" rule) — a real gpt-4o-mini eval run found it re-saving the exact
+        // same already-remembered fact on nearly every later turn, even a plain "ok, thanks",
+        // despite the prompt already telling it to check context.recentMemorySummaries first. This
+        // deterministic backstop is the actual guarantee against an unbounded pile-up of duplicate
+        // memory rows; the prompt guidance alone was not reliable enough here, same lesson as the
+        // resume/CV veto right below.
+        const existing = await getActiveMemories(userId);
+        const duplicate = existing.find((memory) => titlesLookSimilar(memory.summary, summary));
+        if (duplicate) {
+          return { tool: operation.tool, status: "executed", summary: `Already remembered: ${duplicate.summary}`, result: duplicate };
+        }
+
         const created = await createMemory(userId, {
           type: (args.type as never) ?? "note",
-          summary: args.summary as string,
+          summary,
           source: "explicit_user_request",
           confidence: 1
         });
@@ -3495,14 +3510,21 @@ function titlesLookSimilar(a: string, b: string): boolean {
   return overlap / Math.max(wordsA.size, wordsB.length) >= 0.6;
 }
 
-// A real transcript reported this exact fact getting contradicted twice — checked against BOTH
-// the visible recent conversation (this session's own messages) AND context.memories' summaries
-// (durable facts, possibly saved in an earlier session), since either one is a real, honest
-// source for "the user already told Alecto this." Deliberately scoped to resume/CV specifically
-// (the two real reported instances), not a generic "any stated fact" detector — that would be a
-// much bigger, riskier feature than this focused pass calls for.
-const RESUME_UP_TO_DATE_RE = /\b(resume|cv|web cv)\b[\s\S]{0,50}\b(already )?(up.?to.?date|current|updated)\b|\b(already )?(up.?to.?date|current|updated)\b[\s\S]{0,50}\b(resume|cv|web cv)\b/i;
-const RESUME_UPDATE_SUGGESTION_RE = /\b(update|customize|tailor|revise|polish|refresh)\b[\s\S]{0,25}\b(resume|cv|web cv)\b|\b(resume|cv|web cv)\b[\s\S]{0,25}\b(update|customize|tailor|revise|polish|refresh)\b/i;
+// A real transcript reported this exact fact getting contradicted THREE times now — checked
+// against BOTH the visible recent conversation (this session's own messages, capped at
+// MAX_MESSAGES in conversation-session.ts — genuinely just a handful of turns) AND
+// context.memories' summaries (durable facts, possibly saved in an earlier session entirely).
+// The recent-conversation check alone was never enough: a fact stated once during goal setup
+// reliably ages out of that short window within a real, normal-length conversation, which is
+// exactly what happened — see planner.ts's own goal-setup guidance, now updated to actually save
+// this kind of fact as a memory.create'd "goal_context" entry so it survives past that window.
+// Deliberately scoped to resume/CV/portfolio specifically (the real reported instances), not a
+// generic "any stated fact" detector — that would be a much bigger, riskier feature than this
+// focused pass calls for.
+const RESUME_UP_TO_DATE_RE =
+  /\b(resume|cv|web cv|portfolio)\b[\s\S]{0,50}\b(already )?(up.?to.?date|current|updated)\b|\b(already )?(up.?to.?date|current|updated)\b[\s\S]{0,50}\b(resume|cv|web cv|portfolio)\b/i;
+const RESUME_UPDATE_SUGGESTION_RE =
+  /\b(update|customize|improve|tailor|revise|polish|refresh|prepare)\b[\s\S]{0,25}\b(resume|cv|web cv|portfolio)\b|\b(resume|cv|web cv|portfolio)\b[\s\S]{0,25}\b(update|customize|improve|tailor|revise|polish|refresh|prepare)\b/i;
 
 function recentlyStatedResumeUpToDate(context: ContextBundle): boolean {
   const recentUserText = context.session.messages
