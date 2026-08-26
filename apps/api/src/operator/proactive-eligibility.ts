@@ -306,3 +306,42 @@ export function formatEveningCheckinDeliveryDiagnosis(
 
   return EVENING_DIAGNOSIS_MESSAGE[status](time, allowlistActive);
 }
+
+/**
+ * fix/private-alpha-proactive-checkins-and-overdue-action-ux: the compact status line the
+ * "automatic messages" summary (proactive.settings_show) shows for a moment the user has ON —
+ * distinct from formatProactiveDeliveryDiagnosis/formatEveningCheckinDeliveryDiagnosis above,
+ * which answer a DELIBERATE "why didn't X send?" question with a full sentence. This is a short
+ * suffix meant to sit on the same line as "Morning brief: on, around 09:00" — undefined when
+ * nothing is actually blocking today's send (the ordinary, common case), a short clause when
+ * something genuinely is. Reuses the exact same ProactiveDeliveryStatus/EveningCheckinDeliveryStatus
+ * enum getProactiveDeliveryStatus/getEveningCheckinDeliveryStatus already compute, so this can
+ * never disagree with the real diagnosis about WHETHER something is blocked — only how tersely
+ * it's phrased.
+ */
+export function proactiveStatusBlockedClause(status: ProactiveDeliveryStatus | EveningCheckinDeliveryStatus): string | undefined {
+  switch (status) {
+    case "delivery_disabled":
+      return "delivery disabled in this environment";
+    case "user_not_allowlisted":
+      return "not eligible — not in the allowlist";
+    case "daily_loop_disabled":
+      return "blocked — the daily loop itself is off";
+    case "no_candidate":
+      return "nothing grounded to send yet today";
+    case "legacy_daily_loop_sent_instead":
+      return "today's message came from the legacy daily-loop system instead";
+    default:
+      // eligible / outside_..._window / duplicate_dedupe_key / user_not_opted_in — nothing is
+      // actually blocking delivery; the caller shows next-due/last-sent instead of a clause.
+      return undefined;
+  }
+}
+
+/** "today 09:00" if the scheduled local time hasn't happened yet today, else "tomorrow 09:00" —
+ * the "next due" half of the truthful automatic-messages status line. */
+export function nextScheduledMomentLabel(scheduledMinutes: number, now: Date, timezone: string): string {
+  const nowMinutes = minutesOfDayInTimezone(now, timezone);
+  const time = formatMinutesOfDay(scheduledMinutes);
+  return nowMinutes < scheduledMinutes ? `today ${time}` : `tomorrow ${time}`;
+}

@@ -7,6 +7,7 @@ import {
   upsertAgentConversationSession,
   type ActionItemReminderCandidate
 } from "@operator-agent/db";
+import { buildOpenActionCommandFooter, formatOverdueSinceLabelForChat } from "@operator-agent/core";
 
 /**
  * Real Telegram smoke test flagged the old per-action reminder as "too robotic for V3/private
@@ -55,7 +56,7 @@ export async function sendDueActionReminders(now: Date, options: ActionReminderD
 
     try {
       const settings = await getOrCreateNotificationSettings(userId);
-      const message = formatBundledActionReminderMessage(userCandidates, settings.timezone);
+      const message = formatBundledActionReminderMessage(userCandidates, settings.timezone, now);
       await options.sendTelegramMessage(chatId, message);
       await persistVisibleEntitiesForActionReminders(userId, userCandidates, message, now);
 
@@ -85,9 +86,18 @@ export async function sendDueActionReminders(now: Date, options: ActionReminderD
   }
 }
 
-function formatBundledActionReminderMessage(candidates: ActionItemReminderCandidate[], timezone: string): string {
+function formatBundledActionReminderMessage(candidates: ActionItemReminderCandidate[], timezone: string, now: Date): string {
+  // fix/private-alpha-proactive-checkins-and-overdue-action-ux: a real Telegram transcript found
+  // this footer still hardcoded as "Reply: complete 1, snooze 2 tomorrow, or archive 3." — always
+  // referencing indexes 1/2/3 regardless of how many actions were actually bundled (one action
+  // shown, "archive 3" referenced), and still saying the user-facing-forbidden word "snooze".
+  // apps/api's own action.list had already fixed the identical bug for its own footer (see
+  // buildOpenActionCommandFooter's doc comment in @operator-agent/core) — this worker message is a
+  // completely separate code path (apps/worker never imports apps/api) that nothing kept in sync.
+  // Every candidate bundled here is, by construction, an open action whose due (or deferred-
+  // return) moment has already passed, so its own index is always a valid, real "open index".
   const allOverdueDue = candidates.every(
-    (candidate) => candidate.reminderType === "due" && Boolean(candidate.actionItem.dueAt && candidate.actionItem.dueAt < new Date())
+    (candidate) => candidate.reminderType === "due" && Boolean(candidate.actionItem.dueAt && candidate.actionItem.dueAt < now)
   );
   const noun = allOverdueDue ? "overdue action" : "action reminder";
   const header = `You have ${candidates.length} ${noun}${candidates.length === 1 ? "" : "s"}:`;
@@ -95,12 +105,16 @@ function formatBundledActionReminderMessage(candidates: ActionItemReminderCandid
   const lines = [
     header,
     ...candidates.map((candidate, index) => {
-      const dueLine = candidate.actionItem.dueAt ? ` (due: ${formatLocalDateTime(candidate.actionItem.dueAt, timezone)})` : "";
+      const dueLine = candidate.actionItem.dueAt ? ` — ${formatOverdueSinceLabelForChat(candidate.actionItem.dueAt, timezone, now)}` : "";
       return `${index + 1}. ${candidate.actionItem.title}${dueLine}`;
-    }),
-    "",
-    "Reply: complete 1, snooze 2 tomorrow, or archive 3."
+    })
   ];
+
+  const openIndexes = candidates.map((_, index) => index + 1);
+  const footer = buildOpenActionCommandFooter(openIndexes);
+  if (footer) {
+    lines.push("", footer);
+  }
 
   return lines.join("\n");
 }
@@ -128,16 +142,4 @@ async function persistVisibleEntitiesForActionReminders(userId: string, candidat
 function telegramChatIdFromUserId(userId: string): string | undefined {
   const match = userId.match(/^telegram:(\d+)$/);
   return match?.[1];
-}
-
-function formatLocalDateTime(date: Date, timezone: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    timeZone: timezone,
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).format(date);
 }

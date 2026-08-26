@@ -7185,9 +7185,16 @@ test("natural action due parser avoids vague past times and rejects explicit pas
     tonightTimeMinutes: 1200
   };
 
+  // fix/private-alpha-proactive-checkins-and-overdue-action-ux: a bare "today" with no explicit
+  // time or day-part now defaults to the END of the local day (23:59), not defaultActionTimeMinutes
+  // (9am, already passed relative to `now` here) rolled forward by the generic "+15 minutes from
+  // now" vague-past fallback — that fallback used to make a same-day, date-only task go overdue
+  // almost immediately after creation whenever it was made later in the day, a real reported bug.
+  // "today morning"/"this morning" below are UNCHANGED by that fix — an explicit day-part is a
+  // deliberate, specific time the user actually asked for, not the bare "sometime today" case.
   const today = parseActionDueDate("call Alex today", { now, preferences });
   assert.ok(today.dueAt && today.dueAt > now);
-  assert.equal(minutesBetween(now, today.dueAt), 15);
+  assert.equal(localMinutes(today.dueAt), 23 * 60 + 59);
 
   const todayMorning = parseActionDueDate("call Alex today morning", { now, preferences });
   assert.ok(todayMorning.dueAt && todayMorning.dueAt > now);

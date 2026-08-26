@@ -151,8 +151,25 @@ function buildMorningBrief(
   );
 
   if (topActions.length === 0 && overdueActions.length === 0 && deferredReturningToday.length === 0) {
-    // Has goals, but nothing concretely actionable today — nothing grounded to lead with.
-    return null;
+    // fix/private-alpha-proactive-checkins-and-overdue-action-ux: reaching here means the goal-
+    // anchor branch above already ruled out "zero goals AND zero actions" — so there's always at
+    // least one real active goal at this point, just nothing action-shaped scheduled for today
+    // yet. A real audit found this used to silently skip the morning brief entirely in that case
+    // ("no_eligible_candidate"), even though the product requirement is that having an active
+    // goal alone is enough to send — never auto-creates an action, just names the real goal(s)
+    // and asks what to focus on, exactly like the goal-anchor nudge does for the no-goal case.
+    const goalTitles = context.activeGoals.map((goal) => `"${goal.title}"`).join(", ");
+    return {
+      decision: "proposed_message",
+      type: "morning_brief",
+      title: "Morning brief",
+      message: `Morning. Active goal${context.activeGoals.length === 1 ? "" : "s"}: ${goalTitles}. Nothing scheduled for today yet — what do you want to focus on?`,
+      reasons: context.activeGoals.map((goal) => `active goal, no open/overdue/deferred actions yet: "${goal.title}"`),
+      suggestedReplies: ["create a task for today"],
+      dedupeKey: MORNING_BRIEF_DEDUPE_KEY,
+      priority: 1,
+      safeToSend: true
+    };
   }
 
   const lines = ["Morning."];
@@ -261,8 +278,34 @@ function buildEveningCheckin(
     .filter((action) => action.dueAt && formatDateInTimezone(action.dueAt, settings.timezone) === todayLocalDate)
     .slice(0, 2);
 
+  // fix/private-alpha-proactive-checkins-and-overdue-action-ux: untrackedGoals only ever includes
+  // a goal that HAS a trackable metric (a real eventType) AND wasn't logged today — a goal with NO
+  // trackable metrics at all (e.g. a fresh custom goal with no configured signals yet) was
+  // silently excluded from BOTH untrackedGoals (no metrics to be "untracked") and this fallback,
+  // sending nothing at all even though it's the user's only active goal. Deliberately distinct
+  // from "this goal's metrics were already logged today" (untrackedGoals correctly excludes that
+  // case too, but it must still mean "no_message" — the goal already has an honest answer for
+  // today, nagging again would be exactly the "does not nag" behavior this module is tested for).
+  const goalsWithNoTrackableMetric = context.activeGoals.filter((goal) => (goal.targetMetrics ?? []).filter((metric) => metric.eventType).length === 0);
+
   if (untrackedGoals.length === 0 && missedDueTodayActions.length === 0) {
-    return null;
+    if (goalsWithNoTrackableMetric.length === 0) {
+      // Either no active goals at all, or every active goal already has a trackable metric that
+      // was logged today — genuinely nothing to ask about, not a case this fallback should cover.
+      return null;
+    }
+    const goalPhrases = goalsWithNoTrackableMetric.map((goal) => goal.title.toLowerCase());
+    return {
+      decision: "proposed_message",
+      type: "evening_checkin",
+      title: "Evening check-in",
+      message: `Evening check-in: Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "gym 45m and sent 2 CVs" is enough.`,
+      reasons: goalsWithNoTrackableMetric.map((goal) => `active goal, no trackable metric configured: "${goal.title}"`),
+      suggestedReplies: ["gym 45m and sent 2 CVs", "nothing today"],
+      dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
+      priority: 2,
+      safeToSend: true
+    };
   }
 
   const parts: string[] = [];
