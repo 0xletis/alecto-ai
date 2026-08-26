@@ -867,7 +867,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: noRuleUserId, message: "sync my email" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new review items/);
+    assert.match(response.json().reply, /I scanned Gmail with the job-search rule\. No new job-search emails found\./);
 
     response = await server.inject({
       method: "POST",
@@ -895,7 +895,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: syncUserId, message: "check my Gmail now" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new review items/);
+    assert.match(response.json().reply, /I scanned Gmail with the job-search rule\. No new job-search emails found\./);
     assert.doesNotMatch(response.json().reply, /older Gmail connection|active deduped|semantic deduped/);
     assert.doesNotMatch(response.json().reply, /natural-sync-access-token|natural-sync-refresh-token|ciphertext|"iv"|"tag"/);
 
@@ -905,7 +905,7 @@ test("natural Gmail sync requests route through safe sync behavior", async () =>
       payload: { userId: syncUserId, message: "sync integrations" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Gmail sync: 0 messages checked, 0 new review items/);
+    assert.match(response.json().reply, /I scanned Gmail with the job-search rule\. No new job-search emails found\./);
 
     response = await server.inject({
       method: "POST",

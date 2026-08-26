@@ -4160,8 +4160,16 @@ export async function composeGmailGoalUsageStatusReply(
   const coveredKind = [...relevantKinds].find((kind) => activeAdapterIds.has(GMAIL_RULE_KIND_ADAPTER_ID[kind]));
 
   if (coveredKind) {
+    // fix/private-alpha-gmail-evidence-sync-and-review-flow (task 7): "is Gmail on for this
+    // goal" and "how often does it actually check" used to only ever appear in TWO separate
+    // replies (this one vs. gmail.autonomy.status) — a real audit found this specific "yes"
+    // reply never distinguished manual-only from scheduled sync at all, which is exactly the
+    // ambiguity between "I track this" and "I actually poll on a schedule" the task's four
+    // status states are about. Reuses gmailSyncModeSentence verbatim — the SAME sentence
+    // gmail.autonomy.status already shows — rather than composing new wording, so the two can
+    // never drift apart on what "scheduled" actually means for this user right now.
     return {
-      text: `Yes — Gmail is connected and the ${GMAIL_RULE_KIND_LABEL[coveredKind]} rule is active. I can use readonly email signals like ${GMAIL_RULE_KIND_WATCHES[coveredKind]}.`
+      text: `Yes — Gmail is connected and the ${GMAIL_RULE_KIND_LABEL[coveredKind]} rule is active. I can use readonly email signals like ${GMAIL_RULE_KIND_WATCHES[coveredKind]}. ${gmailSyncModeSentence(state)}`
     };
   }
 

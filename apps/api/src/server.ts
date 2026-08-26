@@ -2484,14 +2484,46 @@ function formatConversationGmailSyncResult(result: {
   }
 
   const totals = gmailSyncTotals(result.emailSummaries ?? []);
+  // Only switch to the job-search-specific "Found: ..." breakdown when EVERY rule synced this
+  // call is the job-search rule — a connection can mix job-search with work-action/custom rules
+  // in one "sync Gmail" call, and that combined result isn't specifically about job search, so it
+  // keeps the generic aggregate line instead of a breakdown implying job-search-only signals.
+  const summaries = result.emailSummaries ?? [];
+  const isJobSearchOnlySync = summaries.length > 0 && summaries.every((summary) => summary.adapterId === "job_search_email");
   return [
-    formatGmailSyncTotalsForConversation(totals),
+    formatGmailSyncTotalsForConversation(totals, isJobSearchOnlySync),
     pendingEmailReviewLine(result.pendingEmailReviewCount ?? 0)
   ].filter(Boolean).join("\n\n");
 }
 
-function formatGmailSyncTotalsForConversation(totals: ReturnType<typeof gmailSyncTotals>): string {
+function formatGmailSyncTotalsForConversation(totals: ReturnType<typeof gmailSyncTotals>, isJobSearchOnlySync: boolean): string {
   const messagesChecked = totals.messagesFound + totals.aiMessagesChecked;
+
+  if (isJobSearchOnlySync) {
+    const breakdown = formatJobSearchSignalBreakdown(totals.signalCounts);
+
+    if (!breakdown && totals.reviewItemsCreated === 0 && totals.eventsCreated === 0) {
+      return "I scanned Gmail with the job-search rule. No new job-search emails found.";
+    }
+
+    const lines = ["I scanned Gmail with the job-search rule."];
+    if (breakdown) {
+      lines.push("", "Found:", ...breakdown);
+    }
+
+    const outcomeParts: string[] = [];
+    if (totals.eventsCreated > 0) {
+      outcomeParts.push(`I added ${totals.eventsCreated} clear item${totals.eventsCreated === 1 ? "" : "s"} to your job-search progress.`);
+    }
+    if (totals.reviewItemsCreated > 0) {
+      outcomeParts.push(`${totals.reviewItemsCreated} uncertain email${totals.reviewItemsCreated === 1 ? "" : "s"} need${totals.reviewItemsCreated === 1 ? "s" : ""} review.`);
+    }
+    if (outcomeParts.length > 0) {
+      lines.push("", outcomeParts.join(" "));
+    }
+
+    return lines.join("\n");
+  }
 
   if (totals.reviewItemsCreated > 0 && totals.eventsCreated > 0) {
     return `Gmail sync: ${messagesChecked} messages checked, ${totals.reviewItemsCreated} new review item${totals.reviewItemsCreated === 1 ? "" : "s"}, ${totals.eventsCreated} event${totals.eventsCreated === 1 ? "" : "s"} logged.`;
@@ -2614,7 +2646,8 @@ function gmailSyncTotals(summaries: EmailRuleSyncSummary[]) {
       lowConfidenceIgnored: totals.lowConfidenceIgnored + summary.lowConfidenceIgnored,
       archivedCleanupReprocessed: totals.archivedCleanupReprocessed + summary.archivedCleanupReprocessed,
       skippedDueMaxEventsPerSync: totals.skippedDueMaxEventsPerSync + summary.skippedDueMaxEventsPerSync,
-      eventsCreated: totals.eventsCreated + summary.eventsCreated
+      eventsCreated: totals.eventsCreated + summary.eventsCreated,
+      signalCounts: mergeSignalCounts(totals.signalCounts, summary.signalCounts)
     }),
     {
       messagesFound: 0,
@@ -2640,9 +2673,44 @@ function gmailSyncTotals(summaries: EmailRuleSyncSummary[]) {
       lowConfidenceIgnored: 0,
       archivedCleanupReprocessed: 0,
       skippedDueMaxEventsPerSync: 0,
-      eventsCreated: 0
+      eventsCreated: 0,
+      signalCounts: {} as Record<string, number>
     }
   );
+}
+
+function mergeSignalCounts(a: Record<string, number>, b: Record<string, number>): Record<string, number> {
+  const merged: Record<string, number> = { ...a };
+  for (const [key, count] of Object.entries(b)) {
+    merged[key] = (merged[key] ?? 0) + count;
+  }
+  return merged;
+}
+
+/** Ordered career.* eventTypes surfaced in the job-search "sync Gmail" reply breakdown, paired
+ * with singular/plural labels — kept local to this reply-formatting layer rather than reusing
+ * agent-runtime/executor.ts's EVENT_COUNT_LABELS, since that table's wording (e.g. "interview
+ * scheduled") is tuned for goal-progress sentences, not this "Found: - N interview emails" list. */
+const JOB_SEARCH_SIGNAL_ORDER: Array<[eventType: string, singular: string, plural: string]> = [
+  ["career.recruiter_reply_received", "recruiter reply", "recruiter replies"],
+  ["career.application_confirmation_received", "application confirmation", "application confirmations"],
+  ["career.interview_scheduled", "interview email", "interview emails"],
+  ["career.rejection_received", "rejection email", "rejection emails"],
+  ["career.offer_received", "offer email", "offer emails"]
+];
+
+const JOB_SEARCH_SIGNAL_EVENT_TYPES = new Set(JOB_SEARCH_SIGNAL_ORDER.map(([eventType]) => eventType));
+
+function formatJobSearchSignalBreakdown(signalCounts: Record<string, number>): string[] | undefined {
+  const total = Object.values(signalCounts).reduce((sum, count) => sum + count, 0);
+  if (total === 0) {
+    return undefined;
+  }
+
+  return JOB_SEARCH_SIGNAL_ORDER.map(([eventType, singular, plural]) => {
+    const count = signalCounts[eventType] ?? 0;
+    return `- ${count} ${count === 1 ? singular : plural}`;
+  });
 }
 
 function dedupeLines(lines: string[]): string[] {
@@ -3811,6 +3879,7 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     archivedCleanupReprocessed: 0,
     skippedDueMaxEventsPerSync: 0,
     eventsCreated: 0,
+    signalCounts: {},
     reviewCandidateDebug: [],
     syncDecisionDebug: []
   };
@@ -4245,6 +4314,13 @@ async function syncEmailSignalRule(input: {
         })
       );
       recordEmailReviewItemResult(summary, reviewResult);
+      // Only count a genuinely NEW review item toward the "Found: ..." breakdown — a re-sync of
+      // an already-pending/decided email must report "no new items", not re-announce the same
+      // signal as freshly found (this is exactly what tells a repeat "sync Gmail" apart from the
+      // first one).
+      if (reviewResult.status === "created" && classification.eventType && JOB_SEARCH_SIGNAL_EVENT_TYPES.has(classification.eventType)) {
+        summary.signalCounts[classification.eventType] = (summary.signalCounts[classification.eventType] ?? 0) + 1;
+      }
 
       continue;
     }
@@ -4322,6 +4398,9 @@ async function syncEmailSignalRule(input: {
 
     if (created.created) {
       summary.eventsCreated += 1;
+      if (JOB_SEARCH_SIGNAL_EVENT_TYPES.has(eventType)) {
+        summary.signalCounts[eventType] = (summary.signalCounts[eventType] ?? 0) + 1;
+      }
       await withGmailStage("event_creation", () =>
         approvePendingGmailReviewItemsForSemanticEvent({
           userId: input.userId,
