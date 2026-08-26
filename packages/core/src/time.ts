@@ -101,7 +101,16 @@ function localHour(date: Date, timezone: string): number {
   return Number(hour ?? 0);
 }
 
-function localDateTimeToUtc(date: string, time: string, timezone: string): Date {
+/** Exported for fix/private-alpha-local-date-focus-and-gmail-confirmation-state — reused directly
+ * by action-intake.ts's date-phrase parser (atLocalTime/addDaysAt/nextWeekdayAt), which
+ * previously built "today"/"tomorrow"/weekday due dates with plain Date.setHours/setDate calls.
+ * Those operate in the JS runtime's OWN system timezone (UTC on this app's actual host), not the
+ * user's real one passed all the way through as `preferences.timezone` but never applied — a real
+ * reported bug had "today" at 01:11 Europe/Madrid on Aug 26 (23:11 UTC Aug 25) resolve to Aug 25,
+ * the wrong calendar day, because the arithmetic never left UTC. This is the one already-correct,
+ * already-tested primitive in this codebase for "local wall-clock time in a given IANA timezone
+ * -> the real UTC instant it refers to" — reusing it instead of writing a second implementation. */
+export function localDateTimeToUtc(date: string, time: string, timezone: string): Date {
   const [year, month, day] = date.split("-").map(Number);
   const [hour, minute] = time.split(":").map(Number);
   const utcGuess = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
@@ -133,7 +142,10 @@ function timezoneOffsetMs(date: Date, timezone: string): number {
   return asUtc - date.getTime();
 }
 
-function addDaysToLocalDate(date: string, days: number): string {
+/** Exported alongside localDateTimeToUtc above, same reason — action-intake.ts's date-phrase
+ * parser needs to add days to a LOCAL calendar date (never a UTC one) before converting back to a
+ * real instant. */
+export function addDaysToLocalDate(date: string, days: number): string {
   const [year, month, day] = date.split("-").map(Number);
   const utc = new Date(Date.UTC(year, month - 1, day + days, 12, 0, 0, 0));
   return utc.toISOString().slice(0, 10);

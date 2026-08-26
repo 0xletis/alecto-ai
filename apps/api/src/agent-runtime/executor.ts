@@ -96,6 +96,7 @@ import {
   assessTemporalHealth,
   EVENING_CHECKIN_DEDUPE_KEY,
   formatTemporalHealthLabel,
+  minutesOfDayInTimezone,
   MORNING_BRIEF_DEDUPE_KEY,
   rankOpenActions,
   type TemporalHealth
@@ -312,6 +313,20 @@ export async function executeOperation(
         // invented date. A title with no temporal words at all (the common case) still gets no
         // dueAt, exactly as before.
         const parsedDate = dueText ? parseActionDueDate(dueText) : parseActionDueDate(title);
+        // Task 3/4 (launch-readiness): an EXPLICIT dueText (as opposed to the best-effort title
+        // scan used when no dueText is given at all) that fails to resolve to a real date — a
+        // weekday/day-of-month contradiction ("Thursday 26 August" when the 26th is a Wednesday),
+        // an already-past explicit time, or genuinely unparseable/unsupported phrasing — must
+        // never be silently dropped in favor of creating the task with no due date at all. Only
+        // triggers when dueText was actually provided; the title-scan fallback path (no explicit
+        // date given) is untouched, since finding nothing there is the normal, expected case.
+        if (dueText && !parsedDate.dueAt) {
+          return failed(
+            operation.tool,
+            parsedDate.clarification ??
+              `I couldn't understand the due date "${dueText}". Try something like "Friday", "26 August", or "next Wednesday".`
+          );
+        }
         const description = args.notes as string | undefined;
         const explicitGoalId = args.goalId as string | undefined;
         // Generic goal linkage (Goal Evidence Loop MVP, docs/10-v3-readiness-audit.md §20) —
@@ -335,10 +350,18 @@ export async function executeOperation(
           goalSlug: goalLink.goalSlug ?? undefined,
           goalTitleSnapshot: goalLink.matchedGoalTitle
         });
+        // fix/private-alpha-local-date-focus-and-gmail-confirmation-state: created.dueAt.
+        // toDateString() formats in the JS runtime's OWN system timezone (UTC on this app's
+        // actual host), never the user's real one — a real reported bug had a "today" action
+        // confirmed as "due Tue Aug 25" when it was already Wed Aug 26 in the user's own
+        // timezone. formatDueLabelForChat is the SAME already-timezone-aware, already-tested
+        // "due today/tomorrow/Wed Aug 26" formatter action.list's own per-item line already uses
+        // — reused here for the same value, not a second implementation.
+        const dueSettings = created.dueAt ? await getOrCreateNotificationSettings(userId) : undefined;
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Created task "${created.title}"${created.dueAt ? ` due ${created.dueAt.toDateString()}` : ""}.${goalLink.matchedGoalTitle ? ` Linked to your "${goalLink.matchedGoalTitle}" goal.` : ""}`,
+          summary: `Created task "${created.title}"${created.dueAt && dueSettings ? ` ${formatDueLabelForChat(created.dueAt, dueSettings.timezone)}` : ""}.${goalLink.matchedGoalTitle ? ` Linked to your "${goalLink.matchedGoalTitle}" goal.` : ""}`,
           result: created,
           entities: [actionToEntity(created)]
         };
@@ -349,7 +372,7 @@ export async function executeOperation(
         const untilText = args.untilText as string;
         const parsedDate = parseActionDueDate(untilText);
         if (!parsedDate.dueAt) {
-          return failed(operation.tool, `Couldn't understand the snooze target "${untilText}".`);
+          return failed(operation.tool, parsedDate.clarification ?? `Couldn't understand the snooze target "${untilText}".`);
         }
         const updated = await snoozeActionItem(userId, actionId, parsedDate.dueAt);
         if (!updated) {
@@ -593,10 +616,27 @@ export async function executeOperation(
         const settings = await getOrCreateNotificationSettings(userId);
         const dueText = typeof args.dueText === "string" ? args.dueText.trim() : "";
         const timeText = typeof args.timeText === "string" ? args.timeText.trim() : "";
-        const parsedDate = parseActionRescheduleDate(action, { dueText, timeText, timezone: settings.timezone });
+        const parsedReschedule = parseActionRescheduleDate(action, { dueText, timeText, timezone: settings.timezone });
 
-        if (!parsedDate) {
-          return failed(operation.tool, "I couldn't understand the new due time.");
+        if (!parsedReschedule.dueAt) {
+          return failed(operation.tool, parsedReschedule.clarification ?? "I couldn't understand the new due time.");
+        }
+        const parsedDate = parsedReschedule.dueAt;
+
+        // fix/private-alpha-local-date-focus-and-gmail-confirmation-state: rescheduling to the
+        // EXACT same instant it's already due at (a real reported shape — "move it to wed 26"
+        // when it's already due Wed 26, e.g. because the user was just double-checking after a
+        // parse failure) is honest, not a real change — say so plainly instead of a normal
+        // "Action rescheduled" reply implying something actually moved. A genuine time change on
+        // the same day (e.g. "move it to today at 3pm") still proceeds normally below.
+        if (action.dueAt && parsedDate.getTime() === action.dueAt.getTime()) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `It's already scheduled for ${formatDueLabelForChat(action.dueAt, settings.timezone).replace(/^due /, "")}. I can change the time if you want.`,
+            result: action,
+            entities: [actionToEntity(action)]
+          };
         }
 
         const updated = await rescheduleActionItem(userId, action.id, parsedDate);
@@ -2675,22 +2715,36 @@ function meaningfulQuestionTerms(text: string): string[] {
   return [...new Set(text.split(/\s+/).filter((term) => term.length >= 4 && !stopWords.has(term)))];
 }
 
+// Task 3/4 (launch-readiness): returns the specific clarification (e.g. a weekday/day-of-month
+// mismatch question) whenever parseActionDueDate produced one, rather than collapsing every
+// failure into the same generic "couldn't understand" reply — the caller decides which message
+// to actually show, but only ever proceeds to reschedule when dueAt is present.
 function parseActionRescheduleDate(
   action: ActionItem,
   input: { dueText?: string; timeText?: string; timezone: string }
-): Date | undefined {
+): { dueAt: Date | undefined; clarification?: string } {
   if (input.dueText?.trim()) {
-    const parsed = parseActionDueDate(input.dueText, { timezone: input.timezone });
-    return parsed.invalidReason ? undefined : parsed.dueAt ?? undefined;
+    // fix/private-alpha-local-date-focus-and-gmail-confirmation-state: a date-only reschedule
+    // ("move it to wed 26") used to always fall back to the DEFAULT action time (9am), silently
+    // dropping whatever time the action was already scheduled for. When the action already has a
+    // real dueAt, its own local time-of-day becomes the default parseActionDueDate falls back to
+    // — this only ever affects the no-explicit-time fallback; an explicit time in the new phrase
+    // ("move it to wed 26 at 3pm") still always wins, unchanged.
+    const existingTimeMinutes = action.dueAt ? minutesOfDayInTimezone(action.dueAt, input.timezone) : undefined;
+    const parsed = parseActionDueDate(input.dueText, {
+      timezone: input.timezone,
+      preferences: existingTimeMinutes !== undefined ? { defaultActionTimeMinutes: existingTimeMinutes } : undefined
+    });
+    return { dueAt: parsed.invalidReason ? undefined : parsed.dueAt ?? undefined, clarification: parsed.clarification };
   }
 
   if (input.timeText?.trim() && action.dueAt) {
     const localDate = formatDateInTimezone(action.dueAt, input.timezone);
     const parsed = parseActionDueDate(`${localDate} ${input.timeText}`, { timezone: input.timezone });
-    return parsed.invalidReason ? undefined : parsed.dueAt ?? undefined;
+    return { dueAt: parsed.invalidReason ? undefined : parsed.dueAt ?? undefined, clarification: parsed.clarification };
   }
 
-  return undefined;
+  return { dueAt: undefined };
 }
 
 async function resolveReminderTargetActions(
