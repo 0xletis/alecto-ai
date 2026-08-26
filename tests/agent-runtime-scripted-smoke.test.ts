@@ -1396,8 +1396,13 @@ test("scripted smoke 19: my goal is to go to the gym every day -> yes -> what pr
           plan: { topic: "proactive_settings", intent: "show_proactive_settings", operations: [op("proactive.settings_show")], needsClarification: false, clarificationQuestion: null, replyDraft: "" },
           assert: (turn) => {
             assertNoGenericError(turn);
-            assert.match(turn.reply, /morning brief: on/i);
-            assert.match(turn.reply, /evening check-in: on/i);
+            // fix/private-alpha-proactive-launch-config-cleanup (task 4): the setting itself
+            // being on and real delivery eligibility are now reported distinctly — either "on,
+            // around HH:MM" once genuinely eligible, or "configured on, but delivery is disabled
+            // on this server" while PROACTIVE_OPERATOR_DELIVERY_ENABLED is off (this test
+            // environment's default). Both are correct evidence morningBriefEnabled is true.
+            assert.match(turn.reply, /morning brief: (on,|configured on)/i);
+            assert.match(turn.reply, /evening check-in: (on,|configured on)/i);
             assertNoMutationYet(turn);
           }
         },

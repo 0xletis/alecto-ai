@@ -1,4 +1,4 @@
-import { createNotificationLog, getAgentConversationSession, upsertAgentConversationSession } from "@operator-agent/db";
+import { createNotificationLog, getAgentConversationSession, selfHealDailyLoopEnabled, upsertAgentConversationSession } from "@operator-agent/db";
 import { proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay } from "./datetime.js";
 
@@ -113,21 +113,24 @@ export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificat
       continue;
     }
 
-    // dailyLoopEnabled is a separate, older feature (legacy daily-loop start/end-day messages).
-    // morningBriefEnabled is the actual per-user product consent for THIS feature — required
-    // independently, so a user can never receive a v3 morning brief without having explicitly
-    // opted into it themselves (via /agent/message's proactive.settings_* tools).
-    if (!item.dailyLoopEnabled) {
+    // dailyLoopEnabled is a separate, older feature (legacy daily-loop start/end-day messages),
+    // which the worker also requires alongside morningBriefEnabled. fix/private-alpha-proactive-
+    // launch-config-cleanup: an existing user who opted into morningBriefEnabled BEFORE the fix
+    // that makes dailyLoopEnabled follow along automatically was otherwise stuck here forever —
+    // self-heals right at the one moment it matters (this user's own scheduled minute), a no-op
+    // once already healthy, rather than leaving delivery silently blocked until a manual re-toggle.
+    const healedItem = await selfHealDailyLoopEnabled(item);
+    if (!healedItem.dailyLoopEnabled) {
       logger.log(`V3 proactive morning brief: time matched for ${item.userId} but dailyLoopEnabled is false — skipping.`);
       continue;
     }
 
-    if (!isAllowed(item.userId)) {
+    if (!isAllowed(healedItem.userId)) {
       logger.log(`V3 proactive morning brief: time matched for ${item.userId} but they are not in PROACTIVE_OPERATOR_ALLOWLIST — skipping.`);
       continue;
     }
 
-    await maybeSendV3ProactiveDecision(item, "morning_brief", now, options.apiGet, options.sendTelegramMessage, logger);
+    await maybeSendV3ProactiveDecision(healedItem, "morning_brief", now, options.apiGet, options.sendTelegramMessage, logger);
   }
 }
 
@@ -161,23 +164,23 @@ export async function runV3ProactiveEveningCheckins(settings: V3ProactiveNotific
       continue;
     }
 
-    // dailyLoopEnabled is a separate, older feature (legacy daily-loop start/end-day messages).
-    // eveningCheckinEnabled is the actual per-user product consent for THIS feature — required
-    // independently, exactly mirroring morningBriefEnabled's own relationship to dailyLoopEnabled
-    // above (decideProactiveOperatorMessage itself also gates centrally on dailyLoopEnabled as the
-    // quiet-hours proxy — this re-check here just avoids an HTTP round trip for an already-known
-    // skip, the same reason runV3ProactiveMorningBriefs re-checks it too).
-    if (!item.dailyLoopEnabled) {
+    // dailyLoopEnabled is a separate, older feature (legacy daily-loop start/end-day messages),
+    // which the worker also requires alongside eveningCheckinEnabled — exactly mirroring
+    // morningBriefEnabled's own relationship above. fix/private-alpha-proactive-launch-config-
+    // cleanup: self-heals right at the one moment it matters (this user's own scheduled minute),
+    // a no-op once already healthy.
+    const healedItem = await selfHealDailyLoopEnabled(item);
+    if (!healedItem.dailyLoopEnabled) {
       logger.log(`V3 proactive evening check-in: time matched for ${item.userId} but dailyLoopEnabled is false — skipping.`);
       continue;
     }
 
-    if (!isAllowed(item.userId)) {
+    if (!isAllowed(healedItem.userId)) {
       logger.log(`V3 proactive evening check-in: time matched for ${item.userId} but they are not in PROACTIVE_OPERATOR_ALLOWLIST — skipping.`);
       continue;
     }
 
-    await maybeSendV3ProactiveDecision(item, "evening_checkin", now, options.apiGet, options.sendTelegramMessage, logger);
+    await maybeSendV3ProactiveDecision(healedItem, "evening_checkin", now, options.apiGet, options.sendTelegramMessage, logger);
   }
 }
 

@@ -151,7 +151,13 @@ test("9. 'what proactive messages are on?' shows the real current settings", asy
     mockPlan(proactiveShowPlan());
     const reply = await sendAgentMessage(server, userId, "what proactive messages are on?");
 
-    assert.match(reply.reply, /morning brief: on/i);
+    // fix/private-alpha-proactive-launch-config-cleanup (task 4): the setting itself being on and
+    // real delivery eligibility are now reported distinctly — "on, around HH:MM" once genuinely
+    // eligible, "configured on, but delivery is disabled on this server" while the
+    // PROACTIVE_OPERATOR_DELIVERY_ENABLED env gate is off (the default in this test environment).
+    // Either is correct evidence that morningBriefEnabled itself is true, which is this test's
+    // own concern — delivery eligibility has its own dedicated coverage elsewhere.
+    assert.match(reply.reply, /morning brief: (on,|configured on)/i);
     assert.match(reply.reply, /evening check-in: off/i);
     assert.match(reply.reply, /gmail alerts: on/i);
     assert.equal(reply.debug.mutationExecuted, false);
@@ -258,11 +264,20 @@ test("12. 'move morning brief to 9' while off changes only the time and says it'
 test("13. 'what proactive messages are on?' includes the morning brief's scheduled time", async () => {
   const server = buildServer();
   const userId = `proactive-settings-show-time-${randomUUID()}`;
+  // fix/private-alpha-proactive-launch-config-cleanup (task 4): the scheduled time is shown once
+  // delivery is genuinely eligible ("on, around HH:MM") — while PROACTIVE_OPERATOR_DELIVERY_ENABLED
+  // is off (this test environment's default), the line correctly reads "configured on, but
+  // delivery is disabled" instead, deliberately WITHOUT the time (saying "on, around 01:06" right
+  // next to "delivery is disabled" would itself be the misleading half-on wording this task fixed).
+  // This test's own concern is that morningTimeMinutes propagates into the line at all, so
+  // delivery is turned on here to exercise the branch where a time is actually shown.
+  const previousDeliveryEnabled = process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+  process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = "true";
 
   try {
     await seedUser(userId);
     await prisma.notificationSettings.create({
-      data: { userId, morningBriefEnabled: true, morningTimeMinutes: 66, eveningCheckinEnabled: false, gmailNudgeEnabled: false }
+      data: { userId, morningBriefEnabled: true, morningTimeMinutes: 66, dailyLoopEnabled: true, eveningCheckinEnabled: false, gmailNudgeEnabled: false }
     });
 
     mockPlan(proactiveShowPlan());
@@ -270,6 +285,8 @@ test("13. 'what proactive messages are on?' includes the morning brief's schedul
 
     assert.match(reply.reply, /morning brief: on, around 01:06/i);
   } finally {
+    if (previousDeliveryEnabled === undefined) delete process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+    else process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = previousDeliveryEnabled;
     clearAgentRuntimeMocks();
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });

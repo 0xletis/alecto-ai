@@ -2476,6 +2476,34 @@ export async function updateNotificationSettings(
   return toNotificationSettings(settings);
 }
 
+/**
+ * fix/private-alpha-proactive-launch-config-cleanup: dailyLoopEnabled is a separate, older
+ * umbrella flag the V3 proactive worker also requires alongside morningBriefEnabled/
+ * eveningCheckinEnabled (see apps/worker/src/v3-proactive-delivery.ts) — a user who opted into
+ * morning/evening BEFORE the tool that turns them on started also enabling dailyLoopEnabled (the
+ * prior fix on fix/private-alpha-proactive-checkins-and-overdue-action-ux) is left stuck with
+ * dailyLoopEnabled false forever, until they manually re-touch the setting. This self-heals that
+ * drift wherever settings are read for status/eligibility purposes: ONLY ever turns
+ * dailyLoopEnabled ON, and ONLY when morning or evening is ALREADY true — never touches
+ * morning/evening themselves, and never turns dailyLoopEnabled off (the separate legacy daily-
+ * loop feature may still depend on it independently of V3). A no-op (no DB write) when nothing
+ * needs healing, so this is safe to call on every read without extra write traffic.
+ */
+export async function selfHealDailyLoopEnabled<
+  T extends { userId: string; dailyLoopEnabled: boolean; morningBriefEnabled: boolean; eveningCheckinEnabled: boolean }
+>(settings: T): Promise<T> {
+  if (settings.dailyLoopEnabled || (!settings.morningBriefEnabled && !settings.eveningCheckinEnabled)) {
+    return settings;
+  }
+
+  // Applies the real write (so it survives past this one read) but merges the known-true value
+  // locally rather than round-tripping a second read — generic so both apps/api's full
+  // NotificationSettings and apps/worker's narrower V3ProactiveNotificationSettingsLike get back
+  // the exact same shape they passed in, just with dailyLoopEnabled corrected.
+  await updateNotificationSettings(settings.userId, { dailyLoopEnabled: true });
+  return { ...settings, dailyLoopEnabled: true };
+}
+
 export async function getUsersWithDailyCheckinEnabled(): Promise<NotificationSettings[]> {
   const settings = await prisma.notificationSettings.findMany({
     where: {
@@ -2497,11 +2525,16 @@ export async function getUsersWithEnabledNotifications(): Promise<NotificationSe
         { dailyInsightEnabled: true },
         { weeklyInsightEnabled: true },
         { dailyLoopEnabled: true },
-        // Without this, a user who opted into ONLY the V3 evening check-in (never touching the
-        // legacy daily-loop/checkin/insight flags) would never even appear in this coarse
-        // prefetch — apps/worker/src/index.ts's runTick() would have no row to run its own
+        // Without these two, a user who opted into ONLY a V3 moment (never touching the legacy
+        // daily-loop/checkin/insight flags) would never even appear in this coarse prefetch —
+        // apps/worker/src/index.ts's runTick() would have no row to run its own morningBriefEnabled/
         // eveningCheckinEnabled check against at all. Every individual feature branch downstream
         // still does its own fine-grained gate before acting; this only widens the prefetch.
+        // fix/private-alpha-proactive-launch-config-cleanup: morningBriefEnabled was missing here
+        // entirely — a user who opted into ONLY the morning brief (dailyLoopEnabled still false,
+        // pre-dating the fix that now sets it automatically) was silently invisible to the
+        // worker's own tick loop, on top of the separate dailyLoopEnabled self-heal gap.
+        { morningBriefEnabled: true },
         { eveningCheckinEnabled: true }
       ]
     },

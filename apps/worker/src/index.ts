@@ -61,7 +61,16 @@ function logStartupWarnings(): void {
 /** Logged once at startup so it's immediately visible whether the two developer rollout controls
  * are actually live in THIS process — .env is only read at startup, so a stale env value here is
  * the single most common source of "why isn't V3 sending" confusion. See
- * docs/10-v3-readiness-audit.md §19. */
+ * docs/10-v3-readiness-audit.md §19.
+ *
+ * fix/private-alpha-proactive-launch-config-cleanup (task 2, option D): PROACTIVE_OPERATOR_
+ * DELIVERY_ENABLED being unset/false is a deliberate, real rollout gate — kept exactly as-is, not
+ * removed or defaulted on (a real dev/test environment still needs the ability to keep delivery
+ * off). What was missing was VISIBILITY: an operator deploying this worker with the var simply
+ * forgotten would see the SAME neutral info line as an intentional dev setup, with nothing
+ * distinguishing "I meant to do this" from "I forgot a step." A real console.warn (not .log) when
+ * it's off makes that specific, easy-to-miss deploy mistake much harder to ship silently, without
+ * introducing a new environment-detection mechanism this codebase doesn't otherwise have. */
 function logEffectiveProactiveDeliveryConfig(): void {
   const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
   const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
@@ -70,6 +79,12 @@ function logEffectiveProactiveDeliveryConfig(): void {
     : "inactive — no allowlist configured, every opted-in user is eligible";
 
   console.log(`V3 proactive delivery config: PROACTIVE_OPERATOR_DELIVERY_ENABLED=${deliveryEnabled}, PROACTIVE_OPERATOR_ALLOWLIST=${allowlistSummary}`);
+
+  if (!deliveryEnabled) {
+    console.warn(
+      "[startup] PROACTIVE_OPERATOR_DELIVERY_ENABLED is not \"true\" in this process — morning brief, evening check-in, and Gmail nudges are all silently disabled for EVERY user, even those with their own setting on. If this deploy is meant to actually deliver, set PROACTIVE_OPERATOR_DELIVERY_ENABLED=true. If this is intentional (dev/test/staging), no action needed."
+    );
+  }
 }
 
 async function runTick() {

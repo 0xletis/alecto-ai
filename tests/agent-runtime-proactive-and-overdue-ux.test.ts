@@ -189,7 +189,10 @@ test("2C: if the proactive delivery env is disabled, status says configured on b
     mockPlan({ topic: "settings", intent: "show", operations: [op("proactive.settings_show", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "what proactive messages are on?");
 
-    assert.match(reply.reply, /morning brief: on, around 09:00 — delivery disabled in this environment/i);
+    // fix/private-alpha-proactive-launch-config-cleanup (task 4): "on, around HH:MM — delivery
+    // disabled in this environment" was itself the misleading half-on wording this task closed —
+    // now distinguishes the user's own setting from actual server-side delivery explicitly.
+    assert.match(reply.reply, /morning brief: configured on, but delivery is disabled on this server/i);
   } finally {
     if (previous === undefined) delete process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
     else process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = previous;
@@ -346,29 +349,32 @@ test("3D: an overdue action is called out in the morning brief", async () => {
   }
 });
 
-test("3E: a skip is logged with a real reason when delivery is blocked", async () => {
+test("3E: a skip is logged with a real reason when delivery is blocked (not allowlisted)", async () => {
   const server = buildServer();
   const userId = `proactive-morning-3e-${randomUUID()}`;
   try {
     await seedMadridUser(userId, { telegramUserId: "telegram:700005" });
     await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
-    // Deliberately NOT enabling morningBriefEnabled — dailyLoopEnabled stays false too, matching
-    // the exact real-world state this bug was found in.
+    await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: true });
     const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
-    await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: false });
-    const updated = await prisma.notificationSettings.findUnique({ where: { userId } });
 
+    // fix/private-alpha-proactive-launch-config-cleanup: dailyLoopEnabled=false is no longer a
+    // reachable "still blocked" case to test here — selfHealDailyLoopEnabled (task 1) now fixes it
+    // automatically on this exact code path, so a stale morningBriefEnabled=true/dailyLoopEnabled=
+    // false user now genuinely DELIVERS instead of skipping (covered by the "root fix" tests
+    // above). Not-allowlisted is a real, still-genuinely-blocking reason unaffected by that fix.
     const logger = capturingLogger();
-    await runV3ProactiveMorningBriefs([updated as any], {
+    await runV3ProactiveMorningBriefs([settings as any], {
       now: new Date("2026-08-27T07:00:00Z"),
       deliveryEnabled: true,
+      isAllowed: () => false,
       apiGet: injectApiGet(server),
       sendTelegramMessage: async () => {},
       logger
     });
 
     assert.ok(
-      logger.lines.some((line) => /dailyLoopEnabled is false/i.test(line)),
+      logger.lines.some((line) => /not in PROACTIVE_OPERATOR_ALLOWLIST/i.test(line)),
       `expected a logged, inspectable skip reason — got: ${JSON.stringify(logger.lines)}`
     );
   } finally {
@@ -486,25 +492,33 @@ test("4D: a due-today action still open is mentioned", async () => {
   }
 });
 
-test("4E: a skip is logged with a real reason when delivery is blocked", async () => {
+test("4E: a skip is logged with a real reason when delivery is blocked (not allowlisted)", async () => {
   const server = buildServer();
   const userId = `proactive-evening-4e-${randomUUID()}`;
   try {
     await seedMadridUser(userId, { telegramUserId: "telegram:700015" });
     await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
-    await updateNotificationSettings(userId, { eveningCheckinEnabled: true, dailyLoopEnabled: false });
+    await updateNotificationSettings(userId, { eveningCheckinEnabled: true, dailyLoopEnabled: true });
     const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
 
+    // fix/private-alpha-proactive-launch-config-cleanup: dailyLoopEnabled=false is no longer
+    // reachable here — selfHealDailyLoopEnabled (task 1) fixes it automatically on this exact
+    // path now, so that stale state genuinely delivers instead of skipping. Not-allowlisted
+    // remains a real, still-genuinely-blocking reason.
     const logger = capturingLogger();
     await runV3ProactiveEveningCheckins([settings as any], {
       now: new Date("2026-08-27T17:00:00Z"),
       deliveryEnabled: true,
+      isAllowed: () => false,
       apiGet: injectApiGet(server),
       sendTelegramMessage: async () => {},
       logger
     });
 
-    assert.ok(logger.lines.some((line) => /dailyLoopEnabled is false/i.test(line)), `expected a logged skip reason — got: ${JSON.stringify(logger.lines)}`);
+    assert.ok(
+      logger.lines.some((line) => /not in PROACTIVE_OPERATOR_ALLOWLIST/i.test(line)),
+      `expected a logged skip reason — got: ${JSON.stringify(logger.lines)}`
+    );
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });
