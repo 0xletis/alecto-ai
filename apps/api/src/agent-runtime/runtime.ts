@@ -2422,18 +2422,35 @@ async function gmailGoalUsageStatusResponse(context: ContextBundle, message: str
   }
 
   const { text, pendingOperationUpdate } = await composeGmailGoalUsageStatusReply(context.session.userId, context);
-  if (pendingOperationUpdate) {
+  // fix/private-alpha-local-date-focus-and-gmail-confirmation-state: this used to call
+  // setPendingOperation unconditionally whenever a rule proposal was available — a real reported
+  // bug had this silently REPLACE a still-open pendingOperation (e.g. a not-yet-confirmed pending
+  // action.create) with the Gmail rule proposal, so a "yes" the user meant for the action instead
+  // confirmed enabling the rule. A pure status QUESTION must never do that: it may only install
+  // its own proposal when nothing else is already waiting on a "yes", or when re-asking refreshes
+  // the SAME proposal that was already the active one — exactly the same guard executor.ts's own
+  // gmail.status case already applies (`canProposeRuleNow`), just duplicated here since this path
+  // composes its reply directly rather than going through executeOperation.
+  const existingPending = context.session.pendingOperation;
+  const canProposeRuleNow = !existingPending || existingPending.topic === "gmail_rule_proposal";
+  if (pendingOperationUpdate && canProposeRuleNow) {
     setPendingOperation(context.session, createPendingOperationRecord(pendingOperationUpdate.topic, pendingOperationUpdate.summary, pendingOperationUpdate.operations));
   }
+  const reply =
+    pendingOperationUpdate && !canProposeRuleNow && existingPending
+      ? `${text}\n\nYou still have a pending confirmation waiting. Reply yes or cancel for that first.`
+      : text;
 
   return finalize(context, {
-    reply: text,
+    reply,
     operationsPlanned: [],
-    executedOps: [{ tool: "gmail.status", status: "executed", summary: text, ...(pendingOperationUpdate ? { pendingOperationUpdate } : {}) }],
+    executedOps: [
+      { tool: "gmail.status", status: "executed", summary: text, ...(pendingOperationUpdate && canProposeRuleNow ? { pendingOperationUpdate } : {}) }
+    ],
     plannerUsed: "none",
     llmPlannerAttempted: false,
     toolValidationPassed: true,
-    topic: "gmail_status"
+    topic: canProposeRuleNow ? "gmail_status" : context.session.topic ?? "gmail_status"
   });
 }
 

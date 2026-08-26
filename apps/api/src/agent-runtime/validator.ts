@@ -148,6 +148,21 @@ interface ExplicitActionIndexResolution {
  * (e.g. a stray unrelated number elsewhere in the message) is treated as unresolvable rather than
  * guessed at.
  */
+/**
+ * fix/private-alpha-local-date-focus-and-gmail-confirmation-state: a real reported bug had "just
+ * move it to wednesday 26" fail with "I only showed 0 actions. Use a number from the shown list"
+ * — the day-of-month number ("26") was being treated as an explicit ACTION INDEX reference (as
+ * if the user had said "reschedule action 26"), even though it was plainly part of the date
+ * phrase itself. parseActionDueDate's own `matchedText` is the exact substring it recognized as a
+ * date/time phrase — reused here (timezone-independent for this purpose; only the actual computed
+ * `dueAt` value needs a real timezone, not which numbers got consumed) to know which numbers in
+ * the message are already spoken for by a date, so they're never also treated as list indices.
+ */
+function numbersConsumedByDatePhrase(message: string): Set<number> {
+  const matchedText = parseActionDueDate(message).matchedText;
+  return matchedText ? new Set([...matchedText.matchAll(/\d+/g)].map((match) => Number(match[0]))) : new Set();
+}
+
 function resolveExplicitActionIndexReferences(operations: PlannedOperation[], context: ContextBundle, message: string): ExplicitActionIndexResolution {
   const actionRefOpIndices = operations.map((op, i) => (ACTION_REFERENCE_TOOLS.has(op.tool) ? i : -1)).filter((i) => i >= 0);
 
@@ -155,7 +170,8 @@ function resolveExplicitActionIndexReferences(operations: PlannedOperation[], co
     return { applicable: false };
   }
 
-  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  const dateConsumedNumbers = numbersConsumedByDatePhrase(message);
+  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0])).filter((num) => !dateConsumedNumbers.has(num));
   if (referencedNumbers.length === 0) {
     return { applicable: false };
   }
@@ -271,7 +287,12 @@ interface ExplicitRescheduleIndexResolution {
  * of guessing which digit was meant.
  */
 function resolveExplicitRescheduleIndexReference(context: ContextBundle, message: string): ExplicitRescheduleIndexResolution {
-  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0]));
+  // See numbersConsumedByDatePhrase's own doc comment above — "move it to wednesday 26" has
+  // exactly one digit, but it's the day-of-month of the NEW due date, not an index into a visible
+  // list; excluding it here is what lets that message fall through to real date parsing instead
+  // of a false "I only showed 0 actions" clarification.
+  const dateConsumedNumbers = numbersConsumedByDatePhrase(message);
+  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0])).filter((num) => !dateConsumedNumbers.has(num));
   if (referencedNumbers.length !== 1) {
     return { applicable: false };
   }

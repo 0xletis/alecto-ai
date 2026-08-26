@@ -11,6 +11,7 @@ import {
   updateNotificationSettings,
   upsertAgentConversationSession
 } from "../packages/db/src/index.ts";
+import { addDaysToLocalDate, formatLocalDate } from "../packages/core/src/time.ts";
 import { assertNoGenericAgentError, buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import {
   assertActionCreated,
@@ -94,6 +95,44 @@ function restoreEnv(key: keyof GmailOAuthEnvSnapshot, value: string | undefined)
   } else {
     process.env[key] = value;
   }
+}
+
+// --- date-i18n / calendar-consistency / validator-gated-date-extraction / build-freshness helpers ---
+
+const EN_WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const EN_MONTHS = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December"
+];
+const ES_WEEKDAYS = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+const ES_MONTHS = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"];
+const CA_WEEKDAYS = ["diumenge", "dilluns", "dimarts", "dimecres", "dijous", "divendres", "dissabte"];
+const CA_MONTHS = ["gener", "febrer", "març", "abril", "maig", "juny", "juliol", "agost", "setembre", "octubre", "novembre", "desembre"];
+
+/**
+ * The date-i18n/calendar-consistency scenarios below (242+) run against the REAL LLM at whatever
+ * real wall-clock moment the eval happens to execute — unlike the deterministic unit tests, they
+ * can't hardcode "26 August is a Wednesday". Anchoring `daysAhead` days from today (Europe/Madrid,
+ * the timezone every scenario below seeds) sidesteps the parser's own past-due rollover entirely:
+ * the default 9am action time for a date that many days out is always still ahead of "now", so the
+ * resolved date is always exactly today+daysAhead in the CURRENT month/year, with no ambiguity
+ * about which year a same-day-next-month rollover might have silently picked.
+ */
+function realWeekdayDayMonth(daysAhead: number): { weekdayIndex: number; day: number; monthIndex: number; localDate: string } {
+  const localDate = addDaysToLocalDate(formatLocalDate(new Date(), "Europe/Madrid"), daysAhead);
+  const [, monthNumText, dayText] = localDate.split("-");
+  const weekdayIndex = new Date(`${localDate}T00:00:00Z`).getUTCDay();
+  return { weekdayIndex, day: Number(dayText), monthIndex: Number(monthNumText) - 1, localDate };
 }
 
 test(
@@ -7661,6 +7700,639 @@ test(
         const reply = trace.record("fas servir el meu mail per aquest objectiu?", await sendAgentMessage(server, userId, "fas servir el meu mail per aquest objectiu?"));
         assertNoGenericAgentError(reply, "Catalan goal-usage question");
         assert.doesNotMatch(reply.reply, /alecto (can|will) send/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+/*
+ * fix/private-alpha-local-date-focus-and-gmail-confirmation-state: a real Telegram transcript
+ * found (1) "today" created/displayed on the wrong calendar day near a local/UTC day boundary,
+ * (2) "move it to wed 26"/"wednesday 26" failing to parse and, once fixed, being misread as an
+ * explicit action-index reference ("action 26") instead of a date, and (3) a status question
+ * ("do u use my mail now for my goal?") silently overwriting a still-open pending action.create
+ * confirmation with a Gmail rule proposal, so the user's next "yes" enabled the wrong thing. The
+ * underlying mechanics (timezone-aware date arithmetic, date-number-vs-index disambiguation,
+ * pendingOperation clobber guard) already have deterministic coverage in tests/agent-runtime-
+ * local-date-focus-and-gmail-confirmation.test.ts; these scenarios cover the real end-to-end
+ * behavior through the real LLM planner.
+ */
+
+function madridWeekdayAndDay(daysAhead: number): { weekday: string; day: number } {
+  const target = new Date(Date.now() + daysAhead * 24 * 60 * 60 * 1000);
+  const weekday = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", weekday: "long" }).format(target).toLowerCase();
+  const day = Number(new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", day: "numeric" }).format(target));
+  return { weekday, day };
+}
+
+function madridTodayLocalDate(): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+}
+
+test(
+  "233. the exact live transcript: goal proposal -> refine to send 6 CVs + connect mail -> yes creates the action, due on the real local calendar day",
+  { ...llmEvalOptions(["local-date-time-actions", "mixed-intent-pending-action-gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-transcript-${randomUUID()}`;
+    const trace = new EvalTrace("233-localdate-transcript", ["local-date-time-actions", "mixed-intent-pending-action-gmail"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      await seedPendingActionCreateForEval(userId, "Research 5 new remote Web3 job postings today");
+
+      await trace.guard(async () => {
+        const refineReply = trace.record(
+          "change it to send 6 CVs its more and i wanna connect my mail so u can use it for updates",
+          await sendAgentMessage(server, userId, "change it to send 6 CVs its more and i wanna connect my mail so u can use it for updates")
+        );
+        assertNoGenericAgentError(refineReply, "refine + connect mail");
+        assert.equal(refineReply.debug.pendingOperation, true);
+
+        const yesReply = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(yesReply, "confirming the refined action");
+        assert.equal(yesReply.debug.mutationExecuted, true);
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        trace.checkpoint("exactly one action created", actions.length === 1, JSON.stringify(actions.map((a) => a.title)));
+        assert.equal(actions.length, 1);
+        const dueLocal = actions[0]!.dueAt
+          ? new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(actions[0]!.dueAt)
+          : undefined;
+        trace.checkpoint("due date matches today's real local calendar day", dueLocal === madridTodayLocalDate(), `dueLocal=${dueLocal} expected=${madridTodayLocalDate()}`);
+        assert.equal(dueLocal, madridTodayLocalDate(), `the created action's due date must be TODAY in Europe/Madrid, got ${dueLocal}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "234. creating 'send 6 CVs today' stores a due date on the real local calendar day, not shifted by a UTC/local mismatch",
+  { ...llmEvalOptions(["local-date-time-actions"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-create-${randomUUID()}`;
+    const trace = new EvalTrace("234-localdate-create", ["local-date-time-actions"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      // Seeded with an active goal already in place — a fresh user with NO goal at all reasonably
+      // reads "create a task to send 6 CVs today" as a request to START TRACKING that as a new
+      // goal (a real gpt-4o-mini behavior, not a bug); this scenario is specifically about due-
+      // date timezone correctness, so the setup matches a realistic mid-conversation state where
+      // "create a task" unambiguously means a one-off action, not a new goal proposal.
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("create a task to send 6 CVs today", await sendAgentMessage(server, userId, "create a task to send 6 CVs today"));
+        assertNoGenericAgentError(reply, "create a today-due action");
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        assert.ok(actions.length >= 1, "expected at least one action created");
+        const created = actions.find((a) => /send 6 cvs/i.test(a.title));
+        assert.ok(created, `expected an action about sending CVs — got: ${actions.map((a) => a.title).join(", ")}`);
+        const dueLocal = created!.dueAt
+          ? new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Madrid", year: "numeric", month: "2-digit", day: "2-digit" }).format(created!.dueAt)
+          : undefined;
+        trace.checkpoint("due date is today, Europe/Madrid", dueLocal === madridTodayLocalDate(), `dueLocal=${dueLocal}`);
+        assert.equal(dueLocal, madridTodayLocalDate(), `expected today's real local date, got ${dueLocal}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "235. creating an action, then 'move it to <weekday> <day>' actually reschedules it",
+  { ...llmEvalOptions(["date-only-reschedule", "post-create-action-focus"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-reschedule-${randomUUID()}`;
+    const trace = new EvalTrace("235-localdate-reschedule", ["date-only-reschedule", "post-create-action-focus"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      // See scenario 234's own comment: without an active goal, "create a task to send 6 CVs"
+      // is reasonably read by a real LLM as a request to start tracking a new goal rather than a
+      // one-off action — seeding one first keeps this scenario focused on reschedule parsing.
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const { weekday, day } = madridWeekdayAndDay(5);
+
+      await trace.guard(async () => {
+        const createReply = trace.record("create a task to send 6 CVs", await sendAgentMessage(server, userId, "create a task to send 6 CVs"));
+        assertNoGenericAgentError(createReply, "create action for reschedule test");
+
+        const message = `move it to ${weekday} ${day}`;
+        const reply = trace.record(message, await sendAgentMessage(server, userId, message));
+        assertNoGenericAgentError(reply, "date-only reschedule with weekday + day-of-month");
+        trace.checkpoint("does not fail with a parse error", !/couldn't understand/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /couldn't understand/i, `must parse "${message}" — got: ${reply.reply}`);
+        trace.checkpoint("does not fall back to '0 actions' clarification", !/0 actions/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /0 actions/i, `the day number must not be treated as an action index — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "236. creating an action, then 'archive it' resolves to the newly created action without listing first",
+  { ...llmEvalOptions(["post-create-action-focus"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-focus-${randomUUID()}`;
+    const trace = new EvalTrace("236-localdate-focus", ["post-create-action-focus"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      // See scenario 234's own comment: a fresh user with no active goal at all reasonably reads
+      // "create a task to send 6 CVs" as a request to START TRACKING a new goal, not a one-off
+      // action — seeding one first keeps this scenario focused on post-create focus resolution.
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("create a task to send 6 CVs today", await sendAgentMessage(server, userId, "create a task to send 6 CVs today"));
+        const reply = trace.record("archive it", await sendAgentMessage(server, userId, "archive it"));
+        assertNoGenericAgentError(reply, "archive the just-created action");
+        trace.checkpoint("resolves without asking which task", !/which task|don't have one in view/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /which task|don't have one in view/i, `must resolve the just-created action — got: ${reply.reply}`);
+        assert.equal(reply.debug.mutationExecuted, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "237. mixed action+Gmail reply: 'yes' creates the action only, never touches any Gmail rule",
+  { ...llmEvalOptions(["gmail-rule-confirmation-state", "mixed-intent-pending-action-gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-mixedyes-${randomUUID()}`;
+    const trace = new EvalTrace("237-localdate-mixedyes", ["gmail-rule-confirmation-state", "mixed-intent-pending-action-gmail"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      await seedPendingActionCreateForEval(userId, "Research 5 new remote Web3 job postings today");
+
+      await trace.guard(async () => {
+        trace.record(
+          "change it to send 6 CVs and connect my mail",
+          await sendAgentMessage(server, userId, "change it to send 6 CVs and connect my mail")
+        );
+        const reply = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(reply, "confirming mixed-intent action");
+        assert.equal(reply.debug.mutationExecuted, true);
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        assert.equal(actions.length, 1);
+        assert.match(actions[0]!.title, /send 6 cvs/i);
+        const rules = await prisma.emailSignalRule.findMany({ where: { userId, status: "active" } });
+        trace.checkpoint("no Gmail rule was touched by confirming the action", rules.length === 0, JSON.stringify(rules));
+        assert.equal(rules.length, 0, "a bare 'yes' confirming the action must never also enable a Gmail rule");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "238. a status question, asked repeatedly, never enables a Gmail rule by itself",
+  { ...llmEvalOptions(["gmail-rule-confirmation-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-statusnoop-${randomUUID()}`;
+    const trace = new EvalTrace("238-localdate-statusnoop", ["gmail-rule-confirmation-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("do u use my mail now for my goal?", await sendAgentMessage(server, userId, "do u use my mail now for my goal?"));
+        trace.record("do u use my mail now for my goal?", await sendAgentMessage(server, userId, "do u use my mail now for my goal?"));
+
+        const rules = await prisma.emailSignalRule.findMany({ where: { userId, status: "active" } });
+        trace.checkpoint("no rule enabled just from asking twice", rules.length === 0, JSON.stringify(rules));
+        assert.equal(rules.length, 0, "a read-only status question must never enable a rule, no matter how many times it's asked");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "239. after a real Gmail rule proposal with nothing else pending, 'yes' actually enables it",
+  { ...llmEvalOptions(["gmail-rule-confirmation-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-ruleyes-${randomUUID()}`;
+    const trace = new EvalTrace("239-localdate-ruleyes", ["gmail-rule-confirmation-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const statusReply = trace.record("do u use my mail now for my goal?", await sendAgentMessage(server, userId, "do u use my mail now for my goal?"));
+        assertNoGenericAgentError(statusReply, "status question opening the rule proposal");
+
+        const reply = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(reply, "confirming the rule proposal");
+        assert.equal(reply.debug.mutationExecuted, true);
+
+        const rules = await prisma.emailSignalRule.findMany({ where: { userId, status: "active" } });
+        trace.checkpoint("job-search rule is active", rules.some((rule) => rule.adapterId === "job_search_email"), JSON.stringify(rules));
+        assert.ok(rules.some((rule) => rule.adapterId === "job_search_email"), "expected the job-search rule to actually be active now");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "240. Gmail connected, no rule: status question says no",
+  { ...llmEvalOptions(["gmail-rule-confirmation-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-no-${randomUUID()}`;
+    const trace = new EvalTrace("240-localdate-no", ["gmail-rule-confirmation-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("do u use my mail now for my goal?", await sendAgentMessage(server, userId, "do u use my mail now for my goal?"));
+        assertNoGenericAgentError(reply, "connected, no rule status question");
+        assert.match(reply.reply, /\bno\b/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "241. Gmail connected, active job-search rule: status question says yes",
+  { ...llmEvalOptions(["gmail-rule-confirmation-state"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-localdate-yes-${randomUUID()}`;
+    const trace = new EvalTrace("241-localdate-yes", ["gmail-rule-confirmation-state"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const enableReply = await sendAgentMessage(server, userId, "enable job search rule for Gmail");
+      assert.match(enableReply.reply, /job.search/i, "eval setup: the job-search rule must actually turn on");
+
+      await trace.guard(async () => {
+        const reply = trace.record("do u use my mail now for my goal?", await sendAgentMessage(server, userId, "do u use my mail now for my goal?"));
+        assertNoGenericAgentError(reply, "connected, active rule status question");
+        assert.match(reply.reply, /\byes\b/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// --- Launch-readiness: Spanish/Catalan date parsing + weekday/calendar consistency + validator-
+//     gated LLM date extraction (fix/private-alpha-local-date-focus-and-gmail-confirmation-state,
+//     follow-up) -------------------------------------------------------------------------------
+
+test(
+  "242. Spanish 'muévelo al <weekday> <day>', right after creating the task, is understood — not misread as an unparseable date or an action index",
+  { ...llmEvalOptions(["date-i18n"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-242-${randomUUID()}`;
+    const trace = new EvalTrace("242-spanish-weekday-match", ["date-i18n"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      // Same pattern as scenario 235 (English): creating the task in the SAME conversation right
+      // before the reschedule message gives the real LLM a fresh, unambiguous "it" to resolve —
+      // seeding the action directly in the DB beforehand (no matching conversational turn) proved
+      // too weak a signal for a real model to reliably resolve which task "muévelo al..." means.
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const { weekdayIndex, day } = realWeekdayDayMonth(3);
+
+      await trace.guard(async () => {
+        const createReply = trace.record("crea una tarea para enviar 6 CVs", await sendAgentMessage(server, userId, "crea una tarea para enviar 6 CVs"));
+        assertNoGenericAgentError(createReply, "spanish create action for reschedule test");
+
+        const message = `muévelo al ${ES_WEEKDAYS[weekdayIndex]} ${day}`;
+        const reply = trace.record(message, await sendAgentMessage(server, userId, message));
+        assertNoGenericAgentError(reply, "spanish weekday+day reschedule");
+        trace.checkpoint("does not fail with a parse error", !/couldn'?t understand/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /couldn'?t understand/i, `must parse "${message}" — got: ${reply.reply}`);
+        trace.checkpoint("does not fall back to '0 actions' clarification", !/0 actions/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /0 actions/i, `the day number must not be treated as an action index — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "243. Catalan 'mou-ho a <weekday> <day>', right after creating the task, is understood — not misread as an unparseable date or an action index",
+  { ...llmEvalOptions(["date-i18n"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-243-${randomUUID()}`;
+    const trace = new EvalTrace("243-catalan-weekday-match", ["date-i18n"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const { weekdayIndex, day } = realWeekdayDayMonth(4);
+
+      await trace.guard(async () => {
+        const createReply = trace.record("crea una tasca per enviar 6 CVs", await sendAgentMessage(server, userId, "crea una tasca per enviar 6 CVs"));
+        assertNoGenericAgentError(createReply, "catalan create action for reschedule test");
+
+        const message = `mou-ho a ${CA_WEEKDAYS[weekdayIndex]} ${day}`;
+        const reply = trace.record(message, await sendAgentMessage(server, userId, message));
+        assertNoGenericAgentError(reply, "catalan weekday+day reschedule");
+        trace.checkpoint("does not fail with a parse error", !/couldn'?t understand/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /couldn'?t understand/i, `must parse "${message}" — got: ${reply.reply}`);
+        trace.checkpoint("does not fall back to '0 actions' clarification", !/0 actions/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /0 actions/i, `the day number must not be treated as an action index — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "244. Spanish weekday/day-of-month mismatch ('jueves <day> de <month>' on a date that's really a different weekday) asks for clarification, no mutation",
+  { ...llmEvalOptions(["date-i18n", "calendar-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-244-${randomUUID()}`;
+    const trace = new EvalTrace("244-spanish-weekday-mismatch", ["date-i18n", "calendar-consistency"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const originalDueAt = new Date(Date.now() + 10 * 24 * 60 * 60 * 1000);
+      const action = await createActionItem(userId, { source: "manual", title: "Send 6 CVs", goalId: goalResult.goal.id, dueAt: originalDueAt });
+
+      const { weekdayIndex, day, monthIndex } = realWeekdayDayMonth(5);
+      const wrongWeekdayIndex = (weekdayIndex + 1) % 7;
+      const phrase = `${ES_WEEKDAYS[wrongWeekdayIndex]} ${day} de ${ES_MONTHS[monthIndex]}`;
+
+      await trace.guard(async () => {
+        const reply = trace.record(`muévelo al ${phrase}`, await sendAgentMessage(server, userId, `muévelo al ${phrase}`));
+        assertNoGenericAgentError(reply, "spanish weekday+day mismatch reschedule");
+        const passed = reply.debug.mutationExecuted === false;
+        trace.checkpoint("mismatch reschedule did not execute a mutation", passed, JSON.stringify(reply.debug));
+        assert.ok(passed, `a weekday/day mismatch must never mutate — debug: ${JSON.stringify(reply.debug)}`);
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt?.getTime(), originalDueAt.getTime(), "the action's due date must be unchanged after a rejected mismatch");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "245. Catalan weekday/day-of-month mismatch ('dijous <day> d'<month>' on a date that's really a different weekday) asks for clarification, no mutation",
+  { ...llmEvalOptions(["date-i18n", "calendar-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-245-${randomUUID()}`;
+    const trace = new EvalTrace("245-catalan-weekday-mismatch", ["date-i18n", "calendar-consistency"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const originalDueAt = new Date(Date.now() + 11 * 24 * 60 * 60 * 1000);
+      const action = await createActionItem(userId, { source: "manual", title: "Send 6 CVs", goalId: goalResult.goal.id, dueAt: originalDueAt });
+
+      const { weekdayIndex, day, monthIndex } = realWeekdayDayMonth(6);
+      const wrongWeekdayIndex = (weekdayIndex + 1) % 7;
+      const phrase = `${CA_WEEKDAYS[wrongWeekdayIndex]} ${day} d'${CA_MONTHS[monthIndex]}`;
+
+      await trace.guard(async () => {
+        const reply = trace.record(`mou-ho a ${phrase}`, await sendAgentMessage(server, userId, `mou-ho a ${phrase}`));
+        assertNoGenericAgentError(reply, "catalan weekday+day mismatch reschedule");
+        const passed = reply.debug.mutationExecuted === false;
+        trace.checkpoint("mismatch reschedule did not execute a mutation", passed, JSON.stringify(reply.debug));
+        assert.ok(passed, `a weekday/day mismatch must never mutate — debug: ${JSON.stringify(reply.debug)}`);
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt?.getTime(), originalDueAt.getTime(), "the action's due date must be unchanged after a rejected mismatch");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "246. English weekday/day-of-month mismatch ('move it to <weekday> <day> <month>' on a date that's really a different weekday) asks for clarification, no mutation",
+  { ...llmEvalOptions(["calendar-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-246-${randomUUID()}`;
+    const trace = new EvalTrace("246-english-weekday-mismatch", ["calendar-consistency"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const originalDueAt = new Date(Date.now() + 12 * 24 * 60 * 60 * 1000);
+      const action = await createActionItem(userId, { source: "manual", title: "Send 6 CVs", goalId: goalResult.goal.id, dueAt: originalDueAt });
+
+      const { weekdayIndex, day, monthIndex } = realWeekdayDayMonth(7);
+      const wrongWeekdayIndex = (weekdayIndex + 1) % 7;
+      const phrase = `${EN_WEEKDAYS[wrongWeekdayIndex]} ${day} ${EN_MONTHS[monthIndex]}`;
+
+      await trace.guard(async () => {
+        const reply = trace.record(`move it to ${phrase}`, await sendAgentMessage(server, userId, `move it to ${phrase}`));
+        assertNoGenericAgentError(reply, "english weekday+day mismatch reschedule");
+        // The primary safety property is "never mutate on a mismatch" (checked below via the DB,
+        // same as scenarios 244/245) — the real LLM doesn't always route the phrase through
+        // action.reschedule with a dueText the deterministic parser gets to see (it sometimes
+        // picks action.snooze with no untilText at all, which the validator itself then rejects
+        // with a generic clarification instead). Either path is safe; only a hard string-match on
+        // the specific calendar-mismatch wording would be flaky across real model runs.
+        const passed = reply.debug.mutationExecuted === false;
+        trace.checkpoint("mismatch reschedule did not execute a mutation", passed, JSON.stringify(reply.debug));
+        assert.ok(passed, `a weekday/day mismatch must never mutate — debug: ${JSON.stringify(reply.debug)}`);
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt?.getTime(), originalDueAt.getTime(), "the action's due date must be unchanged after a rejected mismatch");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "247. Genuinely ambiguous/unsupported date phrasing asks for clarification rather than fabricating a due date",
+  { ...llmEvalOptions(["validator-gated-date-extraction"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-247-${randomUUID()}`;
+    const trace = new EvalTrace("247-ambiguous-date-clarification", ["validator-gated-date-extraction"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "create a task to renew my passport sometime whenever works, no rush",
+          await sendAgentMessage(server, userId, "create a task to renew my passport sometime whenever works, no rush")
+        );
+        assertNoGenericAgentError(reply, "genuinely vague due date");
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        const created = actions.find((a) => a.title.toLowerCase().includes("passport"));
+        // Either no task was created yet (the agent asked first) or one was created with NO
+        // fabricated due date — what must never happen is a task silently getting some invented
+        // specific due date out of "sometime whenever works, no rush".
+        const passed = !created || created.dueAt === null;
+        trace.checkpoint("no fabricated due date for a genuinely vague phrase", passed, created ? created.dueAt?.toISOString() : "no action created");
+        assert.ok(passed, `a vague, unsupported date phrase must never produce a fabricated specific due date — got dueAt: ${created?.dueAt}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "248. A plain number mentioned in conversation (not a date phrase) never becomes a fabricated due date",
+  { ...llmEvalOptions(["validator-gated-date-extraction"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-248-${randomUUID()}`;
+    const trace = new EvalTrace("248-bare-number-no-mutation", ["validator-gated-date-extraction"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      // 147 is deliberately OUTSIDE the 1-31 day-of-month range — a number like "26" would also
+      // legitimately show up as TODAY's real day-of-month on the 26th of any month, making
+      // "dueAt's day-of-month happens to be 26" an unreliable signal for "26 got misread as a
+      // date". 147 can never collide with a real calendar day no matter when this eval runs.
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I have 147 unread emails, create a task to clear my inbox",
+          await sendAgentMessage(server, userId, "I have 147 unread emails, create a task to clear my inbox")
+        );
+        assertNoGenericAgentError(reply, "bare number in conversation, unrelated to any date");
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        const created = actions.find((a) => a.title.toLowerCase().includes("inbox"));
+        // A generous 24h bound, not a tight one: "today"/"now"-style dueText can legitimately
+        // resolve up to ~15 minutes out via the (pre-existing, unrelated) past-due rollback
+        // fallback once today's own default action time has already passed — 147 genuinely
+        // getting misread as a date would put dueAt days/weeks away, not within the same day.
+        const passed = !created || created.dueAt === null || created.dueAt.getTime() <= Date.now() + 24 * 60 * 60 * 1000;
+        trace.checkpoint("the bare number 147 (email count) was never misread as a due date far in the future", passed, created?.dueAt?.toISOString());
+        assert.ok(passed, `"147 unread emails" must never be misread as a due date far in the future — got dueAt: ${created?.dueAt}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "249. The running server resolves 'today' correctly end to end, proving the runtime path is on current (not stale) compiled code",
+  { ...llmEvalOptions(["build-freshness"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-datei18n-249-${randomUUID()}`;
+    const trace = new EvalTrace("249-build-freshness-runtime-sanity", ["build-freshness"], userId);
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        // buildServer() (called above) already ran apps/api/src/server.ts's own
+        // assertWorkspacePackagesAreFresh(import.meta.url) at module load — reaching this point
+        // at all means the process is running on a freshly-built @operator-agent/core (Task 5's
+        // deterministic tests exercise the guard's pass/fail logic directly; this scenario proves
+        // the wiring is live in the exact same server the real LLM traffic below runs through).
+        // The date-i18n behavior itself (2026-08-26-style local-date correctness) is a real,
+        // previously-reported bug that a stale dist could silently resurrect — round-tripping it
+        // here through the real LLM is the "at least one runtime/integration probe" this
+        // launch-readiness task explicitly required beyond source-level unit tests.
+        const reply = trace.record("create a task to call the bank today", await sendAgentMessage(server, userId, "create a task to call the bank today"));
+        assertNoGenericAgentError(reply, "build-freshness runtime sanity check");
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        const created = actions.find((a) => a.title.toLowerCase().includes("bank"));
+        const passed = Boolean(created?.dueAt) && formatLocalDate(created!.dueAt!, "Europe/Madrid") === formatLocalDate(new Date(), "Europe/Madrid");
+        trace.checkpoint("today resolves to the real current local date on the running server", passed, created?.dueAt?.toISOString());
+        assert.ok(passed, `expected today's local date, got dueAt: ${created?.dueAt}`);
       });
     } finally {
       await server.close();

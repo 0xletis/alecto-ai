@@ -1,4 +1,13 @@
 import Fastify from "fastify";
+import { assertWorkspacePackagesAreFresh } from "./utils/build-freshness.js";
+
+// Runs once, the moment this module is first loaded — by the real production entrypoint
+// (apps/api/src/index.ts) and by every test file's buildServer() import alike. See build-
+// freshness.ts's own doc comment for the real reported bug this closes: a source fix to
+// packages/core/db/llm silently not taking effect at runtime, with typecheck staying green the
+// whole time. Deliberately placed here (not inside buildServer() itself) so it fires exactly once
+// per process, at the earliest possible point, rather than on every server instance a test spins up.
+assertWorkspacePackagesAreFresh(import.meta.url);
 import {
   buildDailyReview,
   buildCustomGoalConfig,

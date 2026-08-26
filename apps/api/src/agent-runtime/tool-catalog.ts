@@ -58,7 +58,12 @@ export const toolCatalog: ToolDefinition[] = [
       title: z.string().min(1),
       notes: z.string().optional(),
       priority: z.enum(["low", "medium", "high"]).optional(),
-      dueText: z.string().optional().describe("Natural language due date/time, e.g. 'tomorrow', 'friday at 5pm'."),
+      dueText: z
+        .string()
+        .optional()
+        .describe(
+          "Natural language due date/time, e.g. 'tomorrow', 'friday at 5pm'. If the user stated a weekday ALONGSIDE a day-of-month (e.g. 'Thursday 26 August', 'jueves 26 de agosto', 'dijous 26 d'agost'), pass BOTH exactly as said — never drop or 'correct' the weekday yourself, even if it looks inconsistent with the day number. The deterministic parser checks that the two actually match on the real calendar and asks the user to clarify if they don't; silently dropping one side here would hide a real contradiction instead of catching it."
+        ),
       goalId: z
         .string()
         .optional()
@@ -75,7 +80,12 @@ export const toolCatalog: ToolDefinition[] = [
     requiresConfirmation: false,
     argsSchema: z.object({
       actionId: actionIdField,
-      untilText: z.string().min(1).describe("Natural language deferral target, e.g. 'tomorrow', 'next monday', 'friday'.")
+      untilText: z
+        .string()
+        .min(1)
+        .describe(
+          "Natural language deferral target, e.g. 'tomorrow', 'next monday', 'friday'. If the user stated a weekday ALONGSIDE a day-of-month (e.g. 'Thursday 26 August', 'jueves 26 de agosto', 'dijous 26 d'agost'), pass BOTH exactly as said — never drop or 'correct' the weekday yourself, even if it looks inconsistent with the day number. The deterministic parser checks that the two actually match on the real calendar and asks the user to clarify if they don't; silently dropping one side here would hide a real contradiction instead of catching it."
+        )
     })
   },
   {
@@ -127,7 +137,13 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({
       actionId: actionIdField,
       ref: z.string().min(1).optional().describe("The task's visible wording if actionId is not known, e.g. 'brainstorm meeting'."),
-      dueText: z.string().min(1).optional().describe("A full natural-language due date/time, e.g. 'tomorrow afternoon'."),
+      dueText: z
+        .string()
+        .min(1)
+        .optional()
+        .describe(
+          "A full natural-language due date/time, e.g. 'tomorrow afternoon'. If the user stated a weekday ALONGSIDE a day-of-month (e.g. 'Thursday 26 August', 'jueves 26 de agosto', 'dijous 26 d'agost'), pass BOTH exactly as said — never drop or 'correct' the weekday yourself, even if it looks inconsistent with the day number. The deterministic parser checks that the two actually match on the real calendar and asks the user to clarify if they don't; silently dropping one side here would hide a real contradiction instead of catching it."
+        ),
       timeText: z.string().min(1).optional().describe("A time-only correction, e.g. '12pm'. Uses the action's existing local date.")
     })
   },
