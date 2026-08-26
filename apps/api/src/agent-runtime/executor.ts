@@ -23,6 +23,7 @@ import {
   getNotificationLog,
   hasNotificationLog,
   rescheduleActionItem,
+  selfHealDailyLoopEnabled,
   setGoalStatus,
   snoozeActionItem,
   updateEmailSignalRule,
@@ -2532,7 +2533,7 @@ export async function executeOperation(
       }
 
       case "proactive.diagnose_morning_brief": {
-        const settings = await getOrCreateNotificationSettings(userId);
+        const settings = await selfHealDailyLoopEnabled(await getOrCreateNotificationSettings(userId));
         const now = new Date();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const morningKey = MORNING_BRIEF_DEDUPE_KEY;
@@ -2563,7 +2564,7 @@ export async function executeOperation(
       }
 
       case "proactive.diagnose_evening_checkin": {
-        const settings = await getOrCreateNotificationSettings(userId);
+        const settings = await selfHealDailyLoopEnabled(await getOrCreateNotificationSettings(userId));
         const now = new Date();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const eveningKey = EVENING_CHECKIN_DEDUPE_KEY;
@@ -3843,7 +3844,13 @@ function formatGoalTrackingForChat(goal: Goal): string {
  * sentence, plus real next-due/last-sent state so the status is actually inspectable, not just a
  * boolean.
  */
-async function buildTruthfulProactiveSettingsSummary(userId: string, settings: NotificationSettings, context: ContextBundle): Promise<string> {
+async function buildTruthfulProactiveSettingsSummary(userId: string, settingsInput: NotificationSettings, context: ContextBundle): Promise<string> {
+  // fix/private-alpha-proactive-launch-config-cleanup: an existing user who opted into morning/
+  // evening BEFORE the fix that makes dailyLoopEnabled follow along automatically is otherwise
+  // stuck reporting "blocked — the daily loop itself is off" forever, with no way to notice short
+  // of manually re-toggling the setting. Self-heals right here, on every status read, so simply
+  // asking "what proactive messages are on?" repairs it — no separate migration/backfill needed.
+  const settings = await selfHealDailyLoopEnabled(settingsInput);
   const now = new Date();
   const sentForDate = formatDateInTimezone(now, settings.timezone);
   const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
@@ -3861,6 +3868,7 @@ async function buildTruthfulProactiveSettingsSummary(userId: string, settings: N
         dedupeKey: MORNING_BRIEF_DEDUPE_KEY,
         legacyType: "daily_loop_morning",
         scheduledMinutes: settings.morningTimeMinutes,
+        momentPhrase: "morning brief",
         getStatus: (alreadySentDedupeKeys, sentCountToday, legacyDailyLoopSentAt) =>
           getProactiveDeliveryStatus({ context, notificationSettings: settings, now, alreadySentDedupeKeys, sentCountToday, deliveryEnabled, isAllowlisted, legacyDailyLoopSentAt })
       })
@@ -3878,6 +3886,7 @@ async function buildTruthfulProactiveSettingsSummary(userId: string, settings: N
         dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
         legacyType: "daily_loop_evening",
         scheduledMinutes: settings.eveningTimeMinutes,
+        momentPhrase: "evening check-in",
         getStatus: (alreadySentDedupeKeys, sentCountToday, legacyDailyLoopSentAt) =>
           getEveningCheckinDeliveryStatus({ context, notificationSettings: settings, now, alreadySentDedupeKeys, sentCountToday, deliveryEnabled, isAllowlisted, legacyDailyLoopSentAt })
       })
@@ -3897,6 +3906,7 @@ async function buildMomentStatusLine(input: {
   dedupeKey: string;
   legacyType: string;
   scheduledMinutes: number;
+  momentPhrase: "morning brief" | "evening check-in";
   getStatus: (
     alreadySentDedupeKeys: Set<string>,
     sentCountToday: number,
@@ -3911,10 +3921,13 @@ async function buildMomentStatusLine(input: {
 
   const status = input.getStatus(alreadySentToday ? new Set([input.dedupeKey]) : new Set(), alreadySentToday ? 1 : 0, legacyDailyLoopLog?.sentAt);
   const onLabel = `on, around ${formatMinutesOfDay(input.scheduledMinutes)}`;
-  const blockedClause = proactiveStatusBlockedClause(status);
+  const blocked = proactiveStatusBlockedClause(status, input.momentPhrase);
 
-  if (blockedClause) {
-    return `${onLabel} — ${blockedClause}`;
+  if (blocked?.kind === "full_line") {
+    return blocked.text;
+  }
+  if (blocked?.kind === "clause") {
+    return `${onLabel} — ${blocked.text}`;
   }
 
   const nextDue = nextScheduledMomentLabel(input.scheduledMinutes, input.now, input.settings.timezone);

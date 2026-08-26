@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, createNotificationLog, prisma } from "../packages/db/src/index.ts";
 import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+import { formatProactiveDeliveryDiagnosis } from "../apps/api/src/operator/proactive-eligibility.ts";
 
 /**
  * "why didn't I get my morning brief?" (proactive.diagnose_morning_brief) — a grounded diagnosis
@@ -115,23 +116,57 @@ test("7. morning brief not opted in: diagnosis explains user_not_opted_in and ne
   }
 });
 
-test("8. daily loop off: diagnosis explains daily_loop_disabled", async () => {
+test("8. daily loop off self-heals: a stale morningBriefEnabled=true/dailyLoopEnabled=false user is repaired by simply asking, not stuck on daily_loop_disabled", async () => {
   const server = buildServer();
   const userId = `proactive-diagnose-daily-loop-off-${randomUUID()}`;
 
   try {
     await seedUser(userId);
+    // fix/private-alpha-proactive-launch-config-cleanup (task 1): this exact seeded state — a
+    // real, previously-reported one — used to produce a permanent "daily_loop_disabled"
+    // diagnosis until the user manually re-toggled the setting. selfHealDailyLoopEnabled now
+    // repairs it on this same read, so the diagnosis reflects whatever the NEXT real blocker (or
+    // lack of one) actually is, never daily_loop_disabled for a user who is genuinely opted in.
     await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: false, morningBriefEnabled: true, morningTimeMinutes: 66, timezone: "UTC" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /the daily loop itself is off/i);
+      assert.doesNotMatch(reply, /the daily loop itself is off/i, `self-heal should have repaired dailyLoopEnabled before this diagnosis ran — got: ${reply}`);
     });
+
+    const healed = await prisma.notificationSettings.findUnique({ where: { userId } });
+    assert.equal(healed?.dailyLoopEnabled, true, "dailyLoopEnabled must be repaired in the DB, not just in the one reply");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });
   }
+});
+
+test("8b. daily_loop_disabled wording itself is still correct (defensive fallback, exercised directly since self-heal makes it unreachable via the live diagnose path)", () => {
+  const settings: Parameters<typeof formatProactiveDeliveryDiagnosis>[1] = {
+    id: "test",
+    userId: "test",
+    dailyCheckinEnabled: false,
+    dailyInsightEnabled: false,
+    weeklyInsightEnabled: false,
+    dailyLoopEnabled: false,
+    morningBriefEnabled: true,
+    eveningCheckinEnabled: false,
+    gmailNudgeEnabled: false,
+    timezone: "UTC",
+    defaultActionTimeMinutes: 540,
+    morningTimeMinutes: 540,
+    afternoonTimeMinutes: 900,
+    eveningTimeMinutes: 1140,
+    tonightTimeMinutes: 1200,
+    createdAt: new Date(),
+    updatedAt: new Date()
+  };
+  const message = formatProactiveDeliveryDiagnosis("daily_loop_disabled", settings);
+  assert.match(message, /internal daily loop is off/i);
+  assert.match(message, /self-heal automatically/i);
+  assert.match(message, /"turn on morning brief" again to repair/i);
 });
 
 test("9. already sent today: diagnosis explains the dedupe, not a false 'nothing is wrong'", async () => {

@@ -8712,3 +8712,78 @@ test(
     }
   }
 );
+
+// --- Launch-readiness cleanup: dailyLoopEnabled self-heal + truthful env-gate status copy
+//     (fix/private-alpha-proactive-launch-config-cleanup) --------------------------------------
+
+test(
+  "258. A pre-existing user stuck with dailyLoopEnabled false self-heals by simply asking about their real settings, through the real LLM",
+  { ...llmEvalOptions(["proactive-morning-evening-delivery"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-launchconfig-258-${randomUUID()}`;
+    const trace = new EvalTrace("258-selfheal-via-real-chat", ["proactive-morning-evening-delivery"], userId);
+    const previous = process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+    process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = "true";
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid", telegramUserId: `telegram:${randomUUID().replace(/\D/g, "").padEnd(9, "1")}` });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      // Simulates a real pre-existing user: opted into morning brief BEFORE the fix that makes
+      // dailyLoopEnabled follow along automatically existed — stuck exactly like the real
+      // reported transcript, with no way out short of a manual re-toggle before this task.
+      await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: false });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what proactive messages are on?", await sendAgentMessage(server, userId, "what proactive messages are on?"));
+        assertNoGenericAgentError(reply, "self-heal via real status check");
+
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        const passed = settings?.dailyLoopEnabled === true;
+        trace.checkpoint("dailyLoopEnabled self-healed to true by a single real status question", passed, JSON.stringify(settings));
+        assert.ok(passed, `expected dailyLoopEnabled to self-heal to true — got: ${JSON.stringify(settings)}`);
+      });
+    } finally {
+      if (previous === undefined) delete process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+      else process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = previous;
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "259. Real chat status reply distinguishes 'configured on' from 'will actually deliver' when the server env gate is off",
+  { ...llmEvalOptions(["automatic-message-status"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-launchconfig-259-${randomUUID()}`;
+    const trace = new EvalTrace("259-env-gate-truthful-copy", ["automatic-message-status"], userId);
+    const previous = process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+    delete process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+
+    try {
+      await seedUser(userId);
+      await updateNotificationSettings(userId, { timezone: "Europe/Madrid" });
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: true });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what proactive messages are on?", await sendAgentMessage(server, userId, "what proactive messages are on?"));
+        assertNoGenericAgentError(reply, "env-gate-off truthful status check");
+
+        const passed = /configured on, but delivery is disabled on this server/i.test(reply.reply) && !/morning brief: on, around/i.test(reply.reply);
+        trace.checkpoint("status distinguishes configured-on from actually-delivering, never a bare misleading 'on'", passed, reply.reply);
+        assert.ok(passed, `expected the distinguishing status copy — got: ${reply.reply}`);
+      });
+    } finally {
+      if (previous === undefined) delete process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+      else process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = previous;
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

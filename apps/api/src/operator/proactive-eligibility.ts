@@ -177,7 +177,11 @@ const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string, allowlis
   delivery_disabled: (time) => `Morning brief is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
   user_not_allowlisted: (time) => `Morning brief is on at ${time}, but a PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment and this user isn't on it.`,
   user_not_opted_in: () => "Morning brief is currently off — turn it on and I'll start sending it.",
-  daily_loop_disabled: (time) => `Morning brief is on at ${time}, but the daily loop itself is off, which blocks both the V3 morning brief and the legacy daily-loop message — turn the daily loop back on too.`,
+  // fix/private-alpha-proactive-launch-config-cleanup: effectively unreachable in the live tool
+  // (proactive.diagnose_morning_brief self-heals dailyLoopEnabled before ever computing this
+  // status now) — kept as an accurate defensive fallback rather than assumed impossible.
+  daily_loop_disabled: (time) =>
+    `Morning brief is on at ${time}, but the internal daily loop is off, which blocks both the V3 morning brief and the legacy daily-loop message. This should self-heal automatically — if you're still seeing this, say "turn on morning brief" again to repair it.`,
   outside_morning_window: (time) => `Morning brief is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
   duplicate_dedupe_key: (time) => `Morning brief is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
   no_candidate: (time) => `Morning brief is on at ${time}, but there isn't anything grounded to send right now (e.g. no active goals or open actions) — check back closer to ${time}.`,
@@ -285,7 +289,11 @@ const EVENING_DIAGNOSIS_MESSAGE: Record<EveningCheckinDeliveryStatus, (time: str
   delivery_disabled: (time) => `Evening check-in is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
   user_not_allowlisted: (time) => `Evening check-in is on at ${time}, but a PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment and this user isn't on it.`,
   user_not_opted_in: () => "Evening check-in is currently off — turn it on and I'll start sending it.",
-  daily_loop_disabled: (time) => `Evening check-in is on at ${time}, but the daily loop itself is off, which blocks both the V3 evening check-in and the legacy daily-loop message — turn the daily loop back on too.`,
+  // fix/private-alpha-proactive-launch-config-cleanup: effectively unreachable in the live tool
+  // (proactive.diagnose_evening_checkin self-heals dailyLoopEnabled before ever computing this
+  // status now) — kept as an accurate defensive fallback rather than assumed impossible.
+  daily_loop_disabled: (time) =>
+    `Evening check-in is on at ${time}, but the internal daily loop is off, which blocks both the V3 evening check-in and the legacy daily-loop message. This should self-heal automatically — if you're still seeing this, say "turn on evening check-in" again to repair it.`,
   outside_evening_window: (time) => `Evening check-in is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
   duplicate_dedupe_key: (time) => `Evening check-in is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
   no_candidate: (time) => `Evening check-in is on at ${time}, but there isn't anything grounded to ask about right now (every trackable goal already has today's progress logged) — check back closer to ${time}.`,
@@ -307,30 +315,46 @@ export function formatEveningCheckinDeliveryDiagnosis(
   return EVENING_DIAGNOSIS_MESSAGE[status](time, allowlistActive);
 }
 
+export type ProactiveStatusBlockedResult =
+  /** Replaces the ENTIRE status line, including the "on, around HH:MM" prefix — used only for
+   * delivery_disabled, where saying "on, around 09:00" alongside "delivery disabled" reads as
+   * self-contradictory ("on" implying it will actually happen). */
+  | { kind: "full_line"; text: string }
+  /** Appended after "on, around HH:MM — " — every other blocked reason still legitimately has a
+   * real scheduled time worth showing alongside the reason nothing sent. */
+  | { kind: "clause"; text: string };
+
 /**
- * fix/private-alpha-proactive-checkins-and-overdue-action-ux: the compact status line the
- * "automatic messages" summary (proactive.settings_show) shows for a moment the user has ON —
- * distinct from formatProactiveDeliveryDiagnosis/formatEveningCheckinDeliveryDiagnosis above,
- * which answer a DELIBERATE "why didn't X send?" question with a full sentence. This is a short
- * suffix meant to sit on the same line as "Morning brief: on, around 09:00" — undefined when
- * nothing is actually blocking today's send (the ordinary, common case), a short clause when
- * something genuinely is. Reuses the exact same ProactiveDeliveryStatus/EveningCheckinDeliveryStatus
- * enum getProactiveDeliveryStatus/getEveningCheckinDeliveryStatus already compute, so this can
- * never disagree with the real diagnosis about WHETHER something is blocked — only how tersely
- * it's phrased.
+ * fix/private-alpha-proactive-checkins-and-overdue-action-ux (extended by
+ * fix/private-alpha-proactive-launch-config-cleanup — task 4, distinguishing "configured on" from
+ * "will actually deliver," per a real report that "on — delivery disabled in this environment"
+ * still read as fully-on): the compact status line the "automatic messages" summary
+ * (proactive.settings_show) shows for a moment the user has ON — distinct from
+ * formatProactiveDeliveryDiagnosis/formatEveningCheckinDeliveryDiagnosis above, which answer a
+ * DELIBERATE "why didn't X send?" question with a full sentence. Undefined when nothing is
+ * actually blocking today's send (the ordinary, common case). Reuses the exact same
+ * ProactiveDeliveryStatus/EveningCheckinDeliveryStatus enum getProactiveDeliveryStatus/
+ * getEveningCheckinDeliveryStatus already compute, so this can never disagree with the real
+ * diagnosis about WHETHER something is blocked — only how it's phrased.
  */
-export function proactiveStatusBlockedClause(status: ProactiveDeliveryStatus | EveningCheckinDeliveryStatus): string | undefined {
+export function proactiveStatusBlockedClause(
+  status: ProactiveDeliveryStatus | EveningCheckinDeliveryStatus,
+  momentPhrase: "morning brief" | "evening check-in"
+): ProactiveStatusBlockedResult | undefined {
   switch (status) {
     case "delivery_disabled":
-      return "delivery disabled in this environment";
+      return { kind: "full_line", text: "configured on, but delivery is disabled on this server" };
     case "user_not_allowlisted":
-      return "not eligible — not in the allowlist";
+      return { kind: "clause", text: "not eligible — not in the allowlist" };
     case "daily_loop_disabled":
-      return "blocked — the daily loop itself is off";
+      // Should be effectively unreachable for a moment that's actually enabled now that
+      // selfHealDailyLoopEnabled runs on every status/eligibility read — kept as a defensive
+      // fallback (e.g. the self-heal write itself failing) rather than assumed impossible.
+      return { kind: "clause", text: `blocked — internal daily loop is off. Say "turn on ${momentPhrase}" to repair.` };
     case "no_candidate":
-      return "nothing grounded to send yet today";
+      return { kind: "clause", text: "nothing grounded to send yet today" };
     case "legacy_daily_loop_sent_instead":
-      return "today's message came from the legacy daily-loop system instead";
+      return { kind: "clause", text: "today's message came from the legacy daily-loop system instead" };
     default:
       // eligible / outside_..._window / duplicate_dedupe_key / user_not_opted_in — nothing is
       // actually blocking delivery; the caller shows next-due/last-sent instead of a clause.
