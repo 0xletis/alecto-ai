@@ -17,6 +17,7 @@ import {
   getEmailSignalRules,
   getEventsSince,
   getIntegrationConnection,
+  getMostRecentNotificationLog,
   getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getNotificationLog,
@@ -34,6 +35,7 @@ import {
   type IntegrationConnection
 } from "@operator-agent/db";
 import {
+  buildOpenActionCommandFooter,
   countEvidenceForMetric,
   CUSTOM_SIGNAL_EVENT_TYPE,
   describeGoalEvidenceMatch,
@@ -43,6 +45,7 @@ import {
   findCompatibleProgressMetric,
   findGoalsForEventType,
   findGoalsForSignalKey,
+  formatDueLabelForChat,
   getEmailAdapterDefinition,
   gmailScheduledSyncRuntimeFromEnv,
   goalHasOnlyCompletionSignals,
@@ -90,7 +93,9 @@ import {
   formatEveningCheckinDeliveryDiagnosis,
   formatProactiveDeliveryDiagnosis,
   getEveningCheckinDeliveryStatus,
-  getProactiveDeliveryStatus
+  getProactiveDeliveryStatus,
+  nextScheduledMomentLabel,
+  proactiveStatusBlockedClause
 } from "../operator/proactive-eligibility.js";
 import {
   assessTemporalHealth,
@@ -2360,10 +2365,11 @@ export async function executeOperation(
 
       case "proactive.settings_show": {
         const settings = await getOrCreateNotificationSettings(userId);
+        const summary = await buildTruthfulProactiveSettingsSummary(userId, settings, context);
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatProactiveSettingsSummary(settings),
+          summary,
           result: settings
         };
       }
@@ -2397,13 +2403,11 @@ export async function executeOperation(
 
         if (changes.length === 0) {
           const reconnectNote = gmailNudgeEnabled === true ? gmailReconnectNoteAfterNudgeEnabled(userId, context.gmailConnection) : undefined;
+          const truthfulSummary = await buildTruthfulProactiveSettingsSummary(userId, settings, context);
           return {
             tool: operation.tool,
             status: "executed",
-            summary: [
-              `That's already how it's set.\n\n${formatProactiveSettingsSummary(settings)}`,
-              reconnectNote
-            ].filter(Boolean).join("\n\n")
+            summary: [`That's already how it's set.\n\n${truthfulSummary}`, reconnectNote].filter(Boolean).join("\n\n")
           };
         }
 
@@ -2438,7 +2442,30 @@ export async function executeOperation(
         const eveningTimeMinutes = args.eveningTimeMinutes as number | undefined;
         const before = await getOrCreateNotificationSettings(userId);
 
-        const updated = await updateNotificationSettings(userId, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes });
+        // fix/private-alpha-proactive-checkins-and-overdue-action-ux: a real transcript found the
+        // morning brief and evening check-in both reported "on" (morningBriefEnabled/
+        // eveningCheckinEnabled were genuinely true) yet nothing ever delivered — because
+        // dailyLoopEnabled (a separate, older umbrella flag apps/worker's v3-proactive-delivery.ts
+        // ALSO requires, defaulting to false) was never set by this tool at all; only the legacy
+        // daily_loop.settings_apply_update tool ever touched it. A user saying "turn on morning
+        // brief" has no way to know that internal prerequisite exists, let alone to separately ask
+        // for it — so turning morningBriefEnabled/eveningCheckinEnabled ON here now also turns
+        // dailyLoopEnabled on, whenever it isn't already. Deliberately one-directional: turning
+        // morning/evening OFF never touches dailyLoopEnabled, since a user can independently run
+        // just the legacy daily-loop feature through daily_loop.settings_apply_update, and turning
+        // it off here would silently break that unrelated, still-active use — "Do NOT silently
+        // disable reminders."
+        const enablingProactiveMoment = morningBriefEnabled === true || eveningCheckinEnabled === true;
+        const dailyLoopEnabled = enablingProactiveMoment && !before.dailyLoopEnabled ? true : undefined;
+
+        const updated = await updateNotificationSettings(userId, {
+          morningBriefEnabled,
+          eveningCheckinEnabled,
+          gmailNudgeEnabled,
+          morningTimeMinutes,
+          eveningTimeMinutes,
+          dailyLoopEnabled
+        });
         const changes = describeProactiveSettingsChanges(before, { morningBriefEnabled, eveningCheckinEnabled, gmailNudgeEnabled, morningTimeMinutes, eveningTimeMinutes });
 
         const reconnectNote = gmailNudgeEnabled === true ? gmailReconnectNoteAfterNudgeEnabled(userId, context.gmailConnection) : undefined;
@@ -3075,51 +3102,12 @@ function formatActionListForChat(
   // fixed "Reply: complete 1, snooze 2 tomorrow, archive 3." footer referencing index 3 even when
   // only one action was shown — this always reflects the REAL open indexes actually on screen.
   const openIndexes = items.map((item, index) => (item.status === "open" ? index + 1 : null)).filter((index): index is number => index !== null);
-  const footer = buildActionListFooter(openIndexes);
+  const footer = buildOpenActionCommandFooter(openIndexes);
   if (footer) {
     lines.push("", footer);
   }
 
   return lines.join("\n");
-}
-
-/** Never references a numbered index that isn't actually visible — the whole reason this exists.
- * One open action gets purely natural phrasing (no number to get wrong); two or more use the
- * REAL indexes shown, never a hardcoded 1/2/3 regardless of how many actions actually exist.
- * Says "move"/"bring back," never "snooze," in this user-facing copy (fix/private-alpha-action-
- * temporal-coaching task 2) — "snooze" reads as a phone-alarm command, not something a coach
- * says; it's still accepted as an input word (tool-catalog.ts's action.snooze description), just
- * never the word Alecto itself uses back to the user. */
-function buildActionListFooter(openIndexes: number[]): string | undefined {
-  if (openIndexes.length === 0) {
-    return undefined;
-  }
-  if (openIndexes.length === 1) {
-    return "You can say: \"done\", \"move it to tomorrow\", or \"archive it\".";
-  }
-  if (openIndexes.length === 2) {
-    const [first, second] = openIndexes;
-    return `You can say: "complete ${first}", "move ${second} to tomorrow", or "archive ${first}".`;
-  }
-  const [first, second, third] = openIndexes;
-  return `You can say: "complete ${first}", "move ${second} to tomorrow", or "archive ${third}".`;
-}
-
-/** "due today 14:30" / "due tomorrow 09:00" / a full date+time fallback further out — generic
- * relative-day phrasing, not specific to any one caller, so any due-date-bearing list (actions,
- * overdue queries) can read naturally instead of showing a raw timestamp. */
-function formatDueLabelForChat(dueAt: Date, timezone: string): string {
-  const todayLocal = formatDateInTimezone(new Date(), timezone);
-  const dueLocal = formatDateInTimezone(dueAt, timezone);
-  const time = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false }).format(dueAt);
-
-  if (dueLocal === todayLocal) {
-    return `due today ${time}`;
-  }
-  if (dueLocal === addDaysToLocalDateString(todayLocal, 1)) {
-    return `due tomorrow ${time}`;
-  }
-  return `due ${formatLocalDateTime(dueAt, timezone)}`;
 }
 
 /** "moved to tomorrow 11:00" — the SAME today/tomorrow/full-date-fallback shape as
@@ -3841,15 +3829,97 @@ function formatGoalTrackingForChat(goal: Goal): string {
   return lines.join("\n");
 }
 
-function formatProactiveSettingsSummary(settings: NotificationSettings): string {
-  const morning = settings.morningBriefEnabled ? `on, around ${formatMinutesOfDay(settings.morningTimeMinutes)}` : "off";
-  const evening = settings.eveningCheckinEnabled ? `on, around ${formatMinutesOfDay(settings.eveningTimeMinutes)}` : "off";
-  return [
-    "Automatic messages:",
-    `- Morning brief: ${morning}`,
-    `- Evening check-in: ${evening}`,
-    `- Gmail alerts: ${settings.gmailNudgeEnabled ? "on" : "off"}`
-  ].join("\n");
+/**
+ * fix/private-alpha-proactive-checkins-and-overdue-action-ux: a real transcript found this exact
+ * status ("Morning brief: on, around 09:00") reported honestly-worded settings that nonetheless
+ * NEVER delivered — the old formatProactiveSettingsSummary only ever read
+ * morningBriefEnabled/eveningCheckinEnabled, never checking whether the worker would actually be
+ * eligible to send (PROACTIVE_OPERATOR_DELIVERY_ENABLED, the allowlist, dailyLoopEnabled, or
+ * today's own dedupe/candidate state) — the exact same six concerns
+ * proactive.diagnose_morning_brief/diagnose_evening_checkin already computed via
+ * getProactiveDeliveryStatus/getEveningCheckinDeliveryStatus for a DELIBERATE "why didn't it
+ * send?" question. This reuses those same status functions so "is it on" can never disagree with
+ * "would it actually send" — just phrased as a compact suffix instead of a full diagnosis
+ * sentence, plus real next-due/last-sent state so the status is actually inspectable, not just a
+ * boolean.
+ */
+async function buildTruthfulProactiveSettingsSummary(userId: string, settings: NotificationSettings, context: ContextBundle): Promise<string> {
+  const now = new Date();
+  const sentForDate = formatDateInTimezone(now, settings.timezone);
+  const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
+  const isAllowlisted = proactiveOperatorAllowlistFromEnv()(userId);
+
+  const morning = settings.morningBriefEnabled
+    ? await buildMomentStatusLine({
+        userId,
+        settings,
+        context,
+        now,
+        sentForDate,
+        deliveryEnabled,
+        isAllowlisted,
+        dedupeKey: MORNING_BRIEF_DEDUPE_KEY,
+        legacyType: "daily_loop_morning",
+        scheduledMinutes: settings.morningTimeMinutes,
+        getStatus: (alreadySentDedupeKeys, sentCountToday, legacyDailyLoopSentAt) =>
+          getProactiveDeliveryStatus({ context, notificationSettings: settings, now, alreadySentDedupeKeys, sentCountToday, deliveryEnabled, isAllowlisted, legacyDailyLoopSentAt })
+      })
+    : "off";
+
+  const evening = settings.eveningCheckinEnabled
+    ? await buildMomentStatusLine({
+        userId,
+        settings,
+        context,
+        now,
+        sentForDate,
+        deliveryEnabled,
+        isAllowlisted,
+        dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
+        legacyType: "daily_loop_evening",
+        scheduledMinutes: settings.eveningTimeMinutes,
+        getStatus: (alreadySentDedupeKeys, sentCountToday, legacyDailyLoopSentAt) =>
+          getEveningCheckinDeliveryStatus({ context, notificationSettings: settings, now, alreadySentDedupeKeys, sentCountToday, deliveryEnabled, isAllowlisted, legacyDailyLoopSentAt })
+      })
+    : "off";
+
+  return ["Automatic messages:", `- Morning brief: ${morning}`, `- Evening check-in: ${evening}`, `- Gmail alerts: ${settings.gmailNudgeEnabled ? "on" : "off"}`].join("\n");
+}
+
+async function buildMomentStatusLine(input: {
+  userId: string;
+  settings: NotificationSettings;
+  context: ContextBundle;
+  now: Date;
+  sentForDate: string;
+  deliveryEnabled: boolean;
+  isAllowlisted: boolean;
+  dedupeKey: string;
+  legacyType: string;
+  scheduledMinutes: number;
+  getStatus: (
+    alreadySentDedupeKeys: Set<string>,
+    sentCountToday: number,
+    legacyDailyLoopSentAt: Date | undefined
+  ) => ReturnType<typeof getProactiveDeliveryStatus> | ReturnType<typeof getEveningCheckinDeliveryStatus>;
+}): Promise<string> {
+  const [alreadySentToday, legacyDailyLoopLog, mostRecentLog] = await Promise.all([
+    hasNotificationLog({ userId: input.userId, type: input.dedupeKey, sentForDate: input.sentForDate }),
+    getNotificationLog({ userId: input.userId, type: input.legacyType, sentForDate: input.sentForDate }),
+    getMostRecentNotificationLog(input.userId, input.dedupeKey)
+  ]);
+
+  const status = input.getStatus(alreadySentToday ? new Set([input.dedupeKey]) : new Set(), alreadySentToday ? 1 : 0, legacyDailyLoopLog?.sentAt);
+  const onLabel = `on, around ${formatMinutesOfDay(input.scheduledMinutes)}`;
+  const blockedClause = proactiveStatusBlockedClause(status);
+
+  if (blockedClause) {
+    return `${onLabel} — ${blockedClause}`;
+  }
+
+  const nextDue = nextScheduledMomentLabel(input.scheduledMinutes, input.now, input.settings.timezone);
+  const lastSent = mostRecentLog ? formatDueLabelForChat(mostRecentLog.sentAt, input.settings.timezone, input.now).replace(/^due /, "") : "never";
+  return `${onLabel} — next due: ${nextDue} / last sent: ${lastSent}`;
 }
 
 type BuiltInGmailRuleKind = "job_search" | "work_action";

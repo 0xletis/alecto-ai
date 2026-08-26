@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, prisma } from "../packages/db/src/index.ts";
@@ -35,15 +34,24 @@ async function seedTelegramUser(userId: string, telegramUserId: string) {
 }
 
 test("1. multiple overdue actions for one user are bundled into a single natural-language message, no slash commands or UUIDs", async () => {
-  const userId = `worker-bundle-1-${randomUUID()}`;
-  const telegramUserId = "555001";
+  // fix/private-alpha-proactive-checkins-and-overdue-action-ux: previously seeded NotificationSettings
+  // under a randomUUID-based userId while every ActionItem/cleanup used a DIFFERENT, hardcoded
+  // "telegram:555001" id — the NotificationSettings row (with its own real telegramUserId field)
+  // was never cleaned up by the old `finally` block (which only ever deleted "telegram:555001"),
+  // so every run left one more orphaned row behind. That accumulation of duplicate telegramUserId
+  // rows across many runs eventually caused sendDueActionReminders to send the SAME bundled
+  // reminder twice for one real Telegram chat — a real bug this file's own tests exist to catch,
+  // just not one it should ALSO be causing by leaking test data. One real, fully-cleaned-up id
+  // throughout (matching test 2's own already-correct pattern) fixes both.
+  const telegramUserId = `555001${Date.now()}${Math.floor(Math.random() * 1000)}`;
+  const userId = `telegram:${telegramUserId}`;
 
   try {
-    await seedTelegramUser(userId, `telegram:${telegramUserId}`);
+    await seedTelegramUser(userId, userId);
     const overdue = new Date(Date.now() - 60 * 60 * 1000);
-    const taskA = await createActionItem(`telegram:${telegramUserId}`, { source: "manual", title: "Apply to 3 developer jobs", dueAt: overdue });
-    const taskB = await createActionItem(`telegram:${telegramUserId}`, { source: "manual", title: "Upgrade to Node.js 24", dueAt: overdue });
-    const taskC = await createActionItem(`telegram:${telegramUserId}`, { source: "manual", title: "Branding direction meeting", dueAt: overdue });
+    const taskA = await createActionItem(userId, { source: "manual", title: "Apply to 3 developer jobs", dueAt: overdue });
+    const taskB = await createActionItem(userId, { source: "manual", title: "Upgrade to Node.js 24", dueAt: overdue });
+    const taskC = await createActionItem(userId, { source: "manual", title: "Branding direction meeting", dueAt: overdue });
 
     const { send, sent } = stubTelegram();
     await sendDueActionReminders(new Date(), { sendTelegramMessage: send });
@@ -55,7 +63,14 @@ test("1. multiple overdue actions for one user are bundled into a single natural
     assert.match(text, /1\. apply to 3 developer jobs/i);
     assert.match(text, /2\. upgrade to node\.js 24/i);
     assert.match(text, /3\. branding direction meeting/i);
-    assert.match(text, /reply: complete 1, snooze 2 tomorrow, or archive 3/i);
+    // fix/private-alpha-proactive-checkins-and-overdue-action-ux: the footer used to be a single
+    // hardcoded "Reply: complete 1, snooze 2 tomorrow, or archive 3." string, referencing index 3
+    // regardless of how many actions were actually shown, and using the user-facing-forbidden
+    // word "snooze" — now built from the REAL bundled indexes via the same shared
+    // buildOpenActionCommandFooter apps/api's own action.list footer uses.
+    assert.match(text, /you can say: "complete 1", "move 2 to tomorrow", or "archive 3"\./i);
+    assert.doesNotMatch(text, /\bsnooze\b/i, "user-facing overdue reminder copy must never say \"snooze\"");
+    assert.doesNotMatch(text, /\(due: \d{2}\/\d{2}\/\d{4}/i, "must use the natural due-label helper, not a robotic (due: DD/MM/YYYY, HH:mm) format");
     assert.doesNotMatch(text, /\/complete_action|\/snooze_action|\/archive_action/);
     assert.doesNotMatch(text, new RegExp(taskA.id), "the raw ActionItem UUID must never appear in a V3 notification");
     assert.doesNotMatch(text, new RegExp(taskB.id));

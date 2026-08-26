@@ -334,7 +334,21 @@ export function parseActionDueDate(
 
   const today = lower.match(/\b(?:today|hoy|avui)(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\b/);
   if (today) {
-    const dueAt = atLocalTime(now, hour, minute, preferences.timezone);
+    // fix/private-alpha-proactive-checkins-and-overdue-action-ux: a bare "today" with no explicit
+    // time or day-part qualifier used to fall back to the SAME defaultActionTimeMinutes (9am)
+    // every other date-only phrase uses. Every OTHER date-only phrase (tomorrow, a specific
+    // weekday/date) is immune to that default ever already being in the past, because a future
+    // calendar day's own 9am is always still ahead of "now" — "today" is the one case where it
+    // isn't: created at 2pm, 9am has already passed, silently landing in rollVaguePastDate's
+    // "+15 minutes from now" vague-fallback and creating a task that goes overdue almost
+    // immediately (a real reported transcript: created ~01:11, overdue by ~01:26). Defaulting to
+    // the END of the local day instead — only when the user gave neither an explicit time nor a
+    // day-part ("today morning"/"tonight" keep their own already-intentional time) — keeps a
+    // same-day due date comfortably ahead of "now" for a same-day task created at any hour.
+    const effectiveMinutes = explicitTime || dayPart ? minutes : END_OF_DAY_TIME_MINUTES;
+    const effectiveHour = Math.floor(effectiveMinutes / 60);
+    const effectiveMinute = effectiveMinutes % 60;
+    const dueAt = atLocalTime(now, effectiveHour, effectiveMinute, preferences.timezone);
     if (explicitTime && dueAt <= now) {
       return pastExplicitDateResult(today[0], today[0], preferences);
     }
@@ -562,6 +576,13 @@ const WEEKDAY_ALIAS_PATTERN = Object.keys(WEEKDAY_ALIASES).sort((a, b) => b.leng
 // letter; needed (with the "u" regex flag) only where one of these accent-ending words can be
 // the very last thing matched before the boundary.
 const SAFE_END = "(?![\\p{L}\\p{N}_])";
+
+// 23:59 local — the target time-of-day for a bare "today" with no explicit time or day-part
+// qualifier (fix/private-alpha-proactive-checkins-and-overdue-action-ux). Deliberately the LAST
+// minute of the day, not some other "end of day" hour like 21:00: any earlier fixed hour could
+// itself already be in the past for a user creating the task in the evening, reintroducing the
+// exact vague-fallback bug this constant exists to avoid.
+const END_OF_DAY_TIME_MINUTES = 23 * 60 + 59;
 
 // Canonical English weekday/month names, in calendar order — shared by nextWeekdayAt (weekday
 // index lookup) and the weekday-mismatch clarification message (Task 3), so both always agree on

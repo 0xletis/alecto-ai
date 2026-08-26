@@ -2651,6 +2651,21 @@ export async function getNotificationLog(input: NotificationLogInput): Promise<{
   return log ?? undefined;
 }
 
+/** The single most recent NotificationLog row for (userId, type), regardless of which day it was
+ * sent for — unlike getNotificationLog (which only ever looks up ONE specific sentForDate),
+ * this answers "when did this last actually go out at all," the question a truthful "last sent"
+ * status line needs (fix/private-alpha-proactive-checkins-and-overdue-action-ux). Returns
+ * undefined when nothing has ever sent for this user/type — a real "never," not a guess. */
+export async function getMostRecentNotificationLog(userId: string, type: string): Promise<{ sentAt: Date; sentForDate: string } | undefined> {
+  const log = await prisma.notificationLog.findFirst({
+    where: { userId, type },
+    orderBy: { sentAt: "desc" },
+    select: { sentAt: true, sentForDate: true }
+  });
+
+  return log ?? undefined;
+}
+
 export async function hasRecentNotificationLog(input: Pick<NotificationLogInput, "userId" | "type"> & { since: Date }): Promise<boolean> {
   const log = await prisma.notificationLog.findFirst({
     where: {
