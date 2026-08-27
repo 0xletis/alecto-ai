@@ -61,6 +61,12 @@ export interface ClassifyEmailWithLLMOptions {
   model?: string;
 }
 
+// fix/private-alpha-gmail-generic-signal-engine: priority/domain generalize what used to be a
+// career-only concept (only an offer/interview could ever be "high priority") to ANY matched
+// rule — a flight cancellation or an insurance deadline can now be flagged the same way. Both are
+// advisory only: the caller (gmailRuleMatchToEmailClassification/deriveEmailReviewPriorityAndDomain
+// in apps/api/src/server.ts) re-validates priority against a closed enum before it ever reaches a
+// DB column, and domain is truncated/sanitized like every other LLM-derived string field here.
 const GmailRuleMatchClassificationSchema = z.object({
   shouldCreateReview: z.boolean(),
   matchedRuleId: z.string().nullable(),
@@ -69,7 +75,11 @@ const GmailRuleMatchClassificationSchema = z.object({
   reason: z.string().min(1).max(180),
   suggestedReviewTitle: z.string().nullable(),
   detectedDateOrDeadline: z.string().nullable(),
-  skipReason: z.string().nullable()
+  skipReason: z.string().nullable(),
+  // .optional() alongside .nullable() so a caller (or an older recorded mock response in tests)
+  // that predates these two fields still parses — absent is treated exactly like null below.
+  priority: z.enum(["low", "normal", "high"]).nullable().optional(),
+  signalKind: z.string().max(80).nullable().optional()
 });
 
 export interface GmailRuleMatchRule {
@@ -107,6 +117,13 @@ export interface GmailRuleMatchClassification {
   suggestedReviewTitle: string;
   detectedDateOrDeadline: string | null;
   skipReason: string | null;
+  /** Advisory only — re-validated against a closed enum by the caller before it can reach a DB
+   * column. "high" generalizes what used to be a career-only concept to any matched rule. */
+  priority: "low" | "normal" | "high" | null;
+  /** Advisory, short (e.g. "flight_cancellation", "insurance_renewal_deadline") — sanitized like
+   * every other LLM-derived string field before storage. Distinct from a rule's own `domain`
+   * (a coarse category set on the rule itself, not guessed per-message). */
+  signalKind: string | null;
 }
 
 export interface ClassifyGmailMessageAgainstRulesOptions {
@@ -302,7 +319,9 @@ function normalizeGmailRuleMatchClassification(
       reason: cleanOneLine(parsed.reason, 180),
       suggestedReviewTitle: cleanOneLine(parsed.suggestedReviewTitle || "Email review", 120),
       detectedDateOrDeadline: parsed.detectedDateOrDeadline ? cleanOneLine(parsed.detectedDateOrDeadline, 120) : null,
-      skipReason: cleanOneLine(parsed.skipReason ?? (rule ? "no review needed" : "no active rule matched"), 180)
+      skipReason: cleanOneLine(parsed.skipReason ?? (rule ? "no review needed" : "no active rule matched"), 180),
+      priority: null,
+      signalKind: null
     };
   }
 
@@ -314,7 +333,9 @@ function normalizeGmailRuleMatchClassification(
     reason: cleanOneLine(parsed.reason, 180),
     suggestedReviewTitle: cleanOneLine(parsed.suggestedReviewTitle || input.message.subject || rule.name, 120),
     detectedDateOrDeadline: parsed.detectedDateOrDeadline ? cleanOneLine(parsed.detectedDateOrDeadline, 120) : null,
-    skipReason: parsed.skipReason ? cleanOneLine(parsed.skipReason, 180) : null
+    skipReason: parsed.skipReason ? cleanOneLine(parsed.skipReason, 180) : null,
+    priority: parsed.priority ?? null,
+    signalKind: parsed.signalKind ? cleanOneLine(parsed.signalKind, 80) : null
   };
 }
 
@@ -333,7 +354,10 @@ function buildGmailRuleMatchPrompt(): string {
     "If no active rule matches, set shouldCreateReview false, matchedRuleId/name null, and skipReason explaining the non-match.",
     "Do not create a review just because the email is important in general; it must match one of the provided active rules.",
     "Do not invent rule ids, rule names, goals, facts, dates, or deadlines.",
-    "Keep suggestedReviewTitle specific and useful, for example: 'Upgrade Node.js to 24', 'Review Endesa bill', 'Reply to recruiter about frontend role', 'Check apartment viewing appointment'."
+    "Keep suggestedReviewTitle specific and useful, for example: 'Upgrade Node.js to 24', 'Review Endesa bill', 'Reply to recruiter about frontend role', 'Check apartment viewing appointment'.",
+    "Only when shouldCreateReview is true, also set priority and signalKind. priority is high only for something genuinely time-sensitive or consequential if missed (a cancelled/changed flight, an insurance policy about to lapse, an overdue bill, a legal/tax deadline, a real job offer or interview) — normal for most matches, low for minor/optional items. Never mark a newsletter, promotion, or routine confirmation high priority. signalKind is a short snake_case label for what this specific email is (e.g. flight_cancellation, insurance_renewal_deadline, invoice_due, appointment_scheduled, recruiter_reply) — leave both null when shouldCreateReview is false.",
+    "Never treat marketing/promotional bulk content (newsletter, unsubscribe, view in browser, sponsored, digest) as a match UNLESS the matched rule's own name or description explicitly says it wants that kind of content (e.g. a rule literally about tracking newsletters).",
+    "Never treat a bare login/account security code, 2FA code, or password-reset email as a match UNLESS the matched rule's own name or description explicitly asks for security/verification codes."
   ].join("\n");
 }
 
@@ -349,7 +373,9 @@ function buildGmailRuleMatchJsonSchema() {
       reason: { type: "string", maxLength: 180 },
       suggestedReviewTitle: { type: ["string", "null"], maxLength: 120 },
       detectedDateOrDeadline: { type: ["string", "null"], maxLength: 120 },
-      skipReason: { type: ["string", "null"], maxLength: 180 }
+      skipReason: { type: ["string", "null"], maxLength: 180 },
+      priority: { type: ["string", "null"], enum: ["low", "normal", "high", null] },
+      signalKind: { type: ["string", "null"], maxLength: 80 }
     },
     required: [
       "shouldCreateReview",
@@ -359,7 +385,9 @@ function buildGmailRuleMatchJsonSchema() {
       "reason",
       "suggestedReviewTitle",
       "detectedDateOrDeadline",
-      "skipReason"
+      "skipReason",
+      "priority",
+      "signalKind"
     ]
   };
 }

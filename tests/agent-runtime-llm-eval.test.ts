@@ -10262,3 +10262,544 @@ test(
     }
   }
 );
+
+// --- Launch-readiness: Gmail as a generic readonly signal source, not a job-search-only engine
+//     (fix/private-alpha-gmail-generic-signal-engine) - flights, insurance, car maintenance, and
+//     broad admin deadlines now go through the SAME rule + classification path job search always
+//     used, with job search itself preserved as one built-in template on top of it -------------
+
+test(
+  "291. Creating a flight-update Gmail rule from natural language proposes a real, confirmable readonly rule",
+  { ...llmEvalOptions(["gmail-rule-generalization"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-rule-flight-291-${randomUUID()}`;
+    const trace = new EvalTrace("291-rule-flight", ["gmail-rule-generalization"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const propose = trace.record("watch my Gmail for flight changes", await sendAgentMessage(server, userId, "watch my Gmail for flight changes"));
+        assertNoGenericAgentError(propose, "propose flight-changes rule");
+        trace.checkpoint("proposal names readonly access, never claims to send email", /readonly|read-only/i.test(propose.reply) && !/i('ll| will) (send|reply)/i.test(propose.reply), propose.reply);
+        assert.match(propose.reply, /readonly|read-only/i, `expected an explicit readonly disclosure — got: ${propose.reply}`);
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm flight-changes rule");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+        trace.checkpoint("a real custom rule about flights was created, never a job-search rule", Boolean(rule) && /flight/i.test(rule?.name ?? ""), JSON.stringify(rule));
+        assert.ok(rule, "expected a real custom Gmail rule to exist");
+        assert.match(rule!.name, /flight/i);
+        assert.notEqual(rule!.adapterId, "job_search_email", "a flight-change request must never become the job-search built-in");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "292. A real flight-delay email under an active flight rule is classified and reaches review, never silently dropped",
+  { ...llmEvalOptions(["gmail-llm-classifier"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-classify-flight-292-${randomUUID()}`;
+    const trace = new EvalTrace("292-classify-flight", ["gmail-llm-classifier"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-292-flight",
+        subject: "Flight delay notice - BA456",
+        from: "British Airways <noreply@ba.example>",
+        body: "Your flight BA456 departing today has been delayed by 3 hours due to operational reasons. Updated departure time: 18:45."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      await sendAgentMessage(server, userId, "watch my Gmail for flight delays and cancellations");
+      await sendAgentMessage(server, userId, "yes");
+      const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+      assert.ok(rule, "eval setup: the flight rule must actually exist before syncing");
+
+      await trace.guard(async () => {
+        const reply = trace.record("sync Gmail", await sendAgentMessage(server, userId, "sync Gmail"));
+        assertNoGenericAgentError(reply, "flight delay sync");
+
+        const review = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "eval-292-flight" } });
+        trace.checkpoint("the flight delay email reached review, traceable to its source message", Boolean(review), JSON.stringify(review));
+        assert.ok(review, "expected the flight-delay email to reach review");
+        assert.equal(review?.status, "pending");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "293. Creating an insurance-renewal Gmail rule from natural language proposes a real, confirmable readonly rule",
+  { ...llmEvalOptions(["gmail-rule-generalization"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-rule-insurance-293-${randomUUID()}`;
+    const trace = new EvalTrace("293-rule-insurance", ["gmail-rule-generalization"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const propose = trace.record("track emails about my insurance renewal", await sendAgentMessage(server, userId, "track emails about my insurance renewal"));
+        assertNoGenericAgentError(propose, "propose insurance-renewal rule");
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm insurance-renewal rule");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+        trace.checkpoint("a real custom rule about insurance was created", Boolean(rule) && /insurance/i.test(rule?.name ?? ""), JSON.stringify(rule));
+        assert.ok(rule);
+        assert.match(rule!.name, /insurance/i);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "294. A real insurance-renewal email under an active insurance rule reaches review, never auto-logged silently",
+  { ...llmEvalOptions(["gmail-llm-classifier"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-classify-insurance-294-${randomUUID()}`;
+    const trace = new EvalTrace("294-classify-insurance", ["gmail-llm-classifier"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-294-insurance",
+        subject: "Your car insurance policy renewal",
+        from: "Acme Insurance <renewals@acmeinsurance.example>",
+        body: "Your car insurance policy #INS-4471 is due for renewal on the 15th. Please review your coverage and confirm renewal before the deadline."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      await sendAgentMessage(server, userId, "track emails about my insurance renewal");
+      await sendAgentMessage(server, userId, "yes");
+      const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+      assert.ok(rule, "eval setup: the insurance rule must actually exist before syncing");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+
+        const review = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "eval-294-insurance" } });
+        trace.checkpoint("the insurance renewal email reached review", Boolean(review), JSON.stringify(review));
+        assert.ok(review, "expected the insurance-renewal email to reach review");
+        assert.equal(review?.status, "pending");
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("never silently auto-logged as an event without human approval", events === 0, String(events));
+        assert.equal(events, 0);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "295. Creating a car-repair Gmail rule from natural language proposes a real, confirmable readonly rule",
+  { ...llmEvalOptions(["gmail-rule-generalization"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-rule-car-295-${randomUUID()}`;
+    const trace = new EvalTrace("295-rule-car", ["gmail-rule-generalization"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const propose = trace.record("use Gmail for updates about my car repair", await sendAgentMessage(server, userId, "use Gmail for updates about my car repair"));
+        assertNoGenericAgentError(propose, "propose car-repair rule");
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm car-repair rule");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+        trace.checkpoint("a real custom rule about car repair was created", Boolean(rule) && /car|vehicle|repair/i.test(rule?.name ?? ""), JSON.stringify(rule));
+        assert.ok(rule);
+        assert.match(rule!.name, /car|vehicle|repair/i);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "296. A real car-service-appointment email under an active car-repair rule reaches review",
+  { ...llmEvalOptions(["gmail-llm-classifier"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-classify-car-296-${randomUUID()}`;
+    const trace = new EvalTrace("296-classify-car", ["gmail-llm-classifier"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-296-car",
+        subject: "Your car service appointment is confirmed",
+        from: "QuickFix Garage <appointments@quickfixgarage.example>",
+        body: "Your vehicle service appointment is confirmed for Tuesday at 10am. Please bring your service booklet."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      await sendAgentMessage(server, userId, "use Gmail for updates about my car repair");
+      await sendAgentMessage(server, userId, "yes");
+      const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+      assert.ok(rule, "eval setup: the car-repair rule must actually exist before syncing");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const review = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "eval-296-car" } });
+        trace.checkpoint("the car-service-appointment email reached review", Boolean(review), JSON.stringify(review));
+        assert.ok(review, "expected the car-service-appointment email to reach review");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "297. A broad 'important admin emails' rule catches a real flight cancellation without being told about flights specifically",
+  { ...llmEvalOptions(["generic-gmail-signal-engine"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-broad-admin-297-${randomUUID()}`;
+    const trace = new EvalTrace("297-broad-admin", ["generic-gmail-signal-engine"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-297-flight",
+        subject: "URGENT: Your flight has been cancelled",
+        from: "Iberia <noreply@iberia.example>",
+        body: "Your flight IB789 tomorrow has been cancelled. Please contact us to rebook or request a refund."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      await sendAgentMessage(server, userId, "watch for important admin deadlines and urgent notices in my Gmail");
+      await sendAgentMessage(server, userId, "yes");
+      const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+      assert.ok(rule, "eval setup: the broad admin rule must actually exist before syncing");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const review = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "eval-297-flight" } });
+        trace.checkpoint("a broad admin rule (never told about flights specifically) still catches a real flight cancellation", Boolean(review), JSON.stringify(review));
+        assert.ok(review, "expected a broad admin rule to catch a genuinely urgent flight cancellation");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "298. With no active Gmail rule at all, nothing is ever surfaced - the default is do nothing, not arbitrary importance scanning",
+  { ...llmEvalOptions(["generic-gmail-signal-engine"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-no-rule-surfacing-298-${randomUUID()}`;
+    const trace = new EvalTrace("298-no-rule-surfacing", ["generic-gmail-signal-engine"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-298-flight",
+        subject: "Your flight has been cancelled",
+        from: "Iberia <noreply@iberia.example>",
+        body: "Your flight IB789 tomorrow has been cancelled."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const reply = trace.record("sync Gmail", await sendAgentMessage(server, userId, "sync Gmail"));
+        assertNoGenericAgentError(reply, "sync with no active rule");
+        trace.checkpoint("never claims a scan ran with no active rule", !/I scanned Gmail/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /I scanned Gmail/i);
+        assert.equal(await prisma.emailReviewItem.count({ where: { userId } }), 0, "nothing may be surfaced without an active rule, no matter how urgent");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "299. Job-search regression: a genuine recruiter reply is still correctly classified and logged after the generic engine changes",
+  { ...llmEvalOptions(["gmail-job-search-regression"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-regression-recruiter-299-${randomUUID()}`;
+    const trace = new EvalTrace("299-regression-recruiter", ["gmail-job-search-regression"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-299-recruiter",
+        subject: "Quick call about the backend role",
+        from: "Priya (Recruiter) <priya@realcompany.example>",
+        body: "Hi, I'm a recruiter from Real Company. Are you available for a quick call this week to discuss the Backend Engineer role?"
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const enableReply = await sendAgentMessage(server, userId, "enable job search rule for Gmail");
+      assert.match(enableReply.reply, /job.search/i, "eval setup: the job-search rule must actually turn on");
+
+      await trace.guard(async () => {
+        const reply = trace.record("sync Gmail", await sendAgentMessage(server, userId, "sync Gmail"));
+        assertNoGenericAgentError(reply, "recruiter reply regression sync");
+        const events = await prisma.event.findMany({ where: { userId, source: "gmail", type: "career.recruiter_reply_received" } });
+        trace.checkpoint("recruiter reply still auto-logs as a real, traceable event after the generic engine changes", events.length === 1, JSON.stringify(events));
+        assert.equal(events.length, 1);
+        assert.equal((events[0].data as Record<string, unknown>).gmailMessageId, "eval-299-recruiter");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "300. Job-search regression: an interview-prep newsletter still never becomes a recruiter reply or interview event after the generic engine changes",
+  { ...llmEvalOptions(["gmail-job-search-regression"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-regression-newsletter-300-${randomUUID()}`;
+    const trace = new EvalTrace("300-regression-newsletter", ["gmail-job-search-regression"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-300-newsletter",
+        subject: "This week's top remote developer jobs",
+        from: "Jobs Weekly <newsletter@jobsweekly.example>",
+        body: "This week's top 10 remote developer job openings. Unsubscribe anytime from this newsletter."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const enableReply = await sendAgentMessage(server, userId, "enable job search rule for Gmail");
+      assert.match(enableReply.reply, /job.search/i, "eval setup: the job-search rule must actually turn on");
+
+      await trace.guard(async () => {
+        const reply = trace.record("sync Gmail", await sendAgentMessage(server, userId, "sync Gmail"));
+        assertNoGenericAgentError(reply, "newsletter regression sync");
+        trace.checkpoint("no recruiter-reply false positive from a newsletter, even after the generic engine changes", !/1 recruiter reply/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /1 recruiter reply/i);
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        assert.equal(events, 0);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "301. 'What should I do next?' after a generic (non-job-search) Gmail review can propose a real, confirmation-backed action from it",
+  { ...llmEvalOptions(["gmail-event-action-boundary"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-next-action-301-${randomUUID()}`;
+    const trace = new EvalTrace("301-next-action", ["gmail-event-action-boundary"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-301-flight",
+        subject: "Your flight has been cancelled",
+        from: "Iberia <noreply@iberia.example>",
+        body: "Your flight IB789 tomorrow has been cancelled. Please contact us to rebook or request a refund."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      await sendAgentMessage(server, userId, "watch my Gmail for flight changes and cancellations");
+      await sendAgentMessage(server, userId, "yes");
+      await sendAgentMessage(server, userId, "sync Gmail");
+      const review = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "eval-301-flight" } });
+      assert.ok(review, "eval setup: the flight cancellation must actually reach review before this scenario can test it");
+      // gmail.review.to_action resolves its `ref`/`index` against the session's own visible-
+      // entities list (validator.ts), which only gets populated by an actual review-list turn —
+      // matching how a real user would need to see the list before referring to "the flight
+      // cancellation one" by name.
+      await sendAgentMessage(server, userId, "what emails need my attention?");
+
+      await trace.guard(async () => {
+        const reply = trace.record("turn the flight cancellation into a task", await sendAgentMessage(server, userId, "turn the flight cancellation into a task"));
+        assertNoGenericAgentError(reply, "propose action from generic Gmail review");
+
+        const actionExecuted = reply.operationsExecuted.some((operation) => operation.tool === "gmail.review.to_action");
+        trace.checkpoint("a confirmation-backed action tool actually ran for the generic (non-job-search) review", actionExecuted, JSON.stringify(reply.operationsExecuted));
+        assert.ok(actionExecuted, `expected gmail.review.to_action to run — got: ${JSON.stringify(reply.operationsPlanned)}`);
+
+        const actionCount = await prisma.actionItem.count({ where: { userId, source: "email_review" } });
+        trace.checkpoint("a real action item was created from the generic review, not silently skipped", actionCount === 1, String(actionCount));
+        assert.equal(actionCount, 1);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "302. Gmail status lists multiple mixed rules (job-search built-in and generic custom rules) together, distinguishing goal-linked from generic",
+  { ...llmEvalOptions(["gmail-general-rule-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-status-multi-302-${randomUUID()}`;
+    const trace = new EvalTrace("302-status-multi", ["gmail-general-rule-ux"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const enableReply = await sendAgentMessage(server, userId, "enable job search rule for Gmail");
+      assert.match(enableReply.reply, /job.search/i, "eval setup: the job-search rule must actually turn on");
+      await sendAgentMessage(server, userId, "watch my Gmail for flight changes");
+      await sendAgentMessage(server, userId, "yes");
+
+      await trace.guard(async () => {
+        const reply = trace.record("gmail status", await sendAgentMessage(server, userId, "gmail status"));
+        assertNoGenericAgentError(reply, "multi-rule status");
+        trace.checkpoint("status mentions both the job-search rule and the flight rule", /job.search/i.test(reply.reply) && /flight/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /job.search/i);
+        assert.match(reply.reply, /flight/i);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "303. Spanish: 'vigila mi Gmail para cambios de vuelos' creates a real flight-changes rule the same way the English phrase does",
+  { ...llmEvalOptions(["gmail-general-rule-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-rule-flight-es-303-${randomUUID()}`;
+    const trace = new EvalTrace("303-rule-flight-es", ["gmail-general-rule-ux"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const propose = trace.record("vigila mi Gmail para cambios de vuelos", await sendAgentMessage(server, userId, "vigila mi Gmail para cambios de vuelos"));
+        assertNoGenericAgentError(propose, "Spanish flight-rule proposal");
+        const confirm = trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+        assertNoGenericAgentError(confirm, "Spanish flight-rule confirmation");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+        trace.checkpoint("a real custom flight-changes rule was created from the Spanish phrase", Boolean(rule) && /vuelo|flight/i.test(rule?.name ?? ""), JSON.stringify(rule));
+        assert.ok(rule, "expected a real custom Gmail rule to exist from the Spanish request");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "304. Catalan: 'vigila el meu Gmail per canvis de vols' creates a real flight-changes rule the same way the English phrase does",
+  { ...llmEvalOptions(["gmail-general-rule-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-rule-flight-ca-304-${randomUUID()}`;
+    const trace = new EvalTrace("304-rule-flight-ca", ["gmail-general-rule-ux"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const propose = trace.record("vigila el meu Gmail per canvis de vols", await sendAgentMessage(server, userId, "vigila el meu Gmail per canvis de vols"));
+        assertNoGenericAgentError(propose, "Catalan flight-rule proposal");
+        const confirm = trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+        assertNoGenericAgentError(confirm, "Catalan flight-rule confirmation");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, adapterId: "custom_email_review", status: "active" } });
+        trace.checkpoint("a real custom flight-changes rule was created from the Catalan phrase", Boolean(rule) && /vol|flight/i.test(rule?.name ?? ""), JSON.stringify(rule));
+        assert.ok(rule, "expected a real custom Gmail rule to exist from the Catalan request");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

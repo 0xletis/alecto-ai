@@ -437,11 +437,27 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.rule.create",
     description:
-      "Create a new custom, review-first Gmail tracking rule. Matches always go to email review first, never auto-logged, never instant. Optionally links to an active goal and one of that goal's own declared signals, so approving a matching review can log real goal evidence — never invents a link the user didn't ask for.",
+      "Create a new custom, review-first Gmail tracking rule for ANY watch request — not just job search: flights/travel, insurance, bills/invoices, car/vehicle maintenance, appointments, subscriptions, legal/admin deadlines, family/personal logistics, or anything else the user names. Matches always go to email review first, never auto-logged, never instant. Optionally links to an active goal and one of that goal's own declared signals, so approving a matching review can log real goal evidence — never invents a link the user didn't ask for. Use for 'watch my Gmail for flight changes', 'track emails about my insurance renewal', 'use Gmail for updates about my car repair', 'watch for important admin deadlines' — every domain uses this SAME tool, never a job-search-specific one, unless the user is specifically talking about their job search (that's gmail.rule.enable_builtin kind:'job_search' instead, when the built-in fits). Since this opens a pending confirmation (requiresConfirmation), the replyDraft that proposes it MUST explicitly say the access is readonly and that Alecto will never send email or change labels — e.g. 'I can watch Gmail readonly for flight changes and travel updates. I won't send emails or change labels. Enable this rule?' — every domain, not just flights, needs that same explicit disclosure, since it's a brand-new rule the user hasn't seen the safety framing for yet.",
     mutates: true,
     requiresConfirmation: true,
     argsSchema: z.object({
-      label: z.string().min(1).describe("Short human label for what to track, e.g. 'Endesa bills'."),
+      label: z.string().min(1).describe("Short human label for what to track, e.g. 'Flight changes', 'Insurance renewal', 'Endesa bills'."),
+      description: z
+        .string()
+        .min(1)
+        .max(400)
+        .optional()
+        .describe(
+          "A fuller, natural-language explanation of what should count as a match — copy the user's own intent, e.g. 'Flight delays, cancellations, gate or time changes, and boarding pass updates for any upcoming trip.' Feeds the semantic matcher directly, so a real explanation here materially improves precision beyond the short label alone. Omit only when the label is already fully self-explanatory."
+        ),
+      domain: z
+        .string()
+        .min(1)
+        .max(40)
+        .optional()
+        .describe(
+          "A short coarse category for this rule, e.g. 'travel', 'insurance', 'finance', 'legal', 'admin', 'personal', 'car'. Used for status grouping only — never invent a job-search/work category here, those are the built-ins."
+        ),
       matchHint: z.string().optional().describe("Extra keywords/sender hints to narrow the Gmail search query."),
       goalRef: z
         .string()

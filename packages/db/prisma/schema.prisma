@@ -292,6 +292,22 @@ model EmailSignalRule {
   minAutoLogConfidence Float    @default(0.9)
   minReviewConfidence Float     @default(0.65)
   reviewBeforeLogging Boolean   @default(false)
+  // fix/private-alpha-gmail-generic-signal-engine: minimal, additive generalization fields so a
+  // Gmail rule can represent ANY watch request (flights, insurance, bills, admin deadlines...),
+  // not just the two job-search/work-action built-ins. All nullable/defaulted — every existing
+  // row keeps working exactly as before with no backfill required. `domain` is a free-text coarse
+  // category ("career", "travel", "insurance", "finance", "admin", "custom", ...) used for status
+  // grouping and default priority, never a strict enum (a new domain should never need a schema
+  // change). `description` is the fuller natural-language explanation of what counts as a match —
+  // fed to the generic LLM rule-matcher (packages/llm/src/classify-email.ts) instead of that
+  // matcher having to synthesize one from just the short `name`. `notifyPolicy` gates whether a
+  // match under this rule is even eligible for a proactive gmail_nudge, independent of whether it
+  // goes to review — "review_only" (the safe default) never nudges, "notify" allows it,  "silent"
+  // suppresses even the review-count nudge line. A user must opt a rule INTO notify explicitly;
+  // review-first behavior itself is unchanged.
+  domain              String?
+  description         String?
+  notifyPolicy        String    @default("review_only")
   createdBy           String
   lastSyncedAt        DateTime?
   lastError           String?
@@ -325,6 +341,16 @@ model EmailReviewItem {
   reason             String
   extracted          Json
   status             String    @default("pending")
+  // fix/private-alpha-gmail-generic-signal-engine: `priority` generalizes what used to be a
+  // job-search-only concept (HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES, i.e. only offer/interview could
+  // ever be "high priority") — now the generic LLM rule-matcher and any adapter can mark a real
+  // signal high priority (a flight cancellation, an insurance deadline), and gmail_nudge/status
+  // read this field generically instead of a career.*-only check. Existing rows default to
+  // "normal", so nothing already stored silently becomes high-priority. `domain` is copied from
+  // the matching rule's own `domain` at creation time (denormalized on purpose — stable for
+  // display/status grouping even if the rule is later edited or archived).
+  priority           String    @default("normal")
+  domain             String?
   eventId            String?
   actionItemId        String?
   archiveReason      String?

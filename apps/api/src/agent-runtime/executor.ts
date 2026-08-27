@@ -1301,7 +1301,7 @@ export async function executeOperation(
             state.lastSyncedAt,
             proposal?.line,
             context.activeGoals,
-            context.gmailReviews.length,
+            context.gmailReviews,
             state
           ),
           result: connection,
@@ -1464,6 +1464,8 @@ export async function executeOperation(
         const label = args.label as string;
         const matchHint = args.matchHint as string | undefined;
         const query = matchHint ? `${label} ${matchHint}`.trim() : label;
+        const description = args.description as string | undefined;
+        const domain = args.domain as string | undefined;
 
         const existing = findExistingCustomGmailRule(await getEmailSignalRules(userId), label);
         if (existing?.status === "active") {
@@ -1545,6 +1547,9 @@ export async function executeOperation(
           minAutoLogConfidence: 1,
           minReviewConfidence: 0.65,
           reviewBeforeLogging: true,
+          domain,
+          description,
+          notifyPolicy: "review_only",
           createdBy: "user"
         });
 
@@ -4026,7 +4031,11 @@ function formatGmailConnectionStatusForChat(
   // count + manual-vs-scheduled cadence, so "gmail status" alone answers what used to require
   // asking gmail.autonomy.status and goal.status separately too.
   activeGoals: Goal[] = [],
-  pendingReviewCount = 0,
+  // fix/private-alpha-gmail-generic-signal-engine (Task 10): was a bare pendingReviewCount number
+  // — now the real pending review rows, so the per-rule line can show ITS OWN pending count and
+  // the summary line can break the total down by priority, generically across every rule/domain,
+  // not just job-search.
+  pendingReviews: EmailReviewItem[] = [],
   autonomyState?: Awaited<ReturnType<typeof buildGmailAutonomyState>>
 ): string {
   const oauthUrl = gmailOAuthUrlForUser(userId);
@@ -4037,11 +4046,22 @@ function formatGmailConnectionStatusForChat(
         "Active rules:",
         ...activeRules.map((rule, index) => {
           const linkedGoal = resolveLinkedGoalForDisplay(rule, activeGoals);
-          return `${index + 1}. ${rule.name} — review-first tracking${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`;
+          const rulePendingCount = pendingReviews.filter((review) => review.ruleId === rule.id).length;
+          return [
+            `${index + 1}. ${rule.name}`,
+            rule.domain ? ` (${rule.domain})` : "",
+            ` — ${gmailRuleTrackingPolicyLabel(rule)}`,
+            linkedGoal ? ` — linked to "${linkedGoal.title}"` : "",
+            rulePendingCount > 0 ? ` — ${rulePendingCount} pending review${rulePendingCount === 1 ? "" : "s"}` : ""
+          ].join("");
         })
       ]
     : [];
-  const pendingReviewLine = activeRules.length > 0 ? `Pending reviews: ${pendingReviewCount}.` : undefined;
+  const highPriorityPendingCount = pendingReviews.filter((review) => review.priority === "high").length;
+  const pendingReviewLine =
+    activeRules.length > 0
+      ? `Pending reviews: ${pendingReviews.length}${highPriorityPendingCount > 0 ? ` (${highPriorityPendingCount} high priority)` : ""}.`
+      : undefined;
   const syncModeLine = autonomyState && activeRules.length > 0 ? gmailSyncModeSentence(autonomyState) : undefined;
 
   if (!connection || connection.status === "archived") {
@@ -4320,6 +4340,8 @@ async function enableBuiltInGmailRuleForAgent(
     minAutoLogConfidence: defaults.minAutoLogConfidence,
     minReviewConfidence: defaults.minReviewConfidence,
     reviewBeforeLogging: defaults.reviewBeforeLogging,
+    domain: defaults.domain,
+    notifyPolicy: defaults.notifyPolicy,
     createdBy: "user",
     goalId: linkedGoal?.id
   });
@@ -4346,7 +4368,14 @@ function builtInGmailRuleDefaults(kind: BuiltInGmailRuleKind) {
       maxMessagesPerSync: 25,
       maxEventsPerSync: 5,
       minAutoLogConfidence: 0.95,
-      minReviewConfidence: 0.7
+      minReviewConfidence: 0.7,
+      domain: "work",
+      // fix/private-alpha-gmail-generic-signal-engine: unchanged behavior, just named — both
+      // built-ins were already nudge-eligible (buildGmailNudge in operator/proactive.ts has
+      // always been able to surface either one), so "notify" here preserves that exactly rather
+      // than silently narrowing it down to "review_only" the way any brand-new custom rule
+      // defaults to.
+      notifyPolicy: "notify" as const
     };
   }
 
@@ -4359,8 +4388,21 @@ function builtInGmailRuleDefaults(kind: BuiltInGmailRuleKind) {
     maxMessagesPerSync: 25,
     maxEventsPerSync: 10,
     minAutoLogConfidence: 0.9,
-    minReviewConfidence: 0.65
+    minReviewConfidence: 0.65,
+    domain: "career",
+    notifyPolicy: "notify" as const
   };
+}
+
+/**
+ * Task 10 (fix/private-alpha-gmail-generic-signal-engine): the old status line called every
+ * single rule "review-first tracking" — technically wrong for job_search_email, which auto-logs
+ * clear signals at high confidence and only reviews the uncertain ones (reviewBeforeLogging:
+ * false). Branches on that same real flag every rule already carries, generically, rather than
+ * hardcoding per-adapter text.
+ */
+function gmailRuleTrackingPolicyLabel(rule: EmailSignalRule): string {
+  return rule.reviewBeforeLogging ? "review-first tracking" : "auto-logs clear signals, reviews the rest";
 }
 
 function resolveLinkedGoalForDisplay(rule: EmailSignalRule, activeGoals: Goal[]): Goal | undefined {

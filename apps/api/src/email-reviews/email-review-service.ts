@@ -668,10 +668,19 @@ export function gmailReviewChatDescription(review: EmailReviewItem): string | un
   return undefined;
 }
 
-/** career.offer_received / career.interview_scheduled — forced to review even at auto-log
- * confidence (apps/api/src/server.ts's syncEmailSignalRule) precisely so they surface here,
- * clearly marked, rather than silently blending in with lower-stakes review items. */
-export function isHighPriorityGmailReview(review: Pick<EmailReviewItem, "proposedEventType">): boolean {
+/**
+ * fix/private-alpha-gmail-generic-signal-engine: generalizes what used to be a career-only check
+ * (only career.offer_received/career.interview_scheduled could ever be "high priority", forced to
+ * review even at auto-log confidence — apps/api/src/server.ts's syncEmailSignalRule) to any
+ * review — a flight cancellation or an insurance deadline can now carry the same weight. Prefers
+ * the review's own `priority` column (set generically at creation time by
+ * deriveEmailReviewPriorityAndDomain) and falls back to the original career-only check only for
+ * rows written before that column existed, so nothing already stored silently changes meaning.
+ */
+export function isHighPriorityGmailReview(review: Pick<EmailReviewItem, "proposedEventType" | "priority">): boolean {
+  if (review.priority) {
+    return review.priority === "high";
+  }
   return Boolean(review.proposedEventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(review.proposedEventType));
 }
 

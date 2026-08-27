@@ -3938,12 +3938,31 @@ async function syncGmailRecentMessagesAgainstActiveRules(input: {
   const ruleDescriptors = buildGmailRuleMatchRules(input.rules, activeGoals);
   const summariesByRuleId = new Map(input.summaries.map((summary) => [summary.ruleId, summary]));
   const fallbackSummary = input.summaries[0];
+  const anyRuleAllowsNewsletters = input.rules.some((rule) => ruleAllowsNewsletterEmails(rule));
+  const anyRuleAllowsSecurityCodes = input.rules.some((rule) => ruleAllowsSecurityAuthAccountEmails(rule));
 
   for (const messageId of candidateIds) {
     const message = await withGmailStage("gmail_message_fetch", () => getGmailMessageMetadata(input.accessToken, messageId));
     const fields = gmailMessageRuleMatchFields(message);
     fallbackSummary.aiMessagesChecked += 1;
     input.processedMessageIds.add(message.id);
+
+    // Task 5: a deterministic backstop, not a replacement for the LLM's own judgment (the prompt
+    // already tells it to ignore bulk/security content unless a rule explicitly asks for it) —
+    // this just guarantees that behavior even if the model doesn't reliably follow it, and skips
+    // the LLM call entirely (cheaper, and strictly safer) when nothing active could possibly want
+    // this message anyway.
+    const noiseCategory = genericBulkNoiseCategory(`${fields.subject} ${fields.snippet}`);
+    if (noiseCategory === "newsletter" && !anyRuleAllowsNewsletters) {
+      fallbackSummary.aiRuleMatchSkipped += 1;
+      fallbackSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, { decision: "skipped", skipReason: "generic newsletter/bulk content prefilter" }));
+      continue;
+    }
+    if (noiseCategory === "security_code" && !anyRuleAllowsSecurityCodes) {
+      fallbackSummary.aiRuleMatchSkipped += 1;
+      fallbackSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, { decision: "skipped", skipReason: "generic security/verification code prefilter" }));
+      continue;
+    }
 
     try {
       const classification = await classifyGmailMessageAgainstRules({
@@ -4087,7 +4106,15 @@ function gmailRuleMatchDescription(rule: EmailSignalRule): string {
     return "Work/project action emails: requests, deadlines, follow-ups, feedback requests, blockers, and meeting/action scheduling that may need a user decision.";
   }
 
-  return `Custom review-first Gmail tracking rule named "${rule.name}". Match emails relevant to the rule name, query, sender, keywords, and linked goal if present.`;
+  // fix/private-alpha-gmail-generic-signal-engine: a real, user-authored description (Task 3 —
+  // gmail.rule.create's own `description` arg) is always the strongest signal when present, since
+  // it's the user's OWN explanation of what counts as a match, not a synthesized guess — prefer it
+  // over the generic name-only fallback below.
+  if (rule.description) {
+    return rule.domain ? `[${rule.domain}] ${rule.description}` : rule.description;
+  }
+
+  return `Custom review-first Gmail tracking rule named "${rule.name}"${rule.domain ? ` (domain: ${rule.domain})` : ""}. Match emails relevant to the rule name, query, sender, keywords, and linked goal if present.`;
 }
 
 function gmailRuleMatchExamples(rule: EmailSignalRule): string[] {
@@ -4099,7 +4126,7 @@ function gmailRuleMatchExamples(rule: EmailSignalRule): string[] {
     return ["Can you review the dashboard by Friday?", "Brainstorm meeting tomorrow", "Waiting on you for feedback"];
   }
 
-  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""}`);
+  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""} ${rule.description ?? ""} ${rule.domain ?? ""}`);
   const examples: string[] = [];
   if (/\bendesa\b|invoice|bill|factura|receipt|recibo/.test(normalized)) {
     examples.push("Your Endesa bill is ready", "Factura disponible");
@@ -4109,6 +4136,29 @@ function gmailRuleMatchExamples(rule: EmailSignalRule): string[] {
   }
   if (/apartment|rental|rent|flat|viewing/.test(normalized)) {
     examples.push("Viewing appointment for apartment");
+  }
+  // fix/private-alpha-gmail-generic-signal-engine: broadened past the original handful of
+  // hardcoded domains — each of these is a real category from the product goal (flights, car
+  // maintenance, bills, appointments, subscriptions, legal/admin), matched against name/query/
+  // description/domain together so a rule works whether the user gave a rich description or just
+  // a short label.
+  if (/flight|airline|boarding|itinerary|travel|trip/.test(normalized)) {
+    examples.push("Your flight has been changed", "Flight cancellation notice", "Check-in now open for your flight");
+  }
+  if (/insurance|policy|coverage|seguro|poliza/.test(normalized)) {
+    examples.push("Your insurance policy renewal", "Coverage change notice");
+  }
+  if (/\bcar\b|vehicle|mechanic|garage|mot\b|itv\b|repair/.test(normalized)) {
+    examples.push("Your car service appointment is confirmed", "Vehicle repair estimate ready");
+  }
+  if (/subscription|renewal|membership|plan renew/.test(normalized)) {
+    examples.push("Your subscription renews soon", "Membership renewal notice");
+  }
+  if (/legal|tax|government|admin|deadline|gov\.|hacienda|dgt/.test(normalized)) {
+    examples.push("Action required before your filing deadline", "Document requires your signature");
+  }
+  if (/appointment|doctor|clinic|dentist|health/.test(normalized)) {
+    examples.push("Your appointment has been rescheduled", "Appointment confirmation");
   }
   return examples;
 }
@@ -4132,6 +4182,16 @@ function gmailRuleMatchToEmailClassification(
   if (detectedDateOrDeadline) {
     extracted.detectedDateOrDeadline = detectedDateOrDeadline;
     extracted.deadline = detectedDateOrDeadline;
+  }
+
+  // fix/private-alpha-gmail-generic-signal-engine: advisory only — re-validated against a closed
+  // enum by deriveEmailReviewPriorityAndDomain before it can ever reach the EmailReviewItem.priority
+  // column, exactly like every other LLM-derived value this function passes through `extracted`.
+  if (classification.priority) {
+    extracted.suggestedPriority = classification.priority;
+  }
+  if (classification.signalKind) {
+    extracted.signalKind = classification.signalKind;
   }
 
   if (rule.adapterId === "custom_email_review") {
@@ -4533,6 +4593,31 @@ async function classifyEmailForRule(
     return { classification: securityNoise };
   }
 
+  // Task 5 (fix/private-alpha-gmail-generic-signal-engine): custom_email_review's own match here
+  // is a dumb "the Gmail search query found it, so review it" pass-through — unlike job_search_
+  // email/work_action_email, it never routes through classifyJobSearchText's own newsletter
+  // filter at all. A rule with an empty/weak query (falling back to expandGmailQueriesForRule's
+  // broad `newer_than:Nd` search) could otherwise flood review with bulk newsletter content this
+  // rule never actually asked for — the same deterministic backstop the AI rule-match sweep uses.
+  if (rule.adapterId === "custom_email_review" && !ruleAllowsNewsletterEmails(rule) && genericBulkNoiseCategory(text) === "newsletter") {
+    return {
+      classification: {
+        decision: "ignore",
+        eventType: undefined,
+        confidence: 0.05,
+        reason: "filtered_non_action_email",
+        evidence: text.slice(0, 300),
+        extracted: {},
+        metadata: {
+          classifierMode: rule.classifierMode,
+          adapterId: rule.adapterId,
+          source: "gmail",
+          classifier: "rules"
+        }
+      }
+    };
+  }
+
   if (rule.adapterId === "custom_email_review") {
     return {
       classification: {
@@ -4632,8 +4717,41 @@ async function classifyEmailForRule(
 }
 
 function ruleAllowsSecurityAuthAccountEmails(rule: EmailSignalRule): boolean {
-  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""}`);
+  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""} ${rule.description ?? ""}`);
   return /\b(security|account alert|login alert|unknown device|authentication|2fa|verification|password reset)\b/.test(normalized);
+}
+
+/** Task 5 (fix/private-alpha-gmail-generic-signal-engine): the generic mirror of
+ * ruleAllowsSecurityAuthAccountEmails — a rule must explicitly say it wants newsletter/bulk
+ * content (e.g. "track newsletters about X") before the deterministic prefilter below lets one
+ * through to the LLM rule-matcher at all. */
+function ruleAllowsNewsletterEmails(rule: EmailSignalRule): boolean {
+  const normalized = normalizeForComparison(`${rule.name} ${rule.query ?? ""} ${rule.description ?? ""}`);
+  return /\b(newsletters?|digests?|bulletins?|mailing lists?)\b/.test(normalized);
+}
+
+/**
+ * Task 5 (fix/private-alpha-gmail-generic-signal-engine): a lightweight, generic deterministic
+ * noise check run BEFORE any message reaches the LLM rule-matcher sweep (syncGmailRecentMessages
+ * AgainstActiveRules) — that sweep previously had NO prefilter of its own at all (unlike the
+ * primary per-rule job-search/work-action path, which already had isJobNewsletterOrPromotional/
+ * isSecurityAuthAccountEmail as a deterministic backstop), leaving it entirely up to the LLM's own
+ * judgment whether a bulk newsletter or a bare security code should match a rule. Returns which
+ * noise category (if any) the message looks like; the caller only calls the LLM if no active rule
+ * in this sync explicitly opts into that exact category (ruleAllowsNewsletterEmails /
+ * ruleAllowsSecurityAuthAccountEmails) — deliberately narrow phrase lists shared with (not
+ * duplicated from) the job-search path's own generic bulk-content signals, so a real 1:1 email is
+ * never mistaken for noise.
+ */
+function genericBulkNoiseCategory(text: string): "newsletter" | "security_code" | undefined {
+  const normalized = normalizeForComparison(text);
+  if (/\b(unsubscribe|view in browser|view this email in your browser|sponsored)\b/.test(normalized) || /\bnewsletters?\b/.test(normalized)) {
+    return "newsletter";
+  }
+  if (isSecurityAuthAccountEmail(text)) {
+    return "security_code";
+  }
+  return undefined;
 }
 
 function isHardEmailClassification(classification: ReturnType<typeof classifyJobSearchEmail>): boolean {
@@ -4741,6 +4859,38 @@ function isSecurityAuthAccountEmail(text: string): boolean {
   ].some((pattern) => pattern.test(normalized));
 }
 
+const REVIEW_PRIORITY_VALUES = new Set(["low", "normal", "high"]);
+
+/**
+ * fix/private-alpha-gmail-generic-signal-engine: generalizes what used to be a career-only
+ * concept — previously ONLY career.offer_received/career.interview_scheduled could ever be "high
+ * priority" (HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES), so a flight cancellation or an insurance
+ * deadline could never get the same treatment no matter how urgent. The generic LLM rule-matcher
+ * (classifyGmailMessageAgainstRules) can now suggest a priority/domain for ANY rule — but it is
+ * only ever a SUGGESTION: validated against a closed enum here (never trusted as free text into a
+ * DB column), and job_search_email/work_action_email keep their exact pre-existing behavior
+ * (still forced high via HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES) regardless of what the LLM suggests,
+ * so this can never change job-search precision/regression behavior.
+ */
+function deriveEmailReviewPriorityAndDomain(
+  rule: EmailSignalRule,
+  classification: ReturnType<typeof classifyJobSearchEmail>,
+  proposedEventType: string | undefined
+): { priority: "low" | "normal" | "high"; domain: string | undefined } {
+  const domain = rule.domain;
+
+  if (proposedEventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(proposedEventType)) {
+    return { priority: "high", domain };
+  }
+
+  const suggested = classification.extracted.suggestedPriority;
+  if (typeof suggested === "string" && REVIEW_PRIORITY_VALUES.has(suggested)) {
+    return { priority: suggested as "low" | "normal" | "high", domain };
+  }
+
+  return { priority: "normal", domain };
+}
+
 async function createEmailReviewItemForClassification(input: {
   userId: string;
   connectionId: string;
@@ -4752,6 +4902,7 @@ async function createEmailReviewItemForClassification(input: {
   const from = sanitizeEmailText(getGmailHeader(input.message, "from"), 120);
   const reviewExternalId = `gmail-review:${input.rule.id}:${input.message.id}`;
   const proposedEventType = input.classification.eventType ?? safeEmailReviewProposedType(input.classification.reason);
+  const { priority, domain } = deriveEmailReviewPriorityAndDomain(input.rule, input.classification, proposedEventType);
   const company = typeof input.classification.extracted.company === "string" ? input.classification.extracted.company : undefined;
   const role = typeof input.classification.extracted.role === "string" ? input.classification.extracted.role : undefined;
   const project = typeof input.classification.extracted.project === "string" ? input.classification.extracted.project : undefined;
@@ -4879,7 +5030,9 @@ async function createEmailReviewItemForClassification(input: {
       proposedEventType,
       confidence: input.classification.confidence,
       reason: input.classification.reason,
-      extracted: input.classification.extracted
+      extracted: input.classification.extracted,
+      priority,
+      domain
     });
 
     return {
@@ -4908,7 +5061,9 @@ async function createEmailReviewItemForClassification(input: {
     proposedEventType,
     confidence: input.classification.confidence,
     reason: input.classification.reason,
-    extracted: input.classification.extracted
+    extracted: input.classification.extracted,
+    priority,
+    domain
   });
 
   return {
