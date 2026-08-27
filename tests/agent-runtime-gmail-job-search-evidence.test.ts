@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { encryptSecretJson } from "../packages/core/src/index.ts";
 import { createGoal } from "../packages/db/src/index.ts";
-import { approveEmailReviewForUser } from "../apps/api/src/email-reviews/email-review-service.ts";
+import { approveEmailReviewForUser, rejectEmailReviewForUser } from "../apps/api/src/email-reviews/email-review-service.ts";
 import { buildServer, clearAgentRuntimeMocks, getAgentSession, mockPlan, op, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
@@ -188,22 +188,25 @@ test("sync Gmail classifies clear job-search signals into events, sends the ambi
     });
     if (created.duplicate) throw new Error("unexpected duplicate goal in test setup");
 
-    // Task 2: sync reply is a per-type breakdown, not a flat counter, and stays honest about what
-    // still needs review.
+    // Task 4 (2 tasks later, fix/private-alpha-gmail-classifier-precision-and-proactive-
+    // diagnostics): the sync reply now separates CONFIRMED/logged items from uncertain review
+    // candidates entirely — a review candidate is never reported as a found/confirmed signal type.
     const sync = await sendAgentMessage(server, userId, "sync Gmail");
     assert.deepEqual(sync.operationsPlanned.map((operation) => operation.tool), ["gmail.sync"]);
     assert.match(sync.reply, /I scanned Gmail with the job-search rule\./);
-    assert.match(sync.reply, /Found:/);
+    assert.match(sync.reply, /Logged clear items:/);
     assert.match(sync.reply, /- 1 recruiter reply/);
     assert.match(sync.reply, /- 1 application confirmation/);
-    assert.match(sync.reply, /- 1 interview email/);
+    assert.match(sync.reply, /- 0 interview emails/);
     assert.match(sync.reply, /- 1 rejection email/);
-    assert.match(sync.reply, /- 1 offer email/);
+    assert.match(sync.reply, /- 0 offer emails/);
+    assert.doesNotMatch(sync.reply, /- 1 interview email\b/, "interview must never be reported as a logged/confirmed count — it was forced to review");
+    assert.doesNotMatch(sync.reply, /- 1 offer email\b/, "offer must never be reported as a logged/confirmed count — it was forced to review");
     // Offer and interview are high-signal — forced to review even at auto-log confidence — so
     // only recruiter reply/application confirmation/rejection clear straight through; offer,
-    // interview, and the one genuinely ambiguous email all need review.
-    assert.match(sync.reply, /I added 3 clear items to your job-search progress\./);
-    assert.match(sync.reply, /3 uncertain emails need review\./);
+    // interview, and the one genuinely ambiguous email all need review, reported as a bare count
+    // (never re-using the per-type breakdown for uncertain items).
+    assert.match(sync.reply, /3 emails need review before I count them\./);
 
     // Task 2F / readonly: only GET calls should ever reach the Gmail API.
     assert.deepEqual(nonGetCalls, []);
@@ -429,6 +432,109 @@ test("Task 7: Gmail goal-usage status distinguishes not-connected, no-rule, and 
     assert.match(ruleActive.reply, /manual|sync Gmail/i, "must distinguish manual-only from scheduled cadence");
     assert.doesNotMatch(ruleActive.reply, /scheduled Gmail checks are (also )?on|on a schedule/i, "must not claim scheduled sync is on when it is manual-only");
   } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+    if (previousKey === undefined) delete process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+    else process.env.ALECTO_SECRET_ENCRYPTION_KEY = previousKey;
+  }
+});
+
+test("Task 6: a sender rejected twice as newsletter/spam is suppressed on the next sync, but a genuine interview never is", async () => {
+  const previousKey = process.env.ALECTO_SECRET_ENCRYPTION_KEY;
+  process.env.ALECTO_SECRET_ENCRYPTION_KEY = randomBytes(32).toString("base64");
+  const server = buildServer();
+  const userId = `gmail-reject-suppression-${randomUUID()}`;
+  const repeatSender = "jobs@dailyquantboard.example";
+  let restore: () => void = () => {};
+
+  try {
+    await seedUser(userId);
+    const connection = await seedGmailConnection(userId);
+    await seedBuiltInJobSearchRule(userId, connection.id);
+
+    // First sync: two low-confidence "action required" emails from the same sender both land in
+    // review (Task 6's real-transcript starting point — the user bulk-rejects ambiguous items
+    // like this with "reject all, they are just spam or job newsletter no interviews").
+    const firstBatch: SeededGmailMessage[] = [
+      {
+        id: "m-repeat-1",
+        subject: "Application update needed",
+        from: `Daily Quant Board <${repeatSender}>`,
+        body: "Action required: please complete your application for the Quant Researcher role at Daily Quant Board within 48 hours or it will be discarded."
+      },
+      {
+        id: "m-repeat-2",
+        subject: "Application update needed again",
+        from: `Daily Quant Board <${repeatSender}>`,
+        body: "Action required: please complete your application for the Quant Researcher role at Daily Quant Board within 48 hours or it will be discarded, second reminder."
+      }
+    ];
+    ({ restore } = installJobSearchGmailFetchMock(firstBatch));
+    await sendAgentMessage(server, userId, "sync Gmail");
+    const pendingAfterFirstSync = await prisma.emailReviewItem.findMany({ where: { userId, status: "pending" } });
+    assert.equal(pendingAfterFirstSync.length, 2);
+    restore();
+
+    for (const review of pendingAfterFirstSync) {
+      const result = await rejectEmailReviewForUser(userId, review.id);
+      assert.equal(result.status, "ok");
+    }
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId, status: "rejected" } }), 2, "same rejected messages must never reappear as pending again");
+
+    // Second sync: a THIRD low-confidence email from the exact same rejected sender, plus a
+    // genuine interview-scheduling email from an unrelated sender.
+    const secondBatch: SeededGmailMessage[] = [
+      {
+        id: "m-repeat-3",
+        subject: "One more thing about your application",
+        from: `Daily Quant Board <${repeatSender}>`,
+        body: "Action required: please re-confirm your application for the Quant Researcher role at Daily Quant Board within 48 hours or it will be discarded."
+      },
+      {
+        id: "m-genuine-interview",
+        subject: "Let's schedule your interview",
+        from: "Real Recruiter <hiring@othercompany.example>",
+        body: "Great news - let's schedule an interview for the Data Analyst role. Are you available next week?"
+      }
+    ];
+    ({ restore } = installJobSearchGmailFetchMock(secondBatch));
+    const secondSync = await sendAgentMessage(server, userId, "sync Gmail");
+    assert.match(secondSync.reply, /I scanned Gmail with the job-search rule\./);
+    restore();
+
+    // Task 6C: a repeat low-confidence email from an already-twice-rejected sender is suppressed,
+    // not raised for review again.
+    const repeatReview = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "m-repeat-3" } });
+    assert.equal(repeatReview, null, "a third low-confidence email from an already-twice-rejected sender must be suppressed, not raised for review again");
+
+    // Task 6D: a genuine interview email from an unrelated sender is never affected by someone
+    // else's rejection history.
+    const interviewReview = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "m-genuine-interview" } });
+    assert.ok(interviewReview, "a genuine interview email must always surface, unaffected by an unrelated sender's rejection history");
+    assert.equal(interviewReview?.status, "pending");
+    assert.equal(interviewReview?.proposedEventType, "career.interview_scheduled");
+
+    // Third sync: even the repeat-rejected sender's OWN genuine interview email must still
+    // surface — sender-history suppression only ever applies to low-confidence candidates, never
+    // to a high-signal type (Task 6E: no overbroad suppression).
+    const thirdBatch: SeededGmailMessage[] = [
+      {
+        id: "m-repeat-genuine-interview",
+        subject: "Interview invitation",
+        from: `Daily Quant Board <${repeatSender}>`,
+        body: "We'd like to interview you for the Quant Researcher role - please book a time that works for you."
+      }
+    ];
+    ({ restore } = installJobSearchGmailFetchMock(thirdBatch));
+    await sendAgentMessage(server, userId, "sync Gmail");
+    restore();
+
+    const repeatSenderInterviewReview = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "m-repeat-genuine-interview" } });
+    assert.ok(repeatSenderInterviewReview, "a genuine interview from a previously-rejected sender must still surface - suppression never blocks a high-signal type");
+    assert.equal(repeatSenderInterviewReview?.proposedEventType, "career.interview_scheduled");
+  } finally {
+    restore();
     clearAgentRuntimeMocks();
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });

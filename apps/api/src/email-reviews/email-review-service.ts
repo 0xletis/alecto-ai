@@ -798,7 +798,21 @@ export function humanEmailReviewEventLabel(eventType: string): string {
     "career.interview_scheduled": "interview event",
     "career.interview_completed": "completed interview",
     "career.rejection_received": "rejection",
-    "career.offer_received": "job offer"
+    "career.offer_received": "job offer",
+    // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: these are
+    // safeEmailReviewProposedType's own non-eventType reason strings (server.ts) — an
+    // "action required to complete your application" email was falling through to the generic
+    // "event" label here, which told the user nothing. None of these ever map to a real
+    // EventTypeSchema member, so approving one still can't silently create progress from an
+    // action-required/portal email alone (email-review-service.ts's own approve path already
+    // requires a valid EventTypeSchema proposedEventType before logging anything). A genuine
+    // security/verification code email never reaches here at all — it's hard-filtered earlier
+    // (server.ts's classifySecurityAuthEmailNoise, deliberately, regardless of job-application
+    // context) — these two entries exist only in case that policy is ever relaxed to let one
+    // through, so it still never falls back to generic "event".
+    application_action_required: "application portal action required",
+    security_code: "application portal / security code",
+    verify_email: "application portal / verification"
   };
 
   return labels[eventType] ?? "event";

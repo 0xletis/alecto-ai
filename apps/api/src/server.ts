@@ -124,6 +124,7 @@ import {
   getIntegrationConnections,
   approvePendingGmailReviewItemsForSemanticEvent,
   rejectEmailReviewItem,
+  getRejectedEmailReviewSendersForRule,
   reassignActiveEmailSignalRulesToConnection,
   completeActionItem,
   archiveActionItem,
@@ -180,6 +181,7 @@ import {
   containsUnsafeReflectionLanguage,
   normalizeForComparison,
   pendingEmailReviewLine,
+  sanitizeEmailText,
   truncatePlainText
 } from "./utils/text.js";
 import { isGuardrailEvent } from "./utils/events.js";
@@ -2501,26 +2503,32 @@ function formatGmailSyncTotalsForConversation(totals: ReturnType<typeof gmailSyn
   const messagesChecked = totals.messagesFound + totals.aiMessagesChecked;
 
   if (isJobSearchOnlySync) {
-    const breakdown = formatJobSearchSignalBreakdown(totals.signalCounts);
+    // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: a real transcript
+    // showed "Found: - 5 interview emails" for five items that were ALL still-uncertain review
+    // candidates, never logged or confirmed — signalCounts now ONLY ever reflects auto-logged
+    // events (see syncEmailSignalRule's two increment sites), so this breakdown can never again
+    // report a review-only item as a found/confirmed signal type. Uncertain items get a bare
+    // count, deliberately never a per-type breakdown — "needs review" must never imply a specific
+    // confirmed type (an offer/interview forced to review is exactly this case).
+    const loggedBreakdown = formatJobSearchSignalBreakdown(totals.signalCounts);
 
-    if (!breakdown && totals.reviewItemsCreated === 0 && totals.eventsCreated === 0) {
+    if (!loggedBreakdown && totals.reviewItemsCreated === 0) {
       return "I scanned Gmail with the job-search rule. No new job-search emails found.";
     }
 
     const lines = ["I scanned Gmail with the job-search rule."];
-    if (breakdown) {
-      lines.push("", "Found:", ...breakdown);
+
+    if (loggedBreakdown) {
+      lines.push("", "Logged clear items:", ...loggedBreakdown);
+    } else {
+      lines.push("", "No clear job-search events were logged.");
     }
 
-    const outcomeParts: string[] = [];
-    if (totals.eventsCreated > 0) {
-      outcomeParts.push(`I added ${totals.eventsCreated} clear item${totals.eventsCreated === 1 ? "" : "s"} to your job-search progress.`);
-    }
     if (totals.reviewItemsCreated > 0) {
-      outcomeParts.push(`${totals.reviewItemsCreated} uncertain email${totals.reviewItemsCreated === 1 ? "" : "s"} need${totals.reviewItemsCreated === 1 ? "s" : ""} review.`);
-    }
-    if (outcomeParts.length > 0) {
-      lines.push("", outcomeParts.join(" "));
+      lines.push(
+        "",
+        `${totals.reviewItemsCreated} email${totals.reviewItemsCreated === 1 ? "" : "s"} need${totals.reviewItemsCreated === 1 ? "s" : ""} review before I count ${totals.reviewItemsCreated === 1 ? "it" : "them"}.`
+      );
     }
 
     return lines.join("\n");
@@ -2648,7 +2656,9 @@ function gmailSyncTotals(summaries: EmailRuleSyncSummary[]) {
       archivedCleanupReprocessed: totals.archivedCleanupReprocessed + summary.archivedCleanupReprocessed,
       skippedDueMaxEventsPerSync: totals.skippedDueMaxEventsPerSync + summary.skippedDueMaxEventsPerSync,
       eventsCreated: totals.eventsCreated + summary.eventsCreated,
-      signalCounts: mergeSignalCounts(totals.signalCounts, summary.signalCounts)
+      suppressedRepeatSender: totals.suppressedRepeatSender + summary.suppressedRepeatSender,
+      signalCounts: mergeSignalCounts(totals.signalCounts, summary.signalCounts),
+      reviewSignalCounts: mergeSignalCounts(totals.reviewSignalCounts, summary.reviewSignalCounts)
     }),
     {
       messagesFound: 0,
@@ -2675,7 +2685,9 @@ function gmailSyncTotals(summaries: EmailRuleSyncSummary[]) {
       archivedCleanupReprocessed: 0,
       skippedDueMaxEventsPerSync: 0,
       eventsCreated: 0,
-      signalCounts: {} as Record<string, number>
+      suppressedRepeatSender: 0,
+      signalCounts: {} as Record<string, number>,
+      reviewSignalCounts: {} as Record<string, number>
     }
   );
 }
@@ -3881,6 +3893,8 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     skippedDueMaxEventsPerSync: 0,
     eventsCreated: 0,
     signalCounts: {},
+    reviewSignalCounts: {},
+    suppressedRepeatSender: 0,
     reviewCandidateDebug: [],
     syncDecisionDebug: []
   };
@@ -4133,9 +4147,9 @@ function gmailRuleMatchToEmailClassification(
     eventType: gmailRuleMatchEventType(rule, message, classification),
     confidence: classification.confidence,
     reason: "ai_rule_match",
-    evidence: truncatePlainText(
+    evidence: sanitizeEmailText(
       [classification.suggestedReviewTitle, classification.reason, message.snippet].filter(Boolean).join(" - "),
-      500
+      300
     ),
     extracted,
     metadata: {
@@ -4167,7 +4181,16 @@ function gmailRuleMatchEventType(
   }
 
   if (rule.adapterId === "job_search_email") {
-    if (/\binterview|schedule|scheduled|meeting|call\b/.test(text)) {
+    // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: this is a SEPARATE
+    // classification path from packages/core/src/ingestion.ts's classifyJobSearchText (used for
+    // the AI/semantic rule-match fallback pass, not the primary per-rule keyword sync) — same
+    // class of bug was possible here independently: "interview|schedule|scheduled|meeting|call"
+    // is exactly loose enough for a quant/interview-prep newsletter to trip. Tightened to real
+    // scheduling/invitation language, matching isInterviewScheduled's own bar. The final fallback
+    // no longer defaults an unmatched signal to "recruiter reply" — decision is always
+    // "needs_review" either way (see below), so an honest "uncertain signal" review label
+    // (proposedEventType left undefined) beats confidently guessing a specific bucket.
+    if (/\b(schedule (an|your|a technical) interview|interview invitation|invite(d)? you to interview|book a (call|time)|calendar invite|phone screen|technical screen|onsite interview|interview scheduled)\b/.test(text)) {
       return "career.interview_scheduled";
     }
     if (/\boffer letter|job offer|offer of employment|employment agreement\b/.test(text)) {
@@ -4179,7 +4202,10 @@ function gmailRuleMatchEventType(
     if (/\bapplication received|thanks for applying|application confirmation\b/.test(text)) {
       return "career.application_confirmation_received";
     }
-    return "career.recruiter_reply_received";
+    if (/\brecruiter|hiring team|talent acquisition\b/.test(text)) {
+      return "career.recruiter_reply_received";
+    }
+    return undefined;
   }
 
   return undefined;
@@ -4202,9 +4228,9 @@ function gmailSyncDecisionDebug(
 ): GmailSyncDecisionDebug {
   return {
     messageId: message.id,
-    subject: truncatePlainText(getGmailHeader(message, "subject"), 120),
-    from: truncatePlainText(getGmailHeader(message, "from"), 120),
-    date: truncatePlainText(getGmailHeader(message, "date"), 120),
+    subject: sanitizeEmailText(getGmailHeader(message, "subject"), 120),
+    from: sanitizeEmailText(getGmailHeader(message, "from"), 120),
+    date: sanitizeEmailText(getGmailHeader(message, "date"), 120),
     labels: sanitizeGmailLabels(message.labelIds),
     ...decision
   };
@@ -4248,6 +4274,7 @@ async function syncEmailSignalRule(input: {
   const summary = createEmailRuleSyncSummary(input.rule);
   const messageIds = await withGmailStage("gmail_search", () => fetchEmailMessageIds(input.accessToken, input.rule));
   summary.messagesFound = messageIds.length;
+  const rejectedSenders = await buildRejectedSenderSuppressionMap(input.userId, input.rule.id);
 
   for (const messageId of messageIds.slice(0, input.rule.maxMessagesPerSync)) {
     if (summary.eventsCreated >= input.rule.maxEventsPerSync) {
@@ -4311,6 +4338,24 @@ async function syncEmailSignalRule(input: {
         continue;
       }
 
+      // Task 6 (fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics): a sender
+      // already rejected 2+ times for this rule, with none of those rejections a genuine high-
+      // signal type (interview/offer), gets skipped here rather than raised for review again —
+      // "reject all, they are just spam or job newsletter no interviews" should mean the next
+      // newsletter from that exact address doesn't keep coming back. Never applies to a high-
+      // signal candidate (interview/offer), regardless of sender history — a real interview or
+      // offer always still surfaces. Exact sender address only, never a bare domain, so a genuine
+      // recruiter at a large shared domain (e.g. a big employer, or gmail.com) is never silenced
+      // by an unrelated newsletter rejection from the same domain.
+      if (!isHighSignalJobSearchType) {
+        const senderEmail = extractEmailAddress(getGmailHeader(message, "from"));
+        const senderHistory = senderEmail ? rejectedSenders.get(senderEmail) : undefined;
+        if (senderHistory && senderHistory.count >= 2 && !senderHistory.hasHighSignal) {
+          summary.suppressedRepeatSender += 1;
+          continue;
+        }
+      }
+
       summary.needsReview += 1;
       const reviewResult = await withGmailStage("event_creation", () =>
         createEmailReviewItemForClassification({
@@ -4322,12 +4367,13 @@ async function syncEmailSignalRule(input: {
         })
       );
       recordEmailReviewItemResult(summary, reviewResult);
-      // Only count a genuinely NEW review item toward the "Found: ..." breakdown — a re-sync of
-      // an already-pending/decided email must report "no new items", not re-announce the same
-      // signal as freshly found (this is exactly what tells a repeat "sync Gmail" apart from the
-      // first one).
+      // Only count a genuinely NEW review item toward the sync reply — a re-sync of an already-
+      // pending/decided email must report "no new items", not re-announce the same signal as
+      // freshly found. Written to reviewSignalCounts, NEVER signalCounts — this branch is reached
+      // precisely because the item is NOT confirmed/logged (needs_review, review-first policy, or
+      // a high-signal forced review), so it must never be reported as a found/confirmed event type.
       if (reviewResult.status === "created" && classification.eventType && JOB_SEARCH_SIGNAL_EVENT_TYPES.has(classification.eventType)) {
-        summary.signalCounts[classification.eventType] = (summary.signalCounts[classification.eventType] ?? 0) + 1;
+        summary.reviewSignalCounts[classification.eventType] = (summary.reviewSignalCounts[classification.eventType] ?? 0) + 1;
       }
 
       continue;
@@ -4642,6 +4688,16 @@ function classifySecurityAuthEmailNoise(
     return undefined;
   }
 
+  // Task 7 (fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics): deliberately
+  // does NOT carve out an exception for application-flow security codes (e.g. "Security code for
+  // your application to Blockchain.com") — a pre-existing, separately tested policy
+  // (tests/email-review-dedupe.test.ts's "Gmail security and auth emails are hard-filtered...")
+  // hard-filters every security/verification/OTP code regardless of context, since relaying a
+  // real security code back through chat is its own risk independent of whether it's tied to a
+  // job application. Task 7's own instruction allows this ("route to review or ignore per current
+  // policy") — the fix here is limited to humanEmailReviewEventLabel's label map (so if such an
+  // email DOES reach review through a different path, e.g. the AI/semantic rule-match sync, it
+  // never falls back to a generic "event" label) and does not touch this filter.
   return {
     decision: "ignore",
     eventType: undefined,
@@ -4692,8 +4748,8 @@ async function createEmailReviewItemForClassification(input: {
   message: GmailMessage;
   classification: ReturnType<typeof classifyJobSearchEmail>;
 }) {
-  const subject = getGmailHeader(input.message, "subject");
-  const from = getGmailHeader(input.message, "from");
+  const subject = sanitizeEmailText(getGmailHeader(input.message, "subject"), 120);
+  const from = sanitizeEmailText(getGmailHeader(input.message, "from"), 120);
   const reviewExternalId = `gmail-review:${input.rule.id}:${input.message.id}`;
   const proposedEventType = input.classification.eventType ?? safeEmailReviewProposedType(input.classification.reason);
   const company = typeof input.classification.extracted.company === "string" ? input.classification.extracted.company : undefined;
@@ -4818,8 +4874,8 @@ async function createEmailReviewItemForClassification(input: {
       externalId: reviewExternalId,
       subject,
       from,
-      snippet: input.message.snippet ? truncatePlainText(input.message.snippet, 300) : undefined,
-      evidence: truncatePlainText(input.classification.evidence, 500),
+      snippet: input.message.snippet ? sanitizeEmailText(input.message.snippet, 200) : undefined,
+      evidence: sanitizeEmailText(input.classification.evidence, 300),
       proposedEventType,
       confidence: input.classification.confidence,
       reason: input.classification.reason,
@@ -4847,8 +4903,8 @@ async function createEmailReviewItemForClassification(input: {
     externalId: reviewExternalId,
     subject,
     from,
-    snippet: input.message.snippet ? truncatePlainText(input.message.snippet, 300) : undefined,
-    evidence: truncatePlainText(input.classification.evidence, 500),
+    snippet: input.message.snippet ? sanitizeEmailText(input.message.snippet, 200) : undefined,
+    evidence: sanitizeEmailText(input.classification.evidence, 300),
     proposedEventType,
     confidence: input.classification.confidence,
     reason: input.classification.reason,
@@ -5656,16 +5712,68 @@ function isGmailConnectionError(error: unknown): boolean {
 }
 
 function gmailMessageToText(message: GmailMessage): string {
-  const subject = getGmailHeader(message, "subject");
-  const from = getGmailHeader(message, "from");
-  const snippet = message.snippet ?? "";
-  const body = decodeGmailBody(message.payload) || snippet;
+  // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: sanitized (not just
+  // truncated) BEFORE classification, not only at display time — real bulk/newsletter senders
+  // sometimes inject invisible/zero-width characters specifically to dodge naive keyword content
+  // filters (e.g. "n​ewsletter" with a zero-width space mid-word breaks a plain .includes("newsletter")
+  // match), so leaving them in the text the classifier itself reads would undermine the same
+  // precision fix this task is otherwise making. A large cap (not a real one) — this is
+  // classification input, not something ever shown to a user, so length itself isn't the risk here.
+  const subject = sanitizeEmailText(getGmailHeader(message, "subject"), 500);
+  const from = sanitizeEmailText(getGmailHeader(message, "from"), 500);
+  const snippet = sanitizeEmailText(message.snippet ?? "", 2000);
+  const body = sanitizeEmailText(decodeGmailBody(message.payload) || message.snippet || "", 6000);
 
   return [`Subject: ${subject}`, `From: ${from}`, `Snippet: ${snippet}`, `Body: ${body}`].filter(Boolean).join("\n");
 }
 
 function getGmailHeader(message: GmailMessage, name: string): string {
   return message.payload?.headers?.find((header) => header.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+}
+
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics (Task 6): pulls the bare
+ * email address out of a raw "From" header (e.g. `"Jobs Newsletter" <jobs@example.com>`), used to
+ * key repeat-rejection suppression on the exact sender address — never a bare domain, since a
+ * domain-wide match risks silencing a genuine recruiter at a large company (e.g. gmail.com,
+ * or a big employer's own domain) after one unrelated newsletter from that same domain.
+ */
+function extractEmailAddress(from: string): string | undefined {
+  const match = from.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+  return match ? match[0].toLowerCase() : undefined;
+}
+
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics (Task 6): one rejected-
+ * senders lookup per rule sync (not per message), keyed by exact sender address. `hasHighSignal`
+ * records whether any of that sender's rejected items were ever a genuine high-signal type
+ * (interview/offer) — if so, that sender's history is never used to suppress anything, since a
+ * mixed history means this isn't a pure newsletter sender.
+ */
+async function buildRejectedSenderSuppressionMap(
+  userId: string,
+  ruleId: string
+): Promise<Map<string, { count: number; hasHighSignal: boolean }>> {
+  const rejected = await getRejectedEmailReviewSendersForRule(userId, ruleId);
+  const map = new Map<string, { count: number; hasHighSignal: boolean }>();
+
+  for (const item of rejected) {
+    if (!item.from) {
+      continue;
+    }
+    const sender = extractEmailAddress(item.from);
+    if (!sender) {
+      continue;
+    }
+    const existing = map.get(sender) ?? { count: 0, hasHighSignal: false };
+    existing.count += 1;
+    if (item.proposedEventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(item.proposedEventType)) {
+      existing.hasHighSignal = true;
+    }
+    map.set(sender, existing);
+  }
+
+  return map;
 }
 
 function decodeGmailBody(part?: GmailMessagePart): string {

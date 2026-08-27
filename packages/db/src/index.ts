@@ -1961,6 +1961,33 @@ export async function rejectEmailReviewItem(userId: string, reviewId: string): P
   return toEmailReviewItem(item);
 }
 
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: lightweight rejection-
+ * feedback support for Task 6 — after a user bulk-rejects newsletter/spam review items ("reject
+ * all, they are just spam or job newsletter no interviews"), a future sync should be able to
+ * lower priority on further low-confidence items from the SAME sender for the SAME rule, without
+ * ever globally blocking a sender/domain (a genuine recruiter reply from that domain must still
+ * surface). Returns only the `from`/`proposedEventType` pairs needed for that same-sender check —
+ * deliberately no new schema/migration, since the existing `from` column already carries what's
+ * needed.
+ */
+export async function getRejectedEmailReviewSendersForRule(
+  userId: string,
+  ruleId: string,
+  limit = 200
+): Promise<Array<{ from: string | null; proposedEventType: string | null }>> {
+  await ensureUser(userId);
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: { userId, ruleId, status: "rejected" },
+    orderBy: { updatedAt: "desc" },
+    take: limit,
+    select: { from: true, proposedEventType: true }
+  });
+
+  return items;
+}
+
 function emailReviewItemData(input: EmailReviewItemInput): Prisma.EmailReviewItemUncheckedCreateInput {
   return {
     userId: input.userId,

@@ -100,7 +100,8 @@ export type ProactiveDeliveryStatus =
   | "user_not_allowlisted"
   | "user_not_opted_in"
   | "daily_loop_disabled"
-  | "outside_morning_window"
+  | "due_later_today"
+  | "missed_no_record"
   | "duplicate_dedupe_key"
   | "no_candidate"
   | "eligible";
@@ -151,9 +152,16 @@ export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput):
     return "daily_loop_disabled";
   }
 
+  // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: a real Telegram
+  // transcript showed this reached at 10:54 for a 09:00 brief, with NOTHING actually blocking
+  // delivery (every check above already passed) — the only honest remaining question is whether
+  // the scheduled moment is still ahead of "now" (due later today) or already behind it (should
+  // have sent, no record found — likely a missed tick or a failed send, since a failed Telegram
+  // send never writes NotificationLog). Splitting on nowMinutes vs the scheduled minute (not the
+  // ±window edges) answers exactly that, using only facts already established by this point.
   const nowMinutes = minutesOfDayInTimezone(input.now, settings.timezone);
   if (!isWithinWindow(nowMinutes, settings.morningTimeMinutes, TIME_TRIGGER_WINDOW_MINUTES)) {
-    return "outside_morning_window";
+    return nowMinutes < settings.morningTimeMinutes ? "due_later_today" : "missed_no_record";
   }
 
   const decision = decideProactiveOperatorMessage({
@@ -174,16 +182,18 @@ export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput):
 const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string, allowlistActive: boolean) => string> = {
   legacy_daily_loop_sent_instead: (time) =>
     `You did get a morning message today around ${time} — but it came from the older legacy daily-loop system, not the V3 proactive morning brief you're asking about. Real V3 delivery is still a developer rollout control most users aren't on yet; ask "what proactive messages are on?" to check your V3 opt-in and scheduled time.`,
-  delivery_disabled: (time) => `Morning brief is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
-  user_not_allowlisted: (time) => `Morning brief is on at ${time}, but a PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment and this user isn't on it.`,
+  delivery_disabled: () => "Morning brief is configured on, but delivery is disabled on this server.",
+  user_not_allowlisted: (time) => `Morning brief was skipped today. Reason: not eligible — not in the allowlist. It's on at ${time}.`,
   user_not_opted_in: () => "Morning brief is currently off — turn it on and I'll start sending it.",
   // fix/private-alpha-proactive-launch-config-cleanup: effectively unreachable in the live tool
   // (proactive.diagnose_morning_brief self-heals dailyLoopEnabled before ever computing this
   // status now) — kept as an accurate defensive fallback rather than assumed impossible.
   daily_loop_disabled: (time) =>
-    `Morning brief is on at ${time}, but the internal daily loop is off, which blocks both the V3 morning brief and the legacy daily-loop message. This should self-heal automatically — if you're still seeing this, say "turn on morning brief" again to repair it.`,
-  outside_morning_window: (time) => `Morning brief is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
-  duplicate_dedupe_key: (time) => `Morning brief is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
+    `Morning brief was skipped today. Reason: blocked — internal daily loop is off. It's on at ${time}; this should self-heal automatically — if you're still seeing this, say "turn on morning brief" again to repair it.`,
+  due_later_today: (time) => `Morning brief is on and due today around ${time}.`,
+  missed_no_record: (time) =>
+    `Morning brief should have sent today around ${time}, but I don't see a sent record. Current status: eligible. Next due: tomorrow ${time}.`,
+  duplicate_dedupe_key: (time) => `Morning brief was sent today at ${time}.`,
   no_candidate: (time) => `Morning brief is on at ${time}, but there isn't anything grounded to send right now (e.g. no active goals or open actions) — check back closer to ${time}.`,
   eligible: (time, allowlistActive) =>
     `Settings look eligible — morning brief is on at ${time}${allowlistActive ? ", and you're in the configured allowlist" : " (no allowlist is configured, so that's not restricting anyone)"}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
@@ -193,15 +203,21 @@ export function formatProactiveDeliveryDiagnosis(
   status: ProactiveDeliveryStatus,
   settings: NotificationSettings,
   legacyDailyLoopSentAt?: Date,
-  allowlistActive = false
+  allowlistActive = false,
+  // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: the REAL v3 sentAt for
+  // today, when one exists — "Morning brief was sent today at 09:00" must report when it actually
+  // went out, not the currently-configured morningTimeMinutes (which could have been changed since).
+  v3SentAt?: Date
 ): string {
-  // legacy_daily_loop_sent_instead reports the message's REAL sentAt, not the user's current
-  // morningTimeMinutes — the legacy send can be from earlier today, before the scheduled time was
-  // last changed, and reusing the current setting here would misstate when it actually went out.
+  // legacy_daily_loop_sent_instead / duplicate_dedupe_key both report a REAL sentAt, not the
+  // user's current morningTimeMinutes — either send can predate a since-changed schedule, and
+  // reusing the current setting here would misstate when the message actually went out.
   const time =
     status === "legacy_daily_loop_sent_instead" && legacyDailyLoopSentAt
       ? formatMinutesOfDay(minutesOfDayInTimezone(legacyDailyLoopSentAt, settings.timezone))
-      : formatMinutesOfDay(settings.morningTimeMinutes);
+      : status === "duplicate_dedupe_key" && v3SentAt
+        ? formatMinutesOfDay(minutesOfDayInTimezone(v3SentAt, settings.timezone))
+        : formatMinutesOfDay(settings.morningTimeMinutes);
 
   return DIAGNOSIS_MESSAGE[status](time, allowlistActive);
 }
@@ -223,7 +239,8 @@ export type EveningCheckinDeliveryStatus =
   | "user_not_allowlisted"
   | "user_not_opted_in"
   | "daily_loop_disabled"
-  | "outside_evening_window"
+  | "due_later_today"
+  | "missed_no_record"
   | "duplicate_dedupe_key"
   | "no_candidate"
   | "eligible";
@@ -263,9 +280,11 @@ export function getEveningCheckinDeliveryStatus(input: EveningCheckinDeliverySta
     return "daily_loop_disabled";
   }
 
+  // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: same split as the
+  // morning-brief version above — see its comment for the reasoning.
   const nowMinutes = minutesOfDayInTimezone(input.now, settings.timezone);
   if (!isWithinWindow(nowMinutes, settings.eveningTimeMinutes, TIME_TRIGGER_WINDOW_MINUTES)) {
-    return "outside_evening_window";
+    return nowMinutes < settings.eveningTimeMinutes ? "due_later_today" : "missed_no_record";
   }
 
   const decision = decideProactiveOperatorMessage({
@@ -286,16 +305,18 @@ export function getEveningCheckinDeliveryStatus(input: EveningCheckinDeliverySta
 const EVENING_DIAGNOSIS_MESSAGE: Record<EveningCheckinDeliveryStatus, (time: string, allowlistActive: boolean) => string> = {
   legacy_daily_loop_sent_instead: (time) =>
     `You did get an evening message today around ${time} — but it came from the older legacy daily-loop system, not the V3 proactive evening check-in you're asking about. Ask "what proactive messages are on?" to check your V3 opt-in and scheduled time.`,
-  delivery_disabled: (time) => `Evening check-in is on at ${time}, but delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off in this environment.`,
-  user_not_allowlisted: (time) => `Evening check-in is on at ${time}, but a PROACTIVE_OPERATOR_ALLOWLIST is configured in this environment and this user isn't on it.`,
+  delivery_disabled: () => "Evening check-in is configured on, but delivery is disabled on this server.",
+  user_not_allowlisted: (time) => `Evening check-in was skipped today. Reason: not eligible — not in the allowlist. It's on at ${time}.`,
   user_not_opted_in: () => "Evening check-in is currently off — turn it on and I'll start sending it.",
   // fix/private-alpha-proactive-launch-config-cleanup: effectively unreachable in the live tool
   // (proactive.diagnose_evening_checkin self-heals dailyLoopEnabled before ever computing this
   // status now) — kept as an accurate defensive fallback rather than assumed impossible.
   daily_loop_disabled: (time) =>
-    `Evening check-in is on at ${time}, but the internal daily loop is off, which blocks both the V3 evening check-in and the legacy daily-loop message. This should self-heal automatically — if you're still seeing this, say "turn on evening check-in" again to repair it.`,
-  outside_evening_window: (time) => `Evening check-in is on at ${time} — it's not that time yet (or it already passed for today), so nothing should have sent.`,
-  duplicate_dedupe_key: (time) => `Evening check-in is on at ${time}, and it looks like it already sent today — I won't send a duplicate.`,
+    `Evening check-in was skipped today. Reason: blocked — internal daily loop is off. It's on at ${time}; this should self-heal automatically — if you're still seeing this, say "turn on evening check-in" again to repair it.`,
+  due_later_today: (time) => `Evening check-in is on and due today around ${time}.`,
+  missed_no_record: (time) =>
+    `Evening check-in should have sent today around ${time}, but I don't see a sent record. Current status: eligible. Next due: tomorrow ${time}.`,
+  duplicate_dedupe_key: (time) => `Evening check-in was sent today at ${time}.`,
   no_candidate: (time) => `Evening check-in is on at ${time}, but there isn't anything grounded to ask about right now (every trackable goal already has today's progress logged) — check back closer to ${time}.`,
   eligible: (time, allowlistActive) =>
     `Settings look eligible — evening check-in is on at ${time}${allowlistActive ? ", and you're in the configured allowlist" : " (no allowlist is configured, so that's not restricting anyone)"}. Check whether the worker process was running at ${time} and whether Telegram delivery failed.`
@@ -305,12 +326,15 @@ export function formatEveningCheckinDeliveryDiagnosis(
   status: EveningCheckinDeliveryStatus,
   settings: NotificationSettings,
   legacyDailyLoopSentAt?: Date,
-  allowlistActive = false
+  allowlistActive = false,
+  v3SentAt?: Date
 ): string {
   const time =
     status === "legacy_daily_loop_sent_instead" && legacyDailyLoopSentAt
       ? formatMinutesOfDay(minutesOfDayInTimezone(legacyDailyLoopSentAt, settings.timezone))
-      : formatMinutesOfDay(settings.eveningTimeMinutes);
+      : status === "duplicate_dedupe_key" && v3SentAt
+        ? formatMinutesOfDay(minutesOfDayInTimezone(v3SentAt, settings.timezone))
+        : formatMinutesOfDay(settings.eveningTimeMinutes);
 
   return EVENING_DIAGNOSIS_MESSAGE[status](time, allowlistActive);
 }

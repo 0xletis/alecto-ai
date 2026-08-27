@@ -2554,10 +2554,11 @@ export async function executeOperation(
         const now = new Date();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const morningKey = MORNING_BRIEF_DEDUPE_KEY;
-        const [alreadySentToday, legacyDailyLoopLog] = await Promise.all([
-          hasNotificationLog({ userId, type: morningKey, sentForDate }),
+        const [v3SentLog, legacyDailyLoopLog] = await Promise.all([
+          getNotificationLog({ userId, type: morningKey, sentForDate }),
           getNotificationLog({ userId, type: "daily_loop_morning", sentForDate })
         ]);
+        const v3SentAt = v3SentLog?.sentAt;
         const legacyDailyLoopSentAt = legacyDailyLoopLog?.sentAt;
 
         const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
@@ -2565,8 +2566,8 @@ export async function executeOperation(
           context,
           notificationSettings: settings,
           now,
-          alreadySentDedupeKeys: alreadySentToday ? new Set([morningKey]) : new Set(),
-          sentCountToday: alreadySentToday ? 1 : 0,
+          alreadySentDedupeKeys: v3SentAt ? new Set([morningKey]) : new Set(),
+          sentCountToday: v3SentAt ? 1 : 0,
           deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
           isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId),
           legacyDailyLoopSentAt
@@ -2575,7 +2576,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatProactiveDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive),
+          summary: formatProactiveDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive, v3SentAt),
           result: { status }
         };
       }
@@ -2585,10 +2586,11 @@ export async function executeOperation(
         const now = new Date();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const eveningKey = EVENING_CHECKIN_DEDUPE_KEY;
-        const [alreadySentToday, legacyDailyLoopLog] = await Promise.all([
-          hasNotificationLog({ userId, type: eveningKey, sentForDate }),
+        const [v3SentLog, legacyDailyLoopLog] = await Promise.all([
+          getNotificationLog({ userId, type: eveningKey, sentForDate }),
           getNotificationLog({ userId, type: "daily_loop_evening", sentForDate })
         ]);
+        const v3SentAt = v3SentLog?.sentAt;
         const legacyDailyLoopSentAt = legacyDailyLoopLog?.sentAt;
 
         const allowlistActive = proactiveOperatorAllowlistActiveFromEnv();
@@ -2596,8 +2598,8 @@ export async function executeOperation(
           context,
           notificationSettings: settings,
           now,
-          alreadySentDedupeKeys: alreadySentToday ? new Set([eveningKey]) : new Set(),
-          sentCountToday: alreadySentToday ? 1 : 0,
+          alreadySentDedupeKeys: v3SentAt ? new Set([eveningKey]) : new Set(),
+          sentCountToday: v3SentAt ? 1 : 0,
           deliveryEnabled: proactiveOperatorDeliveryEnabledFromEnv(),
           isAllowlisted: proactiveOperatorAllowlistFromEnv()(userId),
           legacyDailyLoopSentAt
@@ -2606,7 +2608,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatEveningCheckinDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive),
+          summary: formatEveningCheckinDeliveryDiagnosis(status, settings, legacyDailyLoopSentAt, allowlistActive, v3SentAt),
           result: { status }
         };
       }

@@ -143,6 +143,52 @@ export function truncatePlainText(text: string, maxLength: number): string {
   return clean.length > maxLength ? `${clean.slice(0, maxLength - 3)}...` : clean;
 }
 
+const HTML_ENTITY_MAP: Record<string, string> = {
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: "\"",
+  apos: "'",
+  "#39": "'",
+  nbsp: " "
+};
+
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: Gmail's own `snippet`
+ * field (a short plain-text preview it generates from the original message) can still carry HTML
+ * entities the source email never fully decoded, stray HTML tags, and invisible/zero-width
+ * unicode characters — real bulk/newsletter senders often use the latter deliberately to dodge
+ * spam-content filters, and a real reported review list showed exactly this ("[tons of invisible
+ * chars]" between visible words). truncatePlainText alone (whitespace + length only) never
+ * touched any of this. Used both where email-derived text enters classification (so injected
+ * invisible characters can't silently break a keyword match either) and wherever it's later shown
+ * in chat — one implementation, not a display-only patch.
+ */
+export function sanitizeEmailText(text: string, maxLength: number): string {
+  // An angle-bracketed email address (e.g. `Daily Quant Board <jobs@example.com>` — the standard
+  // "From" header format) matches a generic HTML-tag pattern just as well as a real tag does;
+  // stripping it unconditionally silently deleted the sender's actual address from every review
+  // item's `from` field. Real HTML tags essentially never contain "@", so that's used to tell
+  // the two apart instead of leaving tag-stripping off entirely (real HTML in a message body/
+  // snippet still needs it).
+  const withoutTags = text.replace(/<([^<>]*)>/g, (match, inner: string) => (inner.includes("@") ? match : " "));
+  const decoded = withoutTags
+    .replace(/&(amp|lt|gt|quot|apos|#39|nbsp);/g, (match, name: string) => HTML_ENTITY_MAP[name] ?? match)
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_match, code: string) => String.fromCodePoint(parseInt(code, 16)));
+  const stripped = decoded.replace(INVISIBLE_CHAR_PATTERN, "");
+  return truncatePlainText(stripped, maxLength);
+}
+
+// Control chars, zero-width/format characters, BOM, bidi override marks, soft hyphen — real
+// invisible-character spam-filter-evasion tricks, never legitimate visible content. Built from
+// \u escape sequences (never a literal invisible character pasted into source) — an actually-
+// invisible character in source code is unreviewable and one accidental edit from corruption.
+const INVISIBLE_CHAR_PATTERN = new RegExp(
+  "[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u00AD\u200B-\u200F\u2028\u2029\u202A-\u202E\u2060-\u2064\uFEFF\uFFF9-\uFFFB]",
+  "g"
+);
+
 /**
  * Generic error-to-loggable-string helper extracted from
  * apps/api/src/server.ts, where it was used both by the legacy semantic
