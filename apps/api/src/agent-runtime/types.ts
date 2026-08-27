@@ -137,6 +137,16 @@ export interface ValidatedOperation {
    * response-composer.ts uses the error text as-is when this is true.
    */
   standaloneError?: boolean;
+  /**
+   * Set only on operations inside a "capability_proposals" pendingOperation (goal.create_apply's
+   * combined post-goal follow-up offer, e.g. daily coaching + Gmail support offered together) —
+   * a short stable id ("daily_coaching" | "gmail_support") and its display label. Lets a selective
+   * reply ("only Gmail", "just daily coaching") resolve to the right subset of `operations` and
+   * lets the skipped subset be named back to the user ("Daily coaching stays off."). Absent on
+   * every other pending-operation topic, which stays fully all-or-nothing exactly as before.
+   */
+  proposalId?: string;
+  proposalLabel?: string;
 }
 
 export interface ExecutedOperation {

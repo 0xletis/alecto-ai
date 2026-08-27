@@ -11262,3 +11262,379 @@ test(
     }
   }
 );
+
+/*
+ * feat/private-alpha-capability-proposal-queue: goal.create_apply used to chain AT MOST one
+ * follow-up pendingOperationUpdate — dailyCoachingInterest's own chain won unconditionally
+ * whenever a goal was BOTH daily-coaching- and Gmail-relevant in the same turn, so the Gmail offer
+ * was silently never computed that turn. Scenarios 316-325 cover the real-LLM path for the new
+ * combined "capability_proposals" queue: both offers surviving together, selective ("only X")
+ * confirmation, domain-scoping (no forced Gmail on unrelated goals), no duplicate offers, the
+ * existing pending-operation firewall protecting an open queue, and Spanish/Catalan replies.
+ */
+
+test(
+  "316. job goal + daily motivation request + Gmail connected offers BOTH capabilities together, mutating nothing yet",
+  { ...llmEvalOptions(["capability-proposal-queue", "post-goal-capabilities", "goal-gmail-daily-combo"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-both-offer-316-${randomUUID()}`;
+    const trace = new EvalTrace("316-capqueue-both-offer", ["capability-proposal-queue", "post-goal-capabilities", "goal-gmail-daily-combo"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const goalReply = trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. My resume is already up to date. I want daily motivation and check-ins.",
+          await sendAgentMessage(
+            server,
+            userId,
+            "I want to find a fully remote developer job, ideally in Web3. My resume is already up to date. I want daily motivation and check-ins."
+          )
+        );
+        assertNoGenericAgentError(goalReply, "job goal creation with daily motivation request");
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "goal creation confirmation");
+        trace.checkpoint("both a daily-coaching and a Gmail proposal are offered together", /coaching/i.test(confirm.reply) && /gmail/i.test(confirm.reply), confirm.reply);
+        assert.match(confirm.reply, /coaching/i, `expected daily coaching offered — got: ${confirm.reply}`);
+        assert.match(confirm.reply, /gmail/i, `expected Gmail support offered — got: ${confirm.reply}`);
+        assert.equal(confirm.debug.pendingOperation, true, "must be a real, confirmable offer, not silent");
+        assert.equal(confirm.debug.mutationExecuted, true, "the goal itself was created this turn");
+
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        trace.checkpoint("nothing mutated before the follow-up is confirmed", settings?.morningBriefEnabled !== true, JSON.stringify(settings));
+        assert.notEqual(settings?.morningBriefEnabled, true, "daily coaching must not be silently enabled");
+        assert.equal(await prisma.emailSignalRule.count({ where: { userId } }), 0, "Gmail must not be silently enabled");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "317. 'yes' to the combined offer enables both daily coaching and Gmail support",
+  { ...llmEvalOptions(["capability-proposal-queue", "multi-confirmation-safety", "goal-gmail-daily-combo"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-yes-both-317-${randomUUID()}`;
+    const trace = new EvalTrace("317-capqueue-yes-both", ["capability-proposal-queue", "multi-confirmation-safety", "goal-gmail-daily-combo"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "combined-offer confirmation");
+        assert.equal(confirm.debug.mutationExecuted, true);
+        assert.equal(confirm.debug.pendingOperation, false, "the queue must be fully resolved");
+
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        trace.checkpoint("daily coaching actually turned on", Boolean(settings?.morningBriefEnabled), JSON.stringify(settings));
+        assert.ok(settings?.morningBriefEnabled, "morning brief must actually be enabled");
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("Gmail support actually enabled and goal-linked", Boolean(rule?.goalId), JSON.stringify(rule));
+        assert.ok(rule, "a real Gmail rule must be created");
+        assert.ok(rule!.goalId);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "318. 'only Gmail' applies Gmail support alone — daily coaching is reported as staying off",
+  { ...llmEvalOptions(["capability-proposal-queue", "multi-confirmation-safety"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-only-gmail-318-${randomUUID()}`;
+    const trace = new EvalTrace("318-capqueue-only-gmail", ["capability-proposal-queue", "multi-confirmation-safety"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const confirm = trace.record("only Gmail", await sendAgentMessage(server, userId, "only Gmail"));
+        assertNoGenericAgentError(confirm, "'only Gmail' selective confirmation");
+        trace.checkpoint("reply says daily coaching stayed off", /coaching.*(off|stay)/i.test(confirm.reply), confirm.reply);
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        assert.notEqual(settings?.morningBriefEnabled, true, "daily coaching must NOT be enabled");
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("Gmail support alone was enabled", Boolean(rule), JSON.stringify(rule));
+        assert.ok(rule, "Gmail support must be enabled");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "319. 'only daily coaching' applies daily coaching alone — Gmail support is reported as staying off",
+  { ...llmEvalOptions(["capability-proposal-queue", "multi-confirmation-safety"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-only-daily-319-${randomUUID()}`;
+    const trace = new EvalTrace("319-capqueue-only-daily", ["capability-proposal-queue", "multi-confirmation-safety"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const confirm = trace.record("only daily coaching", await sendAgentMessage(server, userId, "only daily coaching"));
+        assertNoGenericAgentError(confirm, "'only daily coaching' selective confirmation");
+        trace.checkpoint("reply says Gmail support stayed off", /gmail.*(off|stay)/i.test(confirm.reply), confirm.reply);
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        assert.ok(settings?.morningBriefEnabled, "daily coaching must be enabled");
+        const ruleCount = await prisma.emailSignalRule.count({ where: { userId } });
+        trace.checkpoint("Gmail support was NOT enabled", ruleCount === 0, `rule count: ${ruleCount}`);
+        assert.equal(ruleCount, 0, "Gmail must NOT be enabled");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "320. a travel goal (no daily-motivation request) offers Gmail support alone, using the existing single-offer copy",
+  { ...llmEvalOptions(["post-goal-capabilities", "goal-gmail-daily-combo"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-travel-320-${randomUUID()}`;
+    const trace = new EvalTrace("320-capqueue-travel", ["post-goal-capabilities", "goal-gmail-daily-combo"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I'm planning a two-week trip to Japan in October and want to keep track of flight and hotel bookings.",
+          await sendAgentMessage(server, userId, "I'm planning a two-week trip to Japan in October and want to keep track of flight and hotel bookings.")
+        );
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "travel goal confirmation");
+        trace.checkpoint("Gmail support is offered for the travel goal", /gmail/i.test(confirm.reply), confirm.reply);
+        assert.match(confirm.reply, /gmail/i, `expected Gmail support offered for a travel goal — got: ${confirm.reply}`);
+        trace.checkpoint("daily coaching is not also offered (never asked for)", !/daily coaching/i.test(confirm.reply), confirm.reply);
+        assert.equal(confirm.debug.pendingOperation, true);
+        assert.equal(await prisma.emailSignalRule.count({ where: { userId } }), 0, "must not enable silently");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "321. a fitness goal never offers Gmail support",
+  { ...llmEvalOptions(["post-goal-capabilities"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-fitness-321-${randomUUID()}`;
+    const trace = new EvalTrace("321-capqueue-fitness", ["post-goal-capabilities"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to work out 4 times a week and track my workouts.",
+          await sendAgentMessage(server, userId, "I want to work out 4 times a week and track my workouts.")
+        );
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "fitness goal confirmation");
+        trace.checkpoint("Gmail is never offered for an unrelated fitness goal", !/gmail/i.test(confirm.reply), confirm.reply);
+        assert.doesNotMatch(confirm.reply, /gmail/i, `Gmail must never be forced on an unrelated goal — got: ${confirm.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "322. an open capability-proposal queue is protected by the existing pending-operation firewall — an unrelated request never hijacks it, and 'yes' still applies the original offer",
+  { ...llmEvalOptions(["multi-confirmation-safety", "capability-proposal-queue"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-firewall-322-${randomUUID()}`;
+    const trace = new EvalTrace("322-capqueue-firewall", ["multi-confirmation-safety", "capability-proposal-queue"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote developer job, ideally in Web3. I want daily motivation and check-ins.")
+        );
+        const offer = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assert.equal(offer.debug.pendingOperation, true);
+
+        const unrelated = trace.record(
+          "also remind me to call my dentist tomorrow",
+          await sendAgentMessage(server, userId, "also remind me to call my dentist tomorrow")
+        );
+        trace.checkpoint("an unrelated request does not silently create an action while the queue is open", !/dentist/i.test(unrelated.reply) || /pending/i.test(unrelated.reply), unrelated.reply);
+        const dentistActionCount = await prisma.actionItem.count({ where: { userId, title: { contains: "dentist", mode: "insensitive" } } });
+        trace.checkpoint("no dentist action was silently created while the queue is open", dentistActionCount === 0, `count: ${dentistActionCount}`);
+        assert.equal(dentistActionCount, 0, "an unrelated request must never silently mutate while a capability queue is open");
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "'yes' after the unrelated interruption");
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        trace.checkpoint("'yes' still applies the originally-offered capability queue", Boolean(settings?.morningBriefEnabled), JSON.stringify(settings));
+        assert.ok(settings?.morningBriefEnabled, "'yes' must resolve the thing the user was actually last asked about");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "323. once Gmail support is already enabled for a goal, a later daily-motivation request offers daily coaching alone — never a duplicate Gmail ask",
+  { ...llmEvalOptions(["post-goal-capabilities", "capability-proposal-queue"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-no-dup-323-${randomUUID()}`;
+    const trace = new EvalTrace("323-capqueue-no-dup", ["post-goal-capabilities", "capability-proposal-queue"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "I want to find a fully remote developer job, ideally in Web3.",
+          await sendAgentMessage(server, userId, "I want to find a fully remote developer job, ideally in Web3.")
+        );
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.record("use Gmail for this goal", await sendAgentMessage(server, userId, "use Gmail for this goal"));
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const follow = trace.record("actually, I also want daily motivation for this goal", await sendAgentMessage(server, userId, "actually, I also want daily motivation for this goal"));
+        assertNoGenericAgentError(follow, "later daily-motivation request");
+        trace.checkpoint("does not ask about Gmail again", !/want me to enable both|gmail support:/i.test(follow.reply), follow.reply);
+        assert.doesNotMatch(follow.reply, /want me to enable both/i, `must not re-offer a combined queue when Gmail is already on — got: ${follow.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "324. Spanish 'sí, ambos' enables both daily coaching and Gmail support",
+  { ...llmEvalOptions(["capability-proposal-queue", "goal-gmail-daily-combo"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-es-both-324-${randomUUID()}`;
+    const trace = new EvalTrace("324-capqueue-es-both", ["capability-proposal-queue", "goal-gmail-daily-combo"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "quiero encontrar un trabajo remoto de desarrollador y quiero motivación diaria",
+          await sendAgentMessage(server, userId, "quiero encontrar un trabajo remoto de desarrollador y quiero motivación diaria")
+        );
+        trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+
+        const confirm = trace.record("sí, ambos", await sendAgentMessage(server, userId, "sí, ambos"));
+        assertNoGenericAgentError(confirm, "Spanish 'sí, ambos' confirmation");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        trace.checkpoint("daily coaching enabled via Spanish 'ambos'", Boolean(settings?.morningBriefEnabled), JSON.stringify(settings));
+        assert.ok(settings?.morningBriefEnabled);
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("Gmail support enabled via Spanish 'ambos'", Boolean(rule), JSON.stringify(rule));
+        assert.ok(rule);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "325. Catalan 'tots dos' enables both daily coaching and Gmail support",
+  { ...llmEvalOptions(["capability-proposal-queue", "goal-gmail-daily-combo"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-capqueue-ca-both-325-${randomUUID()}`;
+    const trace = new EvalTrace("325-capqueue-ca-both", ["capability-proposal-queue", "goal-gmail-daily-combo"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        trace.record(
+          "vull trobar una feina remota de desenvolupador i vull motivació diària",
+          await sendAgentMessage(server, userId, "vull trobar una feina remota de desenvolupador i vull motivació diària")
+        );
+        trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+
+        const confirm = trace.record("tots dos", await sendAgentMessage(server, userId, "tots dos"));
+        assertNoGenericAgentError(confirm, "Catalan 'tots dos' confirmation");
+        assert.equal(confirm.debug.mutationExecuted, true);
+
+        const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
+        trace.checkpoint("daily coaching enabled via Catalan 'tots dos'", Boolean(settings?.morningBriefEnabled), JSON.stringify(settings));
+        assert.ok(settings?.morningBriefEnabled);
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("Gmail support enabled via Catalan 'tots dos'", Boolean(rule), JSON.stringify(rule));
+        assert.ok(rule);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
