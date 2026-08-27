@@ -214,6 +214,19 @@ function eventTypeForJobClassification(classification: string): string | undefin
   return eventTypes[classification];
 }
 
+/** fix/private-alpha-gmail-proactive-highsignal-and-goal-association: the two career.* Gmail
+ * signal types that can materially change a job search overnight — an offer needs a real decision,
+ * an interview needs prep — get a launch-readiness carve-out from the ordinary confidence-based
+ * auto-log path (apps/api/src/server.ts's syncEmailSignalRule) so they always land in the review
+ * queue and get flagged for proactive surfacing, even at classifier confidence that would
+ * otherwise clear straight through. Kept here, next to the eventType mapping it's derived from,
+ * as the single shared source every consumer (sync gate, review-list display, morning/evening
+ * brief, gmail_nudge selection) reads from — never redefined independently per call site. */
+export const HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES: ReadonlySet<string> = new Set([
+  "career.offer_received",
+  "career.interview_scheduled"
+]);
+
 function confidenceForJobClassification(classification: string, source: IngestionSource): number {
   if (classification === "filtered_marketing") {
     return 0.1;

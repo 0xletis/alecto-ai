@@ -241,8 +241,11 @@ test("7. morning brief with an active job-search goal surfaces a goal-linked pen
     const body = response.json() as { decision: { decision: string; message?: string } };
     assert.equal(body.decision.decision, "proposed_message");
     assert.match(body.decision.message ?? "", /apply to 3 developer jobs/i);
-    assert.match(body.decision.message ?? "", /email review.*waiting.*goal you're tracking/i);
-    assert.match(body.decision.message ?? "", /interview availability/i);
+    // "1 Gmail item needs review before I log it." is deliberately a bare count for a normal
+    // (non-high-priority) pending review — subject/sender detail belongs to "show Gmail reviews",
+    // not a one-line morning-brief mention (see apps/api/src/operator/proactive.ts's
+    // describeGmailSignalsForBrief).
+    assert.match(body.decision.message ?? "", /1 Gmail item needs review before I log it\./i);
   } finally {
     await server.close();
     await prisma.user.deleteMany({ where: { id: userId } });

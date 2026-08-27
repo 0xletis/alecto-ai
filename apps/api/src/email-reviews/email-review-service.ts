@@ -1,4 +1,4 @@
-import { CUSTOM_SIGNAL_EVENT_TYPE, EventTypeSchema, parseActionDueDate, type StoredEvent } from "@operator-agent/core";
+import { CUSTOM_SIGNAL_EVENT_TYPE, EventTypeSchema, HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES, parseActionDueDate, type Goal, type StoredEvent } from "@operator-agent/core";
 import {
   approveEmailReviewItem,
   createActionItemIfNotExists,
@@ -17,9 +17,11 @@ import {
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
+import { resolveActiveGoalIdsForGmailRule } from "../conversation/gmail-autonomy.js";
 import { emailReviewKind, type EmailReviewKind } from "../utils/email-review.js";
 import { inferActionGoalLink } from "../utils/action-goal-link.js";
 import { truncatePlainText } from "../utils/text.js";
+import { formatDateInTimezone } from "../utils/datetime.js";
 import { formatLocalDateTime, pendingDecisionExpiry } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 
@@ -666,13 +668,33 @@ export function gmailReviewChatDescription(review: EmailReviewItem): string | un
   return undefined;
 }
 
+/** career.offer_received / career.interview_scheduled — forced to review even at auto-log
+ * confidence (apps/api/src/server.ts's syncEmailSignalRule) precisely so they surface here,
+ * clearly marked, rather than silently blending in with lower-stakes review items. */
+export function isHighPriorityGmailReview(review: Pick<EmailReviewItem, "proposedEventType">): boolean {
+  return Boolean(review.proposedEventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(review.proposedEventType));
+}
+
+/** Real signal-type name when the classifier proposed one; an honest "uncertain signal" (never a
+ * guessed category) when it didn't — e.g. an "action required" email with no determinable event type. */
+export function gmailReviewSignalTypeLabel(review: Pick<EmailReviewItem, "proposedEventType">): string {
+  return review.proposedEventType ? humanEmailReviewEventLabel(review.proposedEventType) : "uncertain signal";
+}
+
 /**
  * Itemized (not bare-count) Gmail review list for normal V3 chat — each line grounded in that
  * review's own real subject/sender/snippet/evidence, numbered so a follow-up like "turn the
  * recruiter one into a task" or "reject 1" can resolve deterministically against this exact
- * list (see apps/api/src/agent-runtime/validator.ts's resolveGmailReviewRef).
+ * list (see apps/api/src/agent-runtime/validator.ts's resolveGmailReviewRef). Also states the
+ * classifier's own signal-type guess, received date, high-priority flag (offer/interview), and
+ * linked goal when one resolves — enough for the user to decide without opening Gmail themselves.
  */
-export function formatGmailReviewListForChat(reviews: EmailReviewItem[], rules: EmailSignalRule[]): string {
+export function formatGmailReviewListForChat(
+  reviews: EmailReviewItem[],
+  rules: EmailSignalRule[],
+  activeGoals: Goal[] = [],
+  timezone = "UTC"
+): string {
   if (reviews.length === 0) {
     return "No email reviews are waiting.";
   }
@@ -681,7 +703,16 @@ export function formatGmailReviewListForChat(reviews: EmailReviewItem[], rules: 
   reviews.forEach((review, index) => {
     const label = gmailReviewChatLabel(review, rules);
     const description = gmailReviewChatDescription(review);
-    lines.push(`${index + 1}. ${label}${description ? ` — ${description}` : ""}`);
+    const signalType = gmailReviewSignalTypeLabel(review);
+    const received = formatDateInTimezone(review.createdAt, timezone);
+    const rule = rules.find((item) => item.id === review.ruleId);
+    const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0] : undefined;
+    const linkedGoal = linkedGoalId ? activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+    const priorityPrefix = isHighPriorityGmailReview(review) ? "[High priority] " : "";
+
+    lines.push(
+      `${index + 1}. ${priorityPrefix}${label}${description ? ` — ${description}` : ""} — ${signalType} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`
+    );
   });
   lines.push("", 'Reply naturally: "turn the recruiter one into a task", "reject the Endesa one", or reference by number.');
 

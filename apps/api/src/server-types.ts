@@ -97,6 +97,11 @@ export interface EmailRuleSyncSummary {
   archivedCleanupReprocessed: number;
   skippedDueMaxEventsPerSync: number;
   eventsCreated: number;
+  /** Per-eventType count of classified job-search signals (recruiter reply, application
+   * confirmation, etc.) found this sync, regardless of whether each one was auto-logged or sent
+   * to review — keyed by the same career.* eventType strings classifyJobSearchEmail produces.
+   * Non-job-search rules never populate this. */
+  signalCounts: Record<string, number>;
   lastError?: string;
   lastErrorStage?: GmailErrorStage;
   reviewCandidateDebug: EmailReviewCandidateDebug[];
