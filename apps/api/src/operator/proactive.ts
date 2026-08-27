@@ -462,13 +462,31 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
     return null;
   }
 
-  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: a high-priority signal
-  // (offer/interview — always forced to review, see server.ts) must not sit buried behind an
-  // older, lower-stakes pending review just because it arrived first — this is the "should not be
-  // missed in proactive messages" requirement, satisfied by simply changing WHICH review this tick
-  // nudges about, not by adding a second notification channel.
-  const highPriorityReview = context.gmailReviews.find(isHighPriorityGmailReview);
-  const review = highPriorityReview ?? context.gmailReviews[0];
+  // fix/private-alpha-gmail-generic-signal-engine: a rule explicitly marked "silent"
+  // (EmailSignalRule.notifyPolicy) never nudges at all, regardless of priority — an explicit,
+  // per-rule opt-out, additive on top of the pre-existing behavior below. Every other rule
+  // (including the "review_only" default any brand-new custom rule gets) stays exactly as
+  // eligible as it always was — notifyPolicy intentionally does NOT restrict the plain fallback
+  // any further than that, since a user who explicitly created a tracking rule at all has already
+  // opted into knowing about its matches; requiring a SECOND opt-in per rule would silently break
+  // that expectation for every existing custom rule (Endesa bills, apartment viewings, etc.).
+  const nudgeEligibleReviews = context.gmailReviews.filter((review) => {
+    const rule = context.gmailRules.find((candidate) => candidate.id === review.ruleId);
+    return rule?.notifyPolicy !== "silent";
+  });
+  if (nudgeEligibleReviews.length === 0) {
+    return null;
+  }
+
+  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association (generalized in fix/private-
+  // alpha-gmail-generic-signal-engine): a high-priority signal — now ANY rule's, not just
+  // career.offer_received/career.interview_scheduled — must not sit buried behind an older,
+  // lower-stakes pending review just because it arrived first. This is also what lets a broad
+  // "important admin emails" rule surface a real flight cancellation promptly: the classifier
+  // marks that match high priority, so it wins the slot below over an older, ordinary review from
+  // some other rule.
+  const highPriorityReview = nudgeEligibleReviews.find(isHighPriorityGmailReview);
+  const review = highPriorityReview ?? nudgeEligibleReviews[0];
   const dedupeKey = gmailNudgeDedupeKey(review.id);
   if (alreadySent.has(dedupeKey)) {
     return null;
@@ -477,7 +495,7 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
   const label = gmailReviewChatLabel(review, context.gmailRules);
   const description = gmailReviewChatDescription(review);
   const message = isHighPriorityGmailReview(review)
-    ? `High-priority Gmail signal: ${review.proposedEventType === "career.offer_received" ? "possible offer" : "an interview email"} — ${label}${description ? ` — ${description}` : ""}. Review it today.`
+    ? `High-priority Gmail signal: ${gmailNudgeHighPriorityKind(review)} — ${label}${description ? ` — ${description}` : ""}. Review it today.`
     : `One email looks actionable: ${label}${description ? ` — ${description}` : ""}. Want me to turn it into a task?`;
 
   return {
@@ -492,6 +510,28 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
     priority: 3,
     safeToSend: true
   };
+}
+
+/**
+ * fix/private-alpha-gmail-generic-signal-engine: generalizes what used to be a literal
+ * career.offer_received/career.interview_scheduled ternary — any high-priority review now needs a
+ * short, human phrase to lead the nudge with. Prefers the classifier's own `signalKind` (e.g.
+ * "flight_cancellation" -> "flight cancellation") when the generic rule-matcher supplied one,
+ * falls back to the two original career-specific phrasings for backward compatibility, and a
+ * generic phrase otherwise — never a raw internal key.
+ */
+function gmailNudgeHighPriorityKind(review: Pick<EmailReviewItem, "proposedEventType" | "extracted">): string {
+  if (review.proposedEventType === "career.offer_received") {
+    return "possible offer";
+  }
+  if (review.proposedEventType === "career.interview_scheduled") {
+    return "an interview email";
+  }
+  const signalKind = review.extracted?.signalKind;
+  if (typeof signalKind === "string" && signalKind.trim()) {
+    return signalKind.trim().replace(/_/g, " ");
+  }
+  return "an important email";
 }
 
 /** Exported so goal.recommend_next_action (agent-runtime/executor.ts) can rank a goal's own open

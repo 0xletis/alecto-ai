@@ -668,10 +668,19 @@ export function gmailReviewChatDescription(review: EmailReviewItem): string | un
   return undefined;
 }
 
-/** career.offer_received / career.interview_scheduled — forced to review even at auto-log
- * confidence (apps/api/src/server.ts's syncEmailSignalRule) precisely so they surface here,
- * clearly marked, rather than silently blending in with lower-stakes review items. */
-export function isHighPriorityGmailReview(review: Pick<EmailReviewItem, "proposedEventType">): boolean {
+/**
+ * fix/private-alpha-gmail-generic-signal-engine: generalizes what used to be a career-only check
+ * (only career.offer_received/career.interview_scheduled could ever be "high priority", forced to
+ * review even at auto-log confidence — apps/api/src/server.ts's syncEmailSignalRule) to any
+ * review — a flight cancellation or an insurance deadline can now carry the same weight. Prefers
+ * the review's own `priority` column (set generically at creation time by
+ * deriveEmailReviewPriorityAndDomain) and falls back to the original career-only check only for
+ * rows written before that column existed, so nothing already stored silently changes meaning.
+ */
+export function isHighPriorityGmailReview(review: Pick<EmailReviewItem, "proposedEventType" | "priority">): boolean {
+  if (review.priority) {
+    return review.priority === "high";
+  }
   return Boolean(review.proposedEventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(review.proposedEventType));
 }
 
@@ -798,7 +807,21 @@ export function humanEmailReviewEventLabel(eventType: string): string {
     "career.interview_scheduled": "interview event",
     "career.interview_completed": "completed interview",
     "career.rejection_received": "rejection",
-    "career.offer_received": "job offer"
+    "career.offer_received": "job offer",
+    // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: these are
+    // safeEmailReviewProposedType's own non-eventType reason strings (server.ts) — an
+    // "action required to complete your application" email was falling through to the generic
+    // "event" label here, which told the user nothing. None of these ever map to a real
+    // EventTypeSchema member, so approving one still can't silently create progress from an
+    // action-required/portal email alone (email-review-service.ts's own approve path already
+    // requires a valid EventTypeSchema proposedEventType before logging anything). A genuine
+    // security/verification code email never reaches here at all — it's hard-filtered earlier
+    // (server.ts's classifySecurityAuthEmailNoise, deliberately, regardless of job-application
+    // context) — these two entries exist only in case that policy is ever relaxed to let one
+    // through, so it still never falls back to generic "event".
+    application_action_required: "application portal action required",
+    security_code: "application portal / security code",
+    verify_email: "application portal / verification"
   };
 
   return labels[eventType] ?? "event";

@@ -195,6 +195,18 @@ export interface EmailSignalRule {
   minAutoLogConfidence: number;
   minReviewConfidence: number;
   reviewBeforeLogging: boolean;
+  /** Free-text coarse category ("career", "travel", "insurance", "finance", "admin", "custom",
+   * ...) — never a strict enum, so a brand-new domain never needs a schema change. Undefined for
+   * the two built-ins (job_search_email/work_action_email infer their own label from adapterId)
+   * and for any custom rule created before this field existed. */
+  domain?: string;
+  /** Fuller natural-language explanation of what this rule should match, beyond the short `name`
+   * — fed to the generic LLM rule-matcher (classifyGmailMessageAgainstRules) when present. */
+  description?: string;
+  /** Whether a match under this rule is eligible for a proactive gmail_nudge — "review_only" (the
+   * default) never nudges; a user must opt a rule INTO "notify" explicitly. "silent" suppresses
+   * even the pending-review-count line for this rule. Independent of review/auto-log policy. */
+  notifyPolicy: "silent" | "review_only" | "notify";
   createdBy: "system" | "user";
   lastSyncedAt?: Date;
   lastError?: string;
@@ -224,6 +236,13 @@ export interface EmailReviewItem {
   actionItemId?: string;
   archiveReason?: string;
   reviewedAt?: Date;
+  /** Generalizes what used to be a job-search-only concept (only career.offer_received/
+   * career.interview_scheduled could ever be "high priority") — any adapter/rule can now mark a
+   * real signal high priority. Defaults to "normal" for every existing row. */
+  priority: "low" | "normal" | "high";
+  /** Copied from the matching rule's own `domain` at creation time — denormalized so it stays
+   * stable for display/status grouping even if the rule is later edited or archived. */
+  domain?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -322,6 +341,8 @@ export interface EmailReviewItemInput {
   confidence: number;
   reason: string;
   extracted: Record<string, unknown>;
+  priority?: "low" | "normal" | "high";
+  domain?: string;
 }
 
 export type EmailReviewUpsertResult =
@@ -1188,6 +1209,9 @@ export async function createEmailSignalRule(
       minAutoLogConfidence: input.minAutoLogConfidence,
       minReviewConfidence: input.minReviewConfidence,
       reviewBeforeLogging: input.reviewBeforeLogging,
+      domain: input.domain,
+      description: input.description,
+      notifyPolicy: input.notifyPolicy,
       createdBy: input.createdBy ?? "user"
     }
   });
@@ -1269,6 +1293,9 @@ export async function updateEmailSignalRule(
       minAutoLogConfidence: input.minAutoLogConfidence,
       minReviewConfidence: input.minReviewConfidence,
       reviewBeforeLogging: input.reviewBeforeLogging,
+      domain: input.domain,
+      description: input.description,
+      notifyPolicy: input.notifyPolicy,
       lastError: input.status === "active" ? null : existingRule.lastError
     }
   });
@@ -1961,6 +1988,33 @@ export async function rejectEmailReviewItem(userId: string, reviewId: string): P
   return toEmailReviewItem(item);
 }
 
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: lightweight rejection-
+ * feedback support for Task 6 — after a user bulk-rejects newsletter/spam review items ("reject
+ * all, they are just spam or job newsletter no interviews"), a future sync should be able to
+ * lower priority on further low-confidence items from the SAME sender for the SAME rule, without
+ * ever globally blocking a sender/domain (a genuine recruiter reply from that domain must still
+ * surface). Returns only the `from`/`proposedEventType` pairs needed for that same-sender check —
+ * deliberately no new schema/migration, since the existing `from` column already carries what's
+ * needed.
+ */
+export async function getRejectedEmailReviewSendersForRule(
+  userId: string,
+  ruleId: string,
+  limit = 200
+): Promise<Array<{ from: string | null; proposedEventType: string | null }>> {
+  await ensureUser(userId);
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: { userId, ruleId, status: "rejected" },
+    orderBy: { updatedAt: "desc" },
+    take: limit,
+    select: { from: true, proposedEventType: true }
+  });
+
+  return items;
+}
+
 function emailReviewItemData(input: EmailReviewItemInput): Prisma.EmailReviewItemUncheckedCreateInput {
   return {
     userId: input.userId,
@@ -1978,7 +2032,9 @@ function emailReviewItemData(input: EmailReviewItemInput): Prisma.EmailReviewIte
     confidence: input.confidence,
     reason: input.reason,
     extracted: toJsonObject(input.extracted),
-    status: "pending"
+    status: "pending",
+    priority: input.priority ?? "normal",
+    domain: input.domain
   };
 }
 
@@ -3187,6 +3243,9 @@ function toEmailSignalRule(rule: Prisma.EmailSignalRuleGetPayload<object>): Emai
     minAutoLogConfidence: confidenceOrDefault(rule.minAutoLogConfidence, 0.9),
     minReviewConfidence: confidenceOrDefault(rule.minReviewConfidence, 0.65),
     reviewBeforeLogging: rule.reviewBeforeLogging ?? false,
+    domain: rule.domain ?? undefined,
+    description: rule.description ?? undefined,
+    notifyPolicy: normalizeGmailRuleNotifyPolicy(rule.notifyPolicy),
     createdBy: rule.createdBy as EmailSignalRule["createdBy"],
     lastSyncedAt: rule.lastSyncedAt ?? undefined,
     lastError: rule.lastError ?? undefined,
@@ -3218,6 +3277,8 @@ function toEmailReviewItem(item: Prisma.EmailReviewItemGetPayload<object>): Emai
     actionItemId: item.actionItemId ?? undefined,
     archiveReason: item.archiveReason ?? undefined,
     reviewedAt: item.reviewedAt ?? undefined,
+    priority: normalizeEmailReviewPriority(item.priority),
+    domain: item.domain ?? undefined,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt
   };
@@ -3336,6 +3397,16 @@ function normalizeEmailFetchStrategy(strategy: string | null | undefined): Email
 function normalizeEmailClassifierMode(mode: string | null | undefined): EmailSignalRule["classifierMode"] {
   const normalized = normalizeStatus(mode);
   return normalized === "llm" || normalized === "hybrid" ? normalized : "rules";
+}
+
+function normalizeGmailRuleNotifyPolicy(policy: string | null | undefined): EmailSignalRule["notifyPolicy"] {
+  const normalized = normalizeStatus(policy);
+  return normalized === "silent" || normalized === "notify" ? normalized : "review_only";
+}
+
+function normalizeEmailReviewPriority(priority: string | null | undefined): EmailReviewItem["priority"] {
+  const normalized = normalizeStatus(priority);
+  return normalized === "low" || normalized === "high" ? normalized : "normal";
 }
 
 function positiveIntOrDefault(value: number | null | undefined, defaultValue: number): number {

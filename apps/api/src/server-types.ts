@@ -97,11 +97,24 @@ export interface EmailRuleSyncSummary {
   archivedCleanupReprocessed: number;
   skippedDueMaxEventsPerSync: number;
   eventsCreated: number;
-  /** Per-eventType count of classified job-search signals (recruiter reply, application
-   * confirmation, etc.) found this sync, regardless of whether each one was auto-logged or sent
-   * to review — keyed by the same career.* eventType strings classifyJobSearchEmail produces.
-   * Non-job-search rules never populate this. */
+  /** Per-eventType count of job-search signals AUTO-LOGGED as real events this sync — keyed by
+   * the same career.* eventType strings classifyJobSearchEmail produces. Non-job-search rules
+   * never populate this. Deliberately separate from reviewSignalCounts below (fix/private-alpha-
+   * gmail-classifier-precision-and-proactive-diagnostics) — a real transcript showed the two
+   * conflated into one counter, so "Found: 5 interview emails" reported five items that were
+   * actually all still-uncertain review candidates, never logged/confirmed at all. */
   signalCounts: Record<string, number>;
+  /** Per-eventType count of job-search signals sent to REVIEW this sync (offer/interview forced
+   * by high-signal policy, or genuinely low-confidence) — same key space as signalCounts, kept
+   * separate so a sync reply can honestly say what's confirmed vs merely possible. */
+  reviewSignalCounts: Record<string, number>;
+  /** Count of low-confidence review candidates skipped this sync because the same sender was
+   * already rejected multiple times for this rule (Task 6, fix/private-alpha-gmail-classifier-
+   * precision-and-proactive-diagnostics — "reject all, they are just spam or job newsletter no
+   * interviews" should mean a repeat newsletter from that exact sender doesn't keep coming back).
+   * Only ever applies to weak/uncertain candidates; a candidate with a high-signal eventType
+   * (interview scheduled, offer received) is never suppressed by sender history alone. */
+  suppressedRepeatSender: number;
   lastError?: string;
   lastErrorStage?: GmailErrorStage;
   reviewCandidateDebug: EmailReviewCandidateDebug[];

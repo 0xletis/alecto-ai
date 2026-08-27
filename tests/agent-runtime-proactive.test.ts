@@ -376,3 +376,106 @@ test("12. morning brief surfaces a real same-day risk_pattern memory verbatim, w
     await prisma.user.deleteMany({ where: { id: userId } });
   }
 });
+
+test("13. a generic high-priority review (a flight cancellation, not career.offer_received/interview_scheduled) still wins the gmail_nudge slot over an older normal-priority review", async () => {
+  const server = buildServer();
+  const userId = `proactive-gmail-generic-highpriority-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await seedNotificationSettings(userId);
+    const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+    const adminRule = await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Important admin emails", domain: "admin", status: "active", createdBy: "user" }
+    });
+    // Older review, created first, normal priority — must NOT win the slot.
+    await prisma.emailReviewItem.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        ruleId: adminRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "m-old",
+        externalId: `gmail-review:${adminRule.id}:m-old`,
+        subject: "Your subscription renews soon",
+        snippet: "Just a heads up.",
+        confidence: 0.8,
+        reason: "ai_rule_match",
+        extracted: {},
+        priority: "normal",
+        status: "pending",
+        createdAt: new Date("2026-08-19T09:00:00.000Z")
+      }
+    });
+    // Newer, but genuinely high priority (Task 2/6/7's generic priority - never career.* here).
+    await prisma.emailReviewItem.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        ruleId: adminRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "m-flight",
+        externalId: `gmail-review:${adminRule.id}:m-flight`,
+        subject: "Your flight has been cancelled",
+        snippet: "Flight BA123 on Friday has been cancelled.",
+        confidence: 0.92,
+        reason: "ai_rule_match",
+        extracted: { signalKind: "flight_cancellation" },
+        priority: "high",
+        status: "pending",
+        createdAt: new Date("2026-08-20T08:00:00.000Z")
+      }
+    });
+
+    const decision = await preview(server, userId, MIDDAY_UTC);
+
+    assert.equal(decision.decision, "proposed_message");
+    assert.equal((decision as any).type, "gmail_nudge");
+    assert.match((decision as any).message, /high-priority gmail signal/i);
+    assert.match((decision as any).message, /flight cancellation/i);
+    assert.match((decision as any).message, /your flight has been cancelled/i);
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("14. a rule on notifyPolicy 'silent' never produces a gmail_nudge, even for its only pending review", async () => {
+  const server = buildServer();
+  const userId = `proactive-gmail-silent-rule-${randomUUID()}`;
+
+  try {
+    await prisma.user.upsert({ where: { id: userId }, update: {}, create: { id: userId } });
+    await seedNotificationSettings(userId);
+    const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+    const silentRule = await prisma.emailSignalRule.create({
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Endesa bills", notifyPolicy: "silent", status: "active", createdBy: "user" }
+    });
+    await prisma.emailReviewItem.create({
+      data: {
+        userId,
+        connectionId: connection.id,
+        ruleId: silentRule.id,
+        adapterId: "custom_email_review",
+        provider: "gmail",
+        providerMessageId: "m1",
+        externalId: `gmail-review:${silentRule.id}:m1`,
+        subject: "Your Endesa bill is ready",
+        snippet: "Your electricity bill is ready to review.",
+        confidence: 0.8,
+        reason: "custom_email_match",
+        extracted: {},
+        status: "pending"
+      }
+    });
+
+    const decision = await preview(server, userId, MIDDAY_UTC);
+
+    assert.equal(decision.decision, "no_message", "a rule explicitly opted into notifyPolicy 'silent' must never produce a nudge");
+  } finally {
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});

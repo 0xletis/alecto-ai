@@ -66,8 +66,7 @@ test("5. delivery flag off: diagnosis explains delivery_disabled", async () => {
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: undefined, PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /delivery is blocked because PROACTIVE_OPERATOR_DELIVERY_ENABLED is off/i);
-      assert.match(reply, /01:06/);
+      assert.match(reply, /configured on, but delivery is disabled on this server/i);
     });
   } finally {
     clearAgentRuntimeMocks();
@@ -86,8 +85,8 @@ test("6. not allowlisted: diagnosis explains user_not_allowlisted", async () => 
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: "someone-else" }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /PROACTIVE_OPERATOR_ALLOWLIST is configured/i);
-      assert.match(reply, /this user isn't on it/i);
+      assert.match(reply, /was skipped today/i);
+      assert.match(reply, /not eligible — not in the allowlist/i);
     });
   } finally {
     clearAgentRuntimeMocks();
@@ -184,7 +183,9 @@ test("9. already sent today: diagnosis explains the dedupe, not a false 'nothing
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /already sent today/i);
+      // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: now reports the
+      // real sent time (e.g. "sent today at 10:19"), not a vague "already sent today" hedge.
+      assert.match(reply, /was sent today at \d{2}:\d{2}/i);
     });
   } finally {
     clearAgentRuntimeMocks();
@@ -290,7 +291,7 @@ test("13. if V3 itself already sent today, that takes priority over a stale earl
     await createNotificationLog({ userId, type: "v3_morning_brief", sentForDate });
 
     const reply = await diagnose(server, userId);
-    assert.match(reply, /already sent today/i, "must report V3's own successful send");
+    assert.match(reply, /was sent today at \d{2}:\d{2}/i, "must report V3's own successful send");
     assert.doesNotMatch(reply, /legacy daily-loop/i, "must not resurface the earlier, now-irrelevant legacy send");
   } finally {
     clearAgentRuntimeMocks();
@@ -314,6 +315,89 @@ test("14. with no allowlist configured, the eligible diagnosis names that fact p
       assert.match(reply, /settings look eligible/i);
       assert.match(reply, /no allowlist is configured/i);
       assert.doesNotMatch(reply, /missing|error|misconfigured|not restricting anyone is (wrong|bad)/i, "a missing allowlist is the normal solo/dev-phase default, not a problem to flag");
+    });
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+function mod1440(minutes: number): number {
+  return ((minutes % 1440) + 1440) % 1440;
+}
+
+test("15. asked well before the scheduled window: diagnosis says due today, never the old hand-wavy hedge", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-due-later-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    // Two hours ahead of "now" (outside the +/-30 minute window either side) - the window check
+    // has not opened yet today.
+    const morningTimeMinutes = mod1440(currentMinutesUtc() + 120);
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
+      const reply = await diagnose(server, userId);
+      assert.match(reply, /morning brief is on and due today around \d{2}:\d{2}/i);
+      assert.doesNotMatch(reply, /it's not that time yet|already passed for today|nothing should have sent/i, "must never fall back to the old hand-wavy hedge");
+    });
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("16. asked well after the window with no sent record: diagnosis says missed, not a vague hedge", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-missed-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    // Two hours behind "now" (outside the window either side) with no NotificationLog written -
+    // the window has already closed today and nothing was ever sent.
+    const morningTimeMinutes = mod1440(currentMinutesUtc() - 120);
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
+      const reply = await diagnose(server, userId);
+      assert.match(reply, /morning brief should have sent today around \d{2}:\d{2}, but i don't see a sent record/i);
+      assert.match(reply, /current status: eligible/i);
+      assert.match(reply, /next due: tomorrow \d{2}:\d{2}/i);
+      assert.doesNotMatch(reply, /it's not that time yet|already passed for today|nothing should have sent/i, "must never fall back to the old hand-wavy hedge");
+    });
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("17. timezone Europe/Madrid is respected - computed against the user's own local time, not server UTC", async () => {
+  const server = buildServer();
+  const userId = `proactive-diagnose-madrid-${randomUUID()}`;
+
+  try {
+    await seedUser(userId);
+    const nowMadridMinutes = Number(
+      new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", hour: "numeric", minute: "numeric", hourCycle: "h23" })
+        .formatToParts(new Date())
+        .reduce((acc, part) => (part.type === "hour" ? acc + Number(part.value) * 60 : part.type === "minute" ? acc + Number(part.value) : acc), 0)
+    );
+    // Two hours ahead of Madrid's current local time. If the diagnosis ever computed this
+    // against server/UTC time instead of the configured "Europe/Madrid" timezone, Madrid's UTC
+    // offset (+1 or +2) would push this outside the "due later today" window and misreport it as
+    // missed - so this only passes if the timezone is genuinely honored.
+    // Clamped (never wrapped past midnight) so the comparison stays in the same local day even
+    // if the test happens to run very late in Madrid's day.
+    const morningTimeMinutes = Math.min(nowMadridMinutes + 120, 1439);
+    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "Europe/Madrid" } });
+
+    await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
+      const reply = await diagnose(server, userId);
+      assert.match(reply, /morning brief is on and due today around \d{2}:\d{2}/i);
     });
   } finally {
     clearAgentRuntimeMocks();

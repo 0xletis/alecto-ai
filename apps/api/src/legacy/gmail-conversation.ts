@@ -255,6 +255,11 @@ export async function enableEmailRuleForConversation(userId: string, kind: "job_
     minAutoLogConfidence: input.minAutoLogConfidence,
     minReviewConfidence: input.minReviewConfidence,
     query: adapter.defaultQuery ?? "",
+    // fix/private-alpha-gmail-generic-signal-engine: mirrors builtInGmailRuleDefaults in
+    // agent-runtime/executor.ts — both built-ins were already gmail_nudge-eligible before this
+    // field existed, so "notify" here preserves that exactly.
+    domain: adapter.id === "work_action_email" ? "work" : "career",
+    notifyPolicy: "notify",
     createdBy: "user"
   });
 

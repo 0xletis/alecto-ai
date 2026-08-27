@@ -25,6 +25,11 @@ export const GithubPublicConnectionInputSchema = z.object({
 
 export const EmailFetchStrategySchema = z.enum(["query", "all_recent", "sender_allowlist", "label"]);
 export const EmailClassifierModeSchema = z.enum(["rules", "llm", "hybrid"]);
+// fix/private-alpha-gmail-generic-signal-engine: free-text on purpose (see EmailSignalRule.domain
+// in packages/db) — never a closed set, so a new domain the user asks for never needs a schema
+// change. min(1) still guards against an accidental empty string reaching the DB.
+export const EmailRuleDomainSchema = z.string().min(1);
+export const EmailRuleNotifyPolicySchema = z.enum(["silent", "review_only", "notify"]);
 
 export const CreateEmailSignalRuleInputSchema = z.object({
   connectionId: z.string().min(1),
@@ -41,7 +46,10 @@ export const CreateEmailSignalRuleInputSchema = z.object({
   classifierMode: EmailClassifierModeSchema.default("rules"),
   minAutoLogConfidence: z.number().min(0).max(1).default(0.9),
   minReviewConfidence: z.number().min(0).max(1).default(0.65),
-  reviewBeforeLogging: z.boolean().default(false)
+  reviewBeforeLogging: z.boolean().default(false),
+  domain: EmailRuleDomainSchema.optional(),
+  description: z.string().min(1).max(500).optional(),
+  notifyPolicy: EmailRuleNotifyPolicySchema.default("review_only")
 });
 
 export const UpdateEmailSignalRuleInputSchema = z.object({
@@ -54,7 +62,10 @@ export const UpdateEmailSignalRuleInputSchema = z.object({
   classifierMode: EmailClassifierModeSchema.optional(),
   minAutoLogConfidence: z.number().min(0).max(1).optional(),
   minReviewConfidence: z.number().min(0).max(1).optional(),
-  reviewBeforeLogging: z.boolean().optional()
+  reviewBeforeLogging: z.boolean().optional(),
+  domain: EmailRuleDomainSchema.optional(),
+  description: z.string().min(1).max(500).optional(),
+  notifyPolicy: EmailRuleNotifyPolicySchema.optional()
 });
 
 export const UpdateIntegrationConnectionInputSchema = z.object({

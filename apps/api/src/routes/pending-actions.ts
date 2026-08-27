@@ -268,6 +268,7 @@ export async function applyPendingAction(userId: string, pendingAction: PendingA
         minAutoLogConfidence: 1,
         minReviewConfidence: 0.65,
         reviewBeforeLogging: true,
+        notifyPolicy: "review_only",
         createdBy: "user"
       });
 

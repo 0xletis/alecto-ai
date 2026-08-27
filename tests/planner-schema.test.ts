@@ -140,6 +140,8 @@ test("B. the goal.log_evidence branch still allows its own real args shape", () 
 test("C. the gmail.rule.create branch still allows goalRef/signalKey/eventType from the signal-mapping work", () => {
   const validCall = operation("gmail.rule.create", {
     label: "Endesa bills",
+    description: null,
+    domain: null,
     matchHint: null,
     goalRef: "my Endesa goal",
     signalKey: "endesa_bill_received",
@@ -221,7 +223,7 @@ const validOperationsByTool: Record<string, Record<string, unknown>> = {
   },
   "goal.log_evidence": { eventType: "career.recruiter_reply_received", signalKey: null, goalRef: null, count: 2, notes: null },
   "gmail.review.approve": { reviewId: null, index: 1, ref: null },
-  "gmail.rule.create": { label: "Endesa bills", matchHint: null, goalRef: null, signalKey: null, eventType: null },
+  "gmail.rule.create": { label: "Endesa bills", description: null, domain: null, matchHint: null, goalRef: null, signalKey: null, eventType: null },
   "proactive.settings_propose_update": {
     morningBriefEnabled: null,
     eveningCheckinEnabled: true,

@@ -167,6 +167,20 @@ registerIngestionAdapter(jobSearchTextAdapter);
 function classifyJobSearchText(text: string, source: IngestionSource): string {
   const gmail = source === "gmail";
 
+  // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: checked BEFORE the
+  // hasStrongJobContext escape hatch below, and unconditionally — a job/career newsletter is, BY
+  // DEFINITION, dense with job-related vocabulary (recruiter, applying, hiring, role...), so the
+  // old `hasMarketingContext(text) && !hasStrongJobContext(text)` filter almost always let one
+  // straight through: the newsletter content itself satisfied hasStrongJobContext, exempting it
+  // from its own marketing filter. A real transcript showed exactly this — "CryptoJobsList Talent
+  // Newsletter" got classified as a recruiter reply. Bulk/newsletter conventions (an unsubscribe
+  // link, "view in browser", a numbered digest) are strong enough signals on their own that being
+  // job-related doesn't matter; a newsletter is never a personal recruiter reply or a real
+  // interview email, no matter how job-focused its content is.
+  if (gmail && isJobNewsletterOrPromotional(text)) {
+    return "filtered_marketing";
+  }
+
   if (gmail && hasMarketingContext(text) && !hasStrongJobContext(text)) {
     return "filtered_marketing";
   }
@@ -254,7 +268,13 @@ function hasStrongJobContext(text: string): boolean {
 
   return (
     hasApplicationWithHiringContext ||
-    (text.includes("interview") && hasAny(text, ["schedule", "availability", "available", "call", "recruiter", "hiring", "team"])) ||
+    // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: was `text.includes(
+    // "interview") && hasAny([...6 generic words])` — "interview" plus any ONE of "team"/"call"/
+    // "hiring" is exactly the pattern quant/interview-prep newsletter content trivially satisfies
+    // ("our team explains what quant interviews are really like..."). Reuses isInterviewScheduled's
+    // own curated scheduling/invitation phrase list so this gate and that classification never
+    // define "real interview content" two different ways.
+    isInterviewScheduled(text) ||
     hasAny(text, ["recruiter", "talent acquisition", "hiring team"]) ||
     hasAny(text, ["greenhouse", "lever", "workday", "ashby", "personio", "smartrecruiters", "comeet", "workable", "recruitee"]) ||
     hasAny(text, [
@@ -293,6 +313,40 @@ function isApplicationActionRequired(text: string): boolean {
     "finish your application",
     "action required",
     "required to submit"
+  ]);
+}
+
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: bulk/newsletter
+ * conventions specific enough that a real 1:1 recruiter email would essentially never contain
+ * them — an unsubscribe link and "view in browser" are CAN-SPAM-style boilerplate universal to
+ * bulk senders, and the rest are concrete phrasings a real reported newsletter used verbatim
+ * ("CryptoJobsList Talent Newsletter", "here are the top jobs this week"). Unlike
+ * hasMarketingContext (generic shopping/rewards vocabulary), every signal here is checked
+ * UNCONDITIONALLY in classifyJobSearchText — being job-related content doesn't exempt a
+ * newsletter from being a newsletter; that's the entire point of one.
+ */
+function isJobNewsletterOrPromotional(text: string): boolean {
+  return hasAny(text, [
+    "newsletter",
+    "unsubscribe",
+    "view in browser",
+    "view this email in your browser",
+    "top jobs this week",
+    "weekly jobs",
+    "job digest",
+    "jobs digest",
+    "job alert",
+    "job alerts",
+    "jobs newsletter",
+    "talent newsletter",
+    "sponsored",
+    "here are the top jobs",
+    "curated jobs for you",
+    "jobs curated for you",
+    "recommended jobs for you",
+    "browse more jobs",
+    "jobs board digest"
   ]);
 }
 
@@ -336,24 +390,54 @@ function isJobOffer(text: string): boolean {
   );
 }
 
+/**
+ * fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: mere presence of the
+ * word "interview" is deliberately NOT enough — a real transcript showed a quant-prep newsletter
+ * subject-lined "we need to seriously talk about getcracked" get classified as a confirmed,
+ * high-priority interview event purely because its body mentioned "interview" near "team"/"call".
+ * Every phrase below is a genuine scheduling/invitation signal — something happening TO the
+ * reader, not content ABOUT interviews in general. Deliberately excludes (must NOT match):
+ * "interview prep", "interviews are hard", "how to pass interviews", "interview questions", "mock
+ * interview", "people ask us about interviews" — none of those describe a real interview being
+ * scheduled for this specific reader.
+ */
 function isInterviewScheduled(text: string): boolean {
-  return (
-    hasAny(text, [
-      "schedule an interview",
-      "schedule a call",
-      "calendly",
-      "available next",
-      "available times",
-      "next step is a call",
-      "next step is an interview",
-      "phone screen",
-      "technical screen",
-      "entrevista",
-      "agendar",
-      "programar una llamada"
-    ]) ||
-    (text.includes("interview") && hasAny(text, ["schedule", "availability", "available", "call", "recruiter", "hiring", "team"]))
-  );
+  return hasAny(text, [
+    "schedule an interview",
+    "schedule your interview",
+    "schedule the interview",
+    "schedule a technical interview",
+    "schedule a call",
+    "scheduling your interview",
+    "interview invitation",
+    "invite you to interview",
+    "invited you to interview",
+    "invited to interview",
+    "we'd like to interview you",
+    "we would like to interview you",
+    "like to invite you for an interview",
+    "book a time",
+    "book a call",
+    "calendar invite",
+    "calendly",
+    "availability for the interview",
+    "availability for your interview",
+    "availability for interview",
+    "your availability for interview",
+    "next step is a call",
+    "next step is an interview",
+    "next step is a technical interview",
+    "phone screen",
+    "technical screen",
+    "onsite interview",
+    "interview scheduled",
+    "interview has been scheduled",
+    "confirm your interview",
+    "confirmed for an interview",
+    "entrevista",
+    "agendar",
+    "programar una llamada"
+  ]);
 }
 
 function isRejection(text: string): boolean {
@@ -434,8 +518,12 @@ function isRecruiterReply(text: string): boolean {
       "next step is a screen",
       "next step is an interview"
     ]) ||
+    // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: dropped "interview"
+    // and "screen" from the generic word list — a newsletter mentioning "recruiter" alongside
+    // generic interview/screening content (very common in job-newsletter copy) is not a personal
+    // reply, and isJobNewsletterOrPromotional/isInterviewScheduled already cover the real cases.
     (hasAny(text, ["recruiter", "hiring team", "talent acquisition"]) &&
-      hasAny(text, ["speak", "call", "availability", "available", "more information", "next step", "screen", "interview"]))
+      hasAny(text, ["speak", "call", "availability", "available", "more information", "next step"]))
   );
 }
 
