@@ -454,6 +454,55 @@ export function gmailRecommendationKindForGoal(goal: Goal): GmailRuleKind | unde
   return undefined;
 }
 
+/**
+ * fix/private-alpha-gmail-proactive-highsignal-and-goal-association: the built-in job-search rule
+ * (enableBuiltInGmailRuleForAgent, executor.ts) is created for the CONNECTION, not for any one
+ * goal — unlike a custom rule, which always requires the user to name a goal in conversation
+ * (gmail.rule.create). Called once at rule-creation time to decide whether a real, unambiguous
+ * link should be persisted: only when there's exactly one active job-search-shaped goal (or the
+ * conversation's current focus is one of several candidates) — multiple candidates with no clear
+ * focus deliberately leaves the rule unlinked rather than guessing, matching this codebase's
+ * existing goal-resolution philosophy (resolveGoalForLifecycleAction et al. in executor.ts) of
+ * never silently picking among ties.
+ */
+export function resolveGoalForBuiltInGmailRuleLinking(kind: GmailRuleKind, activeGoals: Goal[], focusedGoalId?: string): Goal | undefined {
+  if (kind !== "job_search") {
+    return undefined;
+  }
+
+  const candidates = activeGoals.filter((goal) => gmailRecommendationKindForGoal(goal) === "job_search");
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  if (focusedGoalId) {
+    const focused = candidates.find((goal) => goal.id === focusedGoalId);
+    if (focused) {
+      return focused;
+    }
+  }
+
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+/**
+ * Read-time counterpart to resolveGoalForBuiltInGmailRuleLinking, for surfacing sites (morning/
+ * evening brief, gmail.status, review-list "linked goal" display) that need to know "does this
+ * rule's evidence belong to an active goal" for EVERY rule — including a built-in job-search rule
+ * that predates this feature, or one created while multiple job-search goals existed and so was
+ * deliberately left unlinked. Falls back to the exact same single-unambiguous-candidate match used
+ * at creation time; still returns nothing for a genuinely ambiguous multi-goal user, so a rule
+ * never gets attributed to the wrong one just because it lacks a stored goalId.
+ */
+export function resolveActiveGoalIdsForGmailRule(rule: Pick<EmailSignalRule, "goalId" | "adapterId">, activeGoals: Goal[]): ReadonlySet<string> {
+  if (rule.goalId && activeGoals.some((goal) => goal.id === rule.goalId)) {
+    return new Set([rule.goalId]);
+  }
+
+  const resolved = resolveGoalForBuiltInGmailRuleLinking(gmailRuleKind(rule), activeGoals);
+  return resolved ? new Set([resolved.id]) : new Set();
+}
+
 function normalizeText(value: string): string {
   return value
     .toLowerCase()

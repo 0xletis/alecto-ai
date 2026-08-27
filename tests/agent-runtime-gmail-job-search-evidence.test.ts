@@ -199,37 +199,44 @@ test("sync Gmail classifies clear job-search signals into events, sends the ambi
     assert.match(sync.reply, /- 1 interview email/);
     assert.match(sync.reply, /- 1 rejection email/);
     assert.match(sync.reply, /- 1 offer email/);
-    assert.match(sync.reply, /I added 5 clear items to your job-search progress\./);
-    assert.match(sync.reply, /1 uncertain email needs review\./);
+    // Offer and interview are high-signal — forced to review even at auto-log confidence — so
+    // only recruiter reply/application confirmation/rejection clear straight through; offer,
+    // interview, and the one genuinely ambiguous email all need review.
+    assert.match(sync.reply, /I added 3 clear items to your job-search progress\./);
+    assert.match(sync.reply, /3 uncertain emails need review\./);
 
     // Task 2F / readonly: only GET calls should ever reach the Gmail API.
     assert.deepEqual(nonGetCalls, []);
 
-    // Task 3 A-E: each clear signal became the correct, traceable career.* Event.
+    // Task 3 A-E: each clear (non-high-signal) signal became the correct, traceable career.* Event.
     const events = await prisma.event.findMany({ where: { userId, source: "gmail" }, orderBy: { type: "asc" } });
-    assert.equal(events.length, 5);
+    assert.equal(events.length, 3);
     const eventByType = new Map(events.map((event) => [event.type, event]));
     assert.ok(eventByType.has("career.application_confirmation_received"));
     assert.ok(eventByType.has("career.recruiter_reply_received"));
-    assert.ok(eventByType.has("career.interview_scheduled"));
     assert.ok(eventByType.has("career.rejection_received"));
-    assert.ok(eventByType.has("career.offer_received"));
+    assert.ok(!eventByType.has("career.interview_scheduled"), "interview is high-signal — must go to review, not auto-log");
+    assert.ok(!eventByType.has("career.offer_received"), "offer is high-signal — must go to review, not auto-log");
     for (const [messageId, eventType] of [
       ["m-application-confirmation", "career.application_confirmation_received"],
       ["m-recruiter-reply", "career.recruiter_reply_received"],
-      ["m-interview-scheduled", "career.interview_scheduled"],
-      ["m-rejection", "career.rejection_received"],
-      ["m-offer", "career.offer_received"]
+      ["m-rejection", "career.rejection_received"]
     ] as const) {
       const event = eventByType.get(eventType);
       assert.equal((event?.data as Record<string, unknown> | undefined)?.gmailMessageId, messageId, `${eventType} must be traceable to its source Gmail message id`);
     }
 
-    // Task 3G: the ambiguous "action required" email is NOT hallucinated into evidence — it waits
-    // for a human, linked to its own source message.
+    // Task 3G / Task 4 (high-signal): the ambiguous "action required" email AND the two
+    // high-signal emails (offer, interview) are NOT hallucinated into evidence — all three wait
+    // for a human, each linked to its own source message.
     const reviews = await prisma.emailReviewItem.findMany({ where: { userId, status: "pending" } });
-    assert.equal(reviews.length, 1);
-    assert.equal(reviews[0].providerMessageId, "m-ambiguous-action-required");
+    assert.equal(reviews.length, 3);
+    const reviewByMessageId = new Map(reviews.map((review) => [review.providerMessageId, review]));
+    assert.ok(reviewByMessageId.has("m-ambiguous-action-required"));
+    assert.ok(reviewByMessageId.has("m-interview-scheduled"));
+    assert.ok(reviewByMessageId.has("m-offer"));
+    assert.equal(reviewByMessageId.get("m-interview-scheduled")?.proposedEventType, "career.interview_scheduled");
+    assert.equal(reviewByMessageId.get("m-offer")?.proposedEventType, "career.offer_received");
     assert.equal(await prisma.event.count({ where: { userId, source: "gmail", data: { path: ["gmailMessageId"], equals: "m-ambiguous-action-required" } } }), 0);
 
     // Task 4: "show reviews" gives a safe summary, never the raw private body text.
@@ -256,8 +263,8 @@ test("sync Gmail classifies clear job-search signals into events, sends the ambi
     // say so honestly.
     const secondSync = await sendAgentMessage(server, userId, "sync Gmail");
     assert.match(secondSync.reply, /I scanned Gmail with the job-search rule\. No new job-search emails found\./);
-    assert.equal(await prisma.event.count({ where: { userId, source: "gmail" } }), 5, "no duplicate events from the repeat sync");
-    assert.equal(await prisma.emailReviewItem.count({ where: { userId } }), 1, "no duplicate review items from the repeat sync");
+    assert.equal(await prisma.event.count({ where: { userId, source: "gmail" } }), 3, "no duplicate events from the repeat sync");
+    assert.equal(await prisma.emailReviewItem.count({ where: { userId } }), 3, "no duplicate review items from the repeat sync");
   } finally {
     restore();
     clearAgentRuntimeMocks();

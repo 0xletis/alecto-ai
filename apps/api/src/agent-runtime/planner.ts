@@ -1,7 +1,9 @@
 import { createOpenAIClient } from "@operator-agent/llm";
 import { toolArgsPlannerJsonSchema, toolCatalog, toolCatalogPromptSummary, type ToolDefinition } from "./tool-catalog.js";
 import { isReminderCompanionAction } from "../actions/reminder-companion.js";
+import { extractSafeSenderLabel, isHighPriorityGmailReview } from "../email-reviews/email-review-service.js";
 import { minutesOfDayInTimezone } from "../operator/proactive.js";
+import { truncatePlainText } from "../utils/text.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import type { ContextBundle, RawPlan } from "./types.js";
 
@@ -275,6 +277,19 @@ export function buildUserPayload(message: string, context: ContextBundle, localT
         .filter((rule) => rule.status === "active")
         .map((rule) => ({ id: rule.id, name: rule.name, query: rule.query })),
       pendingGmailReviewCount: context.gmailReviews.length,
+      // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: previously only a bare
+      // COUNT reached the model — "what should I do next?" (goal.recommend_next_action) could
+      // never ground a real "reply to the recruiter" / "prepare for your interview" recommendation
+      // in an actual pending signal, since it had no idea what any of them WERE. Read-only context,
+      // capped at 5, safe fields only (no raw body) — never a reviewId the model could invent a
+      // mutation against; approving/rejecting still only ever trusts an id from THIS turn's own
+      // visibleEntities (validator.ts's gmail_review_id_trust_check), completely unaffected by this.
+      pendingGmailSignals: context.gmailReviews.slice(0, 5).map((review) => ({
+        signalType: review.proposedEventType ?? null,
+        subject: review.subject ? truncatePlainText(review.subject, 80) : null,
+        from: review.from ? extractSafeSenderLabel(review.from) : null,
+        highPriority: isHighPriorityGmailReview(review)
+      })),
       recentMemorySummaries: context.memories.slice(0, 10).map((memory) => memory.summary),
       // fix/private-alpha-action-state-consistency: a real reported bug had "what should I do
       // today?" reference an action ("...moved to tomorrow 11:00") that had ALREADY been

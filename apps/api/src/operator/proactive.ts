@@ -1,9 +1,16 @@
-import type { ActionItem } from "@operator-agent/db";
-import type { NotificationSettings } from "@operator-agent/core";
+import type { ActionItem, EmailReviewItem } from "@operator-agent/db";
+import type { NotificationSettings, StoredEvent } from "@operator-agent/core";
 import { GOAL_ANCHOR_NUDGE_REPLY } from "../agent-runtime/runtime.js";
 import type { AgentEntity, ContextBundle } from "../agent-runtime/types.js";
-import { gmailReviewChatDescription, gmailReviewChatLabel } from "../email-reviews/email-review-service.js";
+import { resolveActiveGoalIdsForGmailRule } from "../conversation/gmail-autonomy.js";
+import {
+  extractSafeSenderLabel,
+  gmailReviewChatDescription,
+  gmailReviewChatLabel,
+  isHighPriorityGmailReview
+} from "../email-reviews/email-review-service.js";
 import { daysBetweenLocalDates, formatDateInTimezone } from "../utils/datetime.js";
+import { truncatePlainText } from "../utils/text.js";
 
 /**
  * V3 Proactive Operator MVP — a pure, callable decision layer, deliberately NOT wired to
@@ -113,6 +120,16 @@ function buildMorningBrief(
     return null;
   }
 
+  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: computed early, before
+  // either "nothing else to report" early-return below, so a fresh user with an active goal but
+  // zero open actions still hears about a real recruiter reply/offer/pending review — a Gmail
+  // signal is its own reason to send, not something only ever appended to an action-shaped brief.
+  const goalLinkedRuleIds = new Set(
+    context.gmailRules.filter((rule) => resolveActiveGoalIdsForGmailRule(rule, context.activeGoals).size > 0).map((rule) => rule.id)
+  );
+  const goalLinkedReviews = context.gmailReviews.filter((review) => goalLinkedRuleIds.has(review.ruleId));
+  const gmailLines = describeGmailSignalsForBrief(goalLinkedReviews, recentGoalLinkedGmailEvents(context, goalLinkedRuleIds, now));
+
   if (context.activeGoals.length === 0 && context.openActions.length === 0) {
     return {
       decision: "proposed_message",
@@ -150,7 +167,7 @@ function buildMorningBrief(
     (action) => action.snoozedUntil && formatDateInTimezone(action.snoozedUntil, settings.timezone) === todayLocalDate
   );
 
-  if (topActions.length === 0 && overdueActions.length === 0 && deferredReturningToday.length === 0) {
+  if (topActions.length === 0 && overdueActions.length === 0 && deferredReturningToday.length === 0 && gmailLines.length === 0) {
     // fix/private-alpha-proactive-checkins-and-overdue-action-ux: reaching here means the goal-
     // anchor branch above already ruled out "zero goals AND zero actions" — so there's always at
     // least one real active goal at this point, just nothing action-shaped scheduled for today
@@ -201,20 +218,10 @@ function buildMorningBrief(
   }
 
   // Goal Evidence Loop MVP (docs/10-v3-readiness-audit.md §20) — generic across every goal
-  // category, not job-search-specific: a pending Gmail review counts here only when its OWN rule
-  // is linked (EmailSignalRule.goalId) to one of the user's real active goals, exactly the same
-  // linkage goal.status uses. A recruiter email waiting on a job-search goal and an Endesa
-  // invoice waiting on a bills goal are surfaced by the identical code path.
-  const goalLinkedRuleIds = new Set(
-    context.gmailRules.filter((rule) => rule.goalId && context.activeGoals.some((goal) => goal.id === rule.goalId)).map((rule) => rule.id)
-  );
-  const goalLinkedReviews = context.gmailReviews.filter((review) => goalLinkedRuleIds.has(review.ruleId));
-  if (goalLinkedReviews.length > 0) {
-    const label = gmailReviewChatLabel(goalLinkedReviews[0], context.gmailRules);
-    lines.push(
-      `You also have ${goalLinkedReviews.length} email review${goalLinkedReviews.length === 1 ? "" : "s"} waiting on a goal you're tracking — "${label}" — handle that before other things.`
-    );
-  }
+  // category, not job-search-specific: goalLinkedReviews/gmailLines were computed above (before
+  // the two early-returns) precisely so a Gmail signal can be a real reason to send even when
+  // there's nothing action-shaped to report — see the comment up there for the full rationale.
+  lines.push(...gmailLines);
 
   const riskToday = context.memories.find((memory) => memory.type === "risk_pattern" && formatDateInTimezone(memory.createdAt, settings.timezone) === todayLocalDate);
   if (riskToday) {
@@ -231,13 +238,98 @@ function buildMorningBrief(
     reasons: [
       ...overdueActions.map((entry) => `overdue action: "${entry.action.title}" (${formatTemporalHealthLabel(entry.health)})`),
       ...deferredReturningToday.map((action) => `deferred action returning today: "${action.title}"`),
-      ...topActions.map((action) => `open action: "${action.title}" (${action.priority})`)
+      ...topActions.map((action) => `open action: "${action.title}" (${action.priority})`),
+      ...(goalLinkedReviews.length > 0 ? [`${goalLinkedReviews.length} pending goal-linked gmail review(s)`] : [])
     ],
     suggestedReplies: ["mark 1 done", "move 2 to tomorrow"],
     dedupeKey: MORNING_BRIEF_DEDUPE_KEY,
     priority: 1,
     safeToSend: true
   };
+}
+
+/** fix/private-alpha-gmail-proactive-highsignal-and-goal-association: a goal-linked Gmail event is
+ * only "new" for proactive purposes within a rolling day — recentEvents (context) is the 10 most
+ * recent events overall with no built-in time window, so an event from a week ago would otherwise
+ * be re-described every single morning forever. No persisted "already mentioned" state is needed
+ * for events specifically: this window IS the dedupe, since a stale event simply ages out of it. */
+const RECENT_GMAIL_EVENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+function recentGoalLinkedGmailEvents(context: ContextBundle, goalLinkedRuleIds: Set<string>, now: Date): StoredEvent[] {
+  const cutoff = now.getTime() - RECENT_GMAIL_EVENT_WINDOW_MS;
+  return context.recentEvents.filter((event) => {
+    if (event.source !== "gmail" || event.timestamp.getTime() < cutoff) {
+      return false;
+    }
+    const ruleId = typeof event.data.ruleId === "string" ? event.data.ruleId : undefined;
+    return ruleId ? goalLinkedRuleIds.has(ruleId) : false;
+  });
+}
+
+function gmailEventFromLabel(event: StoredEvent): string | undefined {
+  const from = typeof event.data.from === "string" ? event.data.from : undefined;
+  return from ? extractSafeSenderLabel(from) : undefined;
+}
+
+function gmailEventSubjectLabel(event: StoredEvent): string | undefined {
+  return typeof event.data.subject === "string" ? truncatePlainText(event.data.subject, 80) : undefined;
+}
+
+/**
+ * Shared by the morning brief and evening check-in so both describe the exact same goal-linked
+ * Gmail signals the exact same way — never two different phrasings of "a recruiter replied"
+ * depending on which proactive moment happens to be reporting it. Offer/interview reviews (forced
+ * to review regardless of confidence — see server.ts's syncEmailSignalRule) get their own
+ * high-priority line; every other pending review is a single honest count; already-logged
+ * recruiter-reply/confirmation/rejection events get one calm line each, never dramatized.
+ */
+function describeGmailSignalsForBrief(goalLinkedReviews: EmailReviewItem[], goalLinkedEvents: StoredEvent[]): string[] {
+  const lines: string[] = [];
+  const highPriorityReviews = goalLinkedReviews.filter(isHighPriorityGmailReview);
+  const normalReviews = goalLinkedReviews.filter((review) => !isHighPriorityGmailReview(review));
+
+  for (const review of highPriorityReviews) {
+    const signalLabel = review.proposedEventType === "career.offer_received" ? "possible offer" : "an interview email";
+    const sender = review.from ? extractSafeSenderLabel(review.from) : undefined;
+    lines.push(`High-priority Gmail signal: ${signalLabel}${sender ? ` from ${sender}` : ""}. Review it today.`);
+  }
+
+  if (normalReviews.length > 0) {
+    lines.push(
+      normalReviews.length === 1 ? "1 Gmail item needs review before I log it." : `${normalReviews.length} Gmail items need review before I log them.`
+    );
+  }
+
+  const latestEventByType = new Map<string, StoredEvent>();
+  for (const event of goalLinkedEvents) {
+    const existing = latestEventByType.get(event.type);
+    if (!existing || event.timestamp > existing.timestamp) {
+      latestEventByType.set(event.type, event);
+    }
+  }
+
+  const recruiterEvent = latestEventByType.get("career.recruiter_reply_received");
+  if (recruiterEvent) {
+    const sender = gmailEventFromLabel(recruiterEvent);
+    const subject = gmailEventSubjectLabel(recruiterEvent);
+    lines.push(`New Gmail signal: recruiter reply${sender ? ` from ${sender}` : ""}${subject ? ` about "${subject}"` : ""}. Review/follow up today.`);
+  }
+
+  const confirmationEvent = latestEventByType.get("career.application_confirmation_received");
+  if (confirmationEvent) {
+    const sender = gmailEventFromLabel(confirmationEvent);
+    const subject = gmailEventSubjectLabel(confirmationEvent);
+    lines.push(`Gmail: application confirmation${sender ? ` from ${sender}` : ""}${subject ? ` for "${subject}"` : ""}.`);
+  }
+
+  const rejectionEvent = latestEventByType.get("career.rejection_received");
+  if (rejectionEvent) {
+    // Never dramatized — a factual note, not coaching (that's what "what should I do next" is for).
+    const sender = gmailEventFromLabel(rejectionEvent);
+    lines.push(`Gmail: a rejection came in${sender ? ` from ${sender}` : ""}. Onward to the next one.`);
+  }
+
+  return lines;
 }
 
 function buildEveningCheckin(
@@ -288,7 +380,27 @@ function buildEveningCheckin(
   // today, nagging again would be exactly the "does not nag" behavior this module is tested for).
   const goalsWithNoTrackableMetric = context.activeGoals.filter((goal) => (goal.targetMetrics ?? []).filter((metric) => metric.eventType).length === 0);
 
-  if (untrackedGoals.length === 0 && missedDueTodayActions.length === 0) {
+  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: goal-linked Gmail signals
+  // are their own real reason for an evening check-in to exist — a recruiter reply that came in
+  // this afternoon, or a still-pending review, is exactly the kind of thing "what happened today"
+  // should mention, even on a day with no other action/goal-tracking gap to report. Events are
+  // scoped to TODAY specifically (not the rolling 24h window the morning brief uses) since this is
+  // literally "what did Gmail find today"; pending reviews aren't day-scoped — they stay relevant
+  // however many days they've been sitting, same as the morning brief.
+  const goalLinkedRuleIds = new Set(
+    context.gmailRules.filter((rule) => resolveActiveGoalIdsForGmailRule(rule, context.activeGoals).size > 0).map((rule) => rule.id)
+  );
+  const goalLinkedReviews = context.gmailReviews.filter((review) => goalLinkedRuleIds.has(review.ruleId));
+  const goalLinkedEventsToday = context.recentEvents.filter((event) => {
+    if (event.source !== "gmail" || formatDateInTimezone(event.timestamp, settings.timezone) !== todayLocalDate) {
+      return false;
+    }
+    const ruleId = typeof event.data.ruleId === "string" ? event.data.ruleId : undefined;
+    return ruleId ? goalLinkedRuleIds.has(ruleId) : false;
+  });
+  const gmailLines = describeGmailSignalsForBrief(goalLinkedReviews, goalLinkedEventsToday);
+
+  if (untrackedGoals.length === 0 && missedDueTodayActions.length === 0 && gmailLines.length === 0) {
     if (goalsWithNoTrackableMetric.length === 0) {
       // Either no active goals at all, or every active goal already has a trackable metric that
       // was logged today — genuinely nothing to ask about, not a case this fallback should cover.
@@ -319,6 +431,7 @@ function buildEveningCheckin(
     const goalPhrases = untrackedGoals.map((goal) => goal.title.toLowerCase());
     parts.push(`Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "gym 45m and sent 2 CVs" is enough.`);
   }
+  parts.push(...gmailLines);
   const message = `Evening check-in: ${parts.join(" ")}`;
 
   return {
@@ -328,7 +441,9 @@ function buildEveningCheckin(
     message,
     reasons: [
       ...missedDueTodayActions.map((action) => `still-open action due today: "${action.title}"`),
-      ...untrackedGoals.map((goal) => `no tracked signal logged today for goal: "${goal.title}"`)
+      ...untrackedGoals.map((goal) => `no tracked signal logged today for goal: "${goal.title}"`),
+      ...goalLinkedEventsToday.map((event) => `gmail event logged today: ${event.type}`),
+      ...(goalLinkedReviews.length > 0 ? [`${goalLinkedReviews.length} pending goal-linked gmail review(s)`] : [])
     ],
     suggestedReplies: missedDueTodayActions.length > 0 ? ["move it to tomorrow", "archive it", "gym 45m and sent 2 CVs"] : ["gym 45m and sent 2 CVs", "nothing today"],
     dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
@@ -347,7 +462,13 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
     return null;
   }
 
-  const review = context.gmailReviews[0];
+  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: a high-priority signal
+  // (offer/interview — always forced to review, see server.ts) must not sit buried behind an
+  // older, lower-stakes pending review just because it arrived first — this is the "should not be
+  // missed in proactive messages" requirement, satisfied by simply changing WHICH review this tick
+  // nudges about, not by adding a second notification channel.
+  const highPriorityReview = context.gmailReviews.find(isHighPriorityGmailReview);
+  const review = highPriorityReview ?? context.gmailReviews[0];
   const dedupeKey = gmailNudgeDedupeKey(review.id);
   if (alreadySent.has(dedupeKey)) {
     return null;
@@ -355,15 +476,17 @@ function buildGmailNudge(context: ContextBundle, settings: NotificationSettings,
 
   const label = gmailReviewChatLabel(review, context.gmailRules);
   const description = gmailReviewChatDescription(review);
-  const message = `One email looks actionable: ${label}${description ? ` — ${description}` : ""}. Want me to turn it into a task?`;
+  const message = isHighPriorityGmailReview(review)
+    ? `High-priority Gmail signal: ${review.proposedEventType === "career.offer_received" ? "possible offer" : "an interview email"} — ${label}${description ? ` — ${description}` : ""}. Review it today.`
+    : `One email looks actionable: ${label}${description ? ` — ${description}` : ""}. Want me to turn it into a task?`;
 
   return {
     decision: "proposed_message",
     type: "gmail_nudge",
     title: "Gmail review",
     message,
-    reasons: [`pending gmail review: "${label}"`],
-    suggestedReplies: ["turn it into a task", "ignore it"],
+    reasons: [`pending gmail review: "${label}"${isHighPriorityGmailReview(review) ? " (high priority)" : ""}`],
+    suggestedReplies: isHighPriorityGmailReview(review) ? ["show me the details", "approve it"] : ["turn it into a task", "ignore it"],
     dedupeKey,
     entities: [{ type: "gmail_review", id: review.id, label, index: 1 }],
     priority: 3,

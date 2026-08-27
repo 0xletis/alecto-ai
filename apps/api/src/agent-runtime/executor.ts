@@ -79,7 +79,15 @@ import {
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
 import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthLocalhostCallbackWarning, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
-import { buildGmailAutonomyState, gmailRecommendationKindForGoal, formatIntervalMinutes, gmailSyncModeSentence, type GmailRuleKind } from "../conversation/gmail-autonomy.js";
+import {
+  buildGmailAutonomyState,
+  gmailRecommendationKindForGoal,
+  formatIntervalMinutes,
+  gmailSyncModeSentence,
+  resolveActiveGoalIdsForGmailRule,
+  resolveGoalForBuiltInGmailRuleLinking,
+  type GmailRuleKind
+} from "../conversation/gmail-autonomy.js";
 import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
 import {
   approveEmailReviewForUser,
@@ -1291,7 +1299,10 @@ export async function executeOperation(
             settings.timezone,
             args.includeLink === true,
             state.lastSyncedAt,
-            proposal?.line
+            proposal?.line,
+            context.activeGoals,
+            context.gmailReviews.length,
+            state
           ),
           result: connection,
           ...(proposal?.pendingOperationUpdate && canProposeRuleNow ? { pendingOperationUpdate: proposal.pendingOperationUpdate } : {})
@@ -1554,7 +1565,12 @@ export async function executeOperation(
       }
 
       case "gmail.rule.enable_builtin": {
-        const result = await enableBuiltInGmailRuleForAgent(userId, args.kind as BuiltInGmailRuleKind);
+        const result = await enableBuiltInGmailRuleForAgent(
+          userId,
+          args.kind as BuiltInGmailRuleKind,
+          context.activeGoals,
+          resolveCurrentFocusGoal(context)?.id
+        );
         return {
           tool: operation.tool,
           status: result.changed ? "executed" : "skipped",
@@ -1661,10 +1677,11 @@ export async function executeOperation(
       case "gmail.review.list": {
         const status = (args.status as EmailReviewItem["status"] | "all" | undefined) ?? "pending";
         const items = await getEmailReviewItems(userId, { status, limit: (args.limit as number | undefined) ?? 10 });
+        const timezone = await getUserTimezone(userId);
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatGmailReviewListForChat(items, context.gmailRules),
+          summary: formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone),
           result: items,
           entities: items.map((review, index) => reviewToEntity(review, index + 1, context.gmailRules))
         };
@@ -4000,13 +4017,30 @@ function formatGmailConnectionStatusForChat(
   // SAME goal-relevance data buildGmailAutonomyState already computes but the chat reply never
   // surfaced), this REPLACES that generic line with a specific, actionable proposal instead of
   // appending alongside it — showing both would be redundant.
-  ruleProposalLine?: string
+  ruleProposalLine?: string,
+  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: launch-readiness status
+  // clarity — the per-rule line now names its linked goal when one resolves (stored OR the same
+  // live single-candidate fallback rule-creation uses), and the whole reply states pending review
+  // count + manual-vs-scheduled cadence, so "gmail status" alone answers what used to require
+  // asking gmail.autonomy.status and goal.status separately too.
+  activeGoals: Goal[] = [],
+  pendingReviewCount = 0,
+  autonomyState?: Awaited<ReturnType<typeof buildGmailAutonomyState>>
 ): string {
   const oauthUrl = gmailOAuthUrlForUser(userId);
   const activeRules = rules.filter((rule) => rule.status === "active");
   const ruleLines = activeRules.length > 0
-    ? ["", "Active rules:", ...activeRules.map((rule, index) => `${index + 1}. ${rule.name} — review-first tracking`)]
+    ? [
+        "",
+        "Active rules:",
+        ...activeRules.map((rule, index) => {
+          const linkedGoal = resolveLinkedGoalForDisplay(rule, activeGoals);
+          return `${index + 1}. ${rule.name} — review-first tracking${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`;
+        })
+      ]
     : [];
+  const pendingReviewLine = activeRules.length > 0 ? `Pending reviews: ${pendingReviewCount}.` : undefined;
+  const syncModeLine = autonomyState && activeRules.length > 0 ? gmailSyncModeSentence(autonomyState) : undefined;
 
   if (!connection || connection.status === "archived") {
     return [
@@ -4053,7 +4087,8 @@ function formatGmailConnectionStatusForChat(
         "No email tracking rules are active yet. You can say \"enable job search rule for Gmail\", \"enable work action rule for Gmail\", or \"track Endesa bills from Gmail\".")
       : undefined,
     ...ruleLines,
-    "Sync only runs when you say \"sync Gmail\" or when scheduled Gmail checks are enabled."
+    pendingReviewLine,
+    syncModeLine ?? (activeRules.length === 0 ? "Sync only runs when you say \"sync Gmail\" or when scheduled Gmail checks are enabled." : undefined)
   ].filter(Boolean).join("\n");
 }
 
@@ -4197,7 +4232,9 @@ function formatActiveGmailRuleLines(rules: EmailSignalRule[]): string[] {
 
 async function enableBuiltInGmailRuleForAgent(
   userId: string,
-  kind: BuiltInGmailRuleKind
+  kind: BuiltInGmailRuleKind,
+  activeGoals: Goal[],
+  focusedGoalId?: string
 ): Promise<{ changed: boolean; summary: string; rule?: EmailSignalRule }> {
   const adapterId = kind === "work_action" ? "work_action_email" : "job_search_email";
   const adapter = getEmailAdapterDefinition(adapterId);
@@ -4218,7 +4255,12 @@ async function enableBuiltInGmailRuleForAgent(
   if (existingActive) {
     return {
       changed: false,
-      summary: [`${title} is already on.`, "", formatBuiltInGmailRuleEnabled(existingActive), gmailRuleEnableReconnectNote(userId, connection)]
+      summary: [
+        `${title} is already on.`,
+        "",
+        formatBuiltInGmailRuleEnabled(existingActive, resolveLinkedGoalForDisplay(existingActive, activeGoals)),
+        gmailRuleEnableReconnectNote(userId, connection)
+      ]
         .filter(Boolean)
         .join("\n"),
       rule: existingActive
@@ -4241,12 +4283,26 @@ async function enableBuiltInGmailRuleForAgent(
 
     return {
       changed: true,
-      summary: [`${title} is back on.`, "", formatBuiltInGmailRuleEnabled(updated), gmailRuleEnableReconnectNote(userId, connection)]
+      summary: [
+        `${title} is back on.`,
+        "",
+        formatBuiltInGmailRuleEnabled(updated, resolveLinkedGoalForDisplay(updated, activeGoals)),
+        gmailRuleEnableReconnectNote(userId, connection)
+      ]
         .filter(Boolean)
         .join("\n"),
       rule: updated
     };
   }
+
+  // fix/private-alpha-gmail-proactive-highsignal-and-goal-association: the built-in rule is
+  // created for the CONNECTION, with no goal named in conversation the way gmail.rule.create
+  // requires — so this is the one moment to link it automatically, and only when it's genuinely
+  // unambiguous (exactly one active job-search-shaped goal, or the conversation's current focus is
+  // one of several). Anything less clear leaves goalId unset — no fake link — and the built-in
+  // rule's evidence still surfaces generically via resolveActiveGoalIdsForGmailRule's read-time
+  // fallback wherever that matters (morning brief, gmail.status, etc).
+  const linkedGoal = kind === "job_search" ? resolveGoalForBuiltInGmailRuleLinking("job_search", activeGoals, focusedGoalId) : undefined;
 
   const defaults = builtInGmailRuleDefaults(kind);
   const rule = await createEmailSignalRule(userId, {
@@ -4262,12 +4318,13 @@ async function enableBuiltInGmailRuleForAgent(
     minAutoLogConfidence: defaults.minAutoLogConfidence,
     minReviewConfidence: defaults.minReviewConfidence,
     reviewBeforeLogging: defaults.reviewBeforeLogging,
-    createdBy: "user"
+    createdBy: "user",
+    goalId: linkedGoal?.id
   });
 
   return {
     changed: true,
-    summary: [`${title} is on.`, "", formatBuiltInGmailRuleEnabled(rule), gmailRuleEnableReconnectNote(userId, connection)].filter(Boolean).join("\n"),
+    summary: [`${title} is on.`, "", formatBuiltInGmailRuleEnabled(rule, linkedGoal), gmailRuleEnableReconnectNote(userId, connection)].filter(Boolean).join("\n"),
     rule
   };
 }
@@ -4304,7 +4361,12 @@ function builtInGmailRuleDefaults(kind: BuiltInGmailRuleKind) {
   };
 }
 
-function formatBuiltInGmailRuleEnabled(rule: EmailSignalRule): string {
+function resolveLinkedGoalForDisplay(rule: EmailSignalRule, activeGoals: Goal[]): Goal | undefined {
+  const goalId = [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0];
+  return goalId ? activeGoals.find((goal) => goal.id === goalId) : undefined;
+}
+
+function formatBuiltInGmailRuleEnabled(rule: EmailSignalRule, linkedGoal?: Goal): string {
   const isWorkAction = rule.adapterId === "work_action_email";
   const watchItems = isWorkAction
     ? ["work requests", "deadlines", "follow-ups", "feedback requests", "blockers"]
@@ -4316,10 +4378,11 @@ function formatBuiltInGmailRuleEnabled(rule: EmailSignalRule): string {
     "",
     isWorkAction
       ? "Work-action emails go to review before becoming action items."
-      : "Clear job-search emails can become career events. Uncertain emails go to review.",
+      : "Clear job-search emails can become career events. Offers and interview emails always go to review first — everything else uncertain goes to review too.",
+    linkedGoal ? `Linked to your "${linkedGoal.title}" goal.` : undefined,
     "I only scan Gmail while this rule is active.",
     "Sync now: say 'sync Gmail'."
-  ].join("\n");
+  ].filter((line): line is string => line !== undefined).join("\n");
 }
 
 function gmailRuleEnableReconnectNote(userId: string, connection: IntegrationConnection): string | undefined {

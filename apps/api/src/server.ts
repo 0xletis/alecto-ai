@@ -23,6 +23,7 @@ import {
   DailyCheckInTextInputSchema,
   EventTypeSchema,
   eventRegistry,
+  HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES,
   parseActionDueDate,
   normalizeManualActionTitleKey,
   extractEvents,
@@ -4288,10 +4289,17 @@ async function syncEmailSignalRule(input: {
       continue;
     }
 
+    // High-signal job-search types (offer, interview) always go to review, even at auto-log
+    // confidence — a real decision or real prep is at stake, so a human confirms before it's
+    // treated as settled, and it lands in the review queue where morning/evening surfacing and
+    // gmail_nudge can flag it prominently instead of it quietly becoming just another logged event.
+    const isHighSignalJobSearchType = Boolean(classification.eventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(classification.eventType));
+
     if (
       classification.decision === "needs_review" ||
       input.rule.reviewBeforeLogging ||
-      classification.confidence < input.rule.minAutoLogConfidence
+      classification.confidence < input.rule.minAutoLogConfidence ||
+      isHighSignalJobSearchType
     ) {
       if (isReviewItemCapReached(input.rule, summary)) {
         summary.skippedDueMaxEventsPerSync += 1;
