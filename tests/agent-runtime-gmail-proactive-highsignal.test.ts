@@ -243,8 +243,11 @@ test("1D. an existing built-in rule with no stored goalId still resolves to the 
     const goalResult = await createGoal(userId, jobSearchGoalInput());
     if (goalResult.duplicate) throw new Error("unexpected duplicate goal in test setup");
 
+    // refactor/private-alpha-goal-driven-gmail-operator (Task 7): status is goal-first now — a
+    // resolved goal shows as the group's own label ("- <goal title>: on — watches ..."), not a
+    // "linked to X" suffix on a raw rule line.
     const status = await sendAgentMessage(server, userId, "gmail status");
-    assert.match(status.reply, new RegExp(`linked to "${goalResult.goal.title}"`, "i"), "the live single-candidate fallback must resolve the link even without a stored goalId");
+    assert.match(status.reply, new RegExp(`- ${goalResult.goal.title}: on`, "i"), "the live single-candidate fallback must resolve the link even without a stored goalId");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -735,7 +738,9 @@ test("8A/8B/8C. gmail status shows linked goal, manual-only cadence, and pending
       await sendAgentMessage(server, userId, "sync Gmail");
       const status = await sendAgentMessage(server, userId, "gmail status");
 
-      assert.match(status.reply, new RegExp(`linked to "${goalResult.goal.title}"`, "i"));
+      // refactor/private-alpha-goal-driven-gmail-operator (Task 7): status is goal-first — the
+      // resolved goal is the group's own label now, not a "linked to X" suffix.
+      assert.match(status.reply, new RegExp(`- ${goalResult.goal.title}: on`, "i"));
       assert.match(status.reply, /Pending reviews: 2\./);
       assert.match(status.reply, /Alecto checks Gmail when you say 'sync Gmail'\./);
       assert.match(status.reply, /Last synced:/);

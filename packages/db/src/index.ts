@@ -16,6 +16,7 @@ import type {
   ExtractedEvent,
   GithubPublicConnectionInput,
   Goal,
+  GoalMetric,
   GoalStatus,
   MemoryEntry,
   NotificationSettings,
@@ -522,6 +523,45 @@ export async function updateGoalPriority(
       priority: input.priority,
       importanceScore: input.importanceScore ?? scoreForGoalPriority(input.priority),
       priorityReason: input.priorityReason
+    }
+  });
+
+  return toGoal(goal);
+}
+
+/**
+ * refactor/private-alpha-goal-driven-gmail-operator (Task 4 — smart goal evolution): appends ONE
+ * new metric to an active goal's existing targetMetrics JSON array — additive only, never
+ * rewrites or removes an existing metric (editing an already-confirmed goal's OTHER fields stays
+ * unsupported, per this codebase's own established constraint; this is deliberately narrower —
+ * just growing the tracked-signal list when Gmail finds something the goal doesn't track yet).
+ * A no-op (not an error) if a metric with the same key already exists, so a duplicate confirm
+ * can never double-add the same signal.
+ */
+export async function addGoalTrackedMetric(userId: string, goalId: string, metric: GoalMetric): Promise<Goal | undefined> {
+  await ensureUser(userId);
+
+  const existingGoal = await prisma.goal.findFirst({
+    where: {
+      id: goalId,
+      userId,
+      status: "active"
+    }
+  });
+
+  if (!existingGoal) {
+    return undefined;
+  }
+
+  const currentMetrics = parseGoalMetrics(existingGoal.targetMetrics) ?? [];
+  if (currentMetrics.some((existing) => existing.key === metric.key)) {
+    return toGoal(existingGoal);
+  }
+
+  const goal = await prisma.goal.update({
+    where: { id: goalId },
+    data: {
+      targetMetrics: toJsonArray([...currentMetrics, metric])
     }
   });
 

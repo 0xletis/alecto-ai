@@ -289,7 +289,11 @@ test("V3 reconnect and setup phrases return the real Gmail OAuth URL", async () 
     assert.equal(reconnect.debug.mutationExecuted, false);
     assert.match(reconnect.reply, /Gmail authorization is expired/i);
     assert.match(reconnect.reply, /Reconnect Gmail here/i);
-    assert.match(reconnect.reply, /Active rules:/i);
+    // refactor/private-alpha-goal-driven-gmail-operator (Task 7): status is goal-first — this
+    // unlinked rule falls into the shared "General Gmail watch" bucket, and since it has no real
+    // description, its watch-summary falls back to its own name.
+    assert.match(reconnect.reply, /Gmail support:/i);
+    assert.match(reconnect.reply, /General Gmail watch: on/i);
     assert.match(reconnect.reply, /Naturgy invoices/i);
     assertContainsOAuthLink(reconnect.reply);
     assertNoGmailSecrets(reconnect);

@@ -1,4 +1,5 @@
 import {
+  addGoalTrackedMetric,
   approveEmailReviewItem,
   archiveActionItem,
   archiveEmailSignalRule,
@@ -86,6 +87,7 @@ import {
   gmailSyncModeSentence,
   resolveActiveGoalIdsForGmailRule,
   resolveGoalForBuiltInGmailRuleLinking,
+  suggestGmailWatcherForGoal,
   type GmailRuleKind
 } from "../conversation/gmail-autonomy.js";
 import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../gmail/gmail-rule-service.js";
@@ -95,6 +97,7 @@ import {
   formatEmailReviewDetailsForContext,
   formatGmailReviewListForChat,
   gmailReviewChatLabel,
+  humanEmailReviewEventLabel,
   rejectEmailReviewForUser
 } from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
@@ -1163,6 +1166,83 @@ export async function executeOperation(
         };
       }
 
+      case "goal.add_tracked_signal_propose": {
+        const goalId = args.goalId as string;
+        const goalTitle = args.goalTitle as string;
+        const eventType = args.eventType as string | undefined;
+        const signalKey = args.signalKey as string | undefined;
+        const label = args.label as string;
+        const labelSingular = args.labelSingular as string | undefined;
+        const reason = args.reason as string;
+
+        const goal = context.activeGoals.find((candidate) => candidate.id === goalId);
+        if (!goal) {
+          return failed(operation.tool, "I couldn't find that goal anymore, so I can't add a tracked signal to it.");
+        }
+
+        const alreadyTracked = (goal.targetMetrics ?? []).some(
+          (metric) => (eventType && metric.eventType === eventType) || (signalKey && metric.signalKey === signalKey)
+        );
+        if (alreadyTracked) {
+          return {
+            tool: operation.tool,
+            status: "skipped",
+            summary: `"${goal.title}" already tracks ${label}.`,
+            result: goal
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `${reason}. "${goalTitle}" doesn't currently track ${label}. Want me to add it as a tracked signal?`,
+          pendingOperationUpdate: {
+            topic: "goal_tracked_signal",
+            summary: `add ${label} as a tracked signal for "${goalTitle}"`,
+            operations: [
+              {
+                tool: "goal.add_tracked_signal_apply",
+                args: { goalId, goalTitle, eventType: eventType ?? null, signalKey: signalKey ?? null, label, labelSingular: labelSingular ?? null },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "goal.add_tracked_signal_apply": {
+        const goalId = args.goalId as string;
+        const goalTitle = args.goalTitle as string;
+        const eventType = args.eventType as string | null;
+        const signalKey = args.signalKey as string | null;
+        const label = args.label as string;
+        const labelSingular = args.labelSingular as string | null;
+
+        const metric: GoalMetric = {
+          key: signalKey ?? eventType ?? label,
+          label,
+          labelSingular: labelSingular ?? undefined,
+          eventType: eventType ?? undefined,
+          signalKey: signalKey ?? undefined,
+          aggregation: "count",
+          window: "weekly"
+        };
+
+        const updated = await addGoalTrackedMetric(userId, goalId, metric);
+        if (!updated) {
+          return failed(operation.tool, `"${goalTitle}" no longer exists, so I couldn't add that tracked signal.`);
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Done — "${updated.title}" now tracks ${label}.`,
+          result: updated,
+          entities: [goalToEntity(updated)]
+        };
+      }
+
       case "event.log_workout": {
         const created = await createEvent(userId, {
           type: "health.workout_completed",
@@ -1442,11 +1522,33 @@ export async function executeOperation(
       }
 
       case "gmail.rule.list": {
+        // Task 7 (refactor/private-alpha-goal-driven-gmail-operator): the ADVANCED view — real
+        // rule-level detail (domain, exact tracking policy, notifyPolicy, linked goal) — only ever
+        // shown on an explicit ask ('show Gmail rules', 'what are you watching in Gmail?'). Normal
+        // 'gmail status' stays goal-first (formatGmailConnectionStatusForChat); this is the one
+        // place rule/notifyPolicy terminology is expected and appropriate.
         const rules = (await buildGmailAutonomyState(userId)).activeRules;
         const summary =
           rules.length === 0
             ? "No active Gmail rules."
-            : `Active Gmail rules:\n${rules.map((rule, index) => `${index + 1}. ${rule.name} — review-first tracking`).join("\n")}`;
+            : `Active Gmail rules:\n${rules
+                .map((rule, index) => {
+                  const linkedGoal = resolveLinkedGoalForDisplay(rule, context.activeGoals);
+                  // Only worth a separate "watches X" clause when it says something the rule's
+                  // own name doesn't already — a custom rule with no real description just falls
+                  // back to repeating its own name (gmailRuleWatchSummary), which would otherwise
+                  // show up twice on the same line.
+                  const watchSummary = gmailRuleWatchSummary(rule);
+                  return [
+                    `${index + 1}. ${rule.name}`,
+                    rule.domain ? ` (${rule.domain})` : "",
+                    ` — ${gmailRuleTrackingPolicyLabel(rule)}`,
+                    ` — notifications ${rule.notifyPolicy === "notify" ? "on" : rule.notifyPolicy === "silent" ? "off" : "high-priority only"}`,
+                    linkedGoal ? ` — linked to "${linkedGoal.title}"` : " — not linked to a goal",
+                    watchSummary !== rule.name ? ` — watches ${watchSummary}` : ""
+                  ].join("");
+                })
+                .join("\n")}`;
         return {
           tool: operation.tool,
           status: "executed",
@@ -1606,7 +1708,26 @@ export async function executeOperation(
         const ref = args.ref as string;
         const gmailOperation = args.operation as GmailRuleOperation;
         const rules = await getVisibleGmailEmailRules(userId);
-        const matches = sortEmailRuleCandidates(findEmailRulesByTarget(rules, ref));
+        let matches = sortEmailRuleCandidates(findEmailRulesByTarget(rules, ref));
+
+        // refactor/private-alpha-goal-driven-gmail-operator: "stop using Gmail for my job goal" —
+        // the user names a GOAL, not a rule, which findEmailRulesByTarget's name/query text match
+        // can't resolve on its own. Falls back to strict goal resolution, then the rule(s) linked
+        // to that goal — never guesses among multiple linked rules or multiple goal candidates.
+        if (matches.length === 0) {
+          const goalOutcome = resolveGoalForLifecycleAction(ref, context.activeGoals, resolveCurrentFocusGoal(context));
+          if (goalOutcome.status === "matched") {
+            const linkedGoal = goalOutcome.goals[0];
+            matches = sortEmailRuleCandidates(rules.filter((rule) => rule.goalId === linkedGoal.id));
+          } else if (goalOutcome.status === "ambiguous") {
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: describeAmbiguousGoalChoice(goalOutcome.goals),
+              result: goalOutcome.goals
+            };
+          }
+        }
 
         if (matches.length === 0) {
           return {
@@ -1665,7 +1786,9 @@ export async function executeOperation(
         const updated =
           gmailOperation === "archive"
             ? await archiveEmailSignalRule(userId, ruleId)
-            : await updateEmailSignalRule(userId, ruleId, { status: gmailOperation === "pause" ? "paused" : "active" });
+            : gmailOperation === "mute" || gmailOperation === "unmute"
+              ? await updateEmailSignalRule(userId, ruleId, { notifyPolicy: gmailOperation === "mute" ? "review_only" : "notify" })
+              : await updateEmailSignalRule(userId, ruleId, { status: gmailOperation === "pause" ? "paused" : "active" });
 
         if (!updated) {
           return failed(operation.tool, `${ruleName} no longer exists.`);
@@ -1676,6 +1799,161 @@ export async function executeOperation(
           status: "executed",
           summary: `Done — ${updated.name} is now ${gmailRuleTargetStateLabel(gmailOperation)}.`,
           result: updated
+        };
+      }
+
+      case "gmail.goal_watcher.propose_enable": {
+        const goalRef = args.goalRef as string | undefined;
+        const goalOutcome = resolveGoalForLifecycleAction(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
+
+        if (goalOutcome.status === "ambiguous") {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: describeAmbiguousGoalChoice(goalOutcome.goals),
+            result: goalOutcome.goals
+          };
+        }
+
+        if (goalOutcome.status === "no_match") {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: goalRef
+              ? `I don't see an active goal matching "${goalRef}", so I can't set up Gmail for it.`
+              : "I need to know which goal this is for — which one do you mean?"
+          };
+        }
+
+        const goal = goalOutcome.goals[0];
+        const suggestion = suggestGmailWatcherForGoal(goal);
+
+        if (!suggestion) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `I don't see an obvious email signal for "${goal.title}" — if there's something specific you'd like me to watch for in Gmail for this, tell me and I'll set it up.`
+          };
+        }
+
+        const connection = context.gmailConnection;
+        if (!connection || connection.status !== "active") {
+          const oauthUrl = gmailOAuthUrlForUser(userId);
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: [
+              `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary}, but Gmail isn't connected yet.`,
+              ...gmailOAuthActionLines("Connect Gmail here", oauthUrl),
+              "Once it's connected, ask again and I'll set this up."
+            ].join("\n")
+          };
+        }
+
+        // Already covered — either an explicit link, or (for the two built-ins) the same
+        // single-unambiguous-candidate read-time fallback resolveActiveGoalIdsForGmailRule uses
+        // everywhere else, so this never proposes a duplicate watcher for a goal a built-in rule
+        // already implicitly covers.
+        const alreadyCovered = context.gmailRules
+          .filter((rule) => rule.status === "active")
+          .find((rule) => rule.goalId === goal.id || resolveActiveGoalIdsForGmailRule(rule, context.activeGoals).has(goal.id));
+
+        if (alreadyCovered) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `I'm already using Gmail for "${goal.title}" (${alreadyCovered.name}). Say "what are you watching in Gmail?" to see the details.`,
+            entities: [gmailRuleToEntity(alreadyCovered)]
+          };
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary}. I won't send emails or change labels. Want me to enable that?`,
+          pendingOperationUpdate: {
+            topic: "gmail_goal_watcher",
+            summary: `enable Gmail support for "${goal.title}"`,
+            operations: [
+              {
+                tool: "gmail.goal_watcher.apply_enable",
+                args: {
+                  goalId: goal.id,
+                  goalTitle: goal.title,
+                  domain: suggestion.domain,
+                  label: suggestion.label,
+                  description: suggestion.description,
+                  builtInKind: suggestion.builtInKind ?? null
+                },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "gmail.goal_watcher.apply_enable": {
+        const goalId = args.goalId as string;
+        const goalTitle = args.goalTitle as string;
+        const domain = args.domain as string;
+        const label = args.label as string;
+        const description = args.description as string;
+        const builtInKind = args.builtInKind as "job_search" | "work_action" | null;
+
+        const connection = context.gmailConnection;
+        if (!connection || connection.status !== "active") {
+          return failed(operation.tool, "Gmail is not connected anymore, so I can't enable this.");
+        }
+
+        if (builtInKind) {
+          const result = await enableBuiltInGmailRuleForAgent(userId, builtInKind, context.activeGoals, goalId);
+          return {
+            tool: operation.tool,
+            status: result.changed ? "executed" : "skipped",
+            summary: result.changed
+              ? `Done — I'm now using Gmail readonly for "${goalTitle}". Matches go to review first (or auto-log for the clearest ones); I'll surface anything relevant.`
+              : result.summary,
+            result: result.rule
+          };
+        }
+
+        const existing = findExistingCustomGmailRule(await getEmailSignalRules(userId), label);
+        if (existing?.status === "active") {
+          return {
+            tool: operation.tool,
+            status: "skipped",
+            summary: `I'm already using Gmail for "${goalTitle}" (${existing.name}).`,
+            result: existing
+          };
+        }
+
+        const rule = await createEmailSignalRule(userId, {
+          connectionId: connection.id,
+          goalId,
+          adapterId: "custom_email_review",
+          name: label,
+          query: label,
+          fetchStrategy: "query",
+          lookbackDays: 30,
+          maxMessagesPerSync: 25,
+          maxEventsPerSync: 5,
+          classifierMode: "rules",
+          minAutoLogConfidence: 1,
+          minReviewConfidence: 0.65,
+          reviewBeforeLogging: true,
+          domain,
+          description,
+          notifyPolicy: "review_only",
+          createdBy: "user"
+        });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Done — I'm now using Gmail readonly for "${goalTitle}", watching for ${description} Matches go to review first — I'll never send email or change labels.`,
+          result: rule,
+          entities: [gmailRuleToEntity(rule)]
         };
       }
 
@@ -1818,12 +2096,21 @@ export async function executeOperation(
           ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
         ];
 
+        // Task 4 (refactor/private-alpha-goal-driven-gmail-operator — smart goal evolution): a
+        // real event was just logged for a goal-linked rule — if its signal isn't among the
+        // goal's OWN declared targetMetrics yet, offer to add it as a tracked signal, the same
+        // chained-confirmation mechanism goal.create_apply's dailyCoachingInterest/Gmail offers
+        // already use. Never silently changes the goal — only ever offered, and only when the
+        // signal genuinely isn't tracked yet.
+        const evolutionOffer = buildGoalTrackedSignalEvolutionOffer(result.event, result.emailReview, context);
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: result.message,
+          summary: evolutionOffer ? `${result.message}\n\n${evolutionOffer.summary}` : result.message,
           result: { emailReview: result.emailReview, event: result.event, actionItem: result.actionItem },
-          entities
+          entities,
+          ...(evolutionOffer?.pendingOperationUpdate ? { pendingOperationUpdate: evolutionOffer.pendingOperationUpdate } : {})
         };
       }
 
@@ -2140,13 +2427,25 @@ export async function executeOperation(
         // request already uses successfully — never a confirmation-shaped question with nothing
         // behind it. Only proposes the moment(s) actually still off; if both are already on, this
         // says so honestly and opens no pending operation at all.
+        // refactor/private-alpha-goal-driven-gmail-operator: goal-driven Gmail — a newly-created
+        // goal that's obviously email-relevant (job search, travel, insurance, car, bills/admin,
+        // work/client projects) gets offered Gmail support right here, the same chained-follow-up
+        // mechanism dailyCoachingInterest already uses below for morning/evening coaching. Only
+        // ever offered, never enabled silently; only when Gmail is connected AND nothing already
+        // covers this goal (an unrelated goal, or Gmail not connected, gets no offer at all — see
+        // buildGmailGoalWatcherOfferResult). dailyCoachingInterest's own chain takes priority when
+        // BOTH apply this turn, since only one pendingOperationUpdate can exist at a time — the
+        // Gmail offer still naturally comes up on the user's very next relevant turn instead
+        // (gmail.goal_watcher.propose_enable also answers a direct "use Gmail for this goal" ask).
         if (!dailyCoachingInterest) {
+          const gmailOffer = await buildGmailGoalWatcherOffer(userId, result.goal, context);
           return {
             tool: operation.tool,
             status: "executed",
-            summary: doneLine,
+            summary: gmailOffer ? `${doneLine}\n\n${gmailOffer.summary}` : doneLine,
             result: result.goal,
-            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)]
+            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)],
+            ...(gmailOffer?.pendingOperationUpdate ? { pendingOperationUpdate: gmailOffer.pendingOperationUpdate } : {})
           };
         }
 
@@ -2160,12 +2459,15 @@ export async function executeOperation(
         }
 
         if (toEnable.length === 0) {
+          const gmailOffer = await buildGmailGoalWatcherOffer(userId, result.goal, context);
+          const alreadyOnLine = `${doneLine} Morning/evening coaching is already on.`;
           return {
             tool: operation.tool,
             status: "executed",
-            summary: `${doneLine} Morning/evening coaching is already on.`,
+            summary: gmailOffer ? `${alreadyOnLine}\n\n${gmailOffer.summary}` : alreadyOnLine,
             result: result.goal,
-            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)]
+            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)],
+            ...(gmailOffer?.pendingOperationUpdate ? { pendingOperationUpdate: gmailOffer.pendingOperationUpdate } : {})
           };
         }
 
@@ -4040,23 +4342,13 @@ function formatGmailConnectionStatusForChat(
 ): string {
   const oauthUrl = gmailOAuthUrlForUser(userId);
   const activeRules = rules.filter((rule) => rule.status === "active");
-  const ruleLines = activeRules.length > 0
-    ? [
-        "",
-        "Active rules:",
-        ...activeRules.map((rule, index) => {
-          const linkedGoal = resolveLinkedGoalForDisplay(rule, activeGoals);
-          const rulePendingCount = pendingReviews.filter((review) => review.ruleId === rule.id).length;
-          return [
-            `${index + 1}. ${rule.name}`,
-            rule.domain ? ` (${rule.domain})` : "",
-            ` — ${gmailRuleTrackingPolicyLabel(rule)}`,
-            linkedGoal ? ` — linked to "${linkedGoal.title}"` : "",
-            rulePendingCount > 0 ? ` — ${rulePendingCount} pending review${rulePendingCount === 1 ? "" : "s"}` : ""
-          ].join("");
-        })
-      ]
-    : [];
+  // Task 7 (refactor/private-alpha-goal-driven-gmail-operator): the DEFAULT status is goal-first —
+  // "Gmail support: Job search goal: on — watches X", never a raw rule list ("1. Job search
+  // emails — review-first tracking") — a user should be able to tell what Alecto is doing for
+  // their goals without learning what a "rule" is. The full rule-level detail (name, domain,
+  // exact per-rule tracking policy) still exists, just moved to the explicit "show Gmail rules"
+  // advanced view (gmail.rule.list), unchanged by this.
+  const ruleLines = activeRules.length > 0 ? buildGoalFirstGmailSupportLines(activeRules, activeGoals, pendingReviews) : [];
   const highPriorityPendingCount = pendingReviews.filter((review) => review.priority === "high").length;
   const pendingReviewLine =
     activeRules.length > 0
@@ -4242,6 +4534,130 @@ export async function composeGmailGoalUsageStatusReply(
   };
 }
 
+/**
+ * refactor/private-alpha-goal-driven-gmail-operator: goal.create_apply's chained Gmail offer — the
+ * SAME suggestion/coverage logic as gmail.goal_watcher.propose_enable's own executor case (kept
+ * here rather than imported from there to avoid a case-to-case dependency; both stay in sync only
+ * because they're read from the SAME source of truth, suggestGmailWatcherForGoal). Returns
+ * undefined for any goal with no obvious email signal (Task 2 Rule E — never forces Gmail), and
+ * ALSO undefined when Gmail isn't connected (the offer would have nothing real to confirm yet —
+ * still worth a plain informational mention in that case, but not a pendingOperationUpdate, so
+ * this returns the mention as a `summary`-only result with no pendingOperationUpdate. Never
+ * returns anything for a goal a rule already covers.
+ */
+async function buildGmailGoalWatcherOffer(
+  userId: string,
+  goal: Goal,
+  context: ContextBundle
+): Promise<{ summary: string; pendingOperationUpdate?: ExecutedOperation["pendingOperationUpdate"] } | undefined> {
+  const suggestion = suggestGmailWatcherForGoal(goal);
+  if (!suggestion) {
+    return undefined;
+  }
+
+  const connection = context.gmailConnection;
+  if (!connection || connection.status !== "active") {
+    const oauthUrl = gmailOAuthUrlForUser(userId);
+    return {
+      summary: [
+        `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary} — connect Gmail and ask me to set it up whenever you're ready.`,
+        ...gmailOAuthActionLines("Connect Gmail here", oauthUrl)
+      ].join("\n")
+    };
+  }
+
+  const alreadyCovered = context.gmailRules
+    .filter((rule) => rule.status === "active")
+    .some((rule) => rule.goalId === goal.id || resolveActiveGoalIdsForGmailRule(rule, context.activeGoals).has(goal.id));
+  if (alreadyCovered) {
+    return undefined;
+  }
+
+  return {
+    summary: `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary}. I won't send emails or change labels. Want me to enable that?`,
+    pendingOperationUpdate: {
+      topic: "gmail_goal_watcher",
+      summary: `enable Gmail support for "${goal.title}"`,
+      operations: [
+        {
+          tool: "gmail.goal_watcher.apply_enable",
+          args: {
+            goalId: goal.id,
+            goalTitle: goal.title,
+            domain: suggestion.domain,
+            label: suggestion.label,
+            description: suggestion.description,
+            builtInKind: suggestion.builtInKind ?? null
+          },
+          status: "valid",
+          requiresConfirmation: false
+        }
+      ]
+    }
+  };
+}
+
+/**
+ * Task 4 (refactor/private-alpha-goal-driven-gmail-operator — smart goal evolution): called right
+ * after a Gmail review approval logs a real event — if that event's signal (a real eventType, or
+ * a custom signalKey) isn't among the linked goal's OWN declared targetMetrics, offers to add it,
+ * the same chained-pendingOperationUpdate pattern buildGmailGoalWatcherOffer uses. Returns
+ * undefined for: no event was created (approval didn't map to a real signal), the rule isn't
+ * linked to any goal, the goal no longer resolves, the event carries no identifiable signal, or —
+ * the common case — the goal already tracks this exact signal (an ordinary recruiter-reply
+ * approval for a job-search goal that already declares that metric never triggers this).
+ */
+function buildGoalTrackedSignalEvolutionOffer(
+  event: StoredEvent | null | undefined,
+  emailReview: EmailReviewItem,
+  context: ContextBundle
+): { summary: string; pendingOperationUpdate?: ExecutedOperation["pendingOperationUpdate"] } | undefined {
+  if (!event) {
+    return undefined;
+  }
+
+  const rule = context.gmailRules.find((candidate) => candidate.id === emailReview.ruleId);
+  if (!rule?.goalId) {
+    return undefined;
+  }
+
+  const goal = context.activeGoals.find((candidate) => candidate.id === rule.goalId);
+  if (!goal) {
+    return undefined;
+  }
+
+  const signalKey = typeof event.data.signalKey === "string" ? event.data.signalKey : undefined;
+  const eventType = event.type !== CUSTOM_SIGNAL_EVENT_TYPE ? event.type : undefined;
+  if (!eventType && !signalKey) {
+    return undefined;
+  }
+
+  const alreadyTracked = (goal.targetMetrics ?? []).some(
+    (metric) => (eventType && metric.eventType === eventType) || (signalKey && metric.signalKey === signalKey)
+  );
+  if (alreadyTracked) {
+    return undefined;
+  }
+
+  const label = eventType ? humanEmailReviewEventLabel(eventType) : (signalKey as string).replace(/_/g, " ");
+
+  return {
+    summary: `I found what looks like ${/^[aeiou]/i.test(label) ? "an" : "a"} ${label} — "${goal.title}" doesn't currently track this. Want me to add it as a tracked signal?`,
+    pendingOperationUpdate: {
+      topic: "goal_tracked_signal",
+      summary: `add ${label} as a tracked signal for "${goal.title}"`,
+      operations: [
+        {
+          tool: "goal.add_tracked_signal_apply",
+          args: { goalId: goal.id, goalTitle: goal.title, eventType: eventType ?? null, signalKey: signalKey ?? null, label, labelSingular: null },
+          status: "valid",
+          requiresConfirmation: false
+        }
+      ]
+    }
+  };
+}
+
 function noActiveGmailRulesForAgent(): string {
   return "Gmail is connected, but no email tracking rules are active. Say 'enable job search rule for Gmail', 'enable work action rule for Gmail', or 'track Endesa bills from Gmail'.";
 }
@@ -4408,6 +4824,54 @@ function gmailRuleTrackingPolicyLabel(rule: EmailSignalRule): string {
 function resolveLinkedGoalForDisplay(rule: EmailSignalRule, activeGoals: Goal[]): Goal | undefined {
   const goalId = [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0];
   return goalId ? activeGoals.find((goal) => goal.id === goalId) : undefined;
+}
+
+/** Task 7 (refactor/private-alpha-goal-driven-gmail-operator): what a rule actually watches for,
+ * in plain language — the built-ins reuse formatBuiltInGmailRuleEnabled's own exact wording (one
+ * source of truth for "what job_search_email/work_action_email watch"), a custom rule uses its
+ * own real `description` when present, falling back to its name only for a rule created before
+ * that field existed. */
+function gmailRuleWatchSummary(rule: EmailSignalRule): string {
+  if (rule.adapterId === "job_search_email") {
+    return "recruiter replies, application confirmations, interviews, offers, and rejections";
+  }
+  if (rule.adapterId === "work_action_email") {
+    return "work requests, deadlines, follow-ups, feedback requests, and blockers";
+  }
+  return rule.description || rule.name;
+}
+
+/**
+ * Task 7 (refactor/private-alpha-goal-driven-gmail-operator): groups active rules by the goal
+ * they're linked to (resolveLinkedGoalForDisplay — a stored goalId, or the same read-time
+ * single-candidate fallback used everywhere else) — a rule with no resolvable goal link falls
+ * into one shared "General Gmail watch" bucket rather than being silently dropped, so a plain
+ * custom rule (e.g. one created before any goal existed) still shows up honestly.
+ */
+function buildGoalFirstGmailSupportLines(activeRules: EmailSignalRule[], activeGoals: Goal[], pendingReviews: EmailReviewItem[]): string[] {
+  const groupOrder: string[] = [];
+  const groups = new Map<string, { label: string; rules: EmailSignalRule[] }>();
+
+  for (const rule of activeRules) {
+    const linkedGoal = resolveLinkedGoalForDisplay(rule, activeGoals);
+    const key = linkedGoal ? linkedGoal.id : "__general__";
+    const label = linkedGoal ? linkedGoal.title : "General Gmail watch";
+    if (!groups.has(key)) {
+      groups.set(key, { label, rules: [] });
+      groupOrder.push(key);
+    }
+    groups.get(key)!.rules.push(rule);
+  }
+
+  const lines = ["", "Gmail support:"];
+  for (const key of groupOrder) {
+    const group = groups.get(key)!;
+    const pendingCount = pendingReviews.filter((review) => group.rules.some((rule) => rule.id === review.ruleId)).length;
+    const watchSummary = [...new Set(group.rules.map((rule) => gmailRuleWatchSummary(rule)))].join("; ");
+    lines.push(`- ${group.label}: on — watches ${watchSummary}${pendingCount > 0 ? ` — ${pendingCount} pending review${pendingCount === 1 ? "" : "s"}` : ""}`);
+  }
+
+  return lines;
 }
 
 function formatBuiltInGmailRuleEnabled(rule: EmailSignalRule, linkedGoal?: Goal): string {

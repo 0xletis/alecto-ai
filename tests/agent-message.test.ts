@@ -638,11 +638,14 @@ test("agent/message: gmail.rule.list has no duplicated raw summary appended afte
   try {
     await seedGmailUser(userId);
     const connection = await prisma.integrationConnection.findFirstOrThrow({ where: { userId, integrationId: "gmail" } });
+    // reviewBeforeLogging: true matches what gmail.rule.create actually sets for every real
+    // custom_email_review rule — needed so gmailRuleTrackingPolicyLabel's real, accurate wording
+    // (used by both gmail.status and this advanced view) matches what this test expects.
     await prisma.emailSignalRule.create({
-      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Naturgy invoices", status: "active", createdBy: "user" }
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Naturgy invoices", status: "active", reviewBeforeLogging: true, createdBy: "user" }
     });
     await prisma.emailSignalRule.create({
-      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Endesa bills", status: "active", createdBy: "user" }
+      data: { userId, connectionId: connection.id, adapterId: "custom_email_review", name: "Endesa bills", status: "active", reviewBeforeLogging: true, createdBy: "user" }
     });
 
     mockPlan({
