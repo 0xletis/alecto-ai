@@ -2433,64 +2433,85 @@ export async function executeOperation(
         // mechanism dailyCoachingInterest already uses below for morning/evening coaching. Only
         // ever offered, never enabled silently; only when Gmail is connected AND nothing already
         // covers this goal (an unrelated goal, or Gmail not connected, gets no offer at all — see
-        // buildGmailGoalWatcherOfferResult). dailyCoachingInterest's own chain takes priority when
-        // BOTH apply this turn, since only one pendingOperationUpdate can exist at a time — the
-        // Gmail offer still naturally comes up on the user's very next relevant turn instead
-        // (gmail.goal_watcher.propose_enable also answers a direct "use Gmail for this goal" ask).
-        if (!dailyCoachingInterest) {
-          const gmailOffer = await buildGmailGoalWatcherOffer(userId, result.goal, context);
+        // buildGmailGoalWatcherOffer).
+        // feat/private-alpha-capability-proposal-queue: previously dailyCoachingInterest's own
+        // chain took priority whenever BOTH applied in the same turn, since only ONE
+        // pendingOperationUpdate could exist at a time — a goal that was both daily-coaching- and
+        // Gmail-relevant silently never got the Gmail offer that turn. Both are now collected into
+        // ONE combined proposal list; 0 proposals keeps today's plain doneLine (plus a Gmail
+        // connect mention when relevant), exactly 1 reuses that proposal's own EXISTING focused
+        // confirm copy/topic verbatim (no behavior change for the single-offer case), and 2+ are
+        // shown together as a numbered list under one new "capability_proposals" pendingOperation
+        // so a single "yes"/"both" confirms all of them (finalizeDeterministicConfirmation already
+        // executes every operation in a pendingOperation's array) and "only X"/"just X" confirms a
+        // named subset (runtime.ts's topic-scoped selective-confirm handling).
+        const proposals: CapabilityProposal[] = [];
+        let dailyAlreadyOnNote = "";
+        let gmailConnectSuggestionLine: string | undefined;
+
+        if (dailyCoachingInterest) {
+          const dailyProposal = await buildDailyCoachingProposal(userId);
+          if (dailyProposal) {
+            proposals.push(dailyProposal);
+          } else {
+            dailyAlreadyOnNote = " Morning/evening coaching is already on.";
+          }
+        }
+
+        const gmailOffer = await buildGmailGoalWatcherOffer(userId, result.goal, context);
+        if (gmailOffer?.kind === "offer") {
+          proposals.push(gmailOffer.proposal);
+        } else if (gmailOffer?.kind === "not_connected") {
+          gmailConnectSuggestionLine = gmailOffer.connectSuggestionLine;
+        }
+
+        const baseLine = `${doneLine}${dailyAlreadyOnNote}`;
+        const entities = [goalToEntity(result.goal), ...createdActions.map(actionToEntity)];
+
+        if (proposals.length === 0) {
           return {
             tool: operation.tool,
             status: "executed",
-            summary: gmailOffer ? `${doneLine}\n\n${gmailOffer.summary}` : doneLine,
+            summary: gmailConnectSuggestionLine ? `${baseLine}\n\n${gmailConnectSuggestionLine}` : baseLine,
             result: result.goal,
-            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)],
-            ...(gmailOffer?.pendingOperationUpdate ? { pendingOperationUpdate: gmailOffer.pendingOperationUpdate } : {})
+            entities
           };
         }
 
-        const settings = await getOrCreateNotificationSettings(userId);
-        const toEnable: string[] = [];
-        if (!settings.morningBriefEnabled) {
-          toEnable.push(`Morning brief at ${formatMinutesOfDay(settings.morningTimeMinutes)}`);
-        }
-        if (!settings.eveningCheckinEnabled) {
-          toEnable.push(`Evening check-in at ${formatMinutesOfDay(settings.eveningTimeMinutes)}`);
-        }
-
-        if (toEnable.length === 0) {
-          const gmailOffer = await buildGmailGoalWatcherOffer(userId, result.goal, context);
-          const alreadyOnLine = `${doneLine} Morning/evening coaching is already on.`;
+        if (proposals.length === 1) {
+          const only = proposals[0];
           return {
             tool: operation.tool,
             status: "executed",
-            summary: gmailOffer ? `${alreadyOnLine}\n\n${gmailOffer.summary}` : alreadyOnLine,
+            summary: `${baseLine}\n\n${only.standaloneSummary}`,
             result: result.goal,
-            entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)],
-            ...(gmailOffer?.pendingOperationUpdate ? { pendingOperationUpdate: gmailOffer.pendingOperationUpdate } : {})
+            entities,
+            pendingOperationUpdate: {
+              topic: only.pendingTopic,
+              summary: only.pendingSummary,
+              operations: [{ tool: only.tool, args: only.args, status: "valid", requiresConfirmation: false }]
+            }
           };
         }
 
+        const numberedList = proposals.map((p, index) => `${index + 1}. ${p.label}: ${p.numberedDescription}.`).join("\n");
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${doneLine}\n\nNext: you're about to turn on:\n${toEnable.map((line) => `- ${line}`).join("\n")}\n\nReply yes to confirm or cancel.`,
+          summary: `${baseLine}\n\nI can also help in ${proposals.length === 2 ? "two ways" : `${proposals.length} ways`}:\n${numberedList}\n\nWant me to enable both?`,
           result: result.goal,
-          entities: [goalToEntity(result.goal), ...createdActions.map(actionToEntity)],
+          entities,
           pendingOperationUpdate: {
-            topic: "proactive_settings",
-            summary: toEnable.map((line) => line.toLowerCase()).join(" and "),
-            operations: [
-              {
-                tool: "proactive.settings_apply_update",
-                args: {
-                  morningBriefEnabled: settings.morningBriefEnabled ? undefined : true,
-                  eveningCheckinEnabled: settings.eveningCheckinEnabled ? undefined : true
-                },
-                status: "valid",
-                requiresConfirmation: false
-              }
-            ]
+            topic: "capability_proposals",
+            summary: `enable ${proposals.map((p) => p.label.toLowerCase()).join(" and ")} for "${result.goal.title}"`,
+            operations: proposals.map((p) => ({
+              tool: p.tool,
+              args: p.args,
+              status: "valid",
+              requiresConfirmation: false,
+              proposalId: p.id,
+              proposalLabel: p.label
+            }))
           }
         };
       }
@@ -4535,21 +4556,44 @@ export async function composeGmailGoalUsageStatusReply(
 }
 
 /**
+ * feat/private-alpha-capability-proposal-queue: a single post-goal-creation follow-up capability
+ * that goal.create_apply can offer, pre-resolved to a real tool+args (Task 2 Rule: "the queue
+ * contains already-resolved safe operations, but nothing executes until confirmed" — never raw
+ * LLM prose). `numberedDescription` is the fragment used in the queue's numbered list ("2. Gmail
+ * support: {numberedDescription}."); `standaloneSummary` is the EXACT existing single-offer reply
+ * text, reused verbatim when this ends up being the only proposal this turn (Task 4: "if one
+ * proposal, use existing focused confirm copy").
+ */
+interface CapabilityProposal {
+  id: "daily_coaching" | "gmail_support";
+  label: string;
+  numberedDescription: string;
+  standaloneSummary: string;
+  pendingTopic: string;
+  pendingSummary: string;
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+type GmailGoalWatcherOfferResult =
+  | { kind: "not_connected"; connectSuggestionLine: string }
+  | { kind: "already_covered" }
+  | { kind: "offer"; proposal: CapabilityProposal }
+  | undefined;
+
+/**
  * refactor/private-alpha-goal-driven-gmail-operator: goal.create_apply's chained Gmail offer — the
  * SAME suggestion/coverage logic as gmail.goal_watcher.propose_enable's own executor case (kept
  * here rather than imported from there to avoid a case-to-case dependency; both stay in sync only
  * because they're read from the SAME source of truth, suggestGmailWatcherForGoal). Returns
- * undefined for any goal with no obvious email signal (Task 2 Rule E — never forces Gmail), and
- * ALSO undefined when Gmail isn't connected (the offer would have nothing real to confirm yet —
- * still worth a plain informational mention in that case, but not a pendingOperationUpdate, so
- * this returns the mention as a `summary`-only result with no pendingOperationUpdate. Never
- * returns anything for a goal a rule already covers.
+ * undefined for any goal with no obvious email signal (Task 2 Rule E — never forces Gmail).
+ * Returns `{ kind: "not_connected" }` (a plain informational mention, nothing pending) when Gmail
+ * isn't connected, and `{ kind: "already_covered" }` when a rule already covers this goal (Task 3
+ * Rule: never ask about Gmail twice) — feat/private-alpha-capability-proposal-queue's
+ * goal.create_apply reads the `kind` discriminant to decide whether this becomes a real queued
+ * proposal, a plain connect mention, or nothing at all.
  */
-async function buildGmailGoalWatcherOffer(
-  userId: string,
-  goal: Goal,
-  context: ContextBundle
-): Promise<{ summary: string; pendingOperationUpdate?: ExecutedOperation["pendingOperationUpdate"] } | undefined> {
+async function buildGmailGoalWatcherOffer(userId: string, goal: Goal, context: ContextBundle): Promise<GmailGoalWatcherOfferResult> {
   const suggestion = suggestGmailWatcherForGoal(goal);
   if (!suggestion) {
     return undefined;
@@ -4559,7 +4603,8 @@ async function buildGmailGoalWatcherOffer(
   if (!connection || connection.status !== "active") {
     const oauthUrl = gmailOAuthUrlForUser(userId);
     return {
-      summary: [
+      kind: "not_connected",
+      connectSuggestionLine: [
         `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary} — connect Gmail and ask me to set it up whenever you're ready.`,
         ...gmailOAuthActionLines("Connect Gmail here", oauthUrl)
       ].join("\n")
@@ -4570,29 +4615,63 @@ async function buildGmailGoalWatcherOffer(
     .filter((rule) => rule.status === "active")
     .some((rule) => rule.goalId === goal.id || resolveActiveGoalIdsForGmailRule(rule, context.activeGoals).has(goal.id));
   if (alreadyCovered) {
+    return { kind: "already_covered" };
+  }
+
+  return {
+    kind: "offer",
+    proposal: {
+      id: "gmail_support",
+      label: "Gmail support",
+      numberedDescription: `watch ${suggestion.watchSummary}`,
+      standaloneSummary: `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary}. I won't send emails or change labels. Want me to enable that?`,
+      pendingTopic: "gmail_goal_watcher",
+      pendingSummary: `enable Gmail support for "${goal.title}"`,
+      tool: "gmail.goal_watcher.apply_enable",
+      args: {
+        goalId: goal.id,
+        goalTitle: goal.title,
+        domain: suggestion.domain,
+        label: suggestion.label,
+        description: suggestion.description,
+        builtInKind: suggestion.builtInKind ?? null
+      }
+    }
+  };
+}
+
+/**
+ * feat/private-alpha-capability-proposal-queue: goal.create_apply's chained daily-coaching offer —
+ * the SAME morning-brief/evening-check-in-missing computation the pre-queue code inlined directly.
+ * Returns undefined when both are already on (Task 3 Rule: never ask about daily coaching twice).
+ */
+async function buildDailyCoachingProposal(userId: string): Promise<CapabilityProposal | undefined> {
+  const settings = await getOrCreateNotificationSettings(userId);
+  const toEnable: string[] = [];
+  const shortLabels: string[] = [];
+  if (!settings.morningBriefEnabled) {
+    toEnable.push(`Morning brief at ${formatMinutesOfDay(settings.morningTimeMinutes)}`);
+    shortLabels.push("morning brief");
+  }
+  if (!settings.eveningCheckinEnabled) {
+    toEnable.push(`Evening check-in at ${formatMinutesOfDay(settings.eveningTimeMinutes)}`);
+    shortLabels.push("evening check-in");
+  }
+  if (toEnable.length === 0) {
     return undefined;
   }
 
   return {
-    summary: `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary}. I won't send emails or change labels. Want me to enable that?`,
-    pendingOperationUpdate: {
-      topic: "gmail_goal_watcher",
-      summary: `enable Gmail support for "${goal.title}"`,
-      operations: [
-        {
-          tool: "gmail.goal_watcher.apply_enable",
-          args: {
-            goalId: goal.id,
-            goalTitle: goal.title,
-            domain: suggestion.domain,
-            label: suggestion.label,
-            description: suggestion.description,
-            builtInKind: suggestion.builtInKind ?? null
-          },
-          status: "valid",
-          requiresConfirmation: false
-        }
-      ]
+    id: "daily_coaching",
+    label: "Daily coaching",
+    numberedDescription: shortLabels.join(" and "),
+    standaloneSummary: `Next: you're about to turn on:\n${toEnable.map((line) => `- ${line}`).join("\n")}\n\nReply yes to confirm or cancel.`,
+    pendingTopic: "proactive_settings",
+    pendingSummary: toEnable.map((line) => line.toLowerCase()).join(" and "),
+    tool: "proactive.settings_apply_update",
+    args: {
+      morningBriefEnabled: settings.morningBriefEnabled ? undefined : true,
+      eveningCheckinEnabled: settings.eveningCheckinEnabled ? undefined : true
     }
   };
 }

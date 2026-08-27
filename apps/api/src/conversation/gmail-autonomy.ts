@@ -544,7 +544,15 @@ export function suggestGmailWatcherForGoal(goal: Goal): GmailGoalWatcherSuggesti
     };
   }
 
-  if (/\b(work|project|client|dashboard|coding|code|build|shipping|deep work|creative|startup|agency|freelance|trabajo|projecte|client)\b/.test(text)) {
+  // feat/private-alpha-capability-proposal-queue: a real-LLM eval run found "I want to work out 4
+  // times a week" matched this domain's own bare \bwork\b — "work out" contains "work" as a whole
+  // word too — and offered a work-project Gmail watcher for an unrelated fitness goal. Guarded the
+  // same way the finance domain above already guards against health/fitness terms winning a
+  // shared keyword by accident, so a fitness goal never gets a work-domain false positive.
+  if (
+    !/\b(health|strength|training|gym|workout|work out|sleep|energy|energia)\b/.test(text) &&
+    /\b(work|project|client|dashboard|coding|code|build|shipping|deep work|creative|startup|agency|freelance|trabajo|projecte|client)\b/.test(text)
+  ) {
     return {
       domain: "work",
       label: "Work action emails",

@@ -152,6 +152,12 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "gmail.review.to_action",
   "gmail.review.keep",
   "proactive.settings_apply_update",
+  // feat/private-alpha-capability-proposal-queue: goal.create_apply's combined capability-proposal
+  // confirmation can execute this alongside proactive.settings_apply_update in the SAME turn (e.g.
+  // "yes" to both a daily-coaching and a Gmail-support proposal) — both must land in the SAME
+  // bucket (groundTruthOnly, joined with "\n\n") or one silently drops, same reasoning as
+  // action.archive_all_apply/goal.archive_apply being bundled together below.
+  "gmail.goal_watcher.apply_enable",
   // A real-LLM eval run found the planner's pre-execution replyDraft claiming evidence "counted
   // toward" a goal even when this call fell back to the genuinely unlinked path — its own summary
   // is specifically written to state the truth about whether/what was linked, so that truth must
@@ -198,7 +204,8 @@ const HUMAN_ACTION: Record<string, string> = {
   "gmail.rule.apply_update": "update that Gmail rule",
   "gmail.autonomy.apply_update": "update Gmail's sync schedule",
   "daily_loop.settings_apply_update": "update your daily loop settings",
-  "proactive.settings_apply_update": "update your proactive message settings"
+  "proactive.settings_apply_update": "update your proactive message settings",
+  "gmail.goal_watcher.apply_enable": "enable Gmail support for that goal"
 };
 
 function humanAction(tool: string): string {

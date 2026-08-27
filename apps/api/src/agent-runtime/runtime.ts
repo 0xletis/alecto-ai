@@ -51,9 +51,40 @@ const CONFIRM_WHITELIST = new Set([
   "looks good",
   "save this review",
   "save the review",
-  "save it"
+  "save it",
+  // feat/private-alpha-capability-proposal-queue: a multi-proposal capability queue (e.g. daily
+  // coaching + Gmail support offered together) is confirmed in full the same way any other
+  // pending operation is — finalizeDeterministicConfirmation already executes every operation in
+  // pending.operations — so "both"/"enable both" (and the Spanish/Catalan equivalents) are just
+  // more ways of saying the same whole-message "yes" every other entry here already means.
+  "both",
+  "enable both",
+  "both please",
+  "ambos",
+  "los dos",
+  "las dos",
+  "tots dos",
+  "totes dues"
 ]);
-const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget it", "cancelar", "cancela"]);
+const CANCEL_WHITELIST = new Set([
+  "no",
+  "cancel",
+  "stop",
+  "never mind",
+  "forget it",
+  "cancelar",
+  "cancela",
+  // feat/private-alpha-capability-proposal-queue: "not now" and its Spanish/Catalan equivalents
+  // are a natural, unambiguous decline for a capability-proposal offer ("Want me to enable
+  // both?" / "not now") — safe as a universal cancel synonym for any pending operation, the same
+  // way "never mind"/"forget it" already are.
+  "not now",
+  "no ahora",
+  "ahora no",
+  "ara no",
+  "no per ara",
+  "cancel·la"
+]);
 
 // A real Telegram smoke test found "yes create it" rejected — only the bare CONFIRM_WHITELIST
 // phrases above matched, so a clear, unambiguous affirmative got no special handling and fell
@@ -79,8 +110,16 @@ const CANCEL_WHITELIST = new Set(["no", "cancel", "stop", "never mind", "forget 
 // whole proposal repeated back instead of confirming. Still end-to-end anchored either way, so
 // "okay proceed but change the target," "proceed with another goal," and "maybe proceed" all
 // correctly fail to match and fall through to the planner instead.
+//
+// feat/private-alpha-capability-proposal-queue: a real LLM eval run found "sí, ambos" — a natural
+// Spanish reply to a two-proposal capability queue — fell through to the planner instead of
+// confirming (the bare CONFIRM_WHITELIST "ambos" entry only matches a message that's JUST that
+// word, and "sí, ambos" isn't one of EXTENDED_CONFIRM_PHRASE_RE's own listed continuations
+// either). Added "both"/"ambos"/"los dos"/"las dos"/"tots dos"/"totes dues" as continuations here
+// too, so "sí, ambos"/"yes both"/"vale, los dos" all confirm deterministically the same way
+// "yes create it" already does.
 const EXTENDED_CONFIRM_PHRASE_RE =
-  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord|ok|okay)[\s,]*(create it|create this|create the goal|do it|go ahead|make it|make this|confirm this|proceed|cr[eé]alo|h[aá]zlo|crea-?ho|crea esto|crea aquest|crea aix[oò]|procede|endavant)?$|^(proceed|go ahead|adelante|endavant)$/i;
+  /^(yes|yep|yeah|y|s[ií]|vale|confirm[a]?|d['’]?acord|ok|okay)[\s,]*(create it|create this|create the goal|do it|go ahead|make it|make this|confirm this|proceed|cr[eé]alo|h[aá]zlo|crea-?ho|crea esto|crea aquest|crea aix[oò]|procede|endavant|both|enable both|ambos|los dos|las dos|tots dos|totes dues)?$|^(proceed|go ahead|adelante|endavant)$/i;
 
 function looksLikeExtendedConfirmPhrase(normalized: string): boolean {
   return EXTENDED_CONFIRM_PHRASE_RE.test(normalized);
@@ -120,6 +159,23 @@ function mostRecentTurnWasAMutation(session: AgentSessionState): AgentMutationRe
   }
   return previousAssistantMessage.text === mutation.summary ? mutation : undefined;
 }
+
+// feat/private-alpha-capability-proposal-queue: topic used by goal.create_apply's combined
+// post-goal capability offer (e.g. "1. Daily coaching: ... / 2. Gmail support: ..."). A bare
+// "yes"/"both" (CONFIRM_WHITELIST above) or "not now"/"cancel" (CANCEL_WHITELIST above) already
+// resolve the WHOLE queue via the generic paths below — this topic-scoped keyword map exists only
+// to recognize a SELECTIVE reply ("only Gmail", "just daily coaching", "solo Gmail", "només
+// coaching") and route it to finalizeCapabilityProposalSelection instead, which executes just the
+// named subset and reports the rest as skipped ("Daily coaching stays off."), never silently.
+// Deliberately hardcoded to these two known proposal kinds rather than a generic label matcher —
+// this is a small, focused queue for exactly daily coaching and Gmail support, not a general
+// system (see the task's own "Do NOT redesign the whole pendingOperation system" constraint).
+const CAPABILITY_PROPOSALS_TOPIC = "capability_proposals";
+const CAPABILITY_PROPOSAL_ONLY_QUALIFIER_RE = /\b(only|just|solo|sólo|només)\b/i;
+const CAPABILITY_PROPOSAL_KEYWORDS: Record<string, RegExp> = {
+  gmail_support: /\bgmail\b/i,
+  daily_coaching: /\b(coaching|daily coaching|morning brief|evening check-?in|check-?in)\b/i
+};
 
 // Marks session.pendingOperation as "an ambiguous action-completion clarification is open" —
 // there is nothing here to actually confirm, so the mutation firewall below (which exempts this
@@ -579,6 +635,22 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     }
     if (ACTION_DUPLICATE_CLEANUP_CONFIRM_RE.test(message)) {
       return finalizeDeterministicConfirmation(context, message);
+    }
+  }
+
+  // feat/private-alpha-capability-proposal-queue: a selective reply ("only Gmail", "just daily
+  // coaching") to a combined capability-proposal offer must apply exactly the named subset, never
+  // all of it and never none — checked before the generic CONFIRM_WHITELIST below so it isn't
+  // mistaken for a plain "yes" (which would confirm everything). Only fires when the message
+  // names exactly one of the two known proposal kinds; anything else (an unrecognized reply, both
+  // kinds named at once) falls through to the generic whitelist/planner/firewall below, which
+  // asks for clarification rather than guessing.
+  if (pending?.topic === CAPABILITY_PROPOSALS_TOPIC && CAPABILITY_PROPOSAL_ONLY_QUALIFIER_RE.test(message)) {
+    const matchingProposalIds = pending.operations
+      .filter((op) => op.proposalId && CAPABILITY_PROPOSAL_KEYWORDS[op.proposalId]?.test(message))
+      .map((op) => op.proposalId as string);
+    if (matchingProposalIds.length === 1) {
+      return finalizeCapabilityProposalSelection(context, message, matchingProposalIds);
     }
   }
 
@@ -2732,6 +2804,70 @@ async function finalizeDeterministicConfirmation(context: ContextBundle, message
   return finalize(context, {
     reply,
     operationsPlanned: pending.operations.map((op) => ({ tool: op.tool, args: op.args })),
+    executedOps,
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: brokenOps.length === 0,
+    topic: pending.topic,
+    planningTrace
+  });
+}
+
+/**
+ * feat/private-alpha-capability-proposal-queue: resolves a capability-proposal queue's SELECTIVE
+ * reply ("only Gmail", "just daily coaching") — the same revalidate/execute/apply-side-effects
+ * shape as finalizeDeterministicConfirmation, but scoped to just `selectedProposalIds` rather than
+ * every operation in pending.operations. The unselected proposal(s) are never executed and never
+ * re-offered (an explicit subset choice is a real answer, not a deferral) — named back to the user
+ * instead ("Daily coaching stays off.") so "yes" always means what it was last clearly asked about
+ * and nothing is silently dropped.
+ */
+async function finalizeCapabilityProposalSelection(
+  context: ContextBundle,
+  message: string,
+  selectedProposalIds: string[]
+): Promise<AgentMessageResponse> {
+  const { userId } = context.session;
+  const pending = context.session.pendingOperation as AgentPendingOperation;
+  const pendingOperationBefore = pending;
+  const visibleEntitiesBefore = context.session.visibleEntities;
+
+  const toRun = pending.operations.filter((op) => op.proposalId && selectedProposalIds.includes(op.proposalId));
+  const skipped = pending.operations.filter((op) => !(op.proposalId && selectedProposalIds.includes(op.proposalId)));
+
+  const revalidated = toRun.map((op) => revalidateForExecution(op));
+  const readyOps = revalidated.filter((op) => op.status === "valid");
+  const brokenOps = revalidated.filter((op) => op.status !== "valid");
+
+  const executedOps = await Promise.all(readyOps.map((op) => executeOperation(userId, op, context, `[confirmed] ${pending.summary}`)));
+  applyExecutionSideEffects(context.session, executedOps);
+  setPendingOperation(context.session, null);
+
+  const skippedNote = skipped.length > 0 ? skipped.map((op) => `${op.proposalLabel ?? op.tool} stays off.`).join(" ") : undefined;
+  const baseReply = composeReply({
+    replyDraft: "",
+    pendingConfirmationOps: [],
+    executedOps,
+    problemOps: brokenOps
+  });
+  const reply = [baseReply, skippedNote].filter(Boolean).join(" ");
+
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: undefined,
+      validatedOp: readyOps[0] ?? brokenOps[0],
+      executedOp: executedOps.find((op) => isPlanningTool(op.tool)),
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: inferComposerSource({ pendingConfirmationOps: [], executedOps, problemOps: brokenOps, replyDraft: "" })
+    },
+    context.session
+  );
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: toRun.map((op) => ({ tool: op.tool, args: op.args })),
     executedOps,
     plannerUsed: "none",
     llmPlannerAttempted: false,
