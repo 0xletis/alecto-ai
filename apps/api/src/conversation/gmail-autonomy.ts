@@ -454,6 +454,109 @@ export function gmailRecommendationKindForGoal(goal: Goal): GmailRuleKind | unde
   return undefined;
 }
 
+export interface GmailGoalWatcherSuggestion {
+  /** Coarse category — matches EmailSignalRule.domain's free-text convention (packages/db). */
+  domain: string;
+  /** Short human label, e.g. "Travel updates" — used as the rule's own name if created. */
+  label: string;
+  /** Fuller natural-language explanation fed to the generic LLM rule-matcher/gmail.rule.create's
+   * own `description` field when this suggestion becomes a custom_email_review rule. */
+  description: string;
+  /** The user-facing clause naming what will be watched, e.g. "flight changes, hotel
+   * confirmations, booking updates, and travel deadlines" — used in the proposal sentence. */
+  watchSummary: string;
+  /** Set only when this suggestion maps onto one of the two EXISTING built-in adapters
+   * (job_search_email/work_action_email) rather than a new custom_email_review rule — reuses
+   * gmail.rule.enable_builtin's own exact, already-tested behavior instead of duplicating it. */
+  builtInKind?: "job_search" | "work_action";
+}
+
+/**
+ * refactor/private-alpha-goal-driven-gmail-operator: the goal-driven counterpart to
+ * gmailRecommendationKindForGoal above — deliberately a SEPARATE function, not a replacement.
+ * gmailRecommendationKindForGoal (and buildGmailRuleProposal/gmail.status's passive "no rule yet"
+ * line built on it) stays exactly as it was, since real regression tests already lock in its
+ * current wording — this one is richer (real domain + description + watch-summary, not just a
+ * 4-way kind) and is used ONLY by the new goal-creation-time offer and the "use Gmail for this
+ * goal" standalone flow, where a fuller, more specific proposal sentence is the whole point. Both
+ * functions independently agree on job_search/work_action (same regex intent), so they can never
+ * visibly contradict each other for those two cases even though the code isn't shared.
+ */
+export function suggestGmailWatcherForGoal(goal: Goal): GmailGoalWatcherSuggestion | undefined {
+  if (goal.status !== "active") {
+    return undefined;
+  }
+
+  const text = normalizeText(`${goal.title} ${goal.category} ${goal.templateId ?? ""}`);
+
+  if (/\b(betting|gambling|trading|casino|impulsive betting|control betting)\b/.test(text)) {
+    return undefined;
+  }
+
+  if (/\b(job|career|developer|cv|resume|recruiter|interview|application|empleo|trabajo|feina|developer job)\b/.test(text)) {
+    return {
+      domain: "career",
+      label: "Job search emails",
+      description: "Recruiter replies, interview scheduling, job application confirmations, rejections, and offers.",
+      watchSummary: "recruiter replies, application confirmations, interviews, offers, and rejections",
+      builtInKind: "job_search"
+    };
+  }
+
+  if (/\b(travel|trip|vacation|holiday|flight|flights|airline|hotel|itinerary|viaje|viatge|vacances|vacaciones)\b/.test(text)) {
+    return {
+      domain: "travel",
+      label: "Travel updates",
+      description: "Flight delays, cancellations, gate or time changes, hotel booking confirmations, and other travel deadlines for any upcoming trip.",
+      watchSummary: "flight changes, hotel confirmations, booking updates, and travel deadlines"
+    };
+  }
+
+  if (/\b(insurance|policy|coverage|seguro|assegurança|poliza)\b/.test(text) && !/\b(health|salud|salut)\b/.test(text)) {
+    return {
+      domain: "insurance",
+      label: "Insurance updates",
+      description: "Insurance policy renewal notices, payment reminders, coverage changes, and policy documents.",
+      watchSummary: "insurance renewals, payment reminders, and policy updates"
+    };
+  }
+
+  if (/\b(car|vehicle|mechanic|garage|mot\b|itv\b|cotxe|coche)\b/.test(text) && !/\b(career|job)\b/.test(text)) {
+    return {
+      domain: "car",
+      label: "Car updates",
+      description: "Car/vehicle service appointments, repair estimates, garage updates, and related admin like insurance or fines.",
+      watchSummary: "service appointments, repair updates, and related admin"
+    };
+  }
+
+  if (
+    !/\b(health|strength|training|gym|workout|sleep|energy|energia)\b/.test(text) &&
+    /\b(bill|bills|expense|expenses|finance|utility|utilities|invoice|receipt|admin|tax|electricity|water|power|consumption|factura|facturas|recibo|recibos|luz|agua|aigua|endesa|aigues|consumo|despesa|despeses|subscription|subscriptions)\b/.test(
+      text
+    )
+  ) {
+    return {
+      domain: "finance",
+      label: "Bills and admin",
+      description: "Invoices, overdue-payment notices, receipts, and subscription renewals.",
+      watchSummary: "invoices, overdue notices, receipts, and subscription renewals"
+    };
+  }
+
+  if (/\b(work|project|client|dashboard|coding|code|build|shipping|deep work|creative|startup|agency|freelance|trabajo|projecte|client)\b/.test(text)) {
+    return {
+      domain: "work",
+      label: "Work action emails",
+      description: "Work/project requests, deadlines, follow-ups, feedback requests, and blockers that may need a decision.",
+      watchSummary: "work requests, deadlines, follow-ups, and blockers",
+      builtInKind: "work_action"
+    };
+  }
+
+  return undefined;
+}
+
 /**
  * fix/private-alpha-gmail-proactive-highsignal-and-goal-association: the built-in job-search rule
  * (enableBuiltInGmailRuleForAgent, executor.ts) is created for the CONNECTION, not for any one
@@ -466,11 +569,15 @@ export function gmailRecommendationKindForGoal(goal: Goal): GmailRuleKind | unde
  * never silently picking among ties.
  */
 export function resolveGoalForBuiltInGmailRuleLinking(kind: GmailRuleKind, activeGoals: Goal[], focusedGoalId?: string): Goal | undefined {
-  if (kind !== "job_search") {
+  // refactor/private-alpha-goal-driven-gmail-operator: was job_search-only — work_action never got
+  // auto-linked at all, even when a user EXPLICITLY named a work goal ("use Gmail for this goal"),
+  // since gmail.rule.enable_builtin's own goal-inference always returned undefined for it. Same
+  // single-unambiguous-candidate (or explicit focus) rule, just no longer restricted to one kind.
+  if (kind !== "job_search" && kind !== "work_action") {
     return undefined;
   }
 
-  const candidates = activeGoals.filter((goal) => gmailRecommendationKindForGoal(goal) === "job_search");
+  const candidates = activeGoals.filter((goal) => gmailRecommendationKindForGoal(goal) === kind);
   if (candidates.length === 0) {
     return undefined;
   }

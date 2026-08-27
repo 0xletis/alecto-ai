@@ -506,15 +506,26 @@ test("Task 10: gmail status shows domain, tracking policy, and per-rule pending 
       }
     });
 
+    // refactor/private-alpha-goal-driven-gmail-operator (Task 7): default "gmail status" is now
+    // goal-first, not a raw per-rule list — neither rule is linked to a goal here, so both fall
+    // into the shared "General Gmail watch" bucket rather than showing individual rule names.
     mockPlan({ topic: "gmail", intent: "status", operations: [op("gmail.status", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const status = await sendAgentMessage(server, userId, "gmail status");
 
-    assert.match(status.reply, /Job search emails \(career\)/);
-    assert.match(status.reply, /auto-logs clear signals, reviews the rest/, "job_search_email is not purely review-first - the status line must say so accurately");
-    assert.match(status.reply, /Flight changes \(travel\)/);
-    assert.match(status.reply, /review-first tracking/);
-    assert.match(status.reply, /1 pending review/);
+    assert.match(status.reply, /Gmail support:/);
+    assert.match(status.reply, /General Gmail watch: on/);
+    assert.doesNotMatch(status.reply, /Active rules:/, "the default status must never show the old raw rule list");
     assert.match(status.reply, /Pending reviews: 1 \(1 high priority\)/);
+
+    // The rich per-rule detail (domain, exact tracking policy, notifyPolicy) still exists, just
+    // moved to the explicit advanced view.
+    mockPlan({ topic: "gmail", intent: "show_rules", operations: [op("gmail.rule.list", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const rulesView = await sendAgentMessage(server, userId, "show Gmail rules");
+
+    assert.match(rulesView.reply, /Job search emails \(career\)/);
+    assert.match(rulesView.reply, /auto-logs clear signals, reviews the rest/, "job_search_email is not purely review-first - the advanced view must say so accurately");
+    assert.match(rulesView.reply, /Flight changes \(travel\)/);
+    assert.match(rulesView.reply, /review-first tracking/);
     assert.ok(jobRule.id && flightRule.id);
   } finally {
     clearAgentRuntimeMocks();

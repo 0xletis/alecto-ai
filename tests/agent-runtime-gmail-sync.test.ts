@@ -420,12 +420,17 @@ test("V3 Gmail status and rule list use the same active-rule source", async () =
       ]
     });
 
+    // refactor/private-alpha-goal-driven-gmail-operator (Task 7): default status is goal-first —
+    // neither rule here is goal-linked, so both fall into the shared "General Gmail watch" line;
+    // the work_action built-in shows its fixed watch-summary phrase, not its own literal name
+    // (that detail is what the advanced gmail.rule.list view below is for).
     const status = await sendAgentMessage(server, userId, "gmail status");
     assertNoGenericAgentError(status);
     assert.deepEqual(plannedTools(status), ["gmail.status"]);
     assert.match(status.reply, /Gmail is connected as rules@example\.com/i);
+    assert.match(status.reply, /General Gmail watch: on/i);
     assert.match(status.reply, /Endesa bills/);
-    assert.match(status.reply, /Work action emails/);
+    assert.match(status.reply, /work requests, deadlines, follow-ups, feedback requests, and blockers/i);
     assert.doesNotMatch(status.reply, /No email tracking rules are active yet/i);
     assert.doesNotMatch(status.reply, /Paused stale invoices/);
 
@@ -476,7 +481,9 @@ test("V3 Gmail status, sync, and built-in rule enablement share canonical expire
     assert.match(status.reply, /Naturgy invoices/);
     assert.match(status.reply, /Aigues de Barcelona invoices/);
     assert.match(status.reply, /Endesa bills/);
-    assert.match(status.reply, /Work action emails/);
+    // refactor/private-alpha-goal-driven-gmail-operator (Task 7): goal-first status shows the
+    // work_action built-in's fixed watch-summary phrase, not its own literal rule name.
+    assert.match(status.reply, /work requests, deadlines, follow-ups, feedback requests, and blockers/i);
 
     assertNoGenericAgentError(sync);
     assert.deepEqual(plannedTools(sync), ["gmail.sync"]);
@@ -543,7 +550,9 @@ test("Gmail OAuth reconnect preserves active rules for V3 status and sync", asyn
     assert.match(status.reply, /Naturgy invoices/);
     assert.match(status.reply, /Aigues de Barcelona invoices/);
     assert.match(status.reply, /Endesa bills/);
-    assert.match(status.reply, /Work action emails/);
+    // refactor/private-alpha-goal-driven-gmail-operator (Task 7): goal-first status shows the
+    // work_action built-in's fixed watch-summary phrase, not its own literal rule name.
+    assert.match(status.reply, /work requests, deadlines, follow-ups, feedback requests, and blockers/i);
     assert.doesNotMatch(status.reply, /authorization is expired|Reconnect Gmail here|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
 
     const sync = await sendAgentMessage(server, userId, "sync gmail");

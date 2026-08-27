@@ -10803,3 +10803,462 @@ test(
     }
   }
 );
+
+// --- Launch-readiness: goal-driven Gmail operator behavior (refactor/private-alpha-goal-driven-
+//     gmail-operator) - Gmail shifts from user-managed "rules" to something Alecto infers from
+//     the user's own goals, asks permission for, and quietly maintains - the user should never
+//     need to understand rule config, classifier modes, or notifyPolicy to get Gmail's help ------
+
+test(
+  "305. Creating a job-search goal makes Alecto propose Gmail support on its own, without the user asking",
+  { ...llmEvalOptions(["gmail-goal-watcher-proposals"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalwatcher-jobsearch-305-${randomUUID()}`;
+    const trace = new EvalTrace("305-goalwatcher-jobsearch", ["gmail-goal-watcher-proposals"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const propose = trace.record("I want to find a fully remote developer job", await sendAgentMessage(server, userId, "I want to find a fully remote developer job"));
+        assertNoGenericAgentError(propose, "propose job-search goal");
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm job-search goal");
+
+        trace.checkpoint("Alecto proactively offers Gmail support, unprompted, right after goal creation", /gmail/i.test(confirm.reply) && /readonly/i.test(confirm.reply), confirm.reply);
+        assert.match(confirm.reply, /gmail/i, `expected an unprompted Gmail offer after goal creation — got: ${confirm.reply}`);
+        assert.match(confirm.reply, /readonly/i);
+        trace.checkpoint("no rule/classifier-mode jargon leaks into the offer", !/classifier mode|sync mode|notifyPolicy/i.test(confirm.reply), confirm.reply);
+        assert.doesNotMatch(confirm.reply, /classifier mode|sync mode|notifyPolicy/i);
+
+        const enableConfirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(enableConfirm, "enable Gmail for job-search goal");
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("a real Gmail watcher was created and linked to the goal", Boolean(rule?.goalId), JSON.stringify(rule));
+        assert.ok(rule, "expected a real Gmail rule to exist after confirming");
+        assert.ok(rule!.goalId, "the rule must be linked to the goal that triggered the offer");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "306. Creating a travel goal makes Alecto propose Gmail support for flights/hotels, without the user asking",
+  { ...llmEvalOptions(["gmail-goal-watcher-proposals"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalwatcher-travel-306-${randomUUID()}`;
+    const trace = new EvalTrace("306-goalwatcher-travel", ["gmail-goal-watcher-proposals"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const propose = trace.record("I want to prepare for my trip to Japan", await sendAgentMessage(server, userId, "I want to prepare for my trip to Japan"));
+        assertNoGenericAgentError(propose, "propose travel goal");
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm travel goal");
+
+        trace.checkpoint("Alecto proactively offers Gmail support for travel signals", /gmail/i.test(confirm.reply) && /flight|hotel|travel|booking/i.test(confirm.reply), confirm.reply);
+        assert.match(confirm.reply, /gmail/i);
+        assert.match(confirm.reply, /flight|hotel|travel|booking/i);
+
+        const enableConfirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(enableConfirm, "enable Gmail for travel goal");
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("a real custom Gmail watcher (no job-search built-in fits travel) was created and linked", Boolean(rule?.goalId) && rule?.adapterId === "custom_email_review", JSON.stringify(rule));
+        assert.ok(rule);
+        assert.equal(rule!.adapterId, "custom_email_review");
+        assert.ok(rule!.goalId);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "307. Creating an insurance goal makes Alecto propose Gmail support for renewals/payments, without the user asking",
+  { ...llmEvalOptions(["gmail-goal-watcher-proposals"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalwatcher-insurance-307-${randomUUID()}`;
+    const trace = new EvalTrace("307-goalwatcher-insurance", ["gmail-goal-watcher-proposals"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const propose = trace.record("I want to sort out my car insurance", await sendAgentMessage(server, userId, "I want to sort out my car insurance"));
+        assertNoGenericAgentError(propose, "propose insurance goal");
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm insurance goal");
+
+        trace.checkpoint("Alecto proactively offers Gmail support for insurance signals", /gmail/i.test(confirm.reply) && /insuran|renewal|policy/i.test(confirm.reply), confirm.reply);
+        assert.match(confirm.reply, /gmail/i);
+        assert.match(confirm.reply, /insuran|renewal|policy/i);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "308. A real interview-scheduling email, approved for a goal that only tracks CVs/replies, proposes adding interviews as a tracked signal",
+  { ...llmEvalOptions(["gmail-smart-goal-evolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalevolution-interview-308-${randomUUID()}`;
+    const trace = new EvalTrace("308-goalevolution-interview", ["gmail-smart-goal-evolution"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-308-interview",
+        subject: "Let's schedule your interview",
+        from: "Acme Careers <careers@acme.example>",
+        body: "Great news - let's schedule an interview for the Backend Engineer role. Are you available next week?"
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job",
+        category: "career",
+        targetMetrics: [
+          { key: "applications_sent_weekly", label: "Applications sent", labelSingular: "Application sent", eventType: "career.application_sent", aggregation: "count", window: "weekly" },
+          { key: "recruiter_replies_weekly", label: "Recruiter replies", labelSingular: "Recruiter reply", eventType: "career.recruiter_reply_received", aggregation: "count", window: "weekly" }
+        ]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const enableReply = await sendAgentMessage(server, userId, "enable job search rule for Gmail");
+      assert.match(enableReply.reply, /job.search/i, "eval setup: the job-search rule must actually turn on");
+      await prisma.emailSignalRule.updateMany({ where: { userId, adapterId: "job_search_email" }, data: { goalId: goalResult.goal.id } });
+      await sendAgentMessage(server, userId, "sync Gmail");
+      await sendAgentMessage(server, userId, "what emails need my attention?");
+
+      await trace.guard(async () => {
+        const approve = trace.record("approve it", await sendAgentMessage(server, userId, "approve it"));
+        assertNoGenericAgentError(approve, "approve interview review for goal that doesn't track it");
+
+        trace.checkpoint("Alecto proposes adding the new signal, never changes the goal silently", /doesn't currently track|add.*tracked signal|track interviews/i.test(approve.reply), approve.reply);
+        assert.match(approve.reply, /doesn't currently track|add.*tracked signal|track interviews/i, `expected a smart-goal-evolution offer — got: ${approve.reply}`);
+
+        const goalBefore = await prisma.goal.findUniqueOrThrow({ where: { id: goalResult.goal.id } });
+        const metricsBefore = goalBefore.targetMetrics as Array<{ eventType?: string }>;
+        assert.ok(!metricsBefore.some((metric) => metric.eventType === "career.interview_scheduled"), "must not change the goal before confirmation");
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm adding interview signal");
+        const goalAfter = await prisma.goal.findUniqueOrThrow({ where: { id: goalResult.goal.id } });
+        const metricsAfter = goalAfter.targetMetrics as Array<{ eventType?: string }>;
+        trace.checkpoint("confirming actually adds the new tracked signal to the real goal", metricsAfter.some((metric) => metric.eventType === "career.interview_scheduled"), JSON.stringify(metricsAfter));
+        assert.ok(metricsAfter.some((metric) => metric.eventType === "career.interview_scheduled"));
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "309. A real recruiter-reply email lets 'what should I do next?' propose a real, confirmation-backed reply action",
+  { ...llmEvalOptions(["gmail-smart-action-proposals"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-actionproposal-recruiter-309-${randomUUID()}`;
+    const trace = new EvalTrace("309-actionproposal-recruiter", ["gmail-smart-action-proposals"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-309-recruiter",
+        subject: "Quick call about the backend role",
+        from: "Priya (Recruiter) <priya@realcompany.example>",
+        body: "Hi, I'm a recruiter from Real Company. Are you available for a quick call this week to discuss the Backend Engineer role?"
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const enableReply = await sendAgentMessage(server, userId, "enable job search rule for Gmail");
+      assert.match(enableReply.reply, /job.search/i, "eval setup: the job-search rule must actually turn on");
+      await sendAgentMessage(server, userId, "sync Gmail");
+
+      await trace.guard(async () => {
+        const reply = trace.record("what should I do next?", await sendAgentMessage(server, userId, "what should I do next?"));
+        assertNoGenericAgentError(reply, "next-action proposal from recruiter reply");
+        trace.checkpoint("proposes replying to the recruiter, grounded in the real email, confirmation-backed", /recruiter|reply|priya/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /recruiter|reply|priya/i, `expected a recruiter-reply-grounded suggestion — got: ${reply.reply}`);
+
+        const actionsBefore = await prisma.actionItem.count({ where: { userId } });
+        trace.checkpoint("no action was silently created just by asking what to do next", actionsBefore === 0, String(actionsBefore));
+        assert.equal(actionsBefore, 0, "a next-action suggestion must never silently create the action itself");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "310. A real flight-cancellation email can be turned into a real, source-linked action on explicit request",
+  { ...llmEvalOptions(["gmail-smart-action-proposals"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-actionproposal-flight-310-${randomUUID()}`;
+    const trace = new EvalTrace("310-actionproposal-flight", ["gmail-smart-action-proposals"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-310-flight",
+        subject: "Your flight has been cancelled",
+        from: "Iberia <noreply@iberia.example>",
+        body: "Your flight IB789 tomorrow has been cancelled. Please contact us to rebook or request a refund."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      await sendAgentMessage(server, userId, "watch my Gmail for flight changes and cancellations");
+      await sendAgentMessage(server, userId, "yes");
+      await sendAgentMessage(server, userId, "sync Gmail");
+      const review = await prisma.emailReviewItem.findFirst({ where: { userId, providerMessageId: "eval-310-flight" } });
+      assert.ok(review, "eval setup: the flight cancellation must actually reach review");
+      await sendAgentMessage(server, userId, "what emails need my attention?");
+
+      await trace.guard(async () => {
+        const reply = trace.record("turn the flight cancellation into a task", await sendAgentMessage(server, userId, "turn the flight cancellation into a task"));
+        assertNoGenericAgentError(reply, "flight cancellation to action");
+
+        const actionExecuted = reply.operationsExecuted.some((operation) => operation.tool === "gmail.review.to_action");
+        trace.checkpoint("a real action was created from the generic (non-career) review", actionExecuted, JSON.stringify(reply.operationsExecuted));
+        assert.ok(actionExecuted, `expected gmail.review.to_action to run — got: ${JSON.stringify(reply.operationsPlanned)}`);
+
+        const action = await prisma.actionItem.findFirst({ where: { userId, source: "email_review" } });
+        trace.checkpoint("the action is source-linked back to the Gmail review", Boolean(action?.sourceId), JSON.stringify(action));
+        assert.ok(action?.sourceId, "the action must be traceable back to its source Gmail review");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "311. Gmail connected but no watcher for a goal: Alecto says it isn't using Gmail for that goal yet, never claims it is",
+  { ...llmEvalOptions(["gmail-consent-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-consent-nowatcher-311-${randomUUID()}`;
+    const trace = new EvalTrace("311-consent-nowatcher", ["gmail-consent-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("do you use my email for this goal?", await sendAgentMessage(server, userId, "do you use my email for this goal?"));
+        assertNoGenericAgentError(reply, "consent-scope check with no watcher");
+        trace.checkpoint("honestly says Gmail is not in use for this goal yet, despite being connected", /^no|not (currently )?us(e|ing)|don't (currently )?use/i.test(reply.reply.trim()), reply.reply);
+        assert.match(reply.reply, /^no|not (currently )?us(e|ing)|don't (currently )?use/i, `expected an honest "not using Gmail for this yet" — got: ${reply.reply}`);
+        assert.equal(await prisma.emailReviewItem.count({ where: { userId } }), 0, "must never have scanned anything just from asking");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "312. 'Stop using Gmail for this goal' pauses the real linked watcher through a real confirmation, resolved by the goal itself",
+  { ...llmEvalOptions(["goal-driven-gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goaldriven-stop-312-${randomUUID()}`;
+    const trace = new EvalTrace("312-goaldriven-stop", ["goal-driven-gmail"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const rule = await prisma.emailSignalRule.create({
+        data: { userId, connectionId: connection.id, adapterId: "job_search_email", name: "Job search emails", goalId: goalResult.goal.id, status: "active", createdBy: "user" }
+      });
+
+      await trace.guard(async () => {
+        const propose = trace.record("stop using Gmail for my job search goal", await sendAgentMessage(server, userId, "stop using Gmail for my job search goal"));
+        assertNoGenericAgentError(propose, "propose stopping Gmail for the goal");
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirm stopping Gmail for the goal");
+
+        const updated = await prisma.emailSignalRule.findUniqueOrThrow({ where: { id: rule.id } });
+        trace.checkpoint("the real linked watcher was actually paused, resolved by the GOAL, no rule name/id needed from the user", updated.status === "paused", JSON.stringify(updated));
+        assert.equal(updated.status, "paused", `expected the goal-linked rule to be paused — got status: ${updated.status}`);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "313. Gmail status with multiple goals is goal-first, never a raw rule dump",
+  { ...llmEvalOptions(["gmail-goal-first-status"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goalfirst-status-313-${randomUUID()}`;
+    const trace = new EvalTrace("313-goalfirst-status", ["gmail-goal-first-status"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const jobGoal = await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
+      const travelGoal = await createGoal(userId, { title: "Prepare for my trip to Japan", category: "travel", priority: "medium" });
+      if (jobGoal.duplicate || travelGoal.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await prisma.emailSignalRule.create({
+        data: { userId, connectionId: connection.id, adapterId: "job_search_email", name: "Job search emails", goalId: jobGoal.goal.id, status: "active", createdBy: "user" }
+      });
+      await prisma.emailSignalRule.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          adapterId: "custom_email_review",
+          name: "Travel updates",
+          domain: "travel",
+          description: "Flight changes and travel updates",
+          goalId: travelGoal.goal.id,
+          status: "active",
+          createdBy: "user"
+        }
+      });
+
+      await trace.guard(async () => {
+        const reply = trace.record("gmail status", await sendAgentMessage(server, userId, "gmail status"));
+        assertNoGenericAgentError(reply, "goal-first status with multiple goals");
+        trace.checkpoint("status mentions both goals by name, goal-first", /Find a fully remote developer job/i.test(reply.reply) && /Prepare for my trip to Japan/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /Find a fully remote developer job/i);
+        assert.match(reply.reply, /Prepare for my trip to Japan/i);
+        trace.checkpoint("never dumps the raw 'Active rules:' rule-first format by default", !/^Active rules:/im.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /^Active rules:/im);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "314. Spanish: 'usa Gmail para este objetivo' enables Gmail support for the currently-focused goal",
+  { ...llmEvalOptions(["goal-driven-gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goaldriven-es-314-${randomUUID()}`;
+    const trace = new EvalTrace("314-goaldriven-es", ["goal-driven-gmail"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const goalReply = trace.record("quiero encontrar un trabajo remoto de desarrollador", await sendAgentMessage(server, userId, "quiero encontrar un trabajo remoto de desarrollador"));
+        assertNoGenericAgentError(goalReply, "Spanish goal creation");
+        const goalConfirm = trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+        assertNoGenericAgentError(goalConfirm, "Spanish goal confirmation");
+
+        const useGmail = trace.record("usa Gmail para este objetivo", await sendAgentMessage(server, userId, "usa Gmail para este objetivo"));
+        assertNoGenericAgentError(useGmail, "Spanish use-Gmail-for-goal request");
+        const confirm = trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+        assertNoGenericAgentError(confirm, "Spanish use-Gmail confirmation");
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("the Spanish request created a real, goal-linked Gmail watcher", Boolean(rule?.goalId), JSON.stringify(rule));
+        assert.ok(rule, "expected a real Gmail rule from the Spanish request");
+        assert.ok(rule!.goalId);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "315. Catalan: 'fes servir Gmail per aquest objectiu' enables Gmail support for the currently-focused goal",
+  { ...llmEvalOptions(["goal-driven-gmail"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goaldriven-ca-315-${randomUUID()}`;
+    const trace = new EvalTrace("315-goaldriven-ca", ["goal-driven-gmail"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const goalReply = trace.record("vull trobar una feina remota de desenvolupador", await sendAgentMessage(server, userId, "vull trobar una feina remota de desenvolupador"));
+        assertNoGenericAgentError(goalReply, "Catalan goal creation");
+        const goalConfirm = trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+        assertNoGenericAgentError(goalConfirm, "Catalan goal confirmation");
+
+        const useGmail = trace.record("fes servir Gmail per aquest objectiu", await sendAgentMessage(server, userId, "fes servir Gmail per aquest objectiu"));
+        assertNoGenericAgentError(useGmail, "Catalan use-Gmail-for-goal request");
+        const confirm = trace.record("sí", await sendAgentMessage(server, userId, "sí"));
+        assertNoGenericAgentError(confirm, "Catalan use-Gmail confirmation");
+
+        const rule = await prisma.emailSignalRule.findFirst({ where: { userId, status: "active" } });
+        trace.checkpoint("the Catalan request created a real, goal-linked Gmail watcher", Boolean(rule?.goalId), JSON.stringify(rule));
+        assert.ok(rule, "expected a real Gmail rule from the Catalan request");
+        assert.ok(rule!.goalId);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

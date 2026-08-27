@@ -502,13 +502,15 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.rule.propose_update",
     description:
-      "Propose pausing, resuming, or removing an existing Gmail tracking rule (built-in or custom) — resolves the target by name against the user's real rules (a fresh lookup; the user does not need to have listed rules first) and opens a pending confirmation. Use ONLY when the user clearly names a specific existing rule: 'turn off X', 'pause the X rule', 'resume X', 'delete/remove the X rule', 'stop tracking Endesa bills'. Never use this for a general Gmail-checking-frequency request that doesn't name a rule ('check Gmail every hour', 'review my emails every 1h', 'check email sync every 1h') — that always means gmail.autonomy.propose_update instead, even though both mention 'emails'/'review'. Does NOT support changing an existing rule's review/auto-log behavior — that's fixed when a rule is created and can't be changed afterward; if asked, explain that honestly instead of planning this.",
+      "Propose pausing, resuming, removing, muting, or unmuting an existing Gmail watcher (built-in or custom) — resolves the target by rule name OR by the goal it's linked to against the user's real rules (a fresh lookup; the user does not need to have listed rules first) and opens a pending confirmation. Use for: 'turn off X', 'pause the X rule', 'resume X', 'delete/remove the X rule', 'stop tracking Endesa bills' (pause/resume/archive); 'stop using Gmail for my job goal', 'stop using Gmail for this goal', 'pause Gmail support for travel', 'use Gmail again for insurance' (same pause/resume/archive operations, but `ref` is the GOAL's own name/wording instead of a rule name — resolves identically, never require the user to know rule terminology); 'make travel review-only', 'stop notifying me about flight emails', 'just put these in review', 'don't ping me about X, still log it' (operation 'mute' — matches still go to review, just never trigger a proactive nudge); 'notify me about X again', 'un-mute X' (operation 'unmute'). Never use this for a general Gmail-checking-frequency request that doesn't name a rule or goal ('check Gmail every hour', 'review my emails every 1h') — that always means gmail.autonomy.propose_update instead, even though both mention 'emails'/'review'. Does NOT support changing an existing rule's review/auto-log behavior — that's fixed when a rule is created and can't be changed afterward; if asked, explain that honestly instead of planning this.",
     mutates: false,
     requiresConfirmation: false,
     opensPendingProposal: true,
     argsSchema: z.object({
-      ref: z.string().min(1).describe("The rule's name or a distinctive part of it, exactly as the user referred to it (e.g. 'Endesa', 'Naturgy', 'job search'). Never invent an id."),
-      operation: z.enum(["pause", "resume", "archive"]).describe("archive means fully remove/delete the rule.")
+      ref: z.string().min(1).describe("The rule's name or a distinctive part of it (e.g. 'Endesa', 'Naturgy', 'job search'), OR the goal it's linked to (e.g. 'my job search goal', 'travel planning') — exactly as the user referred to it. Never invent an id."),
+      operation: z
+        .enum(["pause", "resume", "archive", "mute", "unmute"])
+        .describe("archive means fully remove/delete the rule. mute means stop proactive nudges for this rule's matches (they still go to review); unmute reverses that.")
     })
   },
   {
@@ -520,7 +522,37 @@ export const toolCatalog: ToolDefinition[] = [
     argsSchema: z.object({
       ruleId: z.string().min(1),
       ruleName: z.string().min(1),
-      operation: z.enum(["pause", "resume", "archive"])
+      operation: z.enum(["pause", "resume", "archive", "mute", "unmute"])
+    })
+  },
+  {
+    name: "gmail.goal_watcher.propose_enable",
+    description:
+      "The PRIMARY, goal-driven way to turn Gmail on for one goal — propose using Gmail readonly to watch for signals relevant to a specific active goal, e.g. 'use Gmail for my job search', 'watch my Gmail for this trip', 'can you use my email for the insurance goal', or right after a new goal is created for a goal that's obviously email-relevant (job search, travel, insurance, car/vehicle, bills/admin, work/client projects). Infers what to watch FROM the goal itself — the user never needs to describe rule config, keywords, domains, or classifier settings. If Gmail is not connected, says so and gives the connect link instead of proposing a watcher. If a watcher already covers this goal, says so instead of proposing a duplicate. If the goal has no obvious email signal (fitness, reading, a personal habit), says so honestly instead of forcing one — do not plan this tool for a goal like that just because the user asked broadly ('use Gmail more'); ask what specifically first. Opens a pending confirmation; never enables anything silently.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({
+      goalRef: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("The user's own wording for the goal, e.g. 'my job search', 'the Japan trip' — omit only when a single goal is unambiguously the current conversation focus.")
+    })
+  },
+  {
+    name: "gmail.goal_watcher.apply_enable",
+    description:
+      "Internal: creates the confirmed goal-linked Gmail watcher. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalId: z.string().min(1),
+      goalTitle: z.string().min(1),
+      domain: z.string().min(1),
+      label: z.string().min(1),
+      description: z.string().min(1),
+      builtInKind: z.enum(["job_search", "work_action"]).nullable().optional()
     })
   },
   {
@@ -629,6 +661,38 @@ export const toolCatalog: ToolDefinition[] = [
           "Defaults to 1. Set to the user's own explicit count, e.g. 'got 2 recruiter replies' -> 2, 'had 2 teas' -> 2, 'read 30 minutes' -> 30 — this is a plain count of whatever unit the signal is in (replies, cups, minutes, pages, ...), not capped to a handful."
         ),
       notes: z.string().optional().describe("Free-text detail actually stated by the user, e.g. a company name — never invented.")
+    })
+  },
+  {
+    name: "goal.add_tracked_signal_propose",
+    description:
+      "Propose adding a NEW signal to an active goal's own tracked metrics — for when a real, grounded event or Gmail review turned up a signal type this goal doesn't currently track (e.g. an interview email for a goal that only tracks CVs sent and recruiter replies). Never invents the signal; only ever proposed right after a real detected fact (a just-approved Gmail review, a just-logged event) that genuinely doesn't map to any of the goal's existing targetMetrics. Additive only — never removes or changes an existing tracked signal. Opens a pending confirmation; the goal's tracked signals never change silently.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({
+      goalId: z.string().min(1).describe("The real, already-known active goal's id — never invented, always copied from context (e.g. the goal a just-approved review is linked to)."),
+      goalTitle: z.string().min(1),
+      eventType: z.string().min(1).optional().describe("A real registered event type this new signal maps to, e.g. 'career.interview_scheduled'. Set this XOR signalKey, never both."),
+      signalKey: z.string().min(1).optional().describe("A custom per-goal signal key when there's no registered event type for this signal. Set this XOR eventType, never both."),
+      label: z.string().min(1).describe("Short human label for the new signal, e.g. 'interviews scheduled'."),
+      labelSingular: z.string().min(1).optional(),
+      reason: z.string().min(1).describe("The real, grounded fact that triggered this proposal, e.g. 'a real interview-scheduling email was found'.")
+    })
+  },
+  {
+    name: "goal.add_tracked_signal_apply",
+    description:
+      "Internal: adds the confirmed new tracked signal to the goal. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalId: z.string().min(1),
+      goalTitle: z.string().min(1),
+      eventType: z.string().min(1).nullable().optional(),
+      signalKey: z.string().min(1).nullable().optional(),
+      label: z.string().min(1),
+      labelSingular: z.string().min(1).nullable().optional()
     })
   },
   {

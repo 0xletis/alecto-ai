@@ -904,6 +904,39 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     };
   }
 
+  // Same reasoning again: gmail.goal_watcher.apply_enable is never planned by the LLM directly,
+  // only ever reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by gmail.goal_watcher.propose_enable. Its args (goalId/domain/label/
+  // description/builtInKind) are resolved by the propose step from the real goal and the goal->
+  // watcher suggestion mapping — a direct plan would have no real goal id to put there anyway.
+  if (tool.name === "gmail.goal_watcher.apply_enable") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending Gmail goal-watcher proposal",
+      rationale: operation.rationale
+    };
+  }
+
+  // Same reasoning again: goal.add_tracked_signal_apply is never planned by the LLM directly,
+  // only ever reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by goal.add_tracked_signal_propose (or the gmail.review.approve chain
+  // that opens the same proposal after a genuinely new signal is found). Its args are resolved
+  // from the real goal and the real detected signal — a direct plan would have no real goal id or
+  // grounded signal to put there anyway.
+  if (tool.name === "goal.add_tracked_signal_apply") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending tracked-signal proposal",
+      rationale: operation.rationale
+    };
+  }
+
   // Same reasoning again: goal.create_apply is never planned by the LLM directly, only ever
   // reached via the deterministic confirm whitelist re-executing an already-stored
   // pendingOperation set by goal.create_propose. This is the one place an LLM-proposed goal
