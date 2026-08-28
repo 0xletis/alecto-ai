@@ -1,4 +1,4 @@
-import type { NotificationSettings } from "@operator-agent/core";
+import { telegramChatIdFromUserId, type NotificationSettings } from "@operator-agent/core";
 import type { ContextBundle } from "../agent-runtime/types.js";
 import { formatMinutesOfDay } from "./daily-loop-settings.js";
 import {
@@ -100,6 +100,7 @@ export type ProactiveDeliveryStatus =
   | "user_not_allowlisted"
   | "user_not_opted_in"
   | "daily_loop_disabled"
+  | "missing_telegram_user_id"
   | "due_later_today"
   | "missed_no_record"
   | "duplicate_dedupe_key"
@@ -152,6 +153,18 @@ export function getProactiveDeliveryStatus(input: ProactiveDeliveryStatusInput):
     return "daily_loop_disabled";
   }
 
+  // fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: a real production incident —
+  // a fully opted-in tester (morningBriefEnabled/dailyLoopEnabled/timezone/morningTimeMinutes all
+  // correct) never received a single message because NotificationSettings.telegramUserId is only
+  // ever written by the legacy Telegram slash commands, never by this natural-chat opt-in path.
+  // The worker itself now falls back to deriving the chat id from userId (telegramChatIdFromUserId
+  // in @operator-agent/core), so this exact status is unreachable for any real Telegram user going
+  // forward — checked here anyway so this diagnosis can never again misreport this failure mode as
+  // "missed_no_record" (which actively pointed away from the real cause) if it somehow recurs.
+  if (!settings.telegramUserId && !telegramChatIdFromUserId(input.context.session.userId)) {
+    return "missing_telegram_user_id";
+  }
+
   // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: a real Telegram
   // transcript showed this reached at 10:54 for a 09:00 brief, with NOTHING actually blocking
   // delivery (every check above already passed) — the only honest remaining question is whether
@@ -190,6 +203,8 @@ const DIAGNOSIS_MESSAGE: Record<ProactiveDeliveryStatus, (time: string, allowlis
   // status now) — kept as an accurate defensive fallback rather than assumed impossible.
   daily_loop_disabled: (time) =>
     `Morning brief was skipped today. Reason: blocked — internal daily loop is off. It's on at ${time}; this should self-heal automatically — if you're still seeing this, say "turn on morning brief" again to repair it.`,
+  missing_telegram_user_id: (time) =>
+    `Morning brief was skipped today. Reason: no reachable Telegram chat found for your account. It's on at ${time}. This should be fixed automatically the next time it's due — if it happens again, message the bot once from Telegram and try again.`,
   due_later_today: (time) => `Morning brief is on and due today around ${time}.`,
   missed_no_record: (time) =>
     `Morning brief should have sent today around ${time}, but I don't see a sent record. Current status: eligible. Next due: tomorrow ${time}.`,
@@ -239,6 +254,7 @@ export type EveningCheckinDeliveryStatus =
   | "user_not_allowlisted"
   | "user_not_opted_in"
   | "daily_loop_disabled"
+  | "missing_telegram_user_id"
   | "due_later_today"
   | "missed_no_record"
   | "duplicate_dedupe_key"
@@ -280,6 +296,12 @@ export function getEveningCheckinDeliveryStatus(input: EveningCheckinDeliverySta
     return "daily_loop_disabled";
   }
 
+  // fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: mirrors the morning-brief
+  // check above — see its comment for the full root-cause writeup.
+  if (!settings.telegramUserId && !telegramChatIdFromUserId(input.context.session.userId)) {
+    return "missing_telegram_user_id";
+  }
+
   // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: same split as the
   // morning-brief version above — see its comment for the reasoning.
   const nowMinutes = minutesOfDayInTimezone(input.now, settings.timezone);
@@ -313,6 +335,8 @@ const EVENING_DIAGNOSIS_MESSAGE: Record<EveningCheckinDeliveryStatus, (time: str
   // status now) — kept as an accurate defensive fallback rather than assumed impossible.
   daily_loop_disabled: (time) =>
     `Evening check-in was skipped today. Reason: blocked — internal daily loop is off. It's on at ${time}; this should self-heal automatically — if you're still seeing this, say "turn on evening check-in" again to repair it.`,
+  missing_telegram_user_id: (time) =>
+    `Evening check-in was skipped today. Reason: no reachable Telegram chat found for your account. It's on at ${time}. This should be fixed automatically the next time it's due — if it happens again, message the bot once from Telegram and try again.`,
   due_later_today: (time) => `Evening check-in is on and due today around ${time}.`,
   missed_no_record: (time) =>
     `Evening check-in should have sent today around ${time}, but I don't see a sent record. Current status: eligible. Next due: tomorrow ${time}.`,
@@ -379,6 +403,8 @@ export function proactiveStatusBlockedClause(
       return { kind: "clause", text: "nothing grounded to send yet today" };
     case "legacy_daily_loop_sent_instead":
       return { kind: "clause", text: "today's message came from the legacy daily-loop system instead" };
+    case "missing_telegram_user_id":
+      return { kind: "clause", text: "no reachable Telegram chat found for your account" };
     default:
       // eligible / outside_..._window / duplicate_dedupe_key / user_not_opted_in — nothing is
       // actually blocking delivery; the caller shows next-due/last-sent instead of a clause.

@@ -8,6 +8,7 @@ import {
   type ActionItemReminderCandidate
 } from "@operator-agent/db";
 import { buildOpenActionCommandFooter, formatOverdueSinceLabelForChat } from "@operator-agent/core";
+import { telegramChatIdFromUserId } from "./telegram-chat-id.js";
 
 /**
  * Real Telegram smoke test flagged the old per-action reminder as "too robotic for V3/private
@@ -138,9 +139,4 @@ async function persistVisibleEntitiesForActionReminders(userId: string, candidat
     // v3-proactive-delivery.ts's persistVisibleEntitiesForDeliveredNudge for why.
     expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000)
   });
-}
-
-function telegramChatIdFromUserId(userId: string): string | undefined {
-  const match = userId.match(/^telegram:(\d+)$/);
-  return match?.[1];
 }

@@ -137,7 +137,7 @@ test("2A: status says 'on' with real eligibility info, not just the raw setting"
   const previous = process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
   process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = "true";
   try {
-    await seedMadridUser(userId);
+    await seedMadridUser(userId, { telegramUserId: "999000020" });
     await createGoal(userId, { title: "Find a fully remote developer job", category: "career", priority: "medium" });
     await enableMorningBrief(server, userId);
 
@@ -161,7 +161,7 @@ test("2B: status includes next due / last sent", async () => {
   const previous = process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
   process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = "true";
   try {
-    await seedMadridUser(userId);
+    await seedMadridUser(userId, { telegramUserId: "999000021" });
     await enableEveningCheckin(server, userId);
 
     mockPlan({ topic: "settings", intent: "show", operations: [op("proactive.settings_show", {})], needsClarification: false, clarificationQuestion: null, replyDraft: "" });

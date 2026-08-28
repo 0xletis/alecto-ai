@@ -1,6 +1,7 @@
 import { createNotificationLog, hasNotificationLog } from "@operator-agent/db";
 import { proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay } from "./datetime.js";
+import { telegramChatIdFromUserId } from "./telegram-chat-id.js";
 import type { V3ProactiveNotificationSettingsLike } from "./v3-proactive-delivery.js";
 
 /**
@@ -53,14 +54,24 @@ export async function runLegacyDailyLoopEveningReviews(
   const v3IsAllowed = options.v3IsAllowed ?? proactiveOperatorAllowlistFromEnv();
   const logger = options.logger ?? console;
 
-  for (const item of settings) {
-    if (!item.telegramUserId || !item.dailyLoopEnabled) {
+  for (const rawItem of settings) {
+    if (!rawItem.dailyLoopEnabled) {
       continue;
     }
 
-    if (formatMinutesOfDay(item.eveningTimeMinutes) !== formatLocalTime(now, item.timezone)) {
+    if (formatMinutesOfDay(rawItem.eveningTimeMinutes) !== formatLocalTime(now, rawItem.timezone)) {
       continue;
     }
+
+    // fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: telegramUserId is only
+    // ever written by the legacy slash commands — falls back to deriving it from the userId
+    // itself (see telegram-chat-id.ts), the same fix v3-proactive-delivery.ts's own senders got.
+    const chatId = rawItem.telegramUserId ?? telegramChatIdFromUserId(rawItem.userId);
+    if (!chatId) {
+      logger.log(`Legacy daily-loop evening review: time matched for ${rawItem.userId} but there's no resolvable Telegram chat id — skipping.`);
+      continue;
+    }
+    const item = { ...rawItem, telegramUserId: chatId };
 
     if (item.eveningCheckinEnabled && v3DeliveryEnabled && v3IsAllowed(item.userId)) {
       logger.log(`Skipping legacy daily-loop evening review for ${item.userId}: V3 proactive evening check-in owns delivery for this user.`);
