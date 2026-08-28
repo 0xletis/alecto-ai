@@ -166,6 +166,16 @@ export interface ValidatedOperation {
    * for goal X" even though the setting itself is technically global.
    */
   proposalGoalId?: string;
+  /**
+   * fix/private-alpha-goal-restore-ambiguity-resolution: set only on operations inside a
+   * "restore_goal_disambiguation" pendingOperation (goal.restore_propose's own ambiguous-match
+   * offer, e.g. several archived goals sharing a similar or identical title) — ISO timestamps
+   * carried alongside proposalIndex (reused here for numbered selection, "only 1"/"the first one")
+   * so a reply can disambiguate by recency ("the latest archived one", "the one created today")
+   * without a second DB round-trip to look the candidate back up. Absent on every other topic.
+   */
+  candidateCreatedAt?: string;
+  candidateArchivedAt?: string | null;
 }
 
 export interface ExecutedOperation {

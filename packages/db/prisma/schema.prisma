@@ -44,6 +44,12 @@ model Goal {
   checkInConfig Json?
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
+  // fix/private-alpha-goal-restore-ambiguity-resolution: when this goal was archived — set by
+  // setGoalStatus on every transition TO "archived", cleared on every transition away from it.
+  // Mirrors Event.archivedAt below; needed so goal.restore_propose's recency disambiguation
+  // ("latest archived", "archived today") has a real, precise timestamp to sort/filter on rather
+  // than the much noisier updatedAt (bumped by any field write, not just archiving).
+  archivedAt    DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 

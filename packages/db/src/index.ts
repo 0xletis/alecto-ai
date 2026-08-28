@@ -464,9 +464,12 @@ export async function archiveGoal(userId: string, goalId: string): Promise<Goal 
     return undefined;
   }
 
+  // fix/private-alpha-goal-restore-ambiguity-resolution: kept in sync with setGoalStatus's own
+  // archivedAt write below, so a goal archived through this legacy REST path is just as findable
+  // by goal.restore_propose's recency disambiguation as one archived through the chat flow.
   const goal = await prisma.goal.update({
     where: { id: goalId },
-    data: { status: "archived" }
+    data: { status: "archived", archivedAt: new Date() }
   });
 
   return toGoal(goal);
@@ -490,9 +493,13 @@ export async function setGoalStatus(userId: string, goalId: string, status: Goal
     return undefined;
   }
 
+  // fix/private-alpha-goal-restore-ambiguity-resolution: archivedAt is set fresh on every
+  // transition INTO "archived" (never reused from a prior archive/restore cycle) and cleared on
+  // every transition away from it — restoring, then re-archiving later, must get a NEW timestamp,
+  // not the original one, or "latest archived" disambiguation would silently go stale.
   const goal = await prisma.goal.update({
     where: { id: goalId },
-    data: { status }
+    data: { status, archivedAt: status === "archived" ? new Date() : null }
   });
 
   return toGoal(goal);
@@ -3044,7 +3051,8 @@ function toGoal(goal: Prisma.GoalGetPayload<object>): Goal {
     targetMetrics: parseGoalMetrics(goal.targetMetrics),
     checkInConfig: parseGoalCheckInQuestions(goal.checkInConfig),
     createdAt: goal.createdAt,
-    updatedAt: goal.updatedAt
+    updatedAt: goal.updatedAt,
+    archivedAt: goal.archivedAt ?? undefined
   };
 }
 

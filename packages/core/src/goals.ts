@@ -55,7 +55,16 @@ export const GoalSchema = z.object({
   targetMetrics: z.array(GoalMetricSchema).optional(),
   checkInConfig: z.array(GoalCheckInQuestionSchema).optional(),
   createdAt: z.coerce.date(),
-  updatedAt: z.coerce.date()
+  updatedAt: z.coerce.date(),
+  /**
+   * fix/private-alpha-goal-restore-ambiguity-resolution: when this goal was archived — set fresh
+   * by setGoalStatus whenever status transitions TO "archived", cleared whenever it transitions
+   * AWAY from "archived" (restored or paused). A dedicated column rather than reusing `updatedAt`
+   * (which any other field write would also bump, making it an unreliable proxy for "archived
+   * at") — mirrors the same real, explicit archivedAt column the Event model already has for the
+   * identical reason. Undefined for a goal that's never been archived.
+   */
+  archivedAt: z.coerce.date().nullable().optional()
 });
 
 export const CreateGoalInputSchema = z.object({
