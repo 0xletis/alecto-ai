@@ -1,6 +1,7 @@
 import { createNotificationLog, getAgentConversationSession, selfHealDailyLoopEnabled, upsertAgentConversationSession } from "@operator-agent/db";
 import { proactiveOperatorAllowlistFromEnv, proactiveOperatorDeliveryEnabledFromEnv } from "@operator-agent/core";
 import { formatLocalDate, formatLocalTime, formatMinutesOfDay } from "./datetime.js";
+import { telegramChatIdFromUserId } from "./telegram-chat-id.js";
 
 /**
  * Real-delivery path for Agent Runtime v3's Proactive Operator MVP
@@ -72,6 +73,40 @@ export interface V3ProactiveDeliveryOptions {
 
 export type V3ProactiveMorningBriefOptions = V3ProactiveDeliveryOptions;
 
+/**
+ * fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise (task 6 — worker observability):
+ * a compact, per-tick summary for runV3ProactiveMorningBriefs/runV3ProactiveEveningCheckins —
+ * "due" counts only users whose exact-minute schedule matched THIS tick (the small subset that
+ * reaches the "only log from here on" point below), not the whole opted-in population, so the
+ * numbers stay meaningful at a glance rather than restating settings.length every minute.
+ */
+export interface V3ProactiveTickSummary {
+  due: number;
+  sent: number;
+  skipped: number;
+  skippedReasons: Record<string, number>;
+  errors: number;
+}
+
+function emptyTickSummary(): V3ProactiveTickSummary {
+  return { due: 0, sent: 0, skipped: 0, skippedReasons: {}, errors: 0 };
+}
+
+function recordSkip(summary: V3ProactiveTickSummary, reason: string): void {
+  summary.skipped += 1;
+  summary.skippedReasons[reason] = (summary.skippedReasons[reason] ?? 0) + 1;
+}
+
+function applyDeliveryResult(summary: V3ProactiveTickSummary, result: V3ProactiveDeliveryResult): void {
+  if (result.status === "sent") {
+    summary.sent += 1;
+  } else if (result.status === "preview_failed" || result.status === "send_failed" || result.status === "session_failed") {
+    summary.errors += 1;
+  } else {
+    recordSkip(summary, result.reason);
+  }
+}
+
 interface ProactiveDecisionResponse {
   decision:
     | { decision: "no_message"; reason: string }
@@ -90,26 +125,50 @@ interface ProactiveDecisionResponse {
   };
 }
 
-export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificationSettingsLike[], options: V3ProactiveDeliveryOptions): Promise<void> {
+/**
+ * fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: NotificationSettings.
+ * telegramUserId is ONLY ever written by the legacy Telegram slash commands — a user who opts in
+ * through natural chat (proactive.settings_apply_update) gets a fully-configured row with this
+ * field null, and every sender below used to gate purely on it being set, silently `continue`ing
+ * forever with no log line and no NotificationLog row. Falling back to deriving it from the
+ * userId itself (the same fallback action-reminders.ts already had) closes that gap; returns the
+ * item unchanged (still carrying whatever real telegramUserId it had) when a chat id resolves.
+ */
+function resolveTelegramChatId(item: V3ProactiveNotificationSettingsLike): V3ProactiveNotificationSettingsLike | undefined {
+  const chatId = item.telegramUserId ?? telegramChatIdFromUserId(item.userId);
+  return chatId ? { ...item, telegramUserId: chatId } : undefined;
+}
+
+export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificationSettingsLike[], options: V3ProactiveDeliveryOptions): Promise<V3ProactiveTickSummary> {
   const now = options.now ?? new Date();
   const deliveryEnabled = options.deliveryEnabled ?? proactiveOperatorDeliveryEnabledFromEnv();
   const isAllowed = options.isAllowed ?? proactiveOperatorAllowlistFromEnv();
   const logger = options.logger ?? console;
+  const summary = emptyTickSummary();
 
   if (!deliveryEnabled) {
     logger.log("V3 proactive morning brief: PROACTIVE_OPERATOR_DELIVERY_ENABLED is not \"true\" in this process — skipping for every user this tick.");
-    return;
+    return summary;
   }
 
-  for (const item of settings) {
-    if (!item.telegramUserId || !item.morningBriefEnabled) {
+  for (const rawItem of settings) {
+    if (!rawItem.morningBriefEnabled) {
       continue;
     }
 
     // Only log from here on — this is the exact minute this user's morning brief was scheduled
     // for, the one moment a silent skip is actually worth surfacing. Every other tick/user
     // combination is normal and would be pure noise if logged.
-    if (formatMinutesOfDay(item.morningTimeMinutes) !== formatLocalTime(now, item.timezone)) {
+    if (formatMinutesOfDay(rawItem.morningTimeMinutes) !== formatLocalTime(now, rawItem.timezone)) {
+      continue;
+    }
+
+    summary.due += 1;
+
+    const item = resolveTelegramChatId(rawItem);
+    if (!item) {
+      logger.log(`V3 proactive morning brief: time matched for ${rawItem.userId} but there's no resolvable Telegram chat id — skipping.`);
+      recordSkip(summary, "missing_telegram_user_id");
       continue;
     }
 
@@ -122,16 +181,21 @@ export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificat
     const healedItem = await selfHealDailyLoopEnabled(item);
     if (!healedItem.dailyLoopEnabled) {
       logger.log(`V3 proactive morning brief: time matched for ${item.userId} but dailyLoopEnabled is false — skipping.`);
+      recordSkip(summary, "daily_loop_disabled");
       continue;
     }
 
     if (!isAllowed(healedItem.userId)) {
       logger.log(`V3 proactive morning brief: time matched for ${item.userId} but they are not in PROACTIVE_OPERATOR_ALLOWLIST — skipping.`);
+      recordSkip(summary, "not_allowlisted");
       continue;
     }
 
-    await maybeSendV3ProactiveDecision(healedItem, "morning_brief", now, options.apiGet, options.sendTelegramMessage, logger);
+    const result = await maybeSendV3ProactiveDecision(healedItem, "morning_brief", now, options.apiGet, options.sendTelegramMessage, logger);
+    applyDeliveryResult(summary, result);
   }
+
+  return summary;
 }
 
 /**
@@ -142,25 +206,35 @@ export async function runV3ProactiveMorningBriefs(settings: V3ProactiveNotificat
  * decideProactiveOperatorMessage's buildEveningCheckin — this function only decides WHETHER to
  * ask for that decision and send it, never what to say.
  */
-export async function runV3ProactiveEveningCheckins(settings: V3ProactiveNotificationSettingsLike[], options: V3ProactiveDeliveryOptions): Promise<void> {
+export async function runV3ProactiveEveningCheckins(settings: V3ProactiveNotificationSettingsLike[], options: V3ProactiveDeliveryOptions): Promise<V3ProactiveTickSummary> {
   const now = options.now ?? new Date();
   const deliveryEnabled = options.deliveryEnabled ?? proactiveOperatorDeliveryEnabledFromEnv();
   const isAllowed = options.isAllowed ?? proactiveOperatorAllowlistFromEnv();
   const logger = options.logger ?? console;
+  const summary = emptyTickSummary();
 
   if (!deliveryEnabled) {
     logger.log("V3 proactive evening check-in: PROACTIVE_OPERATOR_DELIVERY_ENABLED is not \"true\" in this process — skipping for every user this tick.");
-    return;
+    return summary;
   }
 
-  for (const item of settings) {
-    if (!item.telegramUserId || !item.eveningCheckinEnabled) {
+  for (const rawItem of settings) {
+    if (!rawItem.eveningCheckinEnabled) {
       continue;
     }
 
     // Only log from here on — this is the exact minute this user's evening check-in was
     // scheduled for, the one moment a silent skip is actually worth surfacing.
-    if (formatMinutesOfDay(item.eveningTimeMinutes) !== formatLocalTime(now, item.timezone)) {
+    if (formatMinutesOfDay(rawItem.eveningTimeMinutes) !== formatLocalTime(now, rawItem.timezone)) {
+      continue;
+    }
+
+    summary.due += 1;
+
+    const item = resolveTelegramChatId(rawItem);
+    if (!item) {
+      logger.log(`V3 proactive evening check-in: time matched for ${rawItem.userId} but there's no resolvable Telegram chat id — skipping.`);
+      recordSkip(summary, "missing_telegram_user_id");
       continue;
     }
 
@@ -172,16 +246,21 @@ export async function runV3ProactiveEveningCheckins(settings: V3ProactiveNotific
     const healedItem = await selfHealDailyLoopEnabled(item);
     if (!healedItem.dailyLoopEnabled) {
       logger.log(`V3 proactive evening check-in: time matched for ${item.userId} but dailyLoopEnabled is false — skipping.`);
+      recordSkip(summary, "daily_loop_disabled");
       continue;
     }
 
     if (!isAllowed(healedItem.userId)) {
       logger.log(`V3 proactive evening check-in: time matched for ${item.userId} but they are not in PROACTIVE_OPERATOR_ALLOWLIST — skipping.`);
+      recordSkip(summary, "not_allowlisted");
       continue;
     }
 
-    await maybeSendV3ProactiveDecision(healedItem, "evening_checkin", now, options.apiGet, options.sendTelegramMessage, logger);
+    const result = await maybeSendV3ProactiveDecision(healedItem, "evening_checkin", now, options.apiGet, options.sendTelegramMessage, logger);
+    applyDeliveryResult(summary, result);
   }
+
+  return summary;
 }
 
 export interface V3ProactiveDeliveryResult {
@@ -212,9 +291,10 @@ export async function runV3ProactiveGmailNudges(
     return settings.map((item) => ({ type: "gmail_nudge", userId: item.userId, status: "skipped", reason: "delivery_disabled" }));
   }
 
-  for (const item of settings) {
-    if (!item.telegramUserId) {
-      results.push({ type: "gmail_nudge", userId: item.userId, status: "skipped", reason: "missing_telegram_user_id" });
+  for (const rawItem of settings) {
+    const item = resolveTelegramChatId(rawItem);
+    if (!item) {
+      results.push({ type: "gmail_nudge", userId: rawItem.userId, status: "skipped", reason: "missing_telegram_user_id" });
       continue;
     }
     if (!item.dailyLoopEnabled) {

@@ -201,7 +201,7 @@ test("10. everything eligible but nothing arrived: diagnosis points at the worke
   try {
     await seedUser(userId);
     const morningTimeMinutes = currentMinutesUtc();
-    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await prisma.notificationSettings.create({ data: { userId, telegramUserId: "999000010", dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
     await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
@@ -307,7 +307,7 @@ test("14. with no allowlist configured, the eligible diagnosis names that fact p
   try {
     await seedUser(userId);
     const morningTimeMinutes = currentMinutesUtc();
-    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await prisma.notificationSettings.create({ data: { userId, telegramUserId: "999000011", dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
     await createActionItem(userId, { source: "manual", title: "Apply to jobs", priority: "high" });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
@@ -348,7 +348,7 @@ test("15. asked well before the scheduled window: diagnosis says due today, neve
     // Two hours ahead of the fixed "now" (12:00 UTC -> 14:00 UTC = 840) - well outside the
     // +/-30 minute window, and never wraps since 14:00 is still the same UTC day.
     const morningTimeMinutes = 840;
-    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await prisma.notificationSettings.create({ data: { userId, telegramUserId: "999000012", dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
@@ -372,7 +372,7 @@ test("16. asked well after the window with no sent record: diagnosis says missed
     // Two hours behind the fixed "now" (12:00 UTC -> 10:00 UTC = 600) with no NotificationLog
     // written - the window has already closed today and nothing was ever sent.
     const morningTimeMinutes = 600;
-    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
+    await prisma.notificationSettings.create({ data: { userId, telegramUserId: "999000013", dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
@@ -401,7 +401,7 @@ test("17. timezone Europe/Madrid is respected - computed against the user's own 
     // local time (13:00 -> 15:00, 900 minutes), comfortably within the same local day.
     mockNow(FIXED_NOW_UTC);
     const morningTimeMinutes = 900;
-    await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "Europe/Madrid" } });
+    await prisma.notificationSettings.create({ data: { userId, telegramUserId: "999000014", dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "Europe/Madrid" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);

@@ -53,3 +53,22 @@ export const UpdateNotificationSettingsInputSchema = z.object({
 
 export type NotificationSettings = z.infer<typeof NotificationSettingsSchema>;
 export type UpdateNotificationSettingsInput = z.infer<typeof UpdateNotificationSettingsInputSchema>;
+
+/**
+ * fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: NotificationSettings.telegramUserId
+ * is ONLY ever written by the legacy Telegram slash commands (apps/telegram-bot/src/index.ts's
+ * /set_daily_loop, /enable_checkin, etc via PATCH /users/:userId/notification-settings). A user who
+ * enables morning brief/evening check-in through natural chat (proactive.settings_apply_update) never
+ * gets that field set — it stays null forever. Root cause of a real production incident: a fully
+ * configured tester (morningBriefEnabled, dailyLoopEnabled, correct timezone/time) never received a
+ * single proactive message because every worker sender gated purely on telegramUserId being set.
+ *
+ * `userId` is always formatted "telegram:<digits>" for a real Telegram user throughout this system, so
+ * that digit string IS the Telegram chat id — this derives it as a fallback. Shared between
+ * apps/worker (every proactive/legacy sender) and apps/api (proactive delivery-status diagnosis), so
+ * both sides agree on whether a user is actually reachable.
+ */
+export function telegramChatIdFromUserId(userId: string): string | undefined {
+  const match = userId.match(/^telegram:(\d+)$/);
+  return match?.[1];
+}

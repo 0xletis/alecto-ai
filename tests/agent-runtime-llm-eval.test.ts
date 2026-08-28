@@ -11960,3 +11960,215 @@ test(
     }
   }
 );
+
+// --- Launch-readiness: production proactive worker delivery, morning-brief diagnosis, motivational-
+//     quote handling, and Gmail manual_only status honesty (fix/private-alpha-proactive-worker-
+//     delivery-and-gmail-log-noise) — a real tester with morningBriefEnabled/dailyLoopEnabled/
+//     timezone/morningTimeMinutes all correctly set never received their 09:00 morning brief.
+//     Root cause: NotificationSettings.telegramUserId is only ever written by the legacy Telegram
+//     slash commands, never by the natural-chat opt-in path these scenarios all deliberately use
+//     (no telegramUserId is ever pre-seeded below) — every worker sender now falls back to
+//     deriving the chat id from the userId itself. Worker logs also showed "Skipping Gmail
+//     background sync ... manual_only" every minute; scenario E below checks the natural-chat
+//     status reply for that same mode never implies automatic background scanning. --------------
+
+test(
+  "333. 'why didn't I get my morning brief?' through the natural-chat opt-in path (telegramUserId never explicitly set) still gets a specific diagnosis",
+  { ...llmEvalOptions(["proactive-status-diagnostics", "morning-brief-production-path"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `telegram:800333${Date.now()}`;
+    const trace = new EvalTrace("333-natural-optin-diagnosis", ["proactive-status-diagnostics", "morning-brief-production-path"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const proposeReply = trace.record("turn on my morning brief", await sendAgentMessage(server, userId, "turn on my morning brief"));
+        assertNoGenericAgentError(proposeReply, "propose morning brief");
+        const confirmReply = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirmReply, "confirm morning brief");
+
+        const settingsAfterConfirm = await prisma.notificationSettings.findUnique({ where: { userId } });
+        trace.checkpoint(
+          "the real natural-chat opt-in path leaves telegramUserId null, exactly the incident shape",
+          !settingsAfterConfirm?.telegramUserId,
+          JSON.stringify(settingsAfterConfirm)
+        );
+
+        // Move the scheduled time two hours into the past (Europe/Madrid, the default timezone) —
+        // the window has already closed today and no NotificationLog was ever written.
+        const nowMadridMinutes = Number(
+          new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", hour: "numeric", minute: "numeric", hourCycle: "h23" })
+            .formatToParts(new Date())
+            .reduce((acc, part) => (part.type === "hour" ? acc + Number(part.value) * 60 : part.type === "minute" ? acc + Number(part.value) : acc), 0)
+        );
+        const missedMinutes = Math.max(nowMadridMinutes - 120, 0);
+        await updateNotificationSettings(userId, { morningTimeMinutes: missedMinutes });
+
+        const reply = trace.record("why didn't I get my morning brief?", await sendAgentMessage(server, userId, "why didn't I get my morning brief?"));
+        assertNoGenericAgentError(reply, "missed morning brief diagnostic via natural-chat opt-in");
+
+        const specific = /sent today at \d{2}:\d{2}|should have sent today around|sent record|skipped today|delivery is disabled|due today around/i.test(reply.reply);
+        trace.checkpoint("diagnosis is a specific delivery-state answer, not a hedge", specific, reply.reply);
+        assert.ok(specific, `expected a specific delivery diagnosis — got: ${reply.reply}`);
+
+        const wronglyBlamesTelegramId = /no reachable telegram chat/i.test(reply.reply);
+        trace.checkpoint("never misdiagnoses this as a missing Telegram chat id — the userId-derived fallback resolves it", !wronglyBlamesTelegramId, reply.reply);
+        assert.ok(!wronglyBlamesTelegramId, `the fallback should resolve a real telegram:<digits> userId — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "334. 'do I have morning and evening checkin on?' reports real on/off state, scheduled time, and timezone",
+  { ...llmEvalOptions(["proactive-status-diagnostics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `telegram:800334${Date.now()}`;
+    const trace = new EvalTrace("334-status-on-off", ["proactive-status-diagnostics"], userId);
+
+    try {
+      await seedUser(userId);
+
+      await trace.guard(async () => {
+        const proposeReply = trace.record("turn on my morning brief", await sendAgentMessage(server, userId, "turn on my morning brief"));
+        assertNoGenericAgentError(proposeReply, "propose morning brief");
+        const confirmReply = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirmReply, "confirm morning brief");
+
+        const reply = trace.record("do I have morning and evening checkin on?", await sendAgentMessage(server, userId, "do I have morning and evening checkin on?"));
+        assertNoGenericAgentError(reply, "on/off status question");
+
+        const onPassed = /morning brief:\s*on/i.test(reply.reply) && /\d{2}:\d{2}/.test(reply.reply);
+        trace.checkpoint("reports morning brief on with a real scheduled time", onPassed, reply.reply);
+        assert.ok(onPassed, `expected morning brief reported on with a time — got: ${reply.reply}`);
+
+        const offPassed = /evening check-?in:\s*off/i.test(reply.reply);
+        trace.checkpoint("reports evening check-in off, since it was never enabled", offPassed, reply.reply);
+        assert.ok(offPassed, `expected evening check-in reported off — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "335. asking for motivational quotes every morning with no active goal never gets silently accepted-and-dropped",
+  { ...llmEvalOptions(["morning-brief-production-path"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-motivational-quotes-335-${randomUUID()}`;
+    const trace = new EvalTrace("335-motivational-quotes-no-goal", ["morning-brief-production-path"], userId);
+
+    try {
+      await seedUser(userId);
+
+      await trace.guard(async () => {
+        const reply = trace.record("can you send me motivational quotes every morning?", await sendAgentMessage(server, userId, "can you send me motivational quotes every morning?"));
+        assertNoGenericAgentError(reply, "motivational quotes request with no active goal");
+
+        const fabricatedQuote = /"[^"]{15,}"/.test(reply.reply) && !/goal|focus|attach|morning brief/i.test(reply.reply);
+        trace.checkpoint("never fabricates and sends an actual quote right now", !fabricatedQuote, reply.reply);
+        assert.ok(!fabricatedQuote, `must never just invent and send a quote — got: ${reply.reply}`);
+
+        const progressed = reply.debug.pendingOperation === true || /goal|what.*(you.*want to )?focus|attach|morning brief/i.test(reply.reply);
+        trace.checkpoint("either schedules it as real daily-coaching content or clearly asks what goal to attach it to — never a silent no-op", progressed, reply.reply);
+        assert.ok(progressed, `expected either a real proposal or a goal-anchoring question — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "336. an active goal plus daily motivation actually delivers a goal-grounded morning brief at the real scheduled tick",
+  { ...llmEvalOptions(["morning-brief-production-path", "proactive-worker-delivery"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const chatIdDigits = `800336${Date.now()}`;
+    const userId = `telegram:${chatIdDigits}`;
+    const trace = new EvalTrace("336-motivation-with-goal", ["morning-brief-production-path", "proactive-worker-delivery"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalTitle = "Find a fully remote developer job, ideally in Web3";
+      const goalResult = await createGoal(userId, { title: goalTitle, category: "career", priority: "medium" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createActionItem(userId, { source: "manual", title: "Apply to jobs today", goalId: goalResult.goal.id, priority: "high" });
+
+      await trace.guard(async () => {
+        const proposeReply = trace.record(
+          "I want daily motivation for my job search — turn on my morning brief",
+          await sendAgentMessage(server, userId, "I want daily motivation for my job search — turn on my morning brief")
+        );
+        assertNoGenericAgentError(proposeReply, "propose daily motivation / morning brief");
+        const confirmReply = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirmReply, "confirm daily motivation / morning brief");
+
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        const settingsPassed = Boolean(settings?.morningBriefEnabled) && Boolean(settings?.dailyLoopEnabled);
+        trace.checkpoint("morningBriefEnabled and dailyLoopEnabled are both true after a real chat confirm", settingsPassed, JSON.stringify(settings));
+        assert.ok(settingsPassed, `expected both flags true — got morningBriefEnabled=${settings?.morningBriefEnabled}, dailyLoopEnabled=${settings?.dailyLoopEnabled}`);
+
+        const sent: Array<{ chatId: string; text: string }> = [];
+        await runV3ProactiveMorningBriefs([settings as any], {
+          now: nextRealLocalMoment(settings!.morningTimeMinutes),
+          deliveryEnabled: true,
+          apiGet: injectApiGet(server),
+          sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+        });
+
+        const deliveredPassed = sent.length === 1 && sent[0]!.chatId === chatIdDigits;
+        trace.checkpoint("worker actually delivers the brief, chat id derived from the userId itself since telegramUserId was never set", deliveredPassed, JSON.stringify(sent));
+        assert.ok(deliveredPassed, `expected exactly one morning brief delivered to ${chatIdDigits} — got: ${JSON.stringify(sent)}`);
+
+        assertMentionsGoal(sent[0]!.text, "job", "delivered morning brief content", trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "337. Gmail manual_only status is explained honestly — never implying automatic background scanning",
+  { ...llmEvalOptions(["gmail-background-sync-noise"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-gmail-manual-only-337-${randomUUID()}`;
+    const trace = new EvalTrace("337-gmail-manual-only-status", ["gmail-background-sync-noise"], userId);
+
+    try {
+      await seedUser(userId);
+      await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+
+      await trace.guard(async () => {
+        const reply = trace.record("is Gmail checking my inbox automatically in the background?", await sendAgentMessage(server, userId, "is Gmail checking my inbox automatically in the background?"));
+        assertNoGenericAgentError(reply, "Gmail manual_only autonomy status question");
+
+        const impliesBackgroundSync = /every \d+ minutes|automatically in the background|scheduled sync is on|checks? .*(automatically|on a schedule)\b/i.test(reply.reply);
+        trace.checkpoint("never implies automatic background scanning while in manual_only mode", !impliesBackgroundSync, reply.reply);
+        assert.ok(!impliesBackgroundSync, `must never imply automatic background sync in manual_only mode — got: ${reply.reply}`);
+
+        const honestManualOnly = /sync gmail|manual/i.test(reply.reply);
+        trace.checkpoint("honestly states Gmail is checked only on request", honestManualOnly, reply.reply);
+        assert.ok(honestManualOnly, `expected an honest manual-only explanation — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

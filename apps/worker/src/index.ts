@@ -17,9 +17,16 @@ import {
 import { sendDueActionReminders as sendDueActionRemindersImpl } from "./action-reminders.js";
 import { formatLocalDate, formatLocalTime, getPart } from "./datetime.js";
 import { runScheduledIntegrationSync } from "./integration-sync.js";
-import { runV3ProactiveEveningCheckins, runV3ProactiveGmailNudges, runV3ProactiveMorningBriefs } from "./v3-proactive-delivery.js";
+import {
+  runV3ProactiveEveningCheckins,
+  runV3ProactiveGmailNudges,
+  runV3ProactiveMorningBriefs,
+  type V3ProactiveDeliveryResult,
+  type V3ProactiveTickSummary
+} from "./v3-proactive-delivery.js";
 import { runLegacyDailyLoopMorningBriefs } from "./legacy-daily-loop-morning.js";
 import { runLegacyDailyLoopEveningReviews } from "./legacy-daily-loop-evening.js";
+import { telegramChatIdFromUserId } from "./telegram-chat-id.js";
 
 config({
   path: new URL("../../../.env", import.meta.url).pathname
@@ -91,10 +98,14 @@ async function runTick() {
   const settings = await getUsersWithEnabledNotifications();
   const now = new Date();
 
-  for (const item of settings) {
-    if (!item.telegramUserId) {
+  for (const rawItem of settings) {
+    // fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: same telegramUserId fallback
+    // as every other sender in this file — see telegram-chat-id.ts's doc comment.
+    const chatId = rawItem.telegramUserId ?? telegramChatIdFromUserId(rawItem.userId);
+    if (!chatId) {
       continue;
     }
+    const item = { ...rawItem, telegramUserId: chatId };
 
     const localTime = formatLocalTime(now, item.timezone);
 
@@ -127,16 +138,50 @@ async function runTick() {
   // V3 proactive delivery remains opt-in and env-gated. morning_brief and evening_checkin are
   // time-triggered; Gmail nudges only surface already-created EmailReviewItems and never scan
   // Gmail by themselves.
-  await runV3ProactiveMorningBriefs(settings, { apiGet, sendTelegramMessage });
-  await runV3ProactiveEveningCheckins(settings, { apiGet, sendTelegramMessage });
+  const morningSummary = await runV3ProactiveMorningBriefs(settings, { apiGet, sendTelegramMessage });
+  const eveningSummary = await runV3ProactiveEveningCheckins(settings, { apiGet, sendTelegramMessage });
 
   if (integrationSyncEnabled) {
     await runIntegrationSync(now);
   }
 
-  await runV3ProactiveGmailNudges(settings, { now, apiGet, sendTelegramMessage });
+  const gmailResults = await runV3ProactiveGmailNudges(settings, { now, apiGet, sendTelegramMessage });
 
   await sendDueActionReminders(now);
+
+  logProactiveTickSummary(settings.length, morningSummary, eveningSummary, gmailResults);
+}
+
+/** fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise (task 6): one concise line per
+ * tick summarizing V3 proactive delivery, instead of the per-user log lines above being the only
+ * way to tell whether the worker is actually reaching/sending to anyone. Deliberately omits raw
+ * user content or email content — only counts and skip-reason labels. */
+function logProactiveTickSummary(
+  selected: number,
+  morningSummary: V3ProactiveTickSummary,
+  eveningSummary: V3ProactiveTickSummary,
+  gmailResults: V3ProactiveDeliveryResult[]
+): void {
+  const gmailSent = gmailResults.filter((result) => result.status === "sent").length;
+  const gmailErrors = gmailResults.filter((result) => result.status === "preview_failed" || result.status === "send_failed" || result.status === "session_failed").length;
+  const gmailSkipped = gmailResults.filter((result) => result.status === "skipped");
+
+  const skippedReasons = { ...morningSummary.skippedReasons, ...eveningSummary.skippedReasons };
+  for (const result of gmailSkipped) {
+    skippedReasons[result.reason] = (skippedReasons[result.reason] ?? 0) + 1;
+  }
+
+  const sent = morningSummary.sent + eveningSummary.sent + gmailSent;
+  const skipped = morningSummary.skipped + eveningSummary.skipped + gmailSkipped.length;
+  const errors = morningSummary.errors + eveningSummary.errors + gmailErrors;
+
+  const reasonSummary = Object.entries(skippedReasons)
+    .map(([reason, count]) => `${reason}=${count}`)
+    .join(",");
+
+  console.log(
+    `Proactive tick: selected=${selected} dueMorning=${morningSummary.due} dueEvening=${eveningSummary.due} sent=${sent} skipped=${skipped}${reasonSummary ? ` (${reasonSummary})` : ""} errors=${errors}`
+  );
 }
 
 // Delegates to action-reminders.ts (see that file's own doc comment for why it lives separately

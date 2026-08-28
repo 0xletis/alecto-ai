@@ -27,6 +27,13 @@ export interface ScheduledIntegrationSyncOptions {
   sendTelegramMessage: (chatId: string, text: string) => Promise<void>;
   getNotificationSettings?: typeof getOrCreateNotificationSettings;
   logger?: Pick<Console, "log" | "error">;
+  /** Tracks the last time each `${connectionId}:${reason}` skip was logged, so a connection stuck
+   * in an expected, static-until-reconfigured state (manual_only, global_disabled, no_active_rules,
+   * not_due) logs once, then again only once per GMAIL_SKIP_LOG_RATE_LIMIT_MS, instead of every
+   * 60s tick forever. Defaults to a module-level Map that persists for the life of the worker
+   * process (the real runtime behavior); tests inject their own fresh Map to avoid cross-test
+   * pollution and to exercise the rate limit resetting after the window passes. */
+  skipLogRateLimiter?: Map<string, number>;
 }
 
 export interface ScheduledIntegrationSyncResult {
@@ -58,10 +65,22 @@ interface ProactivePreviewResponse {
   };
 }
 
+/**
+ * fix/private-alpha-proactive-worker-delivery-and-gmail-log-noise: a manual_only Gmail connection
+ * (the default sync mode — see gmail-autonomy.ts) is a normal, expected, indefinitely-recurring
+ * state, not a per-tick event worth a fresh log line every 60s — production logs showed "Skipping
+ * Gmail background sync for <id>: manual_only." once a minute forever for a connection that will
+ * never become eligible until the user explicitly turns on scheduled sync. One hour is frequent
+ * enough that the reason stays discoverable in recent logs without being spam.
+ */
+const GMAIL_SKIP_LOG_RATE_LIMIT_MS = 60 * 60_000;
+const gmailSkipLogRateLimiter = new Map<string, number>();
+
 export async function runScheduledIntegrationSync(
   options: ScheduledIntegrationSyncOptions
 ): Promise<ScheduledIntegrationSyncResult> {
   const now = options.now ?? new Date();
+  const skipLogRateLimiter = options.skipLogRateLimiter ?? gmailSkipLogRateLimiter;
   const integrationSyncEnabled = options.integrationSyncEnabled ?? process.env.INTEGRATION_SYNC_ENABLED === "true";
   const integrationSyncIntervalMinutes = options.integrationSyncIntervalMinutes ?? Number(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15");
   const gmailRuntime = options.gmailRuntime ?? gmailScheduledSyncRuntimeFromEnv();
@@ -100,7 +119,13 @@ export async function runScheduledIntegrationSync(
 
       if (!gmailEligibility.eligible) {
         skippedConnectionIds.push(connection.id);
-        logger.log?.(`Skipping Gmail background sync for ${connection.id}: ${gmailEligibility.reason}.`);
+
+        const rateLimitKey = `${connection.id}:${gmailEligibility.reason}`;
+        const lastLoggedAt = skipLogRateLimiter.get(rateLimitKey);
+        if (lastLoggedAt === undefined || now.getTime() - lastLoggedAt >= GMAIL_SKIP_LOG_RATE_LIMIT_MS) {
+          skipLogRateLimiter.set(rateLimitKey, now.getTime());
+          logger.log?.(`Skipping Gmail background sync for ${connection.id}: ${gmailEligibility.reason}.`);
+        }
         continue;
       }
     } else if (connection.lastSyncedAt && now.getTime() - connection.lastSyncedAt.getTime() < intervalMs) {
