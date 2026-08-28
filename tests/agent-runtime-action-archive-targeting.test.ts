@@ -442,7 +442,7 @@ test("5A/5B/5C: restoring an archived goal by title reactivates it, no duplicate
     await seedUser(userId);
     const goalResult = await createGoal(userId, jobGoalInput());
     if (goalResult.duplicate) throw new Error("unexpected duplicate goal in test setup");
-    await prisma.goal.update({ where: { id: goalResult.goal.id }, data: { status: "archived" } });
+    await prisma.goal.update({ where: { id: goalResult.goal.id }, data: { status: "archived", archivedAt: new Date() } });
 
     const propose = await sendAgentMessage(server, userId, "restore my developer job goal");
     assert.match(propose.reply, /archived/i);
@@ -465,7 +465,7 @@ test("5A/5B/5C: restoring an archived goal by title reactivates it, no duplicate
   }
 });
 
-test("5D: ambiguous archived goals ask for clarification instead of guessing", async () => {
+test("5D: ambiguous archived goals ask for a REAL pending clarification instead of guessing", async () => {
   const server = buildServer();
   const userId = `restore-ambiguous-${randomUUID()}`;
   try {
@@ -473,12 +473,16 @@ test("5D: ambiguous archived goals ask for clarification instead of guessing", a
     const goalA = await createGoal(userId, { title: "Job search for developer roles", category: "career" });
     const goalB = await createGoal(userId, { title: "Job search for designer roles", category: "career", allowDuplicate: true });
     if (goalA.duplicate || goalB.duplicate) throw new Error("unexpected duplicate goal in test setup");
-    await prisma.goal.update({ where: { id: goalA.goal.id }, data: { status: "archived" } });
-    await prisma.goal.update({ where: { id: goalB.goal.id }, data: { status: "archived" } });
+    await prisma.goal.update({ where: { id: goalA.goal.id }, data: { status: "archived", archivedAt: new Date() } });
+    await prisma.goal.update({ where: { id: goalB.goal.id }, data: { status: "archived", archivedAt: new Date() } });
 
+    // fix/private-alpha-goal-restore-ambiguity-resolution: this used to be a dead-end "Do you mean
+    // X or Y?" with no pendingOperation behind it at all — now a real, numbered clarification.
     const reply = await sendAgentMessage(server, userId, "restore my job search goal");
-    assert.equal(reply.debug.pendingOperation, false);
-    assert.match(reply.reply, /which one|do you mean/i);
+    assert.equal(reply.debug.pendingOperation, true, "the ambiguity must be a real pending clarification, not a dead end");
+    assert.match(reply.reply, /found several archived goals/i);
+    assert.match(reply.reply, /1\. job search for/i);
+    assert.match(reply.reply, /2\. job search for/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -515,7 +519,7 @@ test("Additional bug regression: 'restore the goal \"X\"' never routes to goal.c
     await seedUser(userId);
     const goalResult = await createGoal(userId, jobGoalInput());
     if (goalResult.duplicate) throw new Error("unexpected duplicate goal in test setup");
-    await prisma.goal.update({ where: { id: goalResult.goal.id }, data: { status: "archived" } });
+    await prisma.goal.update({ where: { id: goalResult.goal.id }, data: { status: "archived", archivedAt: new Date() } });
 
     // Deliberately mocks the planner to return goal.create_propose (the REAL observed wrong
     // behavior) — the deterministic restore shortcut must intercept the message BEFORE the
@@ -576,7 +580,7 @@ test("Restore should preserve linked data: does not restore archived actions, pr
     const archivedAction = await createActionItem(userId, { source: "manual", title: "Old archived task", goalId: goal.id });
     await prisma.actionItem.update({ where: { id: archivedAction.id }, data: { status: "archived" } });
 
-    await prisma.goal.update({ where: { id: goal.id }, data: { status: "archived" } });
+    await prisma.goal.update({ where: { id: goal.id }, data: { status: "archived", archivedAt: new Date() } });
 
     const originalMetrics = (await prisma.goal.findUnique({ where: { id: goal.id } }))?.targetMetrics;
 

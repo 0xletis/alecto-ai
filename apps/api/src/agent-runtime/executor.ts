@@ -49,6 +49,7 @@ import {
   findGoalsForEventType,
   findGoalsForSignalKey,
   formatDueLabelForChat,
+  formatFullLocalDateTime,
   getEmailAdapterDefinition,
   gmailScheduledSyncRuntimeFromEnv,
   goalHasOnlyCompletionSignals,
@@ -2783,13 +2784,16 @@ export async function executeOperation(
 
         const resolution = resolveActiveGoalReference(goalRef, archivedGoals, { status: "archived" });
 
+        // fix/private-alpha-goal-restore-ambiguity-resolution: a real live-trust bug — several
+        // archived goals sharing the same (or a similar) title used to produce a duplicated,
+        // undifferentiated "Do you mean 'A', 'A', 'B'?" question with NO pendingOperation behind
+        // it at all, so every follow-up (repeating the exact title, "the one archived today",
+        // "none", "cancel") fell through to the planner or a bare "nothing pending" reply instead
+        // of ever narrowing down. buildGoalRestoreDisambiguation installs a REAL, numbered,
+        // timestamp-differentiated pending clarification instead — see runtime.ts's own
+        // RESTORE_GOAL_DISAMBIGUATION_TOPIC dispatch for how a reply resolves it.
         if (resolution.status === "ambiguous" && resolution.candidates) {
-          return {
-            tool: operation.tool,
-            status: "executed",
-            summary: describeAmbiguousGoalChoice(resolution.candidates),
-            result: resolution.candidates
-          };
+          return buildGoalRestoreDisambiguation(userId, resolution.candidates, goalRef ?? "");
         }
 
         if (resolution.status !== "matched" || !resolution.goal) {
@@ -2800,20 +2804,9 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `I found "${goal.title}" archived. Restore it? Reply yes to confirm or cancel.`,
+          summary: buildGoalRestoreConfirmationSummary(goal, await getUserTimezone(userId)),
           entities: [goalToEntity(goal)],
-          pendingOperationUpdate: {
-            topic: "goal_restore",
-            summary: `restore "${goal.title}"`,
-            operations: [
-              {
-                tool: "goal.restore_apply",
-                args: { goalId: goal.id, goalTitle: goal.title },
-                status: "valid",
-                requiresConfirmation: false
-              }
-            ]
-          }
+          pendingOperationUpdate: buildGoalRestorePendingOperationUpdate(goal)
         };
       }
 
@@ -3625,6 +3618,27 @@ function formatDeferredLabelForChat(snoozedUntil: Date, timezone: string): strin
   return formatDueLabelForChat(snoozedUntil, timezone).replace(/^due /, "moved to ");
 }
 
+/**
+ * fix/private-alpha-goal-restore-ambiguity-resolution: "archived today 01:39" / "archived
+ * yesterday 22:14" / "archived 27/08/2026, 09:00" — the same relative-day shape as
+ * formatDueLabelForChat, extended with "yesterday" (due-labels only ever look forward; a restore
+ * candidate's archived/created moment is always in the past) since goal.restore_propose's
+ * disambiguation display needs exactly this for BOTH archivedAt and createdAt.
+ */
+function formatPastRelativeLabelForChat(date: Date, timezone: string, verb: string, now: Date = new Date()): string {
+  const todayLocal = formatDateInTimezone(now, timezone);
+  const dateLocal = formatDateInTimezone(date, timezone);
+  const time = new Intl.DateTimeFormat("en-GB", { timeZone: timezone, hour: "2-digit", minute: "2-digit", hour12: false }).format(date);
+
+  if (dateLocal === todayLocal) {
+    return `${verb} today ${time}`;
+  }
+  if (dateLocal === addDaysToLocalDateString(todayLocal, -1)) {
+    return `${verb} yesterday ${time}`;
+  }
+  return `${verb} ${formatFullLocalDateTime(date, timezone)}`;
+}
+
 // Trailing temporal phrases safe to strip when a title is shown ALONGSIDE its own real date/
 // status label — "Apply to roles today" next to "moved to tomorrow 11:00" reads as a flat
 // contradiction otherwise. Deliberately a small, explicit, English-only set of phrases that only
@@ -4165,6 +4179,73 @@ function describeAmbiguousGoalChoice(candidates: Goal[]): string {
   const names = candidates.map((goal) => `"${goal.title}"`);
   const last = names.pop();
   return `Do you mean ${names.length > 0 ? `${names.join(", ")} or ${last}` : last}?`;
+}
+
+/** Exact single-goal restore confirmation copy — shared by goal.restore_propose's direct-match
+ * path and runtime.ts's disambiguation-resolved path, so the two can never say it differently. */
+function buildGoalRestoreConfirmationSummary(goal: Goal, timezone: string): string {
+  const recency = goal.archivedAt && formatDateInTimezone(goal.archivedAt, timezone) === formatDateInTimezone(new Date(), timezone) ? " from today" : "";
+  return `I found the archived goal "${goal.title}"${recency}. Restore it? Reply yes to confirm or cancel.`;
+}
+
+function buildGoalRestorePendingOperationUpdate(goal: Goal): ExecutedOperation["pendingOperationUpdate"] {
+  return {
+    topic: "goal_restore",
+    summary: `restore "${goal.title}"`,
+    operations: [
+      {
+        tool: "goal.restore_apply",
+        args: { goalId: goal.id, goalTitle: goal.title },
+        status: "valid",
+        requiresConfirmation: false
+      }
+    ]
+  };
+}
+
+// Never shown a list longer than this without saying there's more — a real reported bug found a
+// generic "here's everything" reply for a large ambiguous match set unreadable in a chat window.
+const RESTORE_DISAMBIGUATION_DISPLAY_CAP = 8;
+
+/**
+ * fix/private-alpha-goal-restore-ambiguity-resolution: builds a REAL, numbered, timestamp-
+ * differentiated pending clarification for several archived goals matching one restore request —
+ * never a bare "Do you mean 'A', 'A', 'B'?" with duplicate, undifferentiated titles and no
+ * pendingOperation behind it. Each candidate carries its own archivedAt/createdAt (ISO strings, so
+ * they round-trip through the JSON-serialized pendingOperation) for runtime.ts's
+ * matchGoalRestoreDisambiguation to resolve a later recency-shaped reply ("the one archived
+ * today", "latest created") without a second DB round-trip.
+ */
+async function buildGoalRestoreDisambiguation(userId: string, candidates: Goal[], originalQuery: string): Promise<ExecutedOperation> {
+  const timezone = await getUserTimezone(userId);
+  const capped = candidates.slice(0, RESTORE_DISAMBIGUATION_DISPLAY_CAP);
+  const overflowNote = candidates.length > capped.length ? `\n(and ${candidates.length - capped.length} more — try naming it more specifically)` : "";
+
+  const lines = capped.map((goal, index) => {
+    const archivedLabel = goal.archivedAt ? formatPastRelativeLabelForChat(goal.archivedAt, timezone, "archived") : "archived date unknown";
+    const createdLabel = formatPastRelativeLabelForChat(goal.createdAt, timezone, "created");
+    return `${index + 1}. ${goal.title} — ${archivedLabel} — ${createdLabel}`;
+  });
+
+  return {
+    tool: "goal.restore_propose",
+    status: "executed",
+    summary: `I found several archived goals that match:\n${lines.join("\n")}${overflowNote}\nReply with a number, "latest archived", or "cancel".`,
+    result: capped,
+    pendingOperationUpdate: {
+      topic: "restore_goal_disambiguation",
+      summary: `restore one of ${capped.length} archived goals matching "${originalQuery}"`,
+      operations: capped.map((goal, index) => ({
+        tool: "goal.restore_apply",
+        args: { goalId: goal.id, goalTitle: goal.title },
+        status: "valid",
+        requiresConfirmation: false,
+        proposalIndex: index + 1,
+        candidateCreatedAt: goal.createdAt.toISOString(),
+        candidateArchivedAt: goal.archivedAt ? goal.archivedAt.toISOString() : null
+      }))
+    }
+  };
 }
 
 /** "1 CVs sent" reads as a typo, not a real number — a real private-alpha transcript hit exactly

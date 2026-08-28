@@ -19,6 +19,7 @@ import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
+import { getUserTimezone } from "../utils/user-timezone.js";
 import { ACTION_CLARIFICATION_ELIGIBLE_TOOLS, revalidateForExecution, validateOperations } from "./validator.js";
 import type {
   AgentDebugInfo,
@@ -230,6 +231,158 @@ function matchCapabilityProposalSelection(pending: AgentPendingOperation, messag
  * the cancellation path below. */
 function capabilityProposalLabels(pending: AgentPendingOperation): string[] {
   return pending.operations.filter((op) => op.proposalLabel).map((op) => op.proposalLabel as string);
+}
+
+// fix/private-alpha-goal-restore-ambiguity-resolution: topic used by goal.restore_propose's
+// disambiguation offer when several archived goals match one restore request (see executor.ts's
+// buildGoalRestoreDisambiguation). Each pending op carries proposalIndex (numbered position) and
+// candidateCreatedAt/candidateArchivedAt (ISO strings) — matchGoalRestoreDisambiguation below
+// resolves a reply against those three signals (index, exact title, or recency) without a second
+// DB round-trip. Resolving to exactly one candidate never restores it directly — it installs a
+// fresh "goal_restore" single-goal confirmation (see finalizeGoalRestoreDisambiguationSelection),
+// the SAME final "reply yes to confirm" step the direct, unambiguous match path already uses.
+const RESTORE_GOAL_DISAMBIGUATION_TOPIC = "restore_goal_disambiguation";
+const RESTORE_DISAMBIGUATION_NONE_RE = /^(none|ninguno|ninguna|cap)\.?$/i;
+const RESTORE_DISAMBIGUATION_ORDINAL_WORDS: Record<string, number> = {
+  first: 1,
+  second: 2,
+  third: 3,
+  fourth: 4,
+  fifth: 5,
+  sixth: 6,
+  seventh: 7,
+  eighth: 8,
+  primero: 1,
+  primer: 1,
+  segundo: 2,
+  segon: 2,
+  tercero: 3,
+  tercer: 3,
+  cuarto: 4,
+  quart: 4,
+  quinto: 5,
+  cinque: 5
+};
+const RESTORE_DISAMBIGUATION_ORDINAL_RE = new RegExp(`\\b(${Object.keys(RESTORE_DISAMBIGUATION_ORDINAL_WORDS).join("|")})\\b`, "i");
+// Deliberately broad natural-language recency words (English/Spanish/Catalan) — "el último," "l'últim,"
+// "más reciente," "més recent" all mean "the latest" without necessarily also saying "archived"/
+// "created," so a bare recency word defaults to sorting by archivedAt (the more natural default for
+// a RESTORE flow specifically — "the latest one" most naturally means "the one I archived last").
+const RESTORE_DISAMBIGUATION_LATEST_RE = /\b(latest|newest|most recent\w*|more recent\w*|ultimo|último|ultim|últim|mas reciente|más reciente|mes recent|més recent)\b/i;
+const RESTORE_DISAMBIGUATION_ARCHIVED_WORD_RE = /\b(archiv\w*|arxiv\w*)\b/i;
+const RESTORE_DISAMBIGUATION_CREATED_WORD_RE = /\b(creat\w*|creada?s?)\b/i;
+const RESTORE_DISAMBIGUATION_TODAY_RE = /\b(today|hoy|avui)\b/i;
+
+interface RestoreDisambiguationCandidate {
+  goalId: string;
+  goalTitle: string;
+  index?: number;
+  createdAt?: string;
+  archivedAt?: string | null;
+}
+
+function restoreDisambiguationCandidates(pending: AgentPendingOperation): RestoreDisambiguationCandidate[] {
+  return pending.operations
+    .filter((op) => typeof op.args.goalId === "string")
+    .map((op) => ({
+      goalId: op.args.goalId as string,
+      goalTitle: (op.args.goalTitle as string | undefined) ?? "",
+      index: op.proposalIndex,
+      createdAt: op.candidateCreatedAt,
+      archivedAt: op.candidateArchivedAt
+    }));
+}
+
+function normalizeGoalTitleForExactMatch(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+type RestoreDisambiguationResolution =
+  | { status: "resolved"; candidate: RestoreDisambiguationCandidate }
+  | { status: "cancel" }
+  | { status: "unresolved" };
+
+/**
+ * Resolves a reply to an open restore-disambiguation clarification: by 1-based index/ordinal
+ * ("1," "the first one"), by a normalized exact title match that's unique among the candidates, or
+ * by recency ("latest archived," "latest created," "the one archived today," a combination of
+ * both). Never guesses when more than one candidate remains after every signal is applied — the
+ * caller re-asks instead. "none"/"cancel" (English/Spanish/Catalan) clear the clarification
+ * entirely, matching the product rule that a restore disambiguation is a real answerable question,
+ * not a dead end the user can only escape by starting over.
+ */
+function matchGoalRestoreDisambiguation(pending: AgentPendingOperation, message: string, timezone: string): RestoreDisambiguationResolution {
+  const normalizedExact = normalizeExactMessage(message);
+  const text = normalizeIntentText(message);
+
+  if (CANCEL_WHITELIST.has(normalizedExact) || RESTORE_DISAMBIGUATION_NONE_RE.test(message.trim())) {
+    return { status: "cancel" };
+  }
+
+  const candidates = restoreDisambiguationCandidates(pending);
+  if (candidates.length === 0) {
+    return { status: "unresolved" };
+  }
+
+  const numberMatch = text.match(/\b(\d+)\b/);
+  let index: number | undefined = numberMatch ? Number(numberMatch[1]) : undefined;
+  if (index === undefined) {
+    const ordinalMatch = RESTORE_DISAMBIGUATION_ORDINAL_RE.exec(text);
+    if (ordinalMatch) {
+      index = RESTORE_DISAMBIGUATION_ORDINAL_WORDS[ordinalMatch[1].toLowerCase()];
+    }
+  }
+  if (index !== undefined) {
+    const byIndex = candidates.find((c) => c.index === index);
+    if (byIndex) {
+      return { status: "resolved", candidate: byIndex };
+    }
+  }
+
+  const normalizedRef = normalizeGoalTitleForExactMatch(text);
+  if (normalizedRef.length > 0) {
+    const titleMatches = candidates.filter((c) => normalizeGoalTitleForExactMatch(c.goalTitle) === normalizedRef);
+    if (titleMatches.length === 1) {
+      return { status: "resolved", candidate: titleMatches[0] };
+    }
+  }
+
+  const hasArchivedWord = RESTORE_DISAMBIGUATION_ARCHIVED_WORD_RE.test(text);
+  const hasCreatedWord = RESTORE_DISAMBIGUATION_CREATED_WORD_RE.test(text);
+  const hasToday = RESTORE_DISAMBIGUATION_TODAY_RE.test(text);
+  const hasLatest = RESTORE_DISAMBIGUATION_LATEST_RE.test(text);
+
+  let pool = candidates;
+
+  if (hasToday) {
+    const field: "createdAt" | "archivedAt" = hasCreatedWord && !hasArchivedWord ? "createdAt" : "archivedAt";
+    const todayLocal = formatDateInTimezone(new Date(), timezone);
+    const filtered = pool.filter((c) => c[field] && formatDateInTimezone(new Date(c[field] as string), timezone) === todayLocal);
+    if (filtered.length > 0) {
+      pool = filtered;
+    }
+  }
+
+  if (hasLatest || hasCreatedWord || hasArchivedWord) {
+    const field: "createdAt" | "archivedAt" = hasCreatedWord && !hasArchivedWord ? "createdAt" : "archivedAt";
+    const withField = pool.filter((c) => c[field]);
+    if (withField.length > 0) {
+      const latest = withField.reduce((a, b) => (new Date(a[field] as string).getTime() >= new Date(b[field] as string).getTime() ? a : b));
+      return { status: "resolved", candidate: latest };
+    }
+  }
+
+  if (pool.length === 1) {
+    return { status: "resolved", candidate: pool[0] };
+  }
+
+  return { status: "unresolved" };
 }
 
 // Marks session.pendingOperation as "an ambiguous action-completion clarification is open" —
@@ -719,6 +872,26 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     // queue: the next clear reply ("both"/"only Gmail"/"not now") still works exactly as it would
     // have on the very first turn.
     return finalizeCapabilityProposalClarification(context, pending);
+  }
+
+  // fix/private-alpha-goal-restore-ambiguity-resolution: an open restore-disambiguation ("several
+  // archived goals match") is handled entirely here, self-contained — index/ordinal, exact title,
+  // recency ("latest archived"/"the one archived today"), or "none"/"cancel". Never falls through
+  // to the planner: a real live-trust bug found "the one archived today" and "none" both landing
+  // on the generic firewall or a bare "nothing pending" reply, since the ambiguity question was
+  // never actually stored as a real pending operation at all.
+  if (pending?.topic === RESTORE_GOAL_DISAMBIGUATION_TOPIC) {
+    const timezone = await getUserTimezone(context.session.userId);
+    const resolution = matchGoalRestoreDisambiguation(pending, message, timezone);
+    if (resolution.status === "cancel") {
+      return finalizeDeterministicCancellation(context, message);
+    }
+    if (resolution.status === "resolved") {
+      return finalizeGoalRestoreDisambiguationSelection(context, message, resolution.candidate, timezone);
+    }
+    // Unresolved — never guesses, never clears the clarification. The user already saw the full
+    // numbered list once; a short reminder of the allowed replies is enough, not a full re-list.
+    return finalizeGoalRestoreDisambiguationClarification(context, pending);
   }
 
   // Exact confirm/cancel is checked FIRST and ALWAYS — regardless of whether a pending
@@ -3045,6 +3218,82 @@ async function finalizeCapabilityProposalClarification(context: ContextBundle, p
     llmPlannerAttempted: false,
     toolValidationPassed: true,
     topic: CAPABILITY_PROPOSALS_TOPIC
+  });
+}
+
+/**
+ * fix/private-alpha-goal-restore-ambiguity-resolution: a reply to an open restore-disambiguation
+ * resolved to exactly ONE archived goal (by index, exact title, or recency) — NEVER restores it
+ * immediately. Installs a fresh single-goal "goal_restore" confirmation instead, the exact same
+ * final "I found 'X' archived. Restore it?" step the direct, unambiguous-match path already uses
+ * (buildGoalRestoreConfirmationSummary in executor.ts), so a genuine "yes" is always required
+ * before anything is actually restored — disambiguating which goal is not the same as confirming
+ * the mutation.
+ */
+async function finalizeGoalRestoreDisambiguationSelection(
+  context: ContextBundle,
+  message: string,
+  candidate: RestoreDisambiguationCandidate,
+  timezone: string
+): Promise<AgentMessageResponse> {
+  const pendingOperationBefore = context.session.pendingOperation;
+  const visibleEntitiesBefore = context.session.visibleEntities;
+
+  const recency =
+    candidate.archivedAt && formatDateInTimezone(new Date(candidate.archivedAt), timezone) === formatDateInTimezone(new Date(), timezone) ? " from today" : "";
+  const reply = `I found the archived goal "${candidate.goalTitle}"${recency}. Restore it? Reply yes to confirm or cancel.`;
+
+  setPendingOperation(
+    context.session,
+    createPendingOperationRecord("goal_restore", `restore "${candidate.goalTitle}"`, [
+      { tool: "goal.restore_apply", args: { goalId: candidate.goalId, goalTitle: candidate.goalTitle }, status: "valid", requiresConfirmation: false }
+    ])
+  );
+
+  const executedOps: ExecutedOperation[] = [{ tool: "goal.restore_propose", status: "executed", summary: reply }];
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: undefined,
+      validatedOp: undefined,
+      executedOp: undefined,
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: "deterministic_shortcut"
+    },
+    context.session
+  );
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [],
+    executedOps,
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: "goal_restore",
+    planningTrace
+  });
+}
+
+/**
+ * fix/private-alpha-goal-restore-ambiguity-resolution: an unrecognized reply to an open restore-
+ * disambiguation — never applies anything, never clears the clarification (the user already saw
+ * the full numbered list once; the next clear reply — a number, an exact title, "latest archived,"
+ * "none," "cancel" — still resolves it), and never calls the planner to guess which archived goal
+ * was meant.
+ */
+async function finalizeGoalRestoreDisambiguationClarification(context: ContextBundle, pending: AgentPendingOperation): Promise<AgentMessageResponse> {
+  const reply = 'I\'m not sure which archived goal you mean. Reply with a number, an exact title, "latest archived", "latest created", "archived today", or "cancel".';
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [],
+    executedOps: [{ tool: "confirmation.confirm", status: "skipped", summary: reply }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: pending.topic
   });
 }
 
