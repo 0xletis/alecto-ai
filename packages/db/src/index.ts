@@ -2952,6 +2952,7 @@ export interface AgentConversationSessionRow {
   visibleEntities: Prisma.JsonValue;
   recentMutations: Prisma.JsonValue;
   messages: Prisma.JsonValue;
+  deferredCapabilityProposals: Prisma.JsonValue;
   expiresAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -2964,6 +2965,7 @@ export interface UpsertAgentConversationSessionInput {
   visibleEntities: unknown;
   recentMutations: unknown;
   messages: unknown;
+  deferredCapabilityProposals: unknown;
   expiresAt: Date | null;
 }
 
@@ -2992,6 +2994,7 @@ export async function upsertAgentConversationSession(
     visibleEntities: toJsonInput(input.visibleEntities),
     recentMutations: toJsonInput(input.recentMutations),
     messages: toJsonInput(input.messages),
+    deferredCapabilityProposals: toJsonInput(input.deferredCapabilityProposals),
     expiresAt: input.expiresAt
   };
 
@@ -3015,6 +3018,7 @@ function toAgentConversationSessionRow(row: Prisma.AgentConversationSessionGetPa
     visibleEntities: row.visibleEntities,
     recentMutations: row.recentMutations,
     messages: row.messages,
+    deferredCapabilityProposals: row.deferredCapabilityProposals,
     expiresAt: row.expiresAt,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt

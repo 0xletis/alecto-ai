@@ -4,6 +4,7 @@ import test from "node:test";
 import { encryptSecretJson } from "../packages/core/src/index.ts";
 import { createEvent, createGoal } from "../packages/db/src/index.ts";
 import { buildServer, clearAgentRuntimeMocks, mockPlan, op, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
+import { minutesOfDayInTimezone } from "../apps/api/src/operator/proactive.ts";
 
 /**
  * fix/private-alpha-gmail-proactive-highsignal-and-goal-association: closes the remaining
@@ -590,7 +591,24 @@ test("3A/3B. evening check-in mentions Gmail events logged today and pending rev
 
       await sendAgentMessage(server, userId, "sync Gmail");
 
-      const evening = await preview(server, userId, EVENING_UTC);
+      // fix/private-alpha-launch-hardening-flakes-and-pending-clarity: EVENING_UTC (a UTC instant
+      // built from a UTC date string captured once at module load) used to drift from the real
+      // event this "sync Gmail" call just created — the sync stamps its event with a genuinely
+      // real `new Date()` (server.ts's Gmail classification pipeline has no injectable clock), and
+      // the evening check-in's "logged today" filter compares calendar days in the user's
+      // configured Europe/Madrid timezone, not UTC. Whenever the real run happens to fall in the
+      // ~1-2 hour band where Madrid has already rolled to the next calendar day but UTC hasn't
+      // (22:00-24:00 UTC in summer CEST, 23:00-24:00 UTC in winter CET), the module-load-time
+      // TODAY_UTC_DATE and the sync's real event timestamp land on different Madrid calendar days,
+      // so the just-created event silently fails the "today" filter. Fixed by capturing "now" ONCE
+      // here — immediately after the sync that needs to count as "today" — and reusing that exact
+      // instant for both the evening-window schedule (via minutesOfDayInTimezone, the same
+      // Madrid-aware helper the product code itself uses) and the preview's own `now`, so the two
+      // are always the same real moment rather than a stale snapshot compared against a fresh one.
+      const now = new Date();
+      await prisma.notificationSettings.update({ where: { userId }, data: { eveningTimeMinutes: minutesOfDayInTimezone(now, "Europe/Madrid") } });
+
+      const evening = await preview(server, userId, now.toISOString());
       assert.equal(evening.decision, "proposed_message");
       if (evening.decision === "proposed_message") {
         assert.match(evening.message, /New Gmail signal: recruiter reply/i);

@@ -160,9 +160,14 @@ export interface ActiveGoalReferenceResolution<T extends Goal = Goal> {
 export function resolveActiveGoalReference<T extends Goal = Goal>(
   goalRef: string | undefined,
   activeGoals: T[],
-  options: { mostRecent?: T; currentFocus?: T } = {}
+  options: { mostRecent?: T; currentFocus?: T; status?: Goal["status"] } = {}
 ): ActiveGoalReferenceResolution<T> {
-  const goals = activeGoals.filter((goal) => goal.status === "active");
+  // fix/private-alpha-action-archive-targeting: `status` defaults to "active" (every pre-existing
+  // caller keeps matching only active goals, unchanged) — goal.restore_propose is the one caller
+  // that passes "archived", reusing this SAME scoring/fuzzy-match/ambiguity-margin engine rather
+  // than a second, parallel implementation that could drift out of sync with it.
+  const targetStatus = options.status ?? "active";
+  const goals = activeGoals.filter((goal) => goal.status === targetStatus);
 
   if (goals.length === 0) {
     return { status: "no_match" };

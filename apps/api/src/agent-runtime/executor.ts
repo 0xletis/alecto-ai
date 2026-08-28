@@ -17,6 +17,7 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getEventsSince,
+  getGoals,
   getIntegrationConnection,
   getMostRecentNotificationLog,
   getOrCreateNotificationSettings,
@@ -135,11 +136,27 @@ import {
   generateAndSaveWeeklyReview,
   generateDeterministicWeeklyReview
 } from "../weekly-review/review.js";
-import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime, startOfLocalWeek } from "../utils/datetime.js";
+import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime, parseOptionalNow, startOfLocalWeek } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
+import { wasCapabilityProposalRecentlyDeferred } from "./conversation-session.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
 import { gmailSyncDebugForAgentRuntime, syncGmailForAgentRuntime } from "./services.js";
+
+/**
+ * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: proactive.diagnose_morning_brief/
+ * diagnose_evening_checkin previously always called `new Date()` directly, with no way for a test
+ * to pin "now" — the ONLY other consumer of this exact time-window math (the /operator/proactive/
+ * preview route) already accepts an optional injected `now` via its own `?now=` query param
+ * (apps/api/src/routes/agent.ts, parseOptionalNow), precisely so it can be tested deterministically
+ * without racing real wall-clock minute-of-day arithmetic near a UTC day boundary. Mirrors that
+ * exact same pattern here, gated behind an env var only a test would ever set (never reachable from
+ * a real chat message — the LLM planner's tool args never carry a raw "now"): unset in production,
+ * so `new Date()` is the real, unaltered behavior every deployment actually gets.
+ */
+function resolveDiagnosisNow(): Date {
+  return parseOptionalNow(process.env.AGENT_RUNTIME_TEST_NOW) ?? new Date();
+}
 
 export async function executeOperation(
   userId: string,
@@ -499,6 +516,47 @@ export async function executeOperation(
       }
 
       case "action.archive": {
+        const actionIdToArchive = args.actionId as string;
+
+        // fix/private-alpha-action-archive-targeting: a real live-trust bug found "archive it"
+        // silently escalated into archiving a WHOLE critical goal instead of the one action. This
+        // guard is the action-scoped counterpart of goal.archive_propose's own isCriticalArchive
+        // check below — it protects an action linked to a critical goal with a confirmation too,
+        // but the target NEVER changes: the confirmed operation (action.archive_all_apply with
+        // exactly this one actionId) still only ever archives the action, never the goal. Reusing
+        // action.archive_all_apply here (rather than a new tool) is the SAME established pattern
+        // action.archive_all_propose already uses for its own multi-action confirmation.
+        const targetForCriticalCheck = await getActionItem(userId, actionIdToArchive);
+        if (targetForCriticalCheck && targetForCriticalCheck.status !== "archived" && targetForCriticalCheck.goalId) {
+          const linkedGoal = context.activeGoals.find((goal) => goal.id === targetForCriticalCheck.goalId);
+          if (linkedGoal && linkedGoal.priority === "critical") {
+            return {
+              // Reports as action.archive_all_propose (mutates: false in the catalog), NOT
+              // action.archive (mutates: true) — nothing was actually archived on this turn, and
+              // response-composer.ts/the debug envelope's mutationExecuted flag trusts a tool's
+              // static `mutates` declaration alone, with no way to know this specific call of a
+              // mutates:true tool chose to only propose. Reusing archive_all_propose's own real,
+              // already-registered identity (rather than inventing a parallel one) keeps this
+              // honest without a tool-catalog change.
+              tool: "action.archive_all_propose",
+              status: "executed",
+              summary: `This action is linked to a critical goal. Archive only this action?\n1. ${cleanedTitleForDateDisplay(targetForCriticalCheck.title)}\nReply yes to confirm or cancel.`,
+              pendingOperationUpdate: {
+                topic: "action_archive_critical_link",
+                summary: `archive "${targetForCriticalCheck.title}"`,
+                operations: [
+                  {
+                    tool: "action.archive_all_apply",
+                    args: { actionIds: [targetForCriticalCheck.id] },
+                    status: "valid",
+                    requiresConfirmation: false
+                  }
+                ]
+              }
+            };
+          }
+        }
+
         const updated = await archiveActionItem(userId, args.actionId as string);
         // archiveActionItem now itself distinguishes "doesn't exist" from "already archived" (both
         // return undefined) — this reply can't tell which occurred, so it uses the same honest,
@@ -2449,17 +2507,25 @@ export async function executeOperation(
         let dailyAlreadyOnNote = "";
         let gmailConnectSuggestionLine: string | undefined;
 
+        // fix/private-alpha-launch-hardening-flakes-and-pending-clarity: wasCapabilityProposalRecentlyDeferred
+        // guards against re-offering a capability the user already explicitly declined/deferred for
+        // THIS goal earlier in the session (Task 4: "do not re-offer immediately in the same
+        // conversation"). goal.create_apply only ever runs for a genuinely NEW goal (a duplicate
+        // title short-circuits above, before any proposal is built), so this can never actually
+        // find a match today — kept anyway as the defensive, correct check for any future surface
+        // that recomputes an EXISTING goal's capability proposals, mirroring this file's own
+        // established "keeps the guarantee even if that ever changes" precedent elsewhere.
         if (dailyCoachingInterest) {
           const dailyProposal = await buildDailyCoachingProposal(userId);
-          if (dailyProposal) {
-            proposals.push(dailyProposal);
-          } else {
+          if (!dailyProposal) {
             dailyAlreadyOnNote = " Morning/evening coaching is already on.";
+          } else if (!wasCapabilityProposalRecentlyDeferred(context.session, dailyProposal.id, result.goal.id)) {
+            proposals.push(dailyProposal);
           }
         }
 
         const gmailOffer = await buildGmailGoalWatcherOffer(userId, result.goal, context);
-        if (gmailOffer?.kind === "offer") {
+        if (gmailOffer?.kind === "offer" && !wasCapabilityProposalRecentlyDeferred(context.session, gmailOffer.proposal.id, result.goal.id)) {
           proposals.push(gmailOffer.proposal);
         } else if (gmailOffer?.kind === "not_connected") {
           gmailConnectSuggestionLine = gmailOffer.connectSuggestionLine;
@@ -2504,13 +2570,16 @@ export async function executeOperation(
           pendingOperationUpdate: {
             topic: "capability_proposals",
             summary: `enable ${proposals.map((p) => p.label.toLowerCase()).join(" and ")} for "${result.goal.title}"`,
-            operations: proposals.map((p) => ({
+            operations: proposals.map((p, index) => ({
               tool: p.tool,
               args: p.args,
               status: "valid",
               requiresConfirmation: false,
               proposalId: p.id,
-              proposalLabel: p.label
+              proposalLabel: p.label,
+              proposalAliases: p.aliases,
+              proposalIndex: index + 1,
+              proposalGoalId: result.goal.id
             }))
           }
         };
@@ -2675,6 +2744,94 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: `${verb} "${goalTitle}".`,
+          entities: [goalToEntity(updated)]
+        };
+      }
+
+      // fix/private-alpha-action-archive-targeting: a real live-trust bug found "restore the goal
+      // 'X'" (right after that exact goal had been mistakenly archived — see action.archive's own
+      // critical-link guard above) routed to goal.create_propose instead, offering to create a
+      // brand-new goal rather than recognizing "restore" as recovering the one that already
+      // existed. Archived goals are searched FIRST and reported honestly — never silently creates
+      // anything; goal.create_apply's own duplicate check only ever looks at ACTIVE goals, so
+      // without this an archived goal is genuinely invisible to it.
+      case "goal.restore_propose": {
+        const goalRef = args.goalRef as string | undefined;
+
+        // "Already active" must win over "not found" — restoring something that's already active
+        // is a real, common, honest answer, not a dead end.
+        const activeOutcome = resolveGoalForLifecycleAction(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
+        if (activeOutcome.status === "matched") {
+          const goal = activeOutcome.goals[0];
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `"${goal.title}" is already active — nothing to restore.`,
+            entities: [goalToEntity(goal)]
+          };
+        }
+
+        const allGoals = await getGoals(userId);
+        const archivedGoals = allGoals.filter((goal) => goal.status === "archived");
+        const notFoundSummary = goalRef
+          ? `I don't see an archived goal matching "${goalRef}". Want me to create a new goal for this instead? Just tell me and I'll set it up.`
+          : "You don't have any archived goals to restore.";
+
+        if (archivedGoals.length === 0) {
+          return { tool: operation.tool, status: "executed", summary: notFoundSummary };
+        }
+
+        const resolution = resolveActiveGoalReference(goalRef, archivedGoals, { status: "archived" });
+
+        if (resolution.status === "ambiguous" && resolution.candidates) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: describeAmbiguousGoalChoice(resolution.candidates),
+            result: resolution.candidates
+          };
+        }
+
+        if (resolution.status !== "matched" || !resolution.goal) {
+          return { tool: operation.tool, status: "executed", summary: notFoundSummary };
+        }
+
+        const goal = resolution.goal;
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `I found "${goal.title}" archived. Restore it? Reply yes to confirm or cancel.`,
+          entities: [goalToEntity(goal)],
+          pendingOperationUpdate: {
+            topic: "goal_restore",
+            summary: `restore "${goal.title}"`,
+            operations: [
+              {
+                tool: "goal.restore_apply",
+                args: { goalId: goal.id, goalTitle: goal.title },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "goal.restore_apply": {
+        const goalId = args.goalId as string;
+        const goalTitle = args.goalTitle as string;
+        const updated = await setGoalStatus(userId, goalId, "active");
+        if (!updated) return failed(operation.tool, `"${goalTitle}" no longer exists.`);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          // Deliberately never restores linked actions here — Task rule: "do not restore archived
+          // actions unless explicitly requested." setGoalStatus only ever touches the goal's own
+          // status column, so this is honest by construction, not just by wording — nothing else
+          // was touched. Existing targetMetrics/checkInConfig/evidence history are untouched too
+          // (setGoalStatus writes only the status column), so restoring never re-derives metrics
+          // from scratch or duplicates the goal.
+          summary: `Restored "${updated.title}". Its archived actions stay archived unless you ask me to restore them too.`,
           entities: [goalToEntity(updated)]
         };
       }
@@ -2879,7 +3036,7 @@ export async function executeOperation(
 
       case "proactive.diagnose_morning_brief": {
         const settings = await selfHealDailyLoopEnabled(await getOrCreateNotificationSettings(userId));
-        const now = new Date();
+        const now = resolveDiagnosisNow();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const morningKey = MORNING_BRIEF_DEDUPE_KEY;
         const [v3SentLog, legacyDailyLoopLog] = await Promise.all([
@@ -2911,7 +3068,7 @@ export async function executeOperation(
 
       case "proactive.diagnose_evening_checkin": {
         const settings = await selfHealDailyLoopEnabled(await getOrCreateNotificationSettings(userId));
-        const now = new Date();
+        const now = resolveDiagnosisNow();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const eveningKey = EVENING_CHECKIN_DEDUPE_KEY;
         const [v3SentLog, legacyDailyLoopLog] = await Promise.all([
@@ -4567,6 +4724,13 @@ export async function composeGmailGoalUsageStatusReply(
 interface CapabilityProposal {
   id: "daily_coaching" | "gmail_support";
   label: string;
+  /**
+   * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: lowercase natural-language
+   * words a selective reply ("only Gmail", "solo coaching") is matched against — carried onto the
+   * pendingOperation's own ValidatedOperation.proposalAliases so runtime.ts never needs a
+   * hardcoded per-capability keyword table. Adding a third proposal is just a third entry here.
+   */
+  aliases: string[];
   numberedDescription: string;
   standaloneSummary: string;
   pendingTopic: string;
@@ -4623,6 +4787,7 @@ async function buildGmailGoalWatcherOffer(userId: string, goal: Goal, context: C
     proposal: {
       id: "gmail_support",
       label: "Gmail support",
+      aliases: ["gmail", "gmail support", "email"],
       numberedDescription: `watch ${suggestion.watchSummary}`,
       standaloneSummary: `I can use Gmail readonly for "${goal.title}" to watch for ${suggestion.watchSummary}. I won't send emails or change labels. Want me to enable that?`,
       pendingTopic: "gmail_goal_watcher",
@@ -4664,6 +4829,7 @@ async function buildDailyCoachingProposal(userId: string): Promise<CapabilityPro
   return {
     id: "daily_coaching",
     label: "Daily coaching",
+    aliases: ["daily coaching", "coaching", "daily", "morning brief", "evening check-in", "checkin", "check-in"],
     numberedDescription: shortLabels.join(" and "),
     standaloneSummary: `Next: you're about to turn on:\n${toEnable.map((line) => `- ${line}`).join("\n")}\n\nReply yes to confirm or cancel.`,
     pendingTopic: "proactive_settings",

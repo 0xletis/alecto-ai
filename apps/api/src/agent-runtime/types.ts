@@ -147,6 +147,25 @@ export interface ValidatedOperation {
    */
   proposalId?: string;
   proposalLabel?: string;
+  /**
+   * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: extends the capability-proposal
+   * shape above so a THIRD (or Nth) proposal never needs new hardcoded matching logic in runtime.ts
+   * — only a new entry in executor.ts's own proposal-building list. `proposalAliases` are the
+   * lowercase natural-language words/phrases a selective reply ("only Gmail", "solo coaching") is
+   * matched against; `proposalIndex` is this item's 1-based position in the numbered offer list
+   * ("1. Daily coaching…"), so "only 1"/"only 2" work the same way aliases do. Both are set
+   * together with proposalId/proposalLabel above, never independently.
+   */
+  proposalAliases?: string[];
+  proposalIndex?: number;
+  /**
+   * The goal this proposal was offered for — set even for a proposal (like daily coaching) whose
+   * own underlying tool args have no goalId of their own (proactive.settings_apply_update is a
+   * user-level setting, not goal-scoped). Carried so a declined/deferred decision can be recorded
+   * per-goal (DeferredCapabilityProposal), matching the product framing "daily coaching skipped
+   * for goal X" even though the setting itself is technically global.
+   */
+  proposalGoalId?: string;
 }
 
 export interface ExecutedOperation {
@@ -227,6 +246,21 @@ export interface AgentSessionMessage {
  */
 export type AgentFocusedEntities = Partial<Record<AgentEntity["type"], AgentEntity>>;
 
+/**
+ * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: a capability proposal (see
+ * ValidatedOperation.proposalId) the user explicitly declined or deferred — "not now"/"cancel" on
+ * the whole queue, or picking only a subset and leaving the rest unselected. Lets goal.create_apply
+ * skip immediately re-offering the SAME capability for the SAME goal again within this session,
+ * without any permanent suppression: this is a plain marker, not a workflow — it carries no
+ * scheduling/expiry logic of its own beyond the session's own 24h sliding TTL, and an explicit,
+ * direct request for the capability (e.g. "turn on daily coaching") is never gated by this at all.
+ */
+export interface DeferredCapabilityProposal {
+  proposalId: string;
+  goalId: string;
+  decidedAt: string;
+}
+
 export interface AgentSessionState {
   userId: string;
   channel: string;
@@ -236,6 +270,7 @@ export interface AgentSessionState {
   visibleEntities: AgentEntity[];
   focusedEntities: AgentFocusedEntities;
   recentMutations: AgentMutationRecord[];
+  deferredCapabilityProposals: DeferredCapabilityProposal[];
 }
 
 export interface ContextBundle {

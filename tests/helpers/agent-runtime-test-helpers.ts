@@ -64,6 +64,20 @@ export function clearAgentRuntimeMocks(): void {
   delete process.env.AGENT_RUNTIME_FORCE_ERROR;
   delete process.env.AGENT_RUNTIME_PLANNING_TRACE;
   delete process.env.AGENT_RUNTIME_GUARDRAIL_MOCK_RESPONSE;
+  delete process.env.AGENT_RUNTIME_TEST_NOW;
+}
+
+/**
+ * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: pins "now" for
+ * proactive.diagnose_morning_brief/diagnose_evening_checkin (executor.ts's resolveDiagnosisNow),
+ * the same way the /operator/proactive/preview route's own `?now=` query param already does for
+ * that route — lets a test compute BOTH a fixed reference instant and a fixed morningTimeMinutes/
+ * eveningTimeMinutes from it, so their relative ordering (due-later vs missed) can never flip
+ * depending on the real wall-clock minute the test happens to run in. Cleared by
+ * clearAgentRuntimeMocks(); never read outside a test (no real chat request can set this env var).
+ */
+export function mockNow(iso: string): void {
+  process.env.AGENT_RUNTIME_TEST_NOW = iso;
 }
 
 export async function seedUser(userId: string): Promise<void> {

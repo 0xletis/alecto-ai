@@ -2,7 +2,17 @@ import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, getOrCr
 import { loadContext } from "./context-loader.js";
 import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetime.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
-import { appendMessage, createPendingOperationRecord, recordMutation, removeVisibleEntities, saveSession, setPendingOperation, setTopic, setVisibleEntities } from "./conversation-session.js";
+import {
+  appendMessage,
+  createPendingOperationRecord,
+  recordDeferredCapabilityProposal,
+  recordMutation,
+  removeVisibleEntities,
+  saveSession,
+  setPendingOperation,
+  setTopic,
+  setVisibleEntities
+} from "./conversation-session.js";
 import { composeGmailGoalUsageStatusReply, executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
@@ -162,20 +172,65 @@ function mostRecentTurnWasAMutation(session: AgentSessionState): AgentMutationRe
 
 // feat/private-alpha-capability-proposal-queue: topic used by goal.create_apply's combined
 // post-goal capability offer (e.g. "1. Daily coaching: ... / 2. Gmail support: ..."). A bare
-// "yes"/"both" (CONFIRM_WHITELIST above) or "not now"/"cancel" (CANCEL_WHITELIST above) already
-// resolve the WHOLE queue via the generic paths below — this topic-scoped keyword map exists only
-// to recognize a SELECTIVE reply ("only Gmail", "just daily coaching", "solo Gmail", "només
-// coaching") and route it to finalizeCapabilityProposalSelection instead, which executes just the
-// named subset and reports the rest as skipped ("Daily coaching stays off."), never silently.
-// Deliberately hardcoded to these two known proposal kinds rather than a generic label matcher —
-// this is a small, focused queue for exactly daily coaching and Gmail support, not a general
-// system (see the task's own "Do NOT redesign the whole pendingOperation system" constraint).
+// "yes"/"both" (CONFIRM_WHITELIST above) or "not now"/"cancel" (CANCEL_WHITELIST above) resolve the
+// WHOLE queue; a selective reply ("only Gmail", "just daily coaching", "solo Gmail", "només
+// coaching", or an index like "only 2") resolves to a named subset via
+// matchCapabilityProposalSelection below. This topic is handled ENTIRELY within its own dispatch
+// block (see processAgentMessageInner) rather than falling through to the generic whitelist/planner
+// firewall for anything unrecognized — fix/private-alpha-launch-hardening-flakes-and-pending-
+// clarity: an ambiguous reply used to reach the generic "You still have a pending confirmation…"
+// firewall (or, worse, the planner) instead of a clear, queue-specific clarification that names the
+// actual allowed replies.
 const CAPABILITY_PROPOSALS_TOPIC = "capability_proposals";
-const CAPABILITY_PROPOSAL_ONLY_QUALIFIER_RE = /\b(only|just|solo|sólo|només)\b/i;
-const CAPABILITY_PROPOSAL_KEYWORDS: Record<string, RegExp> = {
-  gmail_support: /\bgmail\b/i,
-  daily_coaching: /\b(coaching|daily coaching|morning brief|evening check-?in|check-?in)\b/i
-};
+// Matches "only 2"/"just 1" or a bare "2" — deliberately generic (no per-capability keyword table
+// here at all): matching against a NAME is driven entirely by each pending operation's own
+// proposalAliases (see types.ts), and matching against a POSITION by its own proposalIndex — both
+// set once, per proposal, in executor.ts's proposal-building code. Adding a third capability later
+// needs a new aliases list there, never a change to this file.
+const CAPABILITY_PROPOSAL_INDEX_RE = /\b(?:only|just)\s+(\d+)\b|^\s*(\d+)\s*$/i;
+
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Resolves a reply against an open capability-proposal queue to the subset of proposalIds it
+ * clearly names — by index ("only 2") or by alias ("only Gmail", "solo coaching"). Returns an
+ * empty array for "nothing recognized" and an array with 2+ entries for "more than one named at
+ * once" — both are treated as ambiguous by the caller (finalizeCapabilityProposalClarification),
+ * never guessed. An index outside the queue's actual range (e.g. "only 5" with only two proposals)
+ * also returns empty, so it clarifies rather than silently doing nothing.
+ */
+function matchCapabilityProposalSelection(pending: AgentPendingOperation, message: string): string[] {
+  const normalized = message.trim().toLowerCase();
+  const proposalOps = pending.operations.filter((op) => op.proposalId);
+
+  const indexMatch = CAPABILITY_PROPOSAL_INDEX_RE.exec(normalized);
+  if (indexMatch) {
+    const requestedIndex = Number(indexMatch[1] ?? indexMatch[2]);
+    const byIndex = proposalOps.find((op) => op.proposalIndex === requestedIndex);
+    return byIndex?.proposalId ? [byIndex.proposalId] : [];
+  }
+
+  const matchedIds = new Set<string>();
+  for (const op of proposalOps) {
+    if (!op.proposalId) {
+      continue;
+    }
+    const aliases = op.proposalAliases ?? [];
+    if (aliases.some((alias) => new RegExp(`\\b${escapeRegExpLiteral(alias)}\\b`, "i").test(normalized))) {
+      matchedIds.add(op.proposalId);
+    }
+  }
+  return [...matchedIds];
+}
+
+/** Dynamically built from the queue's own proposal labels, so a third capability's clarification/
+ * cancel copy never needs a hardcoded update here — see finalizeCapabilityProposalClarification and
+ * the cancellation path below. */
+function capabilityProposalLabels(pending: AgentPendingOperation): string[] {
+  return pending.operations.filter((op) => op.proposalLabel).map((op) => op.proposalLabel as string);
+}
 
 // Marks session.pendingOperation as "an ambiguous action-completion clarification is open" —
 // there is nothing here to actually confirm, so the mutation firewall below (which exempts this
@@ -638,20 +693,32 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     }
   }
 
-  // feat/private-alpha-capability-proposal-queue: a selective reply ("only Gmail", "just daily
-  // coaching") to a combined capability-proposal offer must apply exactly the named subset, never
-  // all of it and never none — checked before the generic CONFIRM_WHITELIST below so it isn't
-  // mistaken for a plain "yes" (which would confirm everything). Only fires when the message
-  // names exactly one of the two known proposal kinds; anything else (an unrecognized reply, both
-  // kinds named at once) falls through to the generic whitelist/planner/firewall below, which
-  // asks for clarification rather than guessing.
-  if (pending?.topic === CAPABILITY_PROPOSALS_TOPIC && CAPABILITY_PROPOSAL_ONLY_QUALIFIER_RE.test(message)) {
-    const matchingProposalIds = pending.operations
-      .filter((op) => op.proposalId && CAPABILITY_PROPOSAL_KEYWORDS[op.proposalId]?.test(message))
-      .map((op) => op.proposalId as string);
+  // fix/private-alpha-launch-hardening-flakes-and-pending-clarity: an open capability-proposal
+  // queue is handled ENTIRELY here, self-contained — a whole-queue confirm/cancel, a selective
+  // reply naming exactly one proposal (by alias or index), or a queue-specific clarification for
+  // anything else. Never falls through to the generic whitelist/planner/firewall below: an
+  // ambiguous reply used to reach that generic "You still have a pending confirmation…" text (or
+  // worse, the planner), rather than a clear list of the actual allowed replies. Checked before the
+  // generic CONFIRM_WHITELIST below only so the whole-queue confirm/cancel below reuses the exact
+  // same finalizers those generic paths already use — not a behavior difference, just keeping this
+  // topic's whole flow in one place.
+  if (pending?.topic === CAPABILITY_PROPOSALS_TOPIC) {
+    const normalizedForCapabilityProposal = normalizeExactMessage(message);
+    if (CONFIRM_WHITELIST.has(normalizedForCapabilityProposal) || looksLikeExtendedConfirmPhrase(normalizedForCapabilityProposal)) {
+      return finalizeDeterministicConfirmation(context, message);
+    }
+    if (CANCEL_WHITELIST.has(normalizedForCapabilityProposal)) {
+      return finalizeCapabilityProposalCancellation(context, message);
+    }
+    const matchingProposalIds = matchCapabilityProposalSelection(pending, message);
     if (matchingProposalIds.length === 1) {
       return finalizeCapabilityProposalSelection(context, message, matchingProposalIds);
     }
+    // Ambiguous (nothing recognized, or more than one proposal named at once), or an out-of-range
+    // index — never applies anything, never calls the planner to guess, and never clears the
+    // queue: the next clear reply ("both"/"only Gmail"/"not now") still works exactly as it would
+    // have on the very first turn.
+    return finalizeCapabilityProposalClarification(context, pending);
   }
 
   // Exact confirm/cancel is checked FIRST and ALWAYS — regardless of whether a pending
@@ -801,9 +868,23 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // "Pause/archive/remove/delete THIS GOAL" is an operational goal-MANAGEMENT command, not an
   // avoidance event about the goal's underlying activity — exactly the same class of fix as the
   // Gmail domain shortcuts above (see the comment ahead of the guardrail check below).
-  const goalLifecycleShortcut = goalLifecycleShortcutOperation(message, context);
+  const goalLifecycleShortcut = await goalLifecycleShortcutOperation(message, context);
   if (goalLifecycleShortcut) {
     return finalizeDeterministicOperation(context, message, goalLifecycleShortcut, "goal_lifecycle");
+  }
+
+  // fix/private-alpha-action-archive-targeting: a real live-trust bug found "restore the goal
+  // 'X'" — asked right after that exact goal had been mistakenly archived — routed through the
+  // real LLM planner to goal.create_propose, offering to create a brand-new goal instead of
+  // recognizing "restore" as recovering the one that already existed (goal.create_apply's own
+  // duplicate check only ever looks at ACTIVE goals, so an archived one is genuinely invisible to
+  // it — nothing downstream could have caught this). Checked deterministically, BEFORE the planner
+  // ever runs, for the same reason goalLifecycleShortcut above is: restore/unarchive/reactivate
+  // intent must never be left to the planner's own judgment call between "manage an existing goal"
+  // and "describe a new one."
+  const goalRestoreShortcut = goalRestoreShortcutOperation(message);
+  if (goalRestoreShortcut) {
+    return finalizeDeterministicOperation(context, message, goalRestoreShortcut, "goal_restore");
   }
 
   if (!pending) {
@@ -2655,7 +2736,7 @@ const GOAL_LIFECYCLE_BARE_PRONOUN_COMMAND_RE =
  * like a pronoun reference (falls back to the conversation's current focus, or asks/declines if
  * there isn't one) — so a pronoun-shaped request never needs to be text-matched here at all.
  */
-function goalLifecycleShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+async function goalLifecycleShortcutOperation(message: string, context: ContextBundle): Promise<PlannedOperation | undefined> {
   if (context.activeGoals.length === 0) {
     return undefined;
   }
@@ -2687,6 +2768,29 @@ function goalLifecycleShortcutOperation(message: string, context: ContextBundle)
     return undefined;
   }
 
+  // fix/private-alpha-action-archive-targeting: a real live-trust bug — "archive it" right after
+  // an overdue ACTION reminder resolved here instead, via focusedGoal (session.focusedEntities.goal
+  // is sticky across turns and survives the reminder untouched), and silently archived the WHOLE
+  // GOAL plus its linked actions instead of the one visible action the user was actually replying
+  // about. A bare pronoun command with NO explicit goal word ("archive it," never "archive my job
+  // search goal") must never out-rank a more specific, currently-relevant ACTION target. Skipped
+  // entirely when a GOAL is what's actually currently visible (e.g. right after "show my goals") —
+  // an earlier same-day action reminder must not block an otherwise-unambiguous goal-lifecycle
+  // command in that case (Task 3D: "archive the goal" explicitly, or after a goal list, still
+  // resolves the goal). resolveMostRecentlyNotifiedOrVisibleActionId is the SAME ground-truth
+  // resolver actionCompletionShortcutOperation below already uses for "archive it"/"done"/"move it
+  // to tomorrow" — reusing it here (rather than a separate check) guarantees this gate and that
+  // resolver always agree on what "it" means.
+  if (bareCommandMatch && !goalWordPresent) {
+    const visibleGoalEntity = context.session.visibleEntities.some((entity) => entity.type === "goal");
+    if (!visibleGoalEntity) {
+      const competingAction = await resolveMostRecentlyNotifiedOrVisibleActionId(context);
+      if (competingAction) {
+        return undefined;
+      }
+    }
+  }
+
   let goalRef: string | undefined;
   const stopTrackingMatch = text.match(/\bstop tracking\s+(.+)$/);
   if (stopTrackingMatch) {
@@ -2712,6 +2816,37 @@ function goalLifecycleShortcutOperation(message: string, context: ContextBundle)
     tool: "goal.archive_propose",
     args: { goalRef, operation: isPause ? "pause" : "archive" },
     rationale: `deterministic goal lifecycle shortcut: ${isPause ? "pause" : "archive"}`
+  };
+}
+
+const GOAL_RESTORE_VERB_RE = /\b(restore|unarchive|un-archive|reactivate|restaura|restaurar|reactiva|reactivar)\b/;
+
+/**
+ * fix/private-alpha-action-archive-targeting: deterministic restore/unarchive/reactivate intent —
+ * always routes to goal.restore_propose, never leaves "restore my job search goal" to the LLM
+ * planner's own judgment call (which, on the real reported transcript, chose goal.create_propose
+ * instead — offering to CREATE a new goal rather than recognizing this as recovering an existing,
+ * archived one). goalRef extraction is deliberately forgiving (strips a leading verb, "the
+ * goal"/"my"/"the" filler, a trailing bare "goal", and surrounding quotes) since goal.restore_
+ * propose's own resolveActiveGoalReference call does the real fuzzy title matching — this only
+ * needs to hand it a reasonable candidate string, never an exact one.
+ */
+function goalRestoreShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text || !GOAL_RESTORE_VERB_RE.test(text)) {
+    return undefined;
+  }
+
+  let rest = text.replace(GOAL_RESTORE_VERB_RE, " ").trim();
+  rest = rest.replace(/^(?:the\s+goal|my\s+goal|the|my)\s+/, "").trim();
+  rest = rest.replace(/\s+goal$/, "").trim();
+  rest = rest.replace(/^['"“”‘’]+|['"“”‘’]+$/g, "").trim();
+  rest = rest.replace(/[.!?]+$/, "").trim();
+
+  return {
+    tool: "goal.restore_propose",
+    args: { goalRef: rest.length > 0 ? rest : undefined },
+    rationale: "deterministic goal restore shortcut"
   };
 }
 
@@ -2843,7 +2978,18 @@ async function finalizeCapabilityProposalSelection(
   applyExecutionSideEffects(context.session, executedOps);
   setPendingOperation(context.session, null);
 
-  const skippedNote = skipped.length > 0 ? skipped.map((op) => `${op.proposalLabel ?? op.tool} stays off.`).join(" ") : undefined;
+  // fix/private-alpha-launch-hardening-flakes-and-pending-clarity (Task 4): an explicit subset
+  // choice ("only Gmail") is a real answer for the unselected side too — record it as deferred
+  // (never permanently rejected) so a future automatic re-offer for the SAME goal can skip asking
+  // again this session, without blocking a later EXPLICIT direct request ("turn on daily
+  // coaching"), which never consults this at all.
+  for (const op of skipped) {
+    if (op.proposalId && op.proposalGoalId) {
+      recordDeferredCapabilityProposal(context.session, op.proposalId, op.proposalGoalId);
+    }
+  }
+
+  const skippedNote = skipped.length > 0 ? skipped.map((op) => `${op.proposalLabel ?? op.tool} stays off for now.`).join(" ") : undefined;
   const baseReply = composeReply({
     replyDraft: "",
     pendingConfirmationOps: [],
@@ -2873,6 +3019,79 @@ async function finalizeCapabilityProposalSelection(
     llmPlannerAttempted: false,
     toolValidationPassed: brokenOps.length === 0,
     topic: pending.topic,
+    planningTrace
+  });
+}
+
+/**
+ * fix/private-alpha-launch-hardening-flakes-and-pending-clarity (Task 2): an ambiguous reply to an
+ * open capability-proposal queue ("maybe", "do the useful one", "enable it") — never applies
+ * anything, never touches session.pendingOperation (the queue stays exactly as it was, so the very
+ * next clear reply — "both"/"only Gmail"/"not now" — still resolves it correctly), and never calls
+ * the planner to guess a mutation. The reply names the queue's own real proposal labels rather than
+ * a hardcoded "Gmail"/"daily coaching" pair, so a third capability's clarification stays accurate
+ * without any change here.
+ */
+async function finalizeCapabilityProposalClarification(context: ContextBundle, pending: AgentPendingOperation): Promise<AgentMessageResponse> {
+  const labels = capabilityProposalLabels(pending);
+  const onlyExamples = labels.map((label) => `"only ${label}"`).join(", ");
+  const reply = `I'm not sure which capability you want. Say "both", ${onlyExamples}, or "not now".`;
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [],
+    executedOps: [{ tool: "confirmation.confirm", status: "skipped", summary: reply }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: CAPABILITY_PROPOSALS_TOPIC
+  });
+}
+
+/**
+ * fix/private-alpha-launch-hardening-flakes-and-pending-clarity (Task 5): "not now"/"cancel" on a
+ * capability-proposal queue reads as a permanent "no" if it's answered with the generic
+ * "Cancelled — I won't do that." — this topic-specific cancellation instead names what stays off
+ * and how to ask for it later, and records every proposal in the queue as deferred (Task 4) the
+ * same way a partial selection's unselected side already is.
+ */
+async function finalizeCapabilityProposalCancellation(context: ContextBundle, message: string): Promise<AgentMessageResponse> {
+  const pending = context.session.pendingOperation as AgentPendingOperation;
+  const pendingOperationBefore = pending;
+  const visibleEntitiesBefore = context.session.visibleEntities;
+  setPendingOperation(context.session, null);
+
+  for (const op of pending.operations) {
+    if (op.proposalId && op.proposalGoalId) {
+      recordDeferredCapabilityProposal(context.session, op.proposalId, op.proposalGoalId);
+    }
+  }
+
+  const labels = capabilityProposalLabels(pending);
+  const laterSuggestions = labels.map((label) => `"turn on ${label.toLowerCase()}"`).join(" or ");
+  const reply = `Okay — I won't enable ${labels.length > 1 ? "those" : "that"} now. You can say ${laterSuggestions} later.`;
+
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: undefined,
+      validatedOp: undefined,
+      executedOp: undefined,
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: "cancellation"
+    },
+    context.session
+  );
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [],
+    executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: reply }],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: CAPABILITY_PROPOSALS_TOPIC,
     planningTrace
   });
 }

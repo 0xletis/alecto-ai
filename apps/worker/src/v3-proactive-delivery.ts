@@ -335,6 +335,7 @@ async function persistVisibleEntitiesForDeliveredNudge(
     pendingOperation: existing?.pendingOperation ?? null,
     visibleEntities: entities,
     recentMutations: existing?.recentMutations ?? [],
+    deferredCapabilityProposals: existing?.deferredCapabilityProposals ?? [],
     messages: nextMessages,
     // Deliberately real wall-clock time, not the `now` parameter above (which is the SIMULATED
     // decision time used only for proactive-eligibility windowing/message timestamping, and in

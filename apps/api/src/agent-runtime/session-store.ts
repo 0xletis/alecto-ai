@@ -6,6 +6,7 @@ import type {
   AgentPendingOperation,
   AgentSessionMessage,
   AgentSessionState,
+  DeferredCapabilityProposal,
   ValidatedOperation
 } from "./types.js";
 
@@ -27,7 +28,8 @@ export function emptySession(userId: string, channel: string): AgentSessionState
     pendingOperation: null,
     visibleEntities: [],
     focusedEntities: {},
-    recentMutations: []
+    recentMutations: [],
+    deferredCapabilityProposals: []
   };
 }
 
@@ -51,7 +53,8 @@ export async function loadPersistedSession(userId: string, channel: string): Pro
     visibleEntities: asEntityArray(row.visibleEntities),
     focusedEntities: asFocusedEntities(row.focusedEntities),
     recentMutations: asMutationArray(row.recentMutations),
-    messages: asMessageArray(row.messages)
+    messages: asMessageArray(row.messages),
+    deferredCapabilityProposals: asDeferredCapabilityProposalArray(row.deferredCapabilityProposals)
   };
 }
 
@@ -64,6 +67,7 @@ export async function persistSession(session: AgentSessionState): Promise<void> 
     visibleEntities: session.visibleEntities,
     recentMutations: session.recentMutations,
     messages: session.messages,
+    deferredCapabilityProposals: session.deferredCapabilityProposals,
     expiresAt: new Date(Date.now() + SESSION_TTL_MS)
   });
 }
@@ -118,6 +122,16 @@ function asMessageArray(value: unknown): AgentSessionMessage[] {
   return value.filter(
     (item): item is AgentSessionMessage =>
       isRecord(item) && (item.role === "user" || item.role === "assistant") && typeof item.text === "string" && typeof item.at === "string"
+  );
+}
+
+function asDeferredCapabilityProposalArray(value: unknown): DeferredCapabilityProposal[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter(
+    (item): item is DeferredCapabilityProposal =>
+      isRecord(item) && typeof item.proposalId === "string" && typeof item.goalId === "string" && typeof item.decidedAt === "string"
   );
 }
 

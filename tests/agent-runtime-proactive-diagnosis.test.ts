@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, createNotificationLog, prisma } from "../packages/db/src/index.ts";
-import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+import { buildServer, clearAgentRuntimeMocks, mockNow, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
 import { formatProactiveDeliveryDiagnosis } from "../apps/api/src/operator/proactive-eligibility.ts";
 
 /**
@@ -323,9 +323,20 @@ test("14. with no allowlist configured, the eligible diagnosis names that fact p
   }
 });
 
-function mod1440(minutes: number): number {
-  return ((minutes % 1440) + 1440) % 1440;
-}
+// fix/private-alpha-launch-hardening-flakes-and-pending-clarity: tests 15-17 below used to derive
+// their target morningTimeMinutes from the REAL current wall-clock minute (currentMinutesUtc())
+// with a +/-120 offset, then wrapped it with mod1440 to stay in [0, 1439) — but wrapping (rather
+// than clamping) means that whenever the real run happens to fall within ~2 hours of UTC midnight,
+// the wrapped target lands on the WRONG side of "now" (numerically earlier instead of later, or
+// vice versa), flipping "due_later_today" into "missed_no_record" (or the reverse) even though
+// nothing about the product logic is actually broken — this is exactly what made test 15 fail
+// during a real run at 00:31 local time. Fixed by using mockNow() (executor.ts's
+// resolveDiagnosisNow, the same test-only `now` override the /operator/proactive/preview route's
+// own `?now=` query param already established for this identical time-window math) to pin BOTH
+// the reference instant AND the derived morningTimeMinutes to fixed, hardcoded values — no real
+// wall-clock read anywhere in these three tests anymore, so they pass identically regardless of
+// when or where they run.
+const FIXED_NOW_UTC = "2026-01-15T12:00:00.000Z"; // 12:00 UTC — arbitrary, comfortably mid-day
 
 test("15. asked well before the scheduled window: diagnosis says due today, never the old hand-wavy hedge", async () => {
   const server = buildServer();
@@ -333,14 +344,15 @@ test("15. asked well before the scheduled window: diagnosis says due today, neve
 
   try {
     await seedUser(userId);
-    // Two hours ahead of "now" (outside the +/-30 minute window either side) - the window check
-    // has not opened yet today.
-    const morningTimeMinutes = mod1440(currentMinutesUtc() + 120);
+    mockNow(FIXED_NOW_UTC);
+    // Two hours ahead of the fixed "now" (12:00 UTC -> 14:00 UTC = 840) - well outside the
+    // +/-30 minute window, and never wraps since 14:00 is still the same UTC day.
+    const morningTimeMinutes = 840;
     await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /morning brief is on and due today around \d{2}:\d{2}/i);
+      assert.match(reply, /morning brief is on and due today around 14:00/i);
       assert.doesNotMatch(reply, /it's not that time yet|already passed for today|nothing should have sent/i, "must never fall back to the old hand-wavy hedge");
     });
   } finally {
@@ -356,16 +368,17 @@ test("16. asked well after the window with no sent record: diagnosis says missed
 
   try {
     await seedUser(userId);
-    // Two hours behind "now" (outside the window either side) with no NotificationLog written -
-    // the window has already closed today and nothing was ever sent.
-    const morningTimeMinutes = mod1440(currentMinutesUtc() - 120);
+    mockNow(FIXED_NOW_UTC);
+    // Two hours behind the fixed "now" (12:00 UTC -> 10:00 UTC = 600) with no NotificationLog
+    // written - the window has already closed today and nothing was ever sent.
+    const morningTimeMinutes = 600;
     await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "UTC" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /morning brief should have sent today around \d{2}:\d{2}, but i don't see a sent record/i);
+      assert.match(reply, /morning brief should have sent today around 10:00, but i don't see a sent record/i);
       assert.match(reply, /current status: eligible/i);
-      assert.match(reply, /next due: tomorrow \d{2}:\d{2}/i);
+      assert.match(reply, /next due: tomorrow 10:00/i);
       assert.doesNotMatch(reply, /it's not that time yet|already passed for today|nothing should have sent/i, "must never fall back to the old hand-wavy hedge");
     });
   } finally {
@@ -381,23 +394,18 @@ test("17. timezone Europe/Madrid is respected - computed against the user's own 
 
   try {
     await seedUser(userId);
-    const nowMadridMinutes = Number(
-      new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Madrid", hour: "numeric", minute: "numeric", hourCycle: "h23" })
-        .formatToParts(new Date())
-        .reduce((acc, part) => (part.type === "hour" ? acc + Number(part.value) * 60 : part.type === "minute" ? acc + Number(part.value) : acc), 0)
-    );
-    // Two hours ahead of Madrid's current local time. If the diagnosis ever computed this
-    // against server/UTC time instead of the configured "Europe/Madrid" timezone, Madrid's UTC
-    // offset (+1 or +2) would push this outside the "due later today" window and misreport it as
-    // missed - so this only passes if the timezone is genuinely honored.
-    // Clamped (never wrapped past midnight) so the comparison stays in the same local day even
-    // if the test happens to run very late in Madrid's day.
-    const morningTimeMinutes = Math.min(nowMadridMinutes + 120, 1439);
+    // 12:00 UTC on a fixed January date is 13:00 in Madrid (winter, UTC+1). If the diagnosis ever
+    // computed this against server/UTC time instead of the configured "Europe/Madrid" timezone,
+    // that 1-hour offset would misplace it relative to the +/-30 minute window and misreport it —
+    // so this only passes if the timezone is genuinely honored. Two hours ahead of Madrid's fixed
+    // local time (13:00 -> 15:00, 900 minutes), comfortably within the same local day.
+    mockNow(FIXED_NOW_UTC);
+    const morningTimeMinutes = 900;
     await prisma.notificationSettings.create({ data: { userId, dailyLoopEnabled: true, morningBriefEnabled: true, morningTimeMinutes, timezone: "Europe/Madrid" } });
 
     await withEnv({ PROACTIVE_OPERATOR_DELIVERY_ENABLED: "true", PROACTIVE_OPERATOR_ALLOWLIST: undefined }, async () => {
       const reply = await diagnose(server, userId);
-      assert.match(reply, /morning brief is on and due today around \d{2}:\d{2}/i);
+      assert.match(reply, /morning brief is on and due today around 15:00/i);
     });
   } finally {
     clearAgentRuntimeMocks();
