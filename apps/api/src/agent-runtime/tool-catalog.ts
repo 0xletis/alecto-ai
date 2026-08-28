@@ -828,6 +828,27 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "goal.restore_propose",
+    description:
+      "Propose restoring (unarchiving) an ARCHIVED goal the user named — opens a pending confirmation, never applies until an exact 'yes'. ALWAYS use this (never goal.create_propose) for 'restore my job search goal', 'unarchive the job search goal', 'reactivate \"Find a fully remote developer job\"', 'restore the goal I archived' — restoring/unarchiving/reactivating a PREVIOUSLY-tracked goal is never the same request as starting a brand-new one, even if the wording sounds similar to a fresh goal description. This tool itself searches archived goals first and reports honestly (already active, not found, or ambiguous) — it never silently creates anything. goalRef is the goal's own wording, matched the same fuzzy way goal.status/goal.archive_propose already match it.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({
+      goalRef: z.string().min(1).optional().describe("The goal's own wording, e.g. 'my job search goal', 'Find a fully remote developer job'. Never an invented id.")
+    })
+  },
+  {
+    name: "goal.restore_apply",
+    description: "Internal: applies the confirmed goal restore. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalId: z.string().min(1),
+      goalTitle: z.string().min(1)
+    })
+  },
+  {
     name: "proactive.settings_show",
     description:
       "Show which automatic messages (morning brief, evening check-in, Gmail alerts) are currently on/off for the user, including their scheduled time when on. Use for 'what proactive messages are on?', 'is the morning brief on?', 'am I getting evening check-ins?', 'are Gmail alerts on?'.",

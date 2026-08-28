@@ -132,6 +132,7 @@ async function persistVisibleEntitiesForActionReminders(userId: string, candidat
     pendingOperation: existing?.pendingOperation ?? null,
     visibleEntities: entities,
     recentMutations: existing?.recentMutations ?? [],
+    deferredCapabilityProposals: existing?.deferredCapabilityProposals ?? [],
     messages: nextMessages,
     // Deliberately real wall-clock time — see the identical comment in
     // v3-proactive-delivery.ts's persistVisibleEntitiesForDeliveredNudge for why.

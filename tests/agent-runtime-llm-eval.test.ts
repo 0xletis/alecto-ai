@@ -11638,3 +11638,325 @@ test(
     }
   }
 );
+
+/*
+ * fix/private-alpha-action-archive-targeting: a real live-trust bug — "archive it" right after an
+ * overdue-ACTION reminder silently escalated into archiving the whole linked CRITICAL GOAL (plus
+ * its open actions) instead of the one visible action. Root cause: the deterministic goal-lifecycle
+ * shortcut's bare-pronoun branch resolved via session.focusedEntities.goal (sticky across turns,
+ * untouched by the worker's reminder) before the correct action-archive path ever got a chance to
+ * run — never a "critical guard rewriting the target," which doesn't exist. Scenarios 326-332 cover
+ * the real-LLM path: pronoun resolution after a reminder, the critical-action vs critical-goal
+ * guards staying target-preserving, and the separate "restore the goal" (never goal.create_propose)
+ * fix found once the goal had already been wrongly archived.
+ */
+
+async function seedTelegramEvalUser(userId: string) {
+  await seedUser(userId);
+  await updateNotificationSettings(userId, { timezone: "Europe/Madrid", telegramUserId: userId });
+}
+
+test(
+  "326. archiving an overdue action linked to a critical goal, right after the reminder, archives only the action — never the goal",
+  { ...llmEvalOptions(["action-archive-targeting", "critical-goal-guard"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const chatIdDigits = `800326${Date.now()}`;
+    const userId = `telegram:${chatIdDigits}`;
+    const trace = new EvalTrace("326-archive-critical-action", ["action-archive-targeting", "critical-goal-guard"], userId);
+
+    try {
+      await seedTelegramEvalUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "critical"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const goal = goalResult.goal;
+
+      await trace.guard(async () => {
+        // Establish focus on the goal — the same real-world moment that made the sticky-focus bug
+        // reachable in the first place — before the action reminder ever fires.
+        const focusReply = trace.record("how is my job search going?", await sendAgentMessage(server, userId, "how is my job search going?"));
+        assertNoGenericAgentError(focusReply, "establishing goal focus");
+
+        const action = await createActionItem(userId, {
+          source: "manual",
+          title: "Send 6 CVs today",
+          goalId: goal.id,
+          dueAt: new Date(Date.now() - 60 * 60 * 1000)
+        });
+
+        const sent: Array<{ chatId: string; text: string }> = [];
+        await sendDueActionReminders(new Date(), { sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text }) });
+        assert.ok(sent.find((s) => s.chatId === chatIdDigits), "expected the overdue reminder for this test's own chat id");
+
+        const archiveIt = trace.record("archive it", await sendAgentMessage(server, userId, "archive it"));
+        assertNoGenericAgentError(archiveIt, "'archive it' after the overdue reminder");
+        trace.checkpoint("goal.archive_propose never planned for a bare pronoun after an action reminder", !archiveIt.operationsPlanned.some((op) => op.tool === "goal.archive_propose"), JSON.stringify(archiveIt.operationsPlanned));
+        assert.ok(!archiveIt.operationsPlanned.some((op) => op.tool === "goal.archive_propose"), `goal.archive_propose must never be planned — got: ${JSON.stringify(archiveIt.operationsPlanned)}`);
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirming the action archive");
+
+        const archivedAction = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the action was archived", archivedAction?.status === "archived", JSON.stringify(archivedAction));
+        assert.equal(archivedAction?.status, "archived");
+
+        const goalAfter = await prisma.goal.findUnique({ where: { id: goal.id } });
+        trace.checkpoint("the linked goal stayed active", goalAfter?.status === "active", JSON.stringify(goalAfter));
+        assert.equal(goalAfter?.status, "active", "the critical goal must never have been archived");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "327. explicitly archiving a critical goal by name still works, with confirmation copy naming the goal (not an action)",
+  { ...llmEvalOptions(["critical-goal-guard", "action-archive-targeting"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-critical-goal-archive-327-${randomUUID()}`;
+    const trace = new EvalTrace("327-critical-goal-archive", ["critical-goal-guard", "action-archive-targeting"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "critical"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const propose = trace.record("archive my developer job goal", await sendAgentMessage(server, userId, "archive my developer job goal"));
+        assertNoGenericAgentError(propose, "explicit critical goal archive request");
+        trace.checkpoint("confirmation reads as a GOAL archive, mentions critical", /critical/i.test(propose.reply), propose.reply);
+        assert.match(propose.reply, /critical/i, `expected critical-goal framing — got: ${propose.reply}`);
+        assert.equal(propose.debug.pendingOperation, true);
+        assert.equal(propose.debug.mutationExecuted, false);
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirming the critical goal archive");
+        const archivedGoal = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        trace.checkpoint("the goal was actually archived", archivedGoal?.status === "archived", JSON.stringify(archivedGoal));
+        assert.equal(archivedGoal?.status, "archived");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "328. 'done' right after an overdue reminder completes the visible action, even with a critical goal focused",
+  { ...llmEvalOptions(["action-archive-targeting", "pending-operation-target-integrity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const chatIdDigits = `800328${Date.now()}`;
+    const userId = `telegram:${chatIdDigits}`;
+    const trace = new EvalTrace("328-done-after-reminder", ["action-archive-targeting", "pending-operation-target-integrity"], userId);
+
+    try {
+      await seedTelegramEvalUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "critical"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("how is my job search going?", await sendAgentMessage(server, userId, "how is my job search going?"));
+        const action = await createActionItem(userId, {
+          source: "manual",
+          title: "Send 6 CVs today",
+          goalId: goalResult.goal.id,
+          dueAt: new Date(Date.now() - 60 * 60 * 1000)
+        });
+        const sent: Array<{ chatId: string; text: string }> = [];
+        await sendDueActionReminders(new Date(), { sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text }) });
+        assert.ok(sent.find((s) => s.chatId === chatIdDigits));
+
+        const done = trace.record("done", await sendAgentMessage(server, userId, "done"));
+        assertNoGenericAgentError(done, "'done' after the overdue reminder");
+        const completed = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the visible action was completed", completed?.status === "completed", JSON.stringify(completed));
+        assert.equal(completed?.status, "completed");
+        const goalAfter = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        assert.equal(goalAfter?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "329. 'move it to tomorrow' right after an overdue reminder snoozes the visible action, never touches the goal",
+  { ...llmEvalOptions(["action-archive-targeting", "pending-operation-target-integrity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const chatIdDigits = `800329${Date.now()}`;
+    const userId = `telegram:${chatIdDigits}`;
+    const trace = new EvalTrace("329-move-tomorrow-after-reminder", ["action-archive-targeting", "pending-operation-target-integrity"], userId);
+
+    try {
+      await seedTelegramEvalUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "critical"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("how is my job search going?", await sendAgentMessage(server, userId, "how is my job search going?"));
+        const action = await createActionItem(userId, {
+          source: "manual",
+          title: "Send 6 CVs today",
+          goalId: goalResult.goal.id,
+          dueAt: new Date(Date.now() - 60 * 60 * 1000)
+        });
+        const sent: Array<{ chatId: string; text: string }> = [];
+        await sendDueActionReminders(new Date(), { sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text }) });
+        assert.ok(sent.find((s) => s.chatId === chatIdDigits));
+
+        const moved = trace.record("move it to tomorrow", await sendAgentMessage(server, userId, "move it to tomorrow"));
+        assertNoGenericAgentError(moved, "'move it to tomorrow' after the overdue reminder");
+        const snoozed = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the visible action was snoozed, not archived/completed", snoozed?.status === "snoozed", JSON.stringify(snoozed));
+        assert.equal(snoozed?.status, "snoozed");
+        const goalAfter = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        assert.equal(goalAfter?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "330. restoring an archived job-search goal by name reactivates it — never proposes creating a new one",
+  { ...llmEvalOptions(["goal-restore"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-goal-restore-330-${randomUUID()}`;
+    const trace = new EvalTrace("330-goal-restore", ["goal-restore"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await setGoalStatus(userId, goalResult.goal.id, "archived");
+
+      await trace.guard(async () => {
+        const propose = trace.record(
+          'restore the goal "Find a fully remote developer job, ideally in Web3"',
+          await sendAgentMessage(server, userId, 'restore the goal "Find a fully remote developer job, ideally in Web3"')
+        );
+        assertNoGenericAgentError(propose, "restore request for an archived goal");
+        trace.checkpoint("never proposes creating a new goal", !/want me to create this goal|create a new goal/i.test(propose.reply), propose.reply);
+        assert.doesNotMatch(propose.reply, /want me to create this goal/i, `must never propose creating a new goal — got: ${propose.reply}`);
+        assert.equal(propose.debug.pendingOperation, true);
+
+        const confirm = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        assertNoGenericAgentError(confirm, "confirming the goal restore");
+        const restored = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        trace.checkpoint("the goal is active again", restored?.status === "active", JSON.stringify(restored));
+        assert.equal(restored?.status, "active");
+
+        const goalCount = await prisma.goal.count({ where: { userId, title: goalResult.goal.title } });
+        trace.checkpoint("no duplicate goal was created", goalCount === 1, `count: ${goalCount}`);
+        assert.equal(goalCount, 1);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "331. Spanish: 'archívala' right after an action list archives the visible action, never a linked critical goal",
+  { ...llmEvalOptions(["action-archive-targeting"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-archivala-331-${randomUUID()}`;
+    const trace = new EvalTrace("331-archivala-es", ["action-archive-targeting"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "critical"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs today", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record("¿cómo va mi búsqueda de trabajo?", await sendAgentMessage(server, userId, "¿cómo va mi búsqueda de trabajo?"));
+        const listReply = trace.record("muéstrame mis acciones", await sendAgentMessage(server, userId, "muéstrame mis acciones"));
+        assertNoGenericAgentError(listReply, "Spanish action list");
+
+        const archiveReply = trace.record("archívala", await sendAgentMessage(server, userId, "archívala"));
+        assertNoGenericAgentError(archiveReply, "Spanish 'archívala' after the action list");
+
+        const goalAfter = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        trace.checkpoint("the critical goal was never archived", goalAfter?.status === "active", JSON.stringify(goalAfter));
+        assert.equal(goalAfter?.status, "active", "the critical goal must never be archived by a Spanish action pronoun");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "332. Catalan: 'arxiva-la' right after an action list archives the visible action, never a linked critical goal",
+  { ...llmEvalOptions(["action-archive-targeting"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-arxivala-332-${randomUUID()}`;
+    const trace = new EvalTrace("332-arxivala-ca", ["action-archive-targeting"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job, ideally in Web3",
+        category: "career",
+        priority: "critical"
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs today", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        trace.record("com va la meva cerca de feina?", await sendAgentMessage(server, userId, "com va la meva cerca de feina?"));
+        const listReply = trace.record("mostra les meves accions", await sendAgentMessage(server, userId, "mostra les meves accions"));
+        assertNoGenericAgentError(listReply, "Catalan action list");
+
+        const archiveReply = trace.record("arxiva-la", await sendAgentMessage(server, userId, "arxiva-la"));
+        assertNoGenericAgentError(archiveReply, "Catalan 'arxiva-la' after the action list");
+
+        const goalAfter = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        trace.checkpoint("the critical goal was never archived", goalAfter?.status === "active", JSON.stringify(goalAfter));
+        assert.equal(goalAfter?.status, "active", "the critical goal must never be archived by a Catalan action pronoun");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

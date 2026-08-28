@@ -159,6 +159,15 @@ model AgentConversationSession {
   visibleEntities  Json?
   recentMutations  Json?
   messages         Json?
+  // fix/private-alpha-launch-hardening-flakes-and-pending-clarity: a lightweight, additive-only
+  // marker array for capability proposals the user explicitly declined/deferred (not now / cancel
+  // / picked only one of several) — e.g. { proposalId: "daily_coaching", goalId, decidedAt }. Lets
+  // goal.create_apply skip re-offering the same capability for the same goal again within this
+  // same session's TTL, without any permanent suppression: nullable/defaulted, no backfill, and
+  // scoped to the SAME session lifecycle (24h sliding TTL) every other pending-operation field
+  // here already has, so a "not now" naturally becomes offerable again once the session expires
+  // or the user explicitly asks in the meantime.
+  deferredCapabilityProposals Json?
   expiresAt        DateTime?
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt

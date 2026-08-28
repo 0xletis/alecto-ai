@@ -133,7 +133,7 @@ test("2D/4C: 'only Gmail' enables Gmail support only — daily coaching stays of
     assert.equal(confirm.debug.mutationExecuted, true);
     assert.equal(confirm.debug.pendingOperation, false);
     assert.match(confirm.reply, /I'm now using Gmail readonly/i);
-    assert.match(confirm.reply, /Daily coaching stays off\./);
+    assert.match(confirm.reply, /Daily coaching stays off for now\./);
 
     const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
     assert.equal(settings?.morningBriefEnabled, false, "daily coaching must not be enabled");
@@ -158,7 +158,7 @@ test("4D: 'only daily coaching' enables daily coaching only — Gmail support st
 
     assert.equal(confirm.debug.mutationExecuted, true);
     assert.match(confirm.reply, /morning brief is now on/i);
-    assert.match(confirm.reply, /Gmail support stays off\./);
+    assert.match(confirm.reply, /Gmail support stays off for now\./);
 
     const settings = await prisma.notificationSettings.findFirst({ where: { userId } });
     assert.equal(settings?.morningBriefEnabled, true);

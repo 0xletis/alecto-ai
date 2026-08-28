@@ -970,6 +970,21 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     };
   }
 
+  // Same reasoning again: goal.restore_apply is never planned by the LLM directly, only ever
+  // reached via the deterministic confirm whitelist re-executing an already-stored
+  // pendingOperation set by goal.restore_propose after resolving a real, unambiguous ARCHIVED
+  // goal. A direct plan would have no verified goalId anyway.
+  if (tool.name === "goal.restore_apply") {
+    return {
+      tool: tool.name,
+      args,
+      status: "invalid",
+      requiresConfirmation: false,
+      error: "this can only be run by confirming a pending goal restore",
+      rationale: operation.rationale
+    };
+  }
+
   if (
     tool.name === "proactive.settings_propose_update" &&
     args.morningBriefEnabled === undefined &&

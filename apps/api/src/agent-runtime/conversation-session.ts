@@ -1,5 +1,5 @@
 import { loadPersistedSession, persistSession } from "./session-store.js";
-import type { AgentEntity, AgentPendingOperation, AgentSessionState } from "./types.js";
+import type { AgentEntity, AgentPendingOperation, AgentSessionState, DeferredCapabilityProposal } from "./types.js";
 
 /**
  * Agent Runtime v3's conversation/session state, persisted via
@@ -14,6 +14,7 @@ import type { AgentEntity, AgentPendingOperation, AgentSessionState } from "./ty
 
 const MAX_MESSAGES = 20;
 const MAX_MUTATIONS = 10;
+const MAX_DEFERRED_CAPABILITY_PROPOSALS = 20;
 
 export async function loadSession(userId: string, channel: string): Promise<AgentSessionState> {
   return loadPersistedSession(userId, channel);
@@ -107,4 +108,30 @@ export function recordMutation(session: AgentSessionState, summary: string): voi
   if (session.recentMutations.length > MAX_MUTATIONS) {
     session.recentMutations = session.recentMutations.slice(0, MAX_MUTATIONS);
   }
+}
+
+/**
+ * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: records that the user explicitly
+ * declined/deferred one capability proposal for one goal — "not now"/"cancel" on the whole queue,
+ * or picking only a different subset. A plain marker, never a scheduler: it carries no re-offer
+ * timer of its own, just a fact goal.create_apply can check before building its next proposal list
+ * (see wasCapabilityProposalRecentlyDeferred below). Replaces any EXISTING marker for the same
+ * (proposalId, goalId) pair rather than accumulating duplicates, so "decidedAt" always reflects the
+ * user's most recent answer.
+ */
+export function recordDeferredCapabilityProposal(session: AgentSessionState, proposalId: string, goalId: string): void {
+  const withoutExisting = session.deferredCapabilityProposals.filter((entry) => !(entry.proposalId === proposalId && entry.goalId === goalId));
+  const entry: DeferredCapabilityProposal = { proposalId, goalId, decidedAt: new Date().toISOString() };
+  session.deferredCapabilityProposals = [entry, ...withoutExisting].slice(0, MAX_DEFERRED_CAPABILITY_PROPOSALS);
+}
+
+/**
+ * True only when the user was already asked about this exact (proposalId, goalId) pair earlier in
+ * this SAME session and declined/deferred it — never a permanent block (there is no "never ask
+ * again" marker here at all; that would need an explicit, separate, much stronger signal). An
+ * explicit direct request for the capability (e.g. "turn on daily coaching") never consults this at
+ * all — only the automatic post-goal-creation offer in goal.create_apply does.
+ */
+export function wasCapabilityProposalRecentlyDeferred(session: AgentSessionState, proposalId: string, goalId: string): boolean {
+  return session.deferredCapabilityProposals.some((entry) => entry.proposalId === proposalId && entry.goalId === goalId);
 }
