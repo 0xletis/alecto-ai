@@ -7,6 +7,7 @@ import {
   isConversationalMutationIntent,
   processMessage,
   processMessageFromAnalysis,
+  resolveProductionDefaultedFlag,
   routeIntent,
   type MemoryEntry,
   type MessageIntent,
@@ -1200,8 +1201,13 @@ async function maybeRouteSemanticMessageWithLLM(
   }
 }
 
+// fix/private-alpha-launch-config-sanity: an unset LLM_ROUTER_ENABLED now defaults ON in
+// production as long as the router actually has something to call (a real key or, for tests, the
+// mock hook) — an explicit "true"/"false" still always wins, and local dev/test keep defaulting
+// OFF exactly as before.
 function shouldUseSemanticRouterLLM(): boolean {
-  return process.env.LLM_ROUTER_ENABLED === "true" && (Boolean(process.env.OPENAI_API_KEY) || Boolean(process.env.LLM_ROUTER_MOCK_RESPONSE));
+  const hasCapability = Boolean(process.env.OPENAI_API_KEY) || Boolean(process.env.LLM_ROUTER_MOCK_RESPONSE);
+  return hasCapability && resolveProductionDefaultedFlag(process.env.LLM_ROUTER_ENABLED, true);
 }
 
 function sanitizePendingActionForSemanticRouter(pendingAction: PendingAction): Record<string, unknown> {

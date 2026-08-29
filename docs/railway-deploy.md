@@ -54,9 +54,15 @@ Each Railway service therefore shares:
   would pick a default Node version that could silently drift from what's tested locally. A
   `.node-version` file (Node 22, matching this repo's `@types/node@^22`) is added alongside this
   doc so Railway's build is reproducible; this is a one-line config file, not a product change.
-- **`NODE_ENV` is never read anywhere in this codebase.** Setting it on Railway (see `.env.railway.
-  example`) is harmless (Railway/most tooling sets it by default) but has no actual effect on
-  Alecto's own behavior — noted so it's not mistaken for a real feature switch.
+- **`NODE_ENV` now has a real effect** (fix/private-alpha-launch-config-sanity): when
+  `NODE_ENV=production`, several feature flags that would otherwise need to be set explicitly
+  now default ON instead — `PROACTIVE_OPERATOR_DELIVERY_ENABLED`, `PROACTIVE_BRIEF_LLM_ENABLED`
+  (also needs `OPENAI_API_KEY`), `USE_OPENAI_ANALYSIS`/`LLM_ROUTER_ENABLED` (also need
+  `OPENAI_API_KEY`), and `INTEGRATION_SYNC_ENABLED`. An explicit `true`/`false` on any of these
+  always wins regardless of `NODE_ENV`. Outside production (local dev, tests, CI) nothing changes
+  — every one of these still defaults OFF unless explicitly set, exactly as before this pass.
+  `.env.railway.example` already sets `NODE_ENV=production`, so a real Railway deploy gets these
+  defaults automatically.
 - **`DATABASE_URL` is needed at build time**, not just runtime — `packages/db`'s own `build` script
   runs `prisma generate`, which needs `DATABASE_URL` set (a valid-looking connection string; no
   live connection required) even for the Telegram bot service, which never talks to the database at
@@ -119,9 +125,12 @@ checking your own project.
   `{"ok": true, "service": "operator-agent-api"}`. Set this under **Settings → Deploy → Healthcheck
   Path** so Railway can tell the deploy actually came up before routing traffic to it.
 - **Required env vars**: `DATABASE_URL`, `OPENAI_API_KEY`, `ALECTO_SECRET_ENCRYPTION_KEY`,
-  `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GMAIL_REDIRECT_URI`, `API_PORT`,
-  `PROACTIVE_OPERATOR_DELIVERY_ENABLED`, `PROACTIVE_OPERATOR_ALLOWLIST`. See
+  `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GMAIL_REDIRECT_URI`, `API_PORT`. See
   `.env.railway.example` for the full list including optional tuning vars.
+- `PROACTIVE_OPERATOR_DELIVERY_ENABLED` and `PROACTIVE_BRIEF_LLM_ENABLED` now default ON when
+  unset and `NODE_ENV=production` (the latter also needs `OPENAI_API_KEY`, which this service
+  already requires) — set either explicitly to `false` to opt out. `PROACTIVE_OPERATOR_ALLOWLIST`
+  stays genuinely optional; unset means every opted-in user is eligible.
 
 ### Telegram bot service
 
@@ -136,9 +145,12 @@ checking your own project.
 
 - **Start command**: `pnpm --filter @operator-agent/worker start`
 - **Networking**: none — same reasoning as the Telegram bot.
-- **Required env vars**: `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `API_BASE_URL`,
-  `INTEGRATION_SYNC_ENABLED`, `INTEGRATION_SYNC_INTERVAL_MINUTES`,
-  `PROACTIVE_OPERATOR_DELIVERY_ENABLED`, `PROACTIVE_OPERATOR_ALLOWLIST`.
+- **Required env vars**: `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `API_BASE_URL`.
+- `INTEGRATION_SYNC_ENABLED` and `PROACTIVE_OPERATOR_DELIVERY_ENABLED` now default ON when unset
+  and `NODE_ENV=production` — set either explicitly to `false` to opt out. `INTEGRATION_SYNC_ENABLED`
+  is a system-level switch only; it never makes a manual_only Gmail connection background-sync.
+  `INTEGRATION_SYNC_INTERVAL_MINUTES` defaults to 15 if unset. `PROACTIVE_OPERATOR_ALLOWLIST`
+  stays genuinely optional; unset means every opted-in user is eligible.
 
 ## 5. Migration — run once, before any service handles real traffic
 

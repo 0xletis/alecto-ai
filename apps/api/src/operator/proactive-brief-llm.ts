@@ -2,6 +2,7 @@ import { generateProactiveBriefMessage } from "@operator-agent/llm";
 import { getProactiveBriefPreferences } from "@operator-agent/db";
 import {
   resolveProactiveBriefPreference,
+  resolveProductionDefaultedFlag,
   type Goal,
   type NotificationSettings,
   type ProactiveBriefContext,
@@ -48,8 +49,14 @@ export interface ProactiveBriefPersonalizationResult {
   debug: ProactiveBriefPersonalizationDebug;
 }
 
+// fix/private-alpha-launch-config-sanity: an unset PROACTIVE_BRIEF_LLM_ENABLED now defaults ON in
+// production as long as OPENAI_API_KEY is actually present — an explicit "true"/"false" still
+// always wins, and local dev/test keep defaulting OFF exactly as before.
 export function shouldUseProactiveBriefLLM(): boolean {
-  return process.env.PROACTIVE_BRIEF_LLM_ENABLED === "true" && Boolean(process.env.OPENAI_API_KEY);
+  if (!process.env.OPENAI_API_KEY) {
+    return false;
+  }
+  return resolveProductionDefaultedFlag(process.env.PROACTIVE_BRIEF_LLM_ENABLED, true);
 }
 
 export async function personalizeProactiveDecision(

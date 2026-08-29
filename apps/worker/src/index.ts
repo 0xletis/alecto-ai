@@ -12,7 +12,8 @@ import {
   buildDailyCheckinPrompt,
   describeDeployConfigWarnings,
   proactiveOperatorAllowlistActiveFromEnv,
-  proactiveOperatorDeliveryEnabledFromEnv
+  proactiveOperatorDeliveryEnabledFromEnv,
+  resolveProductionDefaultedFlag
 } from "@operator-agent/core";
 import { sendDueActionReminders as sendDueActionRemindersImpl } from "./action-reminders.js";
 import { formatLocalDate, formatLocalTime, getPart } from "./datetime.js";
@@ -35,7 +36,12 @@ config({
 const telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
 const apiBaseUrl = process.env.API_BASE_URL ?? "http://localhost:3000";
 const tickMs = 60_000;
-const integrationSyncEnabled = process.env.INTEGRATION_SYNC_ENABLED === "true";
+// fix/private-alpha-launch-config-sanity: unset now defaults ON in production (NODE_ENV=production)
+// rather than silently leaving Gmail background sync off on a forgotten Railway service — an
+// explicit "true"/"false" still always wins, and this does NOT change per-connection manual_only
+// gating at all (packages/core/src/gmail-autonomy.ts still refuses to sync any manual_only
+// connection regardless of this system-level flag).
+const integrationSyncEnabled = resolveProductionDefaultedFlag(process.env.INTEGRATION_SYNC_ENABLED, true);
 const integrationSyncIntervalMinutes = Number(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15");
 
 if (!telegramBotToken) {
@@ -46,6 +52,7 @@ console.log(`Worker started. API base URL: ${apiBaseUrl}`);
 logStartupWarnings();
 logEffectiveProactiveDeliveryConfig();
 console.log(`INTEGRATION_SYNC_ENABLED=${integrationSyncEnabled}`);
+logWorkerStartupSummary();
 
 await runTick();
 setInterval(() => {
@@ -92,6 +99,26 @@ function logEffectiveProactiveDeliveryConfig(): void {
       "[startup] PROACTIVE_OPERATOR_DELIVERY_ENABLED is not \"true\" in this process — morning brief, evening check-in, and Gmail nudges are all silently disabled for EVERY user, even those with their own setting on. If this deploy is meant to actually deliver, set PROACTIVE_OPERATOR_DELIVERY_ENABLED=true. If this is intentional (dev/test/staging), no action needed."
     );
   }
+}
+
+/**
+ * fix/private-alpha-launch-config-sanity (task 4): one consolidated, safe-to-read config summary
+ * covering everything Task 4 asked the worker to report at startup that the two functions above
+ * don't already — never a secret value, only presence booleans and already-public config. This is
+ * deliberately IN ADDITION to (not a replacement for) logEffectiveProactiveDeliveryConfig's own
+ * warn-if-off behavior above, which stays as the sharper, harder-to-miss signal for that one flag.
+ */
+function logWorkerStartupSummary(): void {
+  console.log(
+    [
+      "[startup] Worker config summary:",
+      `NODE_ENV=${process.env.NODE_ENV ?? "(unset)"}`,
+      `API_BASE_URL configured=${Boolean(process.env.API_BASE_URL)} (using ${apiBaseUrl})`,
+      `Telegram bot token present=${Boolean(telegramBotToken)}`,
+      `tick interval=${tickMs / 1000}s`,
+      `integration sync interval=${integrationSyncIntervalMinutes}m`
+    ].join(" ")
+  );
 }
 
 async function runTick() {
