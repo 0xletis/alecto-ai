@@ -886,6 +886,21 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "proactive.brief_preference_apply_update",
+    description:
+      "Store what KIND of content the user wants in their morning/evening proactive brief, and turn that brief on if it isn't already. Use for a request for a SPECIFIC content style — 'send me motivational quotes every morning', 'motivate me about this every morning', 'give me a reflection prompt every morning', 'send me a quote to help with this goal', 'I want tough love every morning', 'I want gentle encouragement every morning', 'make the morning brief more practical', 'stop the quotes'/'don't include quotes' (style: practical), 'switch to tough love', 'make it gentler', 'add reflection prompts'. NOT for a plain on/off or time request with no content style mentioned ('turn on morning brief', 'move it to 8am') — that stays proactive.settings_propose_update. Executes immediately — no confirmation needed, mirroring memory.create's own low-risk, easily-corrected treatment (saying a different style again simply replaces it). Set goalRef ONLY when the user's own message names or clearly implies a specific goal ('for this goal', 'to help with my job search'); OMIT it for a general request ('every morning', with no goal named) — the tool resolves goal vs. general scope itself (a single active goal or the conversation's current focus resolves automatically; two or more with nothing focused is a real ambiguity the tool will ask about, never guessed).",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      goalRef: z.string().optional().describe("Which goal this preference is for, in the user's own words — omit for a general/all-mornings preference."),
+      briefType: z.enum(["morning", "evening", "both"]).default("morning").describe("Which proactive moment this content preference applies to."),
+      style: z
+        .enum(["motivational", "reflection", "tough_love", "gentle", "practical"])
+        .describe("motivational: an original, unattributed motivating line. reflection: a reflection question/prompt. tough_love: direct and challenging. gentle: warm, low-pressure encouragement. practical: plain, action/progress-focused — also use this for 'stop the quotes'/'no quotes'/'make it practical'."),
+      contentRequest: z.string().min(1).max(200).describe("The user's own words for what they asked for, e.g. 'motivational quotes', 'reflection prompts', 'tough love' — shown back in status/diagnosis copy.")
+    })
+  },
+  {
     name: "operator_profile.propose_update",
     description:
       "Propose a change to the user's stored coaching-style preferences (communication directness, motivational approach, accountability strictness) — shows what would change and opens a pending confirmation. Use when the user states a coaching-style preference: 'be blunt with me', 'I want you to be direct', 'go easy on me', 'be gentle', 'push me harder', 'be strict about accountability', 'I like tough love', 'be more encouraging' — including as part of an onboarding/setup flow. Set only the field(s) the user actually expressed a preference for. Never applies anything by itself — the user must still confirm.",

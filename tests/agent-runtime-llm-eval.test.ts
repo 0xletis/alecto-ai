@@ -6,6 +6,7 @@ import {
   createActionItem,
   createEvent,
   createGoal,
+  getProactiveBriefPreferences,
   setGoalStatus,
   snoozeActionItem,
   updateNotificationSettings,
@@ -12170,5 +12171,449 @@ test(
       await server.close();
       await prisma.user.deleteMany({ where: { id: userId } });
     }
+  }
+);
+
+// --- Launch-readiness: proactive brief LLM personalization (fix/private-alpha-proactive-brief-
+//     llm-personalization) — a real tester asked for motivational quotes every morning to help
+//     with a life-meaning goal; the delivery-bug fix made the message actually arrive, but an
+//     end-to-end check found the ARRIVED content was still just "nothing scheduled for today yet"
+//     — no durable preference, no LLM call, no personalization anywhere. These scenarios exercise
+//     the real preference-capture tool, the real LLM composition layer (packages/llm/src/
+//     proactive-brief.ts), and its deterministic fallback, through the real planner end to end. ---
+
+const PROACTIVE_BRIEF_EVAL_TAGS = ["proactive-brief-personalization", "morning-brief-user-preferences", "life-meaning-motivation", "proactive-no-fake-actions", "proactive-llm-brief-generation"];
+
+function withProactiveBriefLLMEnabled<T>(fn: () => Promise<T>): Promise<T> {
+  const previousEnabled = process.env.PROACTIVE_BRIEF_LLM_ENABLED;
+  process.env.PROACTIVE_BRIEF_LLM_ENABLED = "true";
+  return fn().finally(() => {
+    if (previousEnabled === undefined) delete process.env.PROACTIVE_BRIEF_LLM_ENABLED;
+    else process.env.PROACTIVE_BRIEF_LLM_ENABLED = previousEnabled;
+  });
+}
+
+const FABRICATED_QUOTE_ATTRIBUTION_NAMES = ["nietzsche", "marcus aurelius", "viktor frankl", "seneca", "aristotle", "socrates", "confucius", "rumi", "buddha", "einstein", "gandhi", "emerson", "thoreau", "epictetus"];
+
+test(
+  "338. asking for motivational quotes every morning for a life-meaning goal durably stores the preference",
+  { ...llmEvalOptions(["proactive-brief-personalization", "life-meaning-motivation", "morning-brief-user-preferences"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-quotes-life-meaning-338-${randomUUID()}`;
+    const trace = new EvalTrace("338-quotes-life-meaning", ["proactive-brief-personalization", "life-meaning-motivation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "can you send me motivational quotes every morning to help with this?",
+          await sendAgentMessage(server, userId, "can you send me motivational quotes every morning to help with this?")
+        );
+        assertNoGenericAgentError(reply, "motivational quotes request for a life-meaning goal");
+
+        const preferences = await getProactiveBriefPreferences(userId);
+        trace.checkpoint("a real proactive_brief_preference row was stored", preferences.length === 1, JSON.stringify(preferences));
+        assert.equal(preferences.length, 1, `expected exactly one stored preference — got: ${JSON.stringify(preferences)}`);
+        trace.checkpoint("the preference is linked to the real goal, not left global", preferences[0]?.goalId === goalResult.goal.id, JSON.stringify(preferences));
+        assert.equal(preferences[0]?.goalId, goalResult.goal.id);
+
+        const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+        trace.checkpoint("morning brief is now actually on, not just a stored-but-dormant preference", settings?.morningBriefEnabled === true, JSON.stringify(settings));
+        assert.equal(settings?.morningBriefEnabled, true);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "339. the next real worker tick delivers an actually personalized brief, not just the goal-anchor nudge",
+  { ...llmEvalOptions(["proactive-llm-brief-generation", "life-meaning-motivation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const server = buildServer();
+      const chatIdDigits = `800339${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("339-personalized-tick", ["proactive-llm-brief-generation", "life-meaning-motivation"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+        await trace.guard(async () => {
+          const proposeReply = trace.record(
+            "can you send me motivational quotes every morning to help with this?",
+            await sendAgentMessage(server, userId, "can you send me motivational quotes every morning to help with this?")
+          );
+          assertNoGenericAgentError(proposeReply, "motivational quotes preference + morning brief on");
+
+          // This scenario is about the DELIVERED CONTENT's personalization, not the planner's own
+          // tool choice for turning morning brief on (already covered by scenario 338) — guarantees
+          // delivery is really on regardless of any nondeterminism on this specific turn, so a real
+          // personalization bug is never masked by (or confused with) an unrelated setup flake.
+          let settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          if (!settings?.morningBriefEnabled) {
+            settings = await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: true });
+          }
+
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          trace.checkpoint("a real brief was delivered", sent.length === 1, JSON.stringify(sent));
+          assert.equal(sent.length, 1, `expected exactly one delivered brief — got: ${JSON.stringify(sent)}`);
+          const text = sent[0]!.text;
+          const groundedInGoalTheme = /meaning|purpose|fulfil/i.test(text);
+          trace.checkpoint("the goal's theme is actually reflected, not a generic non-sequitur", groundedInGoalTheme, text);
+          assert.ok(groundedInGoalTheme, `expected the goal's theme to be reflected — got: ${text}`);
+
+          trace.checkpoint("never just the bare goal-anchor nudge — real personalized content beyond 'nothing scheduled'", !/^morning\. active goal:.*nothing scheduled for today yet/i.test(text.trim()), text);
+          assert.doesNotMatch(text.trim(), /^morning\. active goal:.*nothing scheduled for today yet/i, `expected real personalized content, not the bare fallback — got: ${text}`);
+
+          const actions = await prisma.actionItem.findMany({ where: { userId } });
+          trace.checkpoint("no action was silently created while generating the brief", actions.length === 0, JSON.stringify(actions));
+          assert.equal(actions.length, 0);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
+  }
+);
+
+test(
+  "340. asking for reflection prompts every morning produces an actual reflection-shaped brief",
+  { ...llmEvalOptions(["proactive-brief-personalization", "proactive-llm-brief-generation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const server = buildServer();
+      const chatIdDigits = `800340${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("340-reflection-prompts", ["proactive-brief-personalization", "proactive-llm-brief-generation"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+        await trace.guard(async () => {
+          const reply = trace.record("give me a reflection prompt every morning", await sendAgentMessage(server, userId, "give me a reflection prompt every morning"));
+          assertNoGenericAgentError(reply, "reflection prompt preference");
+
+          const preferences = await getProactiveBriefPreferences(userId);
+          trace.checkpoint("stored as a reflection-style preference", preferences[0]?.style === "reflection", JSON.stringify(preferences));
+          assert.equal(preferences[0]?.style, "reflection");
+
+          let settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          if (!settings?.morningBriefEnabled) {
+            settings = await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: true });
+          }
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          assert.equal(sent.length, 1);
+          trace.checkpoint("the brief includes a real question/prompt, not just a flat statement", sent[0]!.text.includes("?"), sent[0]!.text);
+          assert.ok(sent[0]!.text.includes("?"), `expected a reflection question/prompt — got: ${sent[0]!.text}`);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
+  }
+);
+
+test(
+  "341. a job-search goal's morning brief stays practical and progress-focused, even with LLM personalization on",
+  { ...llmEvalOptions(["proactive-llm-brief-generation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const server = buildServer();
+      const chatIdDigits = `800341${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("341-job-search-practical", ["proactive-llm-brief-generation"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+        await createActionItem(userId, { source: "manual", title: "Apply to 5 remote Web3 roles today", goalId: goalResult.goal.id, priority: "high" });
+
+        await trace.guard(async () => {
+          await sendAgentMessage(server, userId, "turn on my morning brief");
+          await sendAgentMessage(server, userId, "yes");
+
+          const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          assert.equal(sent.length, 1);
+          const text = sent[0]!.text;
+          const groundedInRealAction = /appl(?:y|ying) to 5\b/i.test(text) && /remote/i.test(text) && /web3/i.test(text);
+          trace.checkpoint("the real open action is grounded in the brief", groundedInRealAction, text);
+          assert.ok(groundedInRealAction, `expected the real action to be grounded in the brief — got: ${text}`);
+          trace.checkpoint("no fabricated quote-attribution shape for a plain practical goal", !FABRICATED_QUOTE_ATTRIBUTION_NAMES.some((name) => text.toLowerCase().includes(name)), text);
+          assert.ok(!FABRICATED_QUOTE_ATTRIBUTION_NAMES.some((name) => text.toLowerCase().includes(name)), `must never fabricate a quote attribution — got: ${text}`);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
+  }
+);
+
+test(
+  "342. a fitness goal's morning brief stays fitness-specific, never importing job-search or Gmail language",
+  { ...llmEvalOptions(["proactive-llm-brief-generation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const server = buildServer();
+      const chatIdDigits = `800342${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("342-fitness-specific", ["proactive-llm-brief-generation"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Run 3 times a week", category: "fitness" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+        await createActionItem(userId, { source: "manual", title: "Go for a 30 minute run", goalId: goalResult.goal.id, priority: "medium" });
+
+        await trace.guard(async () => {
+          await sendAgentMessage(server, userId, "turn on my morning brief");
+          await sendAgentMessage(server, userId, "yes");
+
+          const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          assert.equal(sent.length, 1);
+          const text = sent[0]!.text;
+          trace.checkpoint("the real fitness action is grounded in the brief", /30[\s-]minute run/i.test(text), text);
+          assert.match(text, /30[\s-]minute run/i, `expected the real fitness action to be grounded in the brief — got: ${text}`);
+          trace.checkpoint("no job-search/Gmail language leaks into an unrelated fitness goal", !/gmail|recruiter|application|resume|cv\b/i.test(text), text);
+          assert.doesNotMatch(text, /gmail|recruiter|application|resume|cv\b/i, `must never import job-search/Gmail language — got: ${text}`);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
+  }
+);
+
+test(
+  "343. a motivational-quote request with no active goal at all is never silently accepted and dropped",
+  { ...llmEvalOptions(["proactive-brief-personalization", "proactive-no-fake-actions"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-quotes-no-goal-343-${randomUUID()}`;
+    const trace = new EvalTrace("343-quotes-no-goal", ["proactive-brief-personalization", "proactive-no-fake-actions"], userId);
+
+    try {
+      await seedUser(userId);
+
+      await trace.guard(async () => {
+        const reply = trace.record("send me motivational quotes every morning", await sendAgentMessage(server, userId, "send me motivational quotes every morning"));
+        assertNoGenericAgentError(reply, "motivational quotes request with zero active goals");
+
+        const preferences = await getProactiveBriefPreferences(userId);
+        const progressed = preferences.length === 1 || reply.debug.pendingOperation === true || /goal|what.*focus/i.test(reply.reply);
+        trace.checkpoint("either stores a real (global) preference, proposes a goal, or asks what to attach it to — never silently drops it", progressed, JSON.stringify({ preferences, reply: reply.reply }));
+        assert.ok(progressed, `expected real progress, not a silent no-op — got preferences: ${JSON.stringify(preferences)}, reply: ${reply.reply}`);
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        trace.checkpoint("no fake action created", actions.length === 0, JSON.stringify(actions));
+        assert.equal(actions.length, 0);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "344. 'give me tough love instead' replaces an earlier motivational preference, not stacks a second one",
+  { ...llmEvalOptions(["proactive-brief-personalization", "morning-brief-user-preferences"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-switch-tough-love-344-${randomUUID()}`;
+    const trace = new EvalTrace("344-switch-tough-love", ["proactive-brief-personalization", "morning-brief-user-preferences"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("send me motivational quotes every morning", await sendAgentMessage(server, userId, "send me motivational quotes every morning"));
+        const switchReply = trace.record("actually, give me tough love in the morning instead", await sendAgentMessage(server, userId, "actually, give me tough love in the morning instead"));
+        assertNoGenericAgentError(switchReply, "switching to tough love");
+
+        const preferences = await getProactiveBriefPreferences(userId);
+        trace.checkpoint("exactly one active preference after switching — no duplicate stacked rows", preferences.length === 1, JSON.stringify(preferences));
+        assert.equal(preferences.length, 1, `expected exactly one active preference — got: ${JSON.stringify(preferences)}`);
+        trace.checkpoint("the active preference is now tough_love", preferences[0]?.style === "tough_love", JSON.stringify(preferences));
+        assert.equal(preferences[0]?.style, "tough_love");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "345. status honestly shows the real morning brief content style",
+  { ...llmEvalOptions(["morning-brief-user-preferences"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-status-style-345-${randomUUID()}`;
+    const previous = process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+    process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = "true";
+    const trace = new EvalTrace("345-status-style", ["morning-brief-user-preferences"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "send me motivational quotes every morning");
+
+        const reply = trace.record("do I have morning brief on?", await sendAgentMessage(server, userId, "do I have morning brief on?"));
+        assertNoGenericAgentError(reply, "status question after setting a content preference");
+
+        trace.checkpoint("status mentions the content style", /motivational/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /motivational/i, `expected the status to mention the real style — got: ${reply.reply}`);
+      });
+    } finally {
+      if (previous === undefined) delete process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED;
+      else process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED = previous;
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "346. an LLM personalization failure still delivers a real, truthful, goal-grounded brief via the deterministic fallback",
+  { ...llmEvalOptions(["proactive-llm-brief-generation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const previousThrow = process.env.PROACTIVE_BRIEF_LLM_MOCK_THROW;
+      process.env.PROACTIVE_BRIEF_LLM_MOCK_THROW = "true";
+
+      const server = buildServer();
+      const chatIdDigits = `800346${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("346-llm-failure-fallback", ["proactive-llm-brief-generation"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+        await trace.guard(async () => {
+          const reply = trace.record("send me motivational quotes every morning", await sendAgentMessage(server, userId, "send me motivational quotes every morning"));
+          assertNoGenericAgentError(reply, "motivational quotes preference setup");
+
+          // This scenario is specifically about the LLM-failure -> deterministic-fallback safety
+          // property, not about the planner's own tool choice for the setup turn (already covered
+          // by scenarios 338/343/344) — deterministically ensures morning brief delivery is truly
+          // on regardless of any planner nondeterminism on this particular turn, so a real
+          // personalization-layer bug is never masked by (or confused with) an unrelated flake.
+          await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: true });
+
+          const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          trace.checkpoint("a real message still delivers even though the LLM call is forced to fail", sent.length === 1, JSON.stringify(sent));
+          assert.equal(sent.length, 1, `expected the deterministic fallback to still deliver — got: ${JSON.stringify(sent)}`);
+          trace.checkpoint("the fallback still mentions the real goal", /meaning and purpose/i.test(sent[0]!.text), sent[0]!.text);
+          assert.match(sent[0]!.text, /meaning and purpose/i);
+        });
+      } finally {
+        if (previousThrow === undefined) delete process.env.PROACTIVE_BRIEF_LLM_MOCK_THROW;
+        else process.env.PROACTIVE_BRIEF_LLM_MOCK_THROW = previousThrow;
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
+  }
+);
+
+test(
+  "347. a real motivational brief never invents a fake famous-author quote attribution",
+  { ...llmEvalOptions(["proactive-llm-brief-generation", "life-meaning-motivation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const server = buildServer();
+      const chatIdDigits = `800347${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("347-no-fake-attribution", ["proactive-llm-brief-generation", "life-meaning-motivation"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Find meaning and purpose in life", category: "personal development" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+        await trace.guard(async () => {
+          await sendAgentMessage(server, userId, "send me motivational quotes every morning to help with this");
+
+          const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          assert.equal(sent.length, 1);
+          const text = sent[0]!.text.toLowerCase();
+          const hasFakeAttribution = FABRICATED_QUOTE_ATTRIBUTION_NAMES.some((name) => text.includes(name));
+          trace.checkpoint("no fabricated famous-author attribution appears in the delivered brief", !hasFakeAttribution, sent[0]!.text);
+          assert.ok(!hasFakeAttribution, `must never attribute a generated line to a real philosopher/author — got: ${sent[0]!.text}`);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
   }
 );

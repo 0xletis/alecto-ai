@@ -23,6 +23,7 @@ import {
   getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getNotificationLog,
+  getProactiveBriefPreferences,
   hasNotificationLog,
   rescheduleActionItem,
   selfHealDailyLoopEnabled,
@@ -32,6 +33,7 @@ import {
   updateIntegrationConnectionConfig,
   updateNotificationSettings,
   updateUserOperatingProfile,
+  upsertProactiveBriefPreference,
   type ActionItem,
   type EmailReviewItem,
   type EmailSignalRule,
@@ -60,11 +62,14 @@ import {
   proactiveOperatorDeliveryEnabledFromEnv,
   readGmailAutonomyPreferences,
   resolveActiveGoalReference,
+  resolveProactiveBriefPreference,
   writeGmailAutonomyPreferences,
   type EventTypeId,
   type Goal,
   type GoalMetric,
   type NotificationSettings,
+  type ProactiveBriefPreference,
+  type ProactiveBriefStyle,
   type StoredEvent,
   type UserOperatingProfile
 } from "@operator-agent/core";
@@ -111,6 +116,7 @@ import {
   nextScheduledMomentLabel,
   proactiveStatusBlockedClause
 } from "../operator/proactive-eligibility.js";
+import { pickBriefGoal } from "../operator/proactive-brief-llm.js";
 import {
   assessTemporalHealth,
   EVENING_CHECKIN_DEDUPE_KEY,
@@ -2976,6 +2982,82 @@ export async function executeOperation(
         };
       }
 
+      case "proactive.brief_preference_apply_update": {
+        const goalRef = args.goalRef as string | undefined;
+        const briefType = (args.briefType as "morning" | "evening" | "both" | undefined) ?? "morning";
+        const style = args.style as ProactiveBriefStyle;
+        const contentRequest = args.contentRequest as string;
+
+        // Zero active goals at all means there is genuinely nothing to attach to yet — a global
+        // preference, not an error. With at least one active goal, resolveGoalForRecommendation's
+        // existing single-goal/current-focus auto-resolve, real-ambiguity-asks, never-guesses
+        // semantics (already used by goal.recommend_next_action) apply unchanged.
+        let goal: Goal | undefined;
+        if (context.activeGoals.length > 0) {
+          const outcome = resolveGoalForRecommendation(goalRef, context.activeGoals, resolveCurrentFocusGoal(context));
+
+          if (outcome.status === "ambiguous") {
+            const names = outcome.goals.map((candidate) => `"${candidate.title}"`).join(" or ");
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: `Which goal should this apply to — ${names}? Or should it apply to your mornings generally, not tied to one goal?`
+            };
+          }
+
+          if (outcome.status === "no_match" && goalRef) {
+            return failed(operation.tool, `I don't see an active goal called "${goalRef}" — want this to apply generally instead, or a different goal?`);
+          }
+
+          goal = outcome.status === "matched" ? outcome.goals[0] : undefined;
+        }
+
+        const scope: "goal" | "global" = goal ? "goal" : "global";
+        const styleSummaryPhrase = PROACTIVE_BRIEF_STYLE_SUMMARY_PHRASE[style] ?? "personalize it";
+
+        await upsertProactiveBriefPreference(userId, {
+          scope,
+          goalId: goal?.id,
+          briefType,
+          style,
+          contentRequest,
+          summary: `Wants the ${briefType} brief to ${styleSummaryPhrase}${goal ? ` for goal "${goal.title}"` : ""} (asked for: "${contentRequest}").`
+        });
+
+        // "send me motivational quotes every morning" is also, implicitly, a request for the
+        // morning brief itself to actually be on — mirrors proactive.settings_apply_update's own
+        // dailyLoopEnabled self-heal below, so this is a single, complete action rather than
+        // silently storing a preference nothing ever delivers until a SEPARATE settings turn.
+        const settingsBefore = await getOrCreateNotificationSettings(userId);
+        const wantsMorning = briefType === "morning" || briefType === "both";
+        const wantsEvening = briefType === "evening" || briefType === "both";
+        const needsMorningEnable = wantsMorning && !settingsBefore.morningBriefEnabled;
+        const needsEveningEnable = wantsEvening && !settingsBefore.eveningCheckinEnabled;
+
+        if (needsMorningEnable || needsEveningEnable) {
+          await updateNotificationSettings(userId, {
+            morningBriefEnabled: needsMorningEnable ? true : undefined,
+            eveningCheckinEnabled: needsEveningEnable ? true : undefined,
+            dailyLoopEnabled: true
+          });
+        }
+
+        const enabledNote = needsMorningEnable && needsEveningEnable
+          ? " Morning brief and evening check-in are now on."
+          : needsMorningEnable
+            ? " Morning brief is now on."
+            : needsEveningEnable
+              ? " Evening check-in is now on."
+              : "";
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Got it — I'll ${styleSummaryPhrase} in your ${briefType === "both" ? "morning and evening briefs" : `${briefType} brief`}${goal ? ` for "${goal.title}"` : ""}.${enabledNote}`,
+          result: { scope, goalId: goal?.id, briefType, style, contentRequest }
+        };
+      }
+
       case "operator_profile.propose_update": {
         const directnessStyle = args.directness as "gentle" | "balanced" | "blunt" | undefined;
         const motivationalStyle = args.motivationalStyle as string | undefined;
@@ -3799,6 +3881,14 @@ function failed(tool: string, error: string): ExecutedOperation {
   return { tool, status: "failed", summary: error, error };
 }
 
+const PROACTIVE_BRIEF_STYLE_SUMMARY_PHRASE: Record<ProactiveBriefStyle, string> = {
+  motivational: "include a short motivating line",
+  reflection: "include a short reflection prompt",
+  tough_love: "keep it direct and no-nonsense",
+  gentle: "keep it warm and encouraging",
+  practical: "keep it plain and practical"
+};
+
 function normalize(text: string): string {
   return text.trim().toLowerCase();
 }
@@ -4440,6 +4530,7 @@ async function buildTruthfulProactiveSettingsSummary(userId: string, settingsInp
   const sentForDate = formatDateInTimezone(now, settings.timezone);
   const deliveryEnabled = proactiveOperatorDeliveryEnabledFromEnv();
   const isAllowlisted = proactiveOperatorAllowlistFromEnv()(userId);
+  const briefPreferences = await getProactiveBriefPreferences(userId);
 
   const morning = settings.morningBriefEnabled
     ? await buildMomentStatusLine({
@@ -4456,7 +4547,7 @@ async function buildTruthfulProactiveSettingsSummary(userId: string, settingsInp
         momentPhrase: "morning brief",
         getStatus: (alreadySentDedupeKeys, sentCountToday, legacyDailyLoopSentAt) =>
           getProactiveDeliveryStatus({ context, notificationSettings: settings, now, alreadySentDedupeKeys, sentCountToday, deliveryEnabled, isAllowlisted, legacyDailyLoopSentAt })
-      })
+      }) + (formatProactiveBriefStyleSuffix(briefPreferences, context, "morning") ?? "")
     : "off";
 
   const evening = settings.eveningCheckinEnabled
@@ -4474,10 +4565,33 @@ async function buildTruthfulProactiveSettingsSummary(userId: string, settingsInp
         momentPhrase: "evening check-in",
         getStatus: (alreadySentDedupeKeys, sentCountToday, legacyDailyLoopSentAt) =>
           getEveningCheckinDeliveryStatus({ context, notificationSettings: settings, now, alreadySentDedupeKeys, sentCountToday, deliveryEnabled, isAllowlisted, legacyDailyLoopSentAt })
-      })
+      }) + (formatProactiveBriefStyleSuffix(briefPreferences, context, "evening") ?? "")
     : "off";
 
   return ["Automatic messages:", `- Morning brief: ${morning}`, `- Evening check-in: ${evening}`, `- Gmail alerts: ${settings.gmailNudgeEnabled ? "on" : "off"}`].join("\n");
+}
+
+/**
+ * fix/private-alpha-proactive-brief-llm-personalization (Task 9): "Style: motivational for 'Find
+ * meaning and purpose in life'" — honest ONLY when a real, active proactive_brief_preference
+ * exists; undefined (no suffix at all) otherwise, never a fabricated default style. Reuses
+ * pickBriefGoal/resolveProactiveBriefPreference — the exact same functions that decide what the
+ * NEXT real brief will actually contain — so status can never claim a style delivery wouldn't
+ * actually apply.
+ */
+function formatProactiveBriefStyleSuffix(
+  preferences: ProactiveBriefPreference[],
+  context: ContextBundle,
+  briefType: "morning" | "evening"
+): string | undefined {
+  const goal = pickBriefGoal(preferences, context.activeGoals, briefType);
+  const preference = resolveProactiveBriefPreference(preferences, goal?.id, briefType);
+
+  if (!preference) {
+    return undefined;
+  }
+
+  return `\n  Style: ${preference.style}${goal ? ` for "${goal.title}"` : ""} (${preference.contentRequest})`;
 }
 
 async function buildMomentStatusLine(input: {

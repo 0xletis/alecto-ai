@@ -12,6 +12,7 @@ import type {
 } from "../agent-runtime/types.js";
 import { evaluateProactiveEligibility } from "../operator/proactive-eligibility.js";
 import { decideProactiveOperatorMessage, gmailNudgeDedupeKey, EVENING_CHECKIN_DEDUPE_KEY, MORNING_BRIEF_DEDUPE_KEY } from "../operator/proactive.js";
+import { personalizeProactiveDecision, type ProactiveBriefPersonalizationDebug } from "../operator/proactive-brief-llm.js";
 import { formatMinutesOfDay } from "../operator/daily-loop-settings.js";
 import { formatDateInTimezone, parseOptionalNow } from "../utils/datetime.js";
 
@@ -74,6 +75,19 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
         sentCountToday: alreadySentDedupeKeys.size
       });
 
+      // fix/private-alpha-proactive-brief-llm-personalization: the ONE place a real send's message
+      // text can be rewritten by the LLM personalization layer — see proactive-brief-llm.ts's own
+      // doc comment for why this lives here rather than inside decideProactiveOperatorMessage
+      // itself. Only ever replaces `message`; every other field (decision/dedupeKey/entities/
+      // whether anything sends at all) is untouched, and the original deterministic message is
+      // always the safe fallback on any LLM failure.
+      let personalizationDebug: ProactiveBriefPersonalizationDebug | undefined;
+      if (decision.decision === "proposed_message") {
+        const personalized = await personalizeProactiveDecision(decision, context, notificationSettings, now);
+        decision.message = personalized.message;
+        personalizationDebug = personalized.debug;
+      }
+
       // Informational only — env flags are developer rollout controls, not the product UX (see
       // docs/10-v3-readiness-audit.md §15/§19). apps/worker's own delivery code independently
       // re-checks every one of these before an actual send; this route never writes the DB.
@@ -103,7 +117,8 @@ export function registerAgentRoutes(server: FastifyInstance, handlers: AgentRout
             gmailNudgeEnabled: notificationSettings.gmailNudgeEnabled
           },
           pendingGmailReviewCount: context.gmailReviews.length
-        }
+        },
+        personalization: personalizationDebug
       };
     }
   );
