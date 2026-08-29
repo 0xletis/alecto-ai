@@ -7,7 +7,14 @@ export const MemoryEntryTypeSchema = z.enum([
   "risk_pattern",
   "communication_style",
   "important_fact",
-  "note"
+  "note",
+  // fix/private-alpha-proactive-brief-llm-personalization: a durable request for a SPECIFIC kind of
+  // morning/evening brief content (motivational quotes, reflection prompts, tough love, gentle
+  // encouragement) — see proactive-brief-preference.ts for the structured shape stored in `data`.
+  // Deliberately its own type rather than reusing "preference": proactive brief generation reads
+  // this type directly and exclusively (never scans every generic preference memory), so a stray,
+  // unrelated "preference" memory can never accidentally leak into brief content.
+  "proactive_brief_preference"
 ]);
 
 export const MemoryEntryStatusSchema = z.enum(["active", "archived", "rejected"]);

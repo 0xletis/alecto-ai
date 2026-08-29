@@ -7,6 +7,7 @@ import {
   GoalCheckInQuestionSchema,
   GoalMetricSchema,
   normalizeGoalPriority,
+  parseProactiveBriefPreferences,
   scoreForGoalPriority
 } from "@operator-agent/core";
 import type {
@@ -21,6 +22,8 @@ import type {
   MemoryEntry,
   NotificationSettings,
   PendingMemoryCreatePayload,
+  ProactiveBriefPreference,
+  ProactiveBriefPreferenceData,
   StoredEvent,
   UpdateIntegrationConnectionInput,
   UpdateEmailSignalRuleInput,
@@ -2482,6 +2485,53 @@ export async function updateMemory(
   });
 
   return toMemoryEntry(memory);
+}
+
+/**
+ * fix/private-alpha-proactive-brief-llm-personalization: every ACTIVE "proactive_brief_preference"
+ * memory for a user, unbounded by recency — deliberately NOT sourced from ContextBundle.memories
+ * (agent-runtime/context-loader.ts's getRelevantMemories, capped at the 15 most recent ACTIVE
+ * memories of any type), since a real user who has accumulated other memories could push this one
+ * out of that recency window entirely, silently losing a real, durable preference. Brief
+ * generation always reads preferences through this dedicated query instead.
+ */
+export async function getProactiveBriefPreferences(userId: string): Promise<ProactiveBriefPreference[]> {
+  const memories = await getRelevantMemories(userId, { types: ["proactive_brief_preference"], limit: 200 });
+  return parseProactiveBriefPreferences(memories);
+}
+
+/**
+ * Archives any existing ACTIVE preference for the exact same (scope, goalId) pair before creating
+ * the new one — so "make it gentler" replaces an earlier "tough love" for the same goal/scope
+ * instead of stacking a second active row resolveProactiveBriefPreference would then have to pick
+ * between (Task 8's own "no duplicate preference rows" requirement).
+ */
+export async function upsertProactiveBriefPreference(
+  userId: string,
+  input: ProactiveBriefPreferenceData & { summary: string }
+): Promise<MemoryEntry> {
+  const existing = await getProactiveBriefPreferences(userId);
+  const supersedes = existing.filter(
+    (preference) => preference.scope === input.scope && preference.goalId === input.goalId
+  );
+
+  for (const preference of supersedes) {
+    await archiveMemory(userId, preference.id);
+  }
+
+  return createMemory(userId, {
+    type: "proactive_brief_preference",
+    summary: input.summary,
+    data: {
+      scope: input.scope,
+      goalId: input.goalId,
+      briefType: input.briefType,
+      style: input.style,
+      contentRequest: input.contentRequest
+    },
+    source: "explicit_user_request",
+    confidence: 1
+  });
 }
 
 export async function getRelevantMemories(
