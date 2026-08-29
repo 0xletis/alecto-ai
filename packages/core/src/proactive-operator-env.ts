@@ -17,10 +17,18 @@
  *   not further restrict delivery" (every opted-in user is eligible once the kill switch is on).
  *   When set, it's an ADDITIONAL narrowing limiter for controlled rollout — only listed users are
  *   eligible even if opted in.
+ *
+ * fix/private-alpha-launch-config-sanity: PROACTIVE_OPERATOR_DELIVERY_ENABLED left UNSET on one
+ * Railway service was a real production incident (a fully opted-in tester's morning brief never
+ * sent, with zero visibility) — this now defaults ON when genuinely unset in production
+ * (NODE_ENV=production), via resolveProductionDefaultedFlag. An explicit "true"/"false" always
+ * still wins on every environment; local dev/test keep defaulting OFF exactly as before.
  */
 
+import { resolveProductionDefaultedFlag } from "./env-flags.js";
+
 export function proactiveOperatorDeliveryEnabledFromEnv(): boolean {
-  return process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED === "true";
+  return resolveProductionDefaultedFlag(process.env.PROACTIVE_OPERATOR_DELIVERY_ENABLED, true);
 }
 
 /** True when PROACTIVE_OPERATOR_ALLOWLIST is actually configured (non-empty) — lets callers

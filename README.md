@@ -606,8 +606,8 @@ Expected:
 - `/weekly` is a saved operator review for the current local Monday-Sunday week. It uses actions, events, goals, guardrails, action hygiene, daily-loop state, and active operator reflections; it stores one `weekly_review` memory per week and updates it on reruns.
 - Daily insight identifies meaningful progress, gaps, risk state, relevant memory signals, and 1-3 recommended next actions.
 - Weekly insight aggregates the last 7 days by default and looks for repeated patterns such as cooldowns, low sleep, high anxiety, and clustered progress.
-- When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy.
-- When `LLM_ROUTER_ENABLED=true` and `OPENAI_API_KEY` is set, `/messages/process` can use an LLM semantic router for messages that fall just outside deterministic phrase rules. It is wired for the main operator surfaces, Gmail setup/sync/custom-rule create/edit/manage/question flows, recent Gmail-rule context, and conversation repair across English, Spanish, and Catalan phrasing; mutation still happens only through API executors. Route debug includes semantic language, confidence, and side-effect risk for API smoke tests.
+- When `USE_OPENAI_ANALYSIS=true` and `OPENAI_API_KEY` is set, `/messages/process` uses OpenAI structured output for intent/mode/event analysis, validates the JSON, then still runs deterministic risk policy. In production (`NODE_ENV=production`) this now defaults ON automatically whenever `OPENAI_API_KEY` is present — set `USE_OPENAI_ANALYSIS=false` explicitly to opt out.
+- When `LLM_ROUTER_ENABLED=true` and `OPENAI_API_KEY` is set, `/messages/process` can use an LLM semantic router for messages that fall just outside deterministic phrase rules. It is wired for the main operator surfaces, Gmail setup/sync/custom-rule create/edit/manage/question flows, recent Gmail-rule context, and conversation repair across English, Spanish, and Catalan phrasing; mutation still happens only through API executors. Route debug includes semantic language, confidence, and side-effect risk for API smoke tests. Same production default as above: ON automatically when `OPENAI_API_KEY` is present, unless explicitly set to `false`.
 - `CONVERSATION_ORCHESTRATOR_V2_ENABLED` and `LLM_OPERATION_PLANNER_ENABLED` no longer do anything — Conversation Orchestrator v2 has been retired (see `docs/09-architecture-inventory.md`). `/messages/process` route debug still reports `handledBy`, `plannerUsed`, `llmPlannerAttempted`, `llmPlannerUsed`, `llmPlannerFailedReason`, `policyPrecheckResult`, `mutationExecuted`, and whether legacy semantic routing was attempted/used — these are populated by the remaining legacy routers, not v2.
 - ResponseComposer v1 is the final normal-chat reply layer. It supports `fiscal`, `guardian`, `support`, `mirror`, `builder`, and `review` style replies from the same structured context pack.
 - Composer context includes active goals, last 10 active events, up to 5 relevant memories, the user operating profile, and today's factual summary.
@@ -626,7 +626,7 @@ Expected:
 - GitHub events use `source=github`, provider metadata, and external IDs for dedupe. Running the same sync twice should not create duplicate events.
 - Duplicate GitHub connections are prevented for the same normalized repo list and same `author=LOGIN`. Same repo with a different author is allowed.
 - Manual sync uses `/sync_integrations` or `/sync_integration CONNECTION_ID`.
-- Automatic integration sync is disabled by default. Set `INTEGRATION_SYNC_ENABLED=true` on the worker to sync active integrations in the background.
+- Automatic integration sync is disabled by default in development/test. Set `INTEGRATION_SYNC_ENABLED=true` on the worker to sync active integrations in the background. In production (`NODE_ENV=production`) this now defaults ON automatically when unset — set `INTEGRATION_SYNC_ENABLED=false` explicitly to disable it. This is a system-level switch only; it never overrides a Gmail connection's own manual/scheduled sync-mode preference — see the scheduled-sync bullet below.
 - Automatic sync interval defaults to 15 minutes. Override with `INTEGRATION_SYNC_INTERVAL_MINUTES=15`.
 - Scheduled sync skips paused, archived, and error integrations, and skips active integrations synced less than the configured interval ago.
 - Scheduled sync supports active GitHub and Gmail integrations. Gmail background sync runs only when the global worker switch is on, Gmail is active, at least one Gmail rule is active, and the user explicitly chose scheduled Gmail checks.
@@ -641,6 +641,8 @@ GOOGLE_CLIENT_SECRET=your-google-client-secret
 GMAIL_REDIRECT_URI=http://localhost:3000/oauth/gmail/callback
 ALECTO_SECRET_ENCRYPTION_KEY=base64-32-byte-key
 ```
+
+`GMAIL_REDIRECT_URI` is the canonical name the app reads. A legacy `GOOGLE_REDIRECT_URI` name is also honored as a fallback if it's already set somewhere, but `GMAIL_REDIRECT_URI` always wins when both are present — the API logs which one it actually used at startup, and warns if both are set and disagree.
 
 Generate a local encryption key with:
 

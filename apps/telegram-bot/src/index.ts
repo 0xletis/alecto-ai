@@ -34,6 +34,21 @@ for (const warning of describeDeployConfigWarnings({ apiBaseUrl })) {
   console.warn(`[startup] ${warning}`);
 }
 
+// fix/private-alpha-launch-config-sanity (task 4): never a secret value — only presence booleans,
+// a count, and already-public config. TELEGRAM_ALLOWED_USER_IDS unset means every Telegram user
+// can talk to the bot (see apps/telegram-bot's own isAllowedTelegramUser) — worth surfacing
+// plainly at startup, not just inferred from an absent warning.
+console.log(
+  [
+    "[startup] Telegram bot config summary:",
+    `NODE_ENV=${process.env.NODE_ENV ?? "(unset)"}`,
+    `API_BASE_URL configured=${Boolean(process.env.API_BASE_URL)} (using ${apiBaseUrl})`,
+    `bot token present=${Boolean(token)}`,
+    `allowed users=${allowedUserIds ? allowedUserIds.size : "unrestricted (TELEGRAM_ALLOWED_USER_IDS not set)"}`,
+    "mode=long-polling"
+  ].join(" ")
+);
+
 const bot = new Bot(token);
 
 bot.use(async (ctx, next) => {
@@ -164,6 +179,43 @@ bot.command("debug_route", async (ctx) => {
   const inbound = buildNormalizedTelegramMessage(ctx, text);
   const debug = explainNormalizedInboundRoute(inbound);
   await ctx.reply(formatRouteDebug(debug));
+});
+
+// fix/private-alpha-launch-config-sanity (task 7): a minimal, safe status command — not a new
+// admin panel, one flat summary combining what this process knows locally (bot token/allowed
+// users/API_BASE_URL) with the API's own GET /diagnostics/config-status (proactive delivery,
+// proactive brief personalization, OpenAI, Gmail OAuth, redirect URI). Deliberately does NOT
+// cover INTEGRATION_SYNC_ENABLED or "worker last tick": the worker process has no HTTP surface of
+// its own to query (it's a bare tick loop with no listening port) — see the worker's own startup
+// log for those instead.
+bot.command("debug_config_status", async (ctx) => {
+  if (!(await guardDebugAllowedUser(ctx))) {
+    return;
+  }
+
+  try {
+    const apiStatus = await apiGet<ApiConfigStatusResponse>("/diagnostics/config-status");
+    await ctx.reply(
+      [
+        "Telegram bot:",
+        `- API_BASE_URL configured: ${Boolean(process.env.API_BASE_URL)} (using ${apiBaseUrl})`,
+        `- Bot token present: ${Boolean(token)}`,
+        `- Allowed users: ${allowedUserIds ? allowedUserIds.size : "unrestricted (TELEGRAM_ALLOWED_USER_IDS not set)"}`,
+        "",
+        `Environment: ${apiStatus.nodeEnv}`,
+        `OpenAI configured: ${apiStatus.openaiConfigured ? "yes" : "no"}`,
+        `Proactive delivery: ${apiStatus.proactiveDeliveryEnabled ? "enabled" : "disabled"}${apiStatus.proactiveDeliveryAllowlistActive ? " (allowlist active)" : ""}`,
+        `Proactive brief personalization: ${apiStatus.proactiveBriefPersonalizationEnabled ? "enabled" : "disabled"}`,
+        `Gmail OAuth: ${apiStatus.gmailOAuthConfigured ? "configured" : "not configured"}`,
+        `Gmail redirect URI: ${apiStatus.gmailRedirectUri} (source: ${apiStatus.gmailRedirectUriSource})${apiStatus.gmailRedirectUriConflict ? " — WARNING: GOOGLE_REDIRECT_URI also set and disagrees" : ""}`,
+        `Diagnostics logging: ${apiStatus.diagnosticsEnabled ? "on" : "off"}`,
+        "",
+        "(Integration sync / worker last tick: not available here — check the worker process's own startup log.)"
+      ].join("\n")
+    );
+  } catch (error) {
+    await replyWithApiFailure(ctx, error, "I could not reach the API to build a config status.");
+  }
 });
 
 bot.command("debug_conversation_intent", async (ctx) => {
@@ -5320,6 +5372,19 @@ interface ReminderTimePatch {
 interface OnboardingResponse {
   message: string;
   state?: Record<string, unknown>;
+}
+
+interface ApiConfigStatusResponse {
+  nodeEnv: string;
+  openaiConfigured: boolean;
+  proactiveDeliveryEnabled: boolean;
+  proactiveDeliveryAllowlistActive: boolean;
+  proactiveBriefPersonalizationEnabled: boolean;
+  gmailOAuthConfigured: boolean;
+  gmailRedirectUri: string;
+  gmailRedirectUriSource: "GMAIL_REDIRECT_URI" | "GOOGLE_REDIRECT_URI" | "default";
+  gmailRedirectUriConflict: boolean;
+  diagnosticsEnabled: boolean;
 }
 
 interface PendingAction {

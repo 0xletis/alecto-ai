@@ -12081,9 +12081,19 @@ test(
         trace.checkpoint("never fabricates and sends an actual quote right now", !fabricatedQuote, reply.reply);
         assert.ok(!fabricatedQuote, `must never just invent and send a quote — got: ${reply.reply}`);
 
-        const progressed = reply.debug.pendingOperation === true || /goal|what.*(you.*want to )?focus|attach|morning brief/i.test(reply.reply);
-        trace.checkpoint("either schedules it as real daily-coaching content or clearly asks what goal to attach it to — never a silent no-op", progressed, reply.reply);
-        assert.ok(progressed, `expected either a real proposal or a goal-anchoring question — got: ${reply.reply}`);
+        // fix/private-alpha-launch-config-sanity: proactive.brief_preference_apply_update
+        // (added after this scenario was first written) executes DIRECTLY — no pendingOperation —
+        // so "did this really progress" is checked against real DB state now, not just reply text
+        // or a pending-confirmation flag, matching scenario 343's own more robust pattern.
+        const preferences = await getProactiveBriefPreferences(userId);
+        const settingsAfter = await prisma.notificationSettings.findUnique({ where: { userId } });
+        const progressed =
+          preferences.length === 1 ||
+          Boolean(settingsAfter?.morningBriefEnabled) ||
+          reply.debug.pendingOperation === true ||
+          /goal|what.*(you.*want to )?focus|attach|morning brief/i.test(reply.reply);
+        trace.checkpoint("either schedules it as real daily-coaching content or clearly asks what goal to attach it to — never a silent no-op", progressed, JSON.stringify({ preferences, morningBriefEnabled: settingsAfter?.morningBriefEnabled, reply: reply.reply }));
+        assert.ok(progressed, `expected either a real proposal, a stored preference, morning brief turned on, or a goal-anchoring question — got: ${reply.reply}`);
       });
     } finally {
       await server.close();

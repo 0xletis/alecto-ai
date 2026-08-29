@@ -164,6 +164,7 @@ import {
   generateDailyOperatorBrief,
   shouldUseDailyCoachLLM
 } from "./operator/attention.js";
+import { buildApiConfigStatus } from "./operator/config-status.js";
 import { buildOnboardingState, composeOnboardingReply } from "./legacy/daily-conversation.js";
 import { registerMessageRoutes } from "./routes/messages.js";
 import { createMessagesProcessHandler } from "./legacy/messages-process.js";
@@ -295,6 +296,13 @@ export function buildServer() {
     ok: true,
     service: "operator-agent-api"
   }));
+
+  // fix/private-alpha-launch-config-sanity (task 7): a minimal, safe, read-only config status —
+  // never a secret value, only presence booleans and already-public config (shares
+  // buildApiConfigStatus with apps/api/src/index.ts's own startup log, so they can never
+  // disagree). Deliberately not an admin panel: one flat JSON object, no auth of its own beyond
+  // whatever normally fronts this API, matching /health's own unauthenticated-by-default shape.
+  server.get("/diagnostics/config-status", async () => buildApiConfigStatus());
 
   server.get("/events/types", async () => ({
     eventTypes: eventRegistry

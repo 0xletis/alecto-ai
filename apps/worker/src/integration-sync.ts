@@ -8,6 +8,7 @@ import {
   evaluateGmailBackgroundSyncEligibility,
   gmailReviewNotificationsEnabled,
   gmailScheduledSyncRuntimeFromEnv,
+  resolveProductionDefaultedFlag,
   type GmailScheduledSyncRuntime
 } from "@operator-agent/core";
 import {
@@ -81,7 +82,7 @@ export async function runScheduledIntegrationSync(
 ): Promise<ScheduledIntegrationSyncResult> {
   const now = options.now ?? new Date();
   const skipLogRateLimiter = options.skipLogRateLimiter ?? gmailSkipLogRateLimiter;
-  const integrationSyncEnabled = options.integrationSyncEnabled ?? process.env.INTEGRATION_SYNC_ENABLED === "true";
+  const integrationSyncEnabled = options.integrationSyncEnabled ?? resolveProductionDefaultedFlag(process.env.INTEGRATION_SYNC_ENABLED, true);
   const integrationSyncIntervalMinutes = options.integrationSyncIntervalMinutes ?? Number(process.env.INTEGRATION_SYNC_INTERVAL_MINUTES ?? "15");
   const gmailRuntime = options.gmailRuntime ?? gmailScheduledSyncRuntimeFromEnv();
   const getConnections = options.getConnections ?? getActiveIntegrationConnectionsForSync;
