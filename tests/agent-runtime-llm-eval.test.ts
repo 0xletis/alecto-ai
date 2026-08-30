@@ -6,6 +6,7 @@ import {
   createActionItem,
   createEvent,
   createGoal,
+  createMemory,
   getProactiveBriefPreferences,
   setGoalStatus,
   snoozeActionItem,
@@ -12625,5 +12626,359 @@ test(
         await prisma.user.deleteMany({ where: { id: userId } });
       }
     });
+  }
+);
+
+// --- fix/private-alpha-live-action-and-coaching-regressions (Task 9): scenarios 348-356 ---------
+// Real-planner coverage for the 5 live private-alpha regressions this branch fixes — every
+// deterministic backstop is already proven in its own dedicated test file (action-reschedule-
+// search-scope, action-list-all-scope, action-create-confirm-list-dedupe, duplicate-action-
+// cleanup-critical-goal, coaching-intent-vs-action-mutation, vague-commitment-no-silent-
+// reschedule, live-regression-full-transcript-replay), all using mockPlan; these scenarios instead
+// exercise the REAL planner's own tool-choice judgment for the same message shapes — the one thing
+// no mocked test can see — tagged so `LLM_EVAL_TAGS=live-action-query-scope,action-create-confirm-
+// list,duplicate-action-cleanup,proactive-brief-context-grounding,coaching-intent-vs-action-
+// mutation pnpm test:llm` runs just this branch's own new coverage.
+
+test(
+  "348. 'do I already have an action to send CVs? Move it to today if so' finds a DEFERRED action, never claims nothing exists",
+  { ...llmEvalOptions(["live-action-query-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-348-${randomUUID()}`;
+    const trace = new EvalTrace("348-deferred-action-search", ["live-action-query-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high" });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 3 * 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "Do i have an action already to send CVs? Move it to today if so",
+          await sendAgentMessage(server, userId, "Do i have an action already to send CVs? Move it to today if so")
+        );
+        assertNoGenericAgentError(reply, "deferred action search");
+        trace.checkpoint("never claims nothing exists", !/don't have any actions scheduled for today/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /don't have any actions scheduled for today/i, `expected the deferred action to be found — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the deferred action actually moved to today and re-opened", updated?.status === "open", JSON.stringify(updated));
+        assert.equal(updated?.status, "open", `expected the deferred action to be re-opened for today — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "349. 'show me all actions' surfaces overdue, today, and deferred actions together, never narrowed to today",
+  { ...llmEvalOptions(["live-action-query-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-349-${randomUUID()}`;
+    const trace = new EvalTrace("349-all-actions-scope", ["live-action-query-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Follow up with recruiter", priority: "medium", dueAt: new Date(Date.now() - 24 * 60 * 60 * 1000) });
+      await createActionItem(userId, { source: "manual", title: "Call the bank", priority: "medium", dueAt: new Date(Date.now() + 60 * 60 * 1000) });
+      const deferred = await createActionItem(userId, { source: "manual", title: "Book flights", priority: "low" });
+      await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const reply = trace.record("And showme all actions", await sendAgentMessage(server, userId, "And showme all actions"));
+        assertNoGenericAgentError(reply, "all-actions scope");
+        trace.checkpoint("never narrows to a single-day 'nothing scheduled' reply", !/don't have any actions scheduled for today/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /don't have any actions scheduled for today/i);
+        trace.checkpoint("the overdue action is included", /follow up with recruiter/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /follow up with recruiter/i, `expected the overdue action to be listed — got: ${reply.reply}`);
+        trace.checkpoint("the deferred action is included", /book flights/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /book flights/i, `expected the deferred action to be listed — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "350. 'schedule sending CVs today' then 'Yes do so and show me my actions so i can verify' never creates a duplicate",
+  { ...llmEvalOptions(["action-create-confirm-list"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-350-${randomUUID()}`;
+    const trace = new EvalTrace("350-create-confirm-list", ["action-create-confirm-list"], userId);
+
+    try {
+      await seedUser(userId);
+
+      await trace.guard(async () => {
+        const t1 = trace.record("schedule sending CVs today", await sendAgentMessage(server, userId, "schedule sending CVs today"));
+        assertNoGenericAgentError(t1, "action creation");
+
+        const t2 = trace.record(
+          "Yes do so and show me my actions so i can verify",
+          await sendAgentMessage(server, userId, "Yes do so and show me my actions so i can verify")
+        );
+        assertNoGenericAgentError(t2, "confirm + list");
+
+        const actions = await prisma.actionItem.findMany({ where: { userId } });
+        const cvActions = actions.filter((item) => /cv/i.test(item.title));
+        trace.checkpoint("exactly one CV-related action exists after confirming", cvActions.length === 1, JSON.stringify(actions.map((a) => a.title)));
+        assert.equal(cvActions.length, 1, `expected exactly one CV action, never a duplicate — got titles: ${actions.map((a) => a.title).join(", ")}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "351. a duplicate-cleanup proposal for an action linked to a critical goal needs only ONE confirmation",
+  { ...llmEvalOptions(["duplicate-action-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-351-${randomUUID()}`;
+    const trace = new EvalTrace("351-duplicate-cleanup-critical", ["duplicate-action-cleanup"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote Web3 developer job", category: "career", priority: "critical" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const first = await createActionItem(userId, { source: "manual", title: "Apply to 3 more remote Web3 roles today", goalId: goalResult.goal.id });
+      await snoozeActionItem(userId, first.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+      const second = await createActionItem(userId, {
+        source: "manual",
+        title: "Apply to 3 more remote Web3 roles by the end of the week",
+        goalId: goalResult.goal.id
+      });
+      await snoozeActionItem(userId, second.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+
+      await trace.guard(async () => {
+        const t1 = trace.record("do i have something to do tomorrow?", await sendAgentMessage(server, userId, "do i have something to do tomorrow?"));
+        assertNoGenericAgentError(t1, "duplicate-cleanup proposal");
+        trace.checkpoint("the proposal discloses the critical-goal link up front", t1.debug.pendingOperation === true, t1.reply);
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("a single yes actually archives the duplicate", t2.debug.mutationExecuted === true, t2.reply);
+        assert.equal(t2.debug.mutationExecuted, true, `expected one confirmation to be enough — got: ${t2.reply}`);
+        trace.checkpoint("never re-asks a second critical-goal confirmation", !/archive only this action\?/i.test(t2.reply), t2.reply);
+        assert.doesNotMatch(t2.reply, /archive only this action\?/i, `expected no second confirmation — got: ${t2.reply}`);
+
+        const goal = await prisma.goal.findUnique({ where: { id: goalResult.goal.id } });
+        trace.checkpoint("the critical goal itself is never touched", goal?.status === "active", JSON.stringify(goal));
+        assert.equal(goal?.status, "active", "the goal must remain completely untouched by this action-level cleanup");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "352. a proactive morning brief never contradicts an already-stated 'resume is up to date' fact",
+  { ...llmEvalOptions(["proactive-brief-context-grounding"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    await withProactiveBriefLLMEnabled(async () => {
+      const server = buildServer();
+      const chatIdDigits = `800352${Date.now()}`;
+      const userId = `telegram:${chatIdDigits}`;
+      const trace = new EvalTrace("352-resume-context-grounding", ["proactive-brief-context-grounding"], userId);
+
+      try {
+        await seedUser(userId);
+        const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+        await createMemory(userId, {
+          type: "goal_context",
+          summary: "User's resume and web CV are already up to date — do not suggest updating/customizing them.",
+          source: "explicit_user_request",
+          confidence: 1
+        });
+        await updateNotificationSettings(userId, { morningBriefEnabled: true, dailyLoopEnabled: true });
+
+        await trace.guard(async () => {
+          const settings = await prisma.notificationSettings.findUnique({ where: { userId } });
+          const sent: Array<{ chatId: string; text: string }> = [];
+          await runV3ProactiveMorningBriefs([settings as any], {
+            now: nextRealLocalMoment(settings!.morningTimeMinutes),
+            deliveryEnabled: true,
+            apiGet: injectApiGet(server),
+            sendTelegramMessage: async (chatId, text) => void sent.push({ chatId, text })
+          });
+
+          assert.equal(sent.length, 1);
+          trace.checkpoint("the brief never suggests updating an already-current resume/CV", !/update.{0,20}(resume|cv)/i.test(sent[0]!.text), sent[0]!.text);
+          assert.doesNotMatch(sent[0]!.text, /update.{0,20}(resume|cv)/i, `expected the durable fact to be honored — got: ${sent[0]!.text}`);
+        });
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: userId } });
+      }
+    });
+  }
+);
+
+test(
+  "353. 'Is it okay? About the weekend thing' answers as a coach, never with a mechanical mutation confirmation",
+  { ...llmEvalOptions(["coaching-intent-vs-action-mutation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-353-${randomUUID()}`;
+    const trace = new EvalTrace("353-coaching-judgment-question", ["coaching-intent-vs-action-mutation"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high", dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.record(
+          "Hey Ive been this weekend doing some mindfulnes w friends, will try to send some this week",
+          await sendAgentMessage(server, userId, "Hey Ive been this weekend doing some mindfulnes w friends, will try to send some this week")
+        );
+
+        const before = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const reply = trace.record("Is it okay? About the weekend thing", await sendAgentMessage(server, userId, "Is it okay? About the weekend thing"));
+        assertNoGenericAgentError(reply, "coaching judgment question");
+        trace.checkpoint("never a mechanical mutation-confirmation reply", !/action rescheduled|due:/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /action rescheduled|due:/i, `expected a real coaching answer — got: ${reply.reply}`);
+
+        const after = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the judgment question itself never mutates the action", after?.dueAt?.getTime() === before?.dueAt?.getTime(), JSON.stringify({ before, after }));
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "354. a vague, mixed-timing weekend update never silently reschedules — concrete options offered instead",
+  { ...llmEvalOptions(["coaching-intent-vs-action-mutation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-354-${randomUUID()}`;
+    const trace = new EvalTrace("354-vague-commitment", ["coaching-intent-vs-action-mutation"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high", dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+
+        const before = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const reply = trace.record(
+          "today I will go back to Barcelona and will lock in will try to send some when I get there this night and also lot this week",
+          await sendAgentMessage(
+            server,
+            userId,
+            "today I will go back to Barcelona and will lock in will try to send some when I get there this night and also lot this week"
+          )
+        );
+        assertNoGenericAgentError(reply, "vague weekend update");
+        trace.checkpoint("no silent mutation from a vague, mixed-timing message", reply.debug.mutationExecuted === false, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent reschedule — got: ${reply.reply}`);
+
+        const after = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(after?.dueAt?.getTime(), before?.dueAt?.getTime(), "the due date must stay exactly what it was");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "355. the full live transcript shape — deferred-action search, all-actions scope, and a weekend coaching question — in one conversation",
+  {
+    ...llmEvalOptions(["live-action-query-scope", "coaching-intent-vs-action-mutation"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-355-${randomUUID()}`;
+    const trace = new EvalTrace("355-full-transcript-shape", ["live-action-query-scope", "coaching-intent-vs-action-mutation"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high" });
+      await snoozeActionItem(userId, action.id, new Date(Date.now() + 3 * 24 * 60 * 60 * 1000));
+      await createActionItem(userId, { source: "manual", title: "Follow up with recruiter", priority: "medium", dueAt: new Date(Date.now() - 24 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const t1 = trace.record(
+          "Do i have an action already to send CVs? Move it to today if so",
+          await sendAgentMessage(server, userId, "Do i have an action already to send CVs? Move it to today if so")
+        );
+        assertNoGenericAgentError(t1, "deferred action search");
+        assert.doesNotMatch(t1.reply, /don't have any actions scheduled for today/i);
+
+        const t2 = trace.record("And showme all actions", await sendAgentMessage(server, userId, "And showme all actions"));
+        assertNoGenericAgentError(t2, "all-actions scope");
+        assert.match(t2.reply, /follow up with recruiter/i, `expected the overdue action to be listed — got: ${t2.reply}`);
+
+        const before = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const t3 = trace.record("Is it okay? About the weekend thing", await sendAgentMessage(server, userId, "Is it okay? About the weekend thing"));
+        assertNoGenericAgentError(t3, "coaching judgment question");
+        trace.checkpoint("never a mechanical mutation reply to a judgment question", !/action rescheduled|due:/i.test(t3.reply), t3.reply);
+        assert.doesNotMatch(t3.reply, /action rescheduled|due:/i);
+        const after = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("no incidental mutation from the judgment question", after?.dueAt?.getTime() === before?.dueAt?.getTime(), JSON.stringify({ before, after }));
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "356. an explicit 'move it to tomorrow' with no vague or coaching language still mutates normally, unaffected by the new guards",
+  {
+    ...llmEvalOptions(["coaching-intent-vs-action-mutation", "live-action-query-scope"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-356-${randomUUID()}`;
+    const trace = new EvalTrace("356-explicit-mutation-unaffected", ["coaching-intent-vs-action-mutation", "live-action-query-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+
+        const reply = trace.record("reschedule it to tomorrow", await sendAgentMessage(server, userId, "reschedule it to tomorrow"));
+        assertNoGenericAgentError(reply, "explicit reschedule");
+        trace.checkpoint("an explicit, concrete instruction still mutates normally", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected a genuine 'move it to tomorrow' to still work — got: ${reply.reply}`);
+
+        // "reschedule it to tomorrow" is legitimately fulfilled either via action.reschedule
+        // (sets dueAt, action stays open) or action.snooze (sets snoozedUntil, action becomes
+        // "snoozed" until then) — both genuinely move the task to tomorrow; the real planner is
+        // free to choose either, same as the runtime's own deterministic "move it" shortcut
+        // already treats this phrasing as action.snooze. This scenario is about the guards never
+        // BLOCKING an explicit instruction, not about which of the two valid tools gets picked.
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const actuallyMoved = Boolean(updated?.dueAt) || updated?.status === "snoozed";
+        trace.checkpoint("the action was actually moved to tomorrow, via either reschedule or snooze", actuallyMoved, JSON.stringify(updated));
+        assert.ok(actuallyMoved, `expected the action to actually move to tomorrow (dueAt set or status snoozed) — got: ${JSON.stringify(updated)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
   }
 );

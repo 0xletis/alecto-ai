@@ -41,6 +41,15 @@ export const ProactiveBriefContextSchema = z.object({
   openActionTitles: z.array(z.string()).default([]),
   overdueActionLines: z.array(z.string()).default([]),
   recentWins: z.array(z.string()).default([]),
+  /** fix/private-alpha-live-action-and-coaching-regressions: durable "goal_context" memory
+   * summaries (e.g. "resume and web CV are already up to date — do not suggest updating them") —
+   * the exact same memory type/mechanism planner.ts's own "Durable goal-setup constraints"
+   * instruction already saves for the chat path. A live incident found the morning brief LLM
+   * contradicting this within a day of it being stated, because this context previously carried
+   * NO memories at all (buildMorningBrief's own deterministic path only ever reads today's
+   * risk_pattern memories, never goal_context). Capped the same way planner.ts caps
+   * recentMemorySummaries, to keep the prompt small. */
+  durableFacts: z.array(z.string()).default([]),
   /** Already redacted/summarized lines from describeGmailSignalsForBrief — never raw email
    * subject/body/sender beyond what that function already extracts safely. */
   gmailSignalLines: z.array(z.string()).default([]),
@@ -75,7 +84,28 @@ export type ProactiveBriefValidationFailureCode =
   | "fake_quote_attribution"
   | "long_quoted_span"
   | "silent_mutation_language"
-  | "meta_disclosure";
+  | "meta_disclosure"
+  | "contradicts_durable_fact";
+
+/**
+ * fix/private-alpha-live-action-and-coaching-regressions: a real tester was told "resume already
+ * up to date" once (saved as a durable "goal_context" memory per planner.ts's own instruction),
+ * then had the morning brief suggest updating it anyway a day later. This exact contradiction was
+ * already fixed once for goal.recommend_next_action (apps/api/src/agent-runtime/executor.ts) with
+ * both a prompt instruction AND this deterministic regex backstop — "prompt guidance alone was not
+ * reliable enough here on its own" per that fix's own comment. Shared here (not duplicated) so
+ * executor.ts and this module can never drift on what counts as "already up to date" vs. "a
+ * suggestion to update it." Deliberately scoped to resume/CV/portfolio specifically, the real
+ * reported instances — not a generic "any stated fact" contradiction detector.
+ */
+export const RESUME_UP_TO_DATE_RE =
+  /\b(resume|cv|web cv|portfolio)\b[\s\S]{0,50}\b(already )?(up.?to.?date|current|updated)\b|\b(already )?(up.?to.?date|current|updated)\b[\s\S]{0,50}\b(resume|cv|web cv|portfolio)\b/i;
+// fix/private-alpha-live-action-and-coaching-regressions: the original verb list here only ever
+// matched the bare infinitive ("update"), never a real inflection ("updating", "updated") — a live
+// incident's own transcript said "updating your resume," which this regex silently let through.
+// Each verb now allows an optional -e/-ing/-ed/-es suffix.
+export const RESUME_UPDATE_SUGGESTION_RE =
+  /\b(updat|customiz|improv|tailor|revis|polish|refresh|prepar)(e|es|ed|ing|s)?\b[\s\S]{0,25}\b(resume|cv|web cv|portfolio)\b|\b(resume|cv|web cv|portfolio)\b[\s\S]{0,25}\b(updat|customiz|improv|tailor|revis|polish|refresh|prepar)(e|es|ed|ing|s)?\b/i;
 
 export class ProactiveBriefValidationError extends Error {
   constructor(
@@ -148,6 +178,10 @@ export function validateProactiveBriefResponseAgainstContext(
 
   if (claimsFabricatedProgress(lower, context)) {
     failureCodes.push("fabricated_progress_claim");
+  }
+
+  if (context.durableFacts.some((fact) => RESUME_UP_TO_DATE_RE.test(fact)) && RESUME_UPDATE_SUGGESTION_RE.test(text)) {
+    failureCodes.push("contradicts_durable_fact");
   }
 
   if (FABRICATED_ATTRIBUTION_NAMES.some((name) => lower.includes(name))) {

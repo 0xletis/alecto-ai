@@ -219,7 +219,7 @@ test("3D: the tomorrow list after cleanup shows exactly one action", async () =>
   }
 });
 
-test("3E: 'show me all my actions' after cleanup labels the archived duplicate", async () => {
+test("3E: 'show me all my actions, including archived' after cleanup labels the archived duplicate", async () => {
   const server = buildServer();
   const userId = `dedupe-3e-${randomUUID()}`;
   try {
@@ -230,8 +230,12 @@ test("3E: 'show me all my actions' after cleanup labels the archived duplicate",
     await sendAgentMessage(server, userId, "do i have something to do tomorrow?");
     await sendAgentMessage(server, userId, "merge them yes");
 
+    // fix/private-alpha-live-action-and-coaching-regressions: a bare "show me all my actions" now
+    // deterministically means status "active" (open + deferred, never archived) — the message must
+    // explicitly ask for archived items too, exactly like test C in agent-runtime-action-list-
+    // status-default.test.ts already does, for the validator to allow status "all" through.
     mockPlan(actionListPlan({ status: "all" }));
-    const reply = await sendAgentMessage(server, userId, "show me all my actions");
+    const reply = await sendAgentMessage(server, userId, "show me all my actions, including archived ones");
 
     assert.match(reply.reply, /archived/i);
     const archivedCount = (reply.reply.match(/— archived/gi) ?? []).length;

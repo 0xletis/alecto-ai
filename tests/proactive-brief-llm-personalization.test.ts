@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createActionItem, createGoal, prisma } from "../packages/db/src/index.ts";
+import { createActionItem, createGoal, createMemory, prisma, updateNotificationSettings } from "../packages/db/src/index.ts";
 import {
   buildDeterministicProactiveBriefResponse,
   ProactiveBriefValidationError,
@@ -165,6 +165,7 @@ test("D (4D). the LLM context never includes raw Gmail subject/snippet content �
     activeGoals: [goal],
     openActions: [],
     gmailReviews: [{ id: "r1", subject: sensitiveSubject, from: "someone@example.com", snippet: sensitiveSubject } as any],
+    memories: [],
     operatingProfile: { directness: 3, warmth: 3, confrontation: 3, verbosity: 3, motivationalStyle: "balanced" }
   } as unknown as ContextBundle;
 
@@ -181,6 +182,7 @@ test("5A/5B. validateProactiveBriefResponseAgainstContext rejects a fake attribu
     timezone: "Europe/Madrid",
     goal: { id: "g1", title: "Find meaning and purpose in life", category: "personal development" },
     otherActiveGoalTitles: [],
+    durableFacts: [],
     openActionTitles: [],
     overdueActionLines: [],
     recentWins: [],
@@ -211,6 +213,7 @@ test("5D. a long quoted span is rejected regardless of attribution — guards ag
     date: "2026-08-20",
     timezone: "Europe/Madrid",
     otherActiveGoalTitles: [],
+    durableFacts: [],
     openActionTitles: [],
     overdueActionLines: [],
     recentWins: [],
@@ -232,6 +235,7 @@ test("goal leak: a response mentioning a DIFFERENT active goal's title is reject
     timezone: "Europe/Madrid",
     goal: { id: "g1", title: "Find meaning and purpose in life", category: "personal development" },
     otherActiveGoalTitles: ["Apply to remote jobs"],
+    durableFacts: [],
     openActionTitles: [],
     overdueActionLines: [],
     recentWins: [],
@@ -251,6 +255,7 @@ test("silent mutation language is rejected", () => {
     date: "2026-08-20",
     timezone: "Europe/Madrid",
     otherActiveGoalTitles: [],
+    durableFacts: [],
     openActionTitles: [],
     overdueActionLines: [],
     recentWins: [],
@@ -270,6 +275,7 @@ test("buildDeterministicProactiveBriefResponse always returns the given fallback
     date: "2026-08-20",
     timezone: "Europe/Madrid",
     otherActiveGoalTitles: [],
+    durableFacts: [],
     openActionTitles: [],
     overdueActionLines: [],
     recentWins: [],
@@ -334,6 +340,134 @@ test("6. exact tester scenario end to end: goal, preference, and a real worker t
 
         const actions = await prisma.actionItem.findMany({ where: { userId: fullUserId } });
         assert.equal(actions.length, 0, "no action was silently created");
+      } finally {
+        await server.close();
+        await prisma.user.deleteMany({ where: { id: fullUserId } });
+      }
+    }
+  );
+});
+
+// --- Task 1 (fix/private-alpha-live-action-and-coaching-regressions): morning brief context
+//     grounding — a real tester was told the morning brief kept suggesting "update your resume"
+//     a day after they'd already told Alecto their resume/web CV were up to date. -----------------
+
+test("1A. a stored 'resume already up to date' memory rejects an LLM response that suggests updating it", () => {
+  const context: ProactiveBriefContext = {
+    briefType: "morning",
+    date: "2026-08-20",
+    timezone: "Europe/Madrid",
+    goal: { id: "g1", title: "Find a fully remote developer job, ideally in Web3", category: "career" },
+    otherActiveGoalTitles: [],
+    durableFacts: ["User's resume and web CV are already up to date — do not suggest updating/customizing them."],
+    openActionTitles: [],
+    overdueActionLines: [],
+    recentWins: [],
+    gmailSignalLines: [],
+    deterministicFallbackMessage: "Morning. Active goal: \"Find a fully remote developer job, ideally in Web3\". Nothing scheduled for today yet — what do you want to focus on?"
+  };
+
+  assert.throws(
+    () => validateProactiveBriefResponseAgainstContext({ message: "Good morning! Consider dedicating today to updating your resume or networking with peers in the field." }, context),
+    (error: unknown) => error instanceof ProactiveBriefValidationError && error.failureCodes.includes("contradicts_durable_fact")
+  );
+});
+
+test("1B. with no resume-related memory, a resume suggestion is not rejected by the durable-fact guard", () => {
+  const context: ProactiveBriefContext = {
+    briefType: "morning",
+    date: "2026-08-20",
+    timezone: "Europe/Madrid",
+    goal: { id: "g1", title: "Find a fully remote developer job, ideally in Web3", category: "career" },
+    otherActiveGoalTitles: [],
+    durableFacts: [],
+    openActionTitles: [],
+    overdueActionLines: [],
+    recentWins: [],
+    gmailSignalLines: [],
+    deterministicFallbackMessage: "Morning. Active goal: \"Find a fully remote developer job, ideally in Web3\". Nothing scheduled for today yet — what do you want to focus on?"
+  };
+
+  const response = validateProactiveBriefResponseAgainstContext({ message: "Good morning! Consider dedicating today to updating your resume or networking with peers in the field." }, context);
+  assert.match(response.message, /resume/i);
+});
+
+test("1C. an open action linked to the goal is included in the LLM context, so the brief can prioritize it", () => {
+  const goal = { id: "goal-1", title: "Find a fully remote developer job, ideally in Web3", category: "career", why: undefined, priority: "medium", importanceScore: 0, priorityReason: "", targetMetrics: [], checkInConfig: [], createdAt: new Date(), updatedAt: new Date(), archivedAt: null, status: "active" as const, templateId: null };
+  const decision: ProactiveMessageProposal = {
+    decision: "proposed_message",
+    type: "morning_brief",
+    title: "Morning brief",
+    message: "Morning. Today I'd focus on:\n1. Send 3 CVs.",
+    reasons: [],
+    suggestedReplies: [],
+    dedupeKey: "v3_morning_brief",
+    priority: 1,
+    safeToSend: true
+  };
+  const fakeContext = {
+    user: { id: "telegram:900002" },
+    activeGoals: [goal],
+    openActions: [{ id: "a1", userId: "telegram:900002", title: "Send 3 CVs", goalId: "goal-1", status: "open", priority: "high", dueAt: null, postponeCount: 0 } as any],
+    gmailReviews: [],
+    memories: [],
+    operatingProfile: { directness: 3, warmth: 3, confrontation: 3, verbosity: 3, motivationalStyle: "balanced" }
+  } as unknown as ContextBundle;
+
+  const built = buildProactiveBriefContext(decision, fakeContext, { timezone: "Europe/Madrid" } as any, new Date("2026-08-20T07:00:00.000Z"), "morning", goal as any, undefined);
+
+  assert.deepEqual(built.openActionTitles, ["Send 3 CVs"]);
+});
+
+test("1D. the durable-fact guard never flags a response that avoids the known fact entirely — no false positives", () => {
+  const context: ProactiveBriefContext = {
+    briefType: "morning",
+    date: "2026-08-20",
+    timezone: "Europe/Madrid",
+    goal: { id: "g1", title: "Find a fully remote developer job, ideally in Web3", category: "career" },
+    otherActiveGoalTitles: [],
+    durableFacts: ["User's resume and web CV are already up to date — do not suggest updating/customizing them."],
+    openActionTitles: ["Send 3 CVs"],
+    overdueActionLines: [],
+    recentWins: [],
+    gmailSignalLines: [],
+    deterministicFallbackMessage: "Morning. Today I'd focus on: Send 3 CVs."
+  };
+
+  const response = validateProactiveBriefResponseAgainstContext({ message: "Your CV is already ready; today's useful move is pipeline. Send 3 targeted applications or message 2 people in remote Web3 teams." }, context);
+  assert.match(response.message, /pipeline|applications/i);
+});
+
+test("1E. end to end: a real durable resume-up-to-date memory makes a bad LLM suggestion fall back safely to the deterministic message", async () => {
+  await withEnv(
+    {
+      PROACTIVE_BRIEF_LLM_ENABLED: "true",
+      OPENAI_API_KEY: "test-key",
+      PROACTIVE_BRIEF_LLM_MOCK_RESPONSE: JSON.stringify({ message: "Good morning! Consider dedicating today to updating your resume or networking with peers in the field." })
+    },
+    async () => {
+      const chatIdDigits = `900007${Date.now()}`;
+      const fullUserId = `telegram:${chatIdDigits}`;
+      const server = buildServer();
+
+      try {
+        await seedUser(fullUserId);
+        const goalResult = await createGoal(fullUserId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+        if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+        await createMemory(fullUserId, {
+          type: "goal_context",
+          summary: "User's resume and web CV are already up to date — do not suggest updating/customizing them.",
+          source: "explicit_user_request",
+          confidence: 1
+        });
+        await updateNotificationSettings(fullUserId, { morningBriefEnabled: true, dailyLoopEnabled: true });
+
+        const response = await server.inject({ method: "GET", url: `/users/${fullUserId}/operator/proactive/preview?now=${encodeURIComponent(MORNING_UTC)}` });
+        const body = response.json();
+
+        assert.equal(body.personalization.source, "fallback_invalid", "the bad LLM suggestion must be rejected, not delivered");
+        assert.doesNotMatch(body.decision.message, /updating your resume/i);
+        assert.ok(body.decision.message.length > 0, "the deterministic fallback message must still be real, non-empty content");
       } finally {
         await server.close();
         await prisma.user.deleteMany({ where: { id: fullUserId } });

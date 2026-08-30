@@ -63,6 +63,8 @@ import {
   readGmailAutonomyPreferences,
   resolveActiveGoalReference,
   resolveProactiveBriefPreference,
+  RESUME_UP_TO_DATE_RE,
+  RESUME_UPDATE_SUGGESTION_RE,
   writeGmailAutonomyPreferences,
   type EventTypeId,
   type Goal,
@@ -176,7 +178,7 @@ export async function executeOperation(
   try {
     switch (operation.tool) {
       case "action.list": {
-        const status = (args.status as ActionItem["status"] | "all" | undefined) ?? "open";
+        const status = (args.status as ActionItem["status"] | "all" | "active" | undefined) ?? "open";
         const limit = (args.limit as number | undefined) ?? 10;
         const overdueOnly = Boolean(args.overdueOnly);
         const when = args.when as "today" | "tomorrow" | "this_week" | undefined;
@@ -207,11 +209,18 @@ export async function executeOperation(
         // than layering on top of it — private-alpha's real reported bug was exactly this: "do i
         // have actions for tomorrow?" silently ran the default open-only list and could never see
         // the very action that had just been moved there.
-        const pool = when
-          ? (await getActionItems(userId, { status: "all", limit: ACTION_LIST_POOL_CAP })).filter(
-              (item) => item.status === "open" || item.status === "snoozed"
-            )
-          : await getActionItems(userId, { status, limit: ACTION_LIST_POOL_CAP });
+        // fix/private-alpha-live-action-and-coaching-regressions: "active" is the same open+snoozed
+        // widening `when` already does, for a genuinely UNSCOPED "show me all my actions" request —
+        // a real Telegram transcript found "show me all actions" answered as if nothing existed,
+        // because the only status this tool understood for "everything actionable" was strict
+        // "open," which hides anything already snoozed/deferred. Never includes archived/completed
+        // — those still require asking for them explicitly (status "archived"/"completed"/"all").
+        const pool =
+          when || status === "active"
+            ? (await getActionItems(userId, { status: "all", limit: ACTION_LIST_POOL_CAP })).filter(
+                (item) => item.status === "open" || item.status === "snoozed"
+              )
+            : await getActionItems(userId, { status, limit: ACTION_LIST_POOL_CAP });
         let realActions = pool
           .filter((item) => !isReminderCompanionAction(item))
           .filter((item) => !overdueOnly || (item.status === "open" && Boolean(item.dueAt) && item.dueAt! < now))
@@ -268,7 +277,7 @@ export async function executeOperation(
           return {
             tool: operation.tool,
             status: "executed",
-            summary: `That's all ${items.length} ${status === "all" ? "" : `${status} `}action${items.length === 1 ? "" : "s"} — nothing more to show.`,
+            summary: `That's all ${items.length} ${status === "all" || status === "active" ? "" : `${status} `}action${items.length === 1 ? "" : "s"} — nothing more to show.`,
             result: items,
             entities: items.map((item, index) => actionToEntity(item, index + 1))
           };
@@ -291,18 +300,44 @@ export async function executeOperation(
           const similarPair = findSimilarActionPair(items);
           if (similarPair) {
             const [keep, archiveTarget] = similarPair;
-            summary = `${baseSummary}\n\nYou have two similar actions scheduled. Keep "${cleanedTitleForDateDisplay(keep.title)}" and archive the duplicate?\n\nReply yes to confirm or cancel.`;
+            // fix/private-alpha-live-action-and-coaching-regressions (Task 5): when the duplicate
+            // being archived is itself linked to a critical goal, action.archive's own guard
+            // (right above, in the "action.archive" case) would otherwise ask a SECOND "this is
+            // linked to a critical goal, archive only this action?" confirmation after the user
+            // already said yes once to THIS proposal — the same real mutation confirmed twice.
+            // Disclosing the critical-goal link right here, in this single proposal, and planning
+            // action.archive_all_apply directly (the same already-established "confirmed target
+            // never changes, never touches the goal" tool the guard itself hands off to) means one
+            // "yes" is enough. A DIRECT "archive it" request for a critical-goal-linked action —
+            // never routed through this duplicate-cleanup proposal at all — still gets its own
+            // single confirmation from action.archive's guard, completely unchanged.
+            const linkedCriticalGoal = archiveTarget.goalId
+              ? context.activeGoals.find((goal) => goal.id === archiveTarget.goalId && goal.priority === "critical")
+              : undefined;
+            const criticalNote = linkedCriticalGoal
+              ? ` It's linked to your critical "${linkedCriticalGoal.title}" goal — this only removes the duplicate action, never the goal.`
+              : "";
+            summary = `${baseSummary}\n\nYou have two similar actions scheduled. Keep "${cleanedTitleForDateDisplay(keep.title)}" and archive the duplicate?${criticalNote}\n\nReply yes to confirm or cancel.`;
             duplicateCleanupUpdate = {
               topic: "action_duplicate_cleanup",
               summary: `keep "${keep.title}" and archive the duplicate "${archiveTarget.title}"`,
-              operations: [
-                {
-                  tool: "action.archive",
-                  args: { actionId: archiveTarget.id },
-                  status: "valid",
-                  requiresConfirmation: false
-                }
-              ]
+              operations: linkedCriticalGoal
+                ? [
+                    {
+                      tool: "action.archive_all_apply",
+                      args: { actionIds: [archiveTarget.id] },
+                      status: "valid",
+                      requiresConfirmation: false
+                    }
+                  ]
+                : [
+                    {
+                      tool: "action.archive",
+                      args: { actionId: archiveTarget.id },
+                      status: "valid",
+                      requiresConfirmation: false
+                    }
+                  ]
             };
           }
         }
@@ -381,7 +416,18 @@ export async function executeOperation(
         const goalLink = explicitGoalId
           ? { goalId: explicitGoalId, goalSlug: undefined, matchedGoalTitle: context.activeGoals.find((goal) => goal.id === explicitGoalId)?.title }
           : await inferActionGoalLink(userId, title, description);
-        const created = await createActionItem(userId, {
+        // fix/private-alpha-live-action-and-coaching-regressions (Task 4): a real Telegram
+        // transcript found "yes do so and show me my actions so i can verify" creating a SECOND
+        // "Send 3 CVs" action — action.create has no confirmation gate of its own
+        // (requiresConfirmation: false; the planner's own replyDraft alone decides whether a
+        // turn READS like a question), so a real planner call on the first message can genuinely
+        // create the row while its own reply still asks "want me to?", leaving the next turn's
+        // planner with no way to know it already happened, and it re-plans the same create.
+        // createActionItemIfNotExists (already used elsewhere for source-linked actions) is
+        // reused here for manual ones too — an exact-title, same-source, still-open-or-snoozed
+        // match is treated as the same task rather than a new one; never silently drops the
+        // request, always reports the real existing task honestly instead.
+        const { created, actionItem } = await createActionItemIfNotExists(userId, {
           source: "manual",
           title,
           description,
@@ -391,20 +437,24 @@ export async function executeOperation(
           goalSlug: goalLink.goalSlug ?? undefined,
           goalTitleSnapshot: goalLink.matchedGoalTitle
         });
-        // fix/private-alpha-local-date-focus-and-gmail-confirmation-state: created.dueAt.
+        // fix/private-alpha-local-date-focus-and-gmail-confirmation-state: actionItem.dueAt.
         // toDateString() formats in the JS runtime's OWN system timezone (UTC on this app's
         // actual host), never the user's real one — a real reported bug had a "today" action
         // confirmed as "due Tue Aug 25" when it was already Wed Aug 26 in the user's own
         // timezone. formatDueLabelForChat is the SAME already-timezone-aware, already-tested
         // "due today/tomorrow/Wed Aug 26" formatter action.list's own per-item line already uses
         // — reused here for the same value, not a second implementation.
-        const dueSettings = created.dueAt ? await getOrCreateNotificationSettings(userId) : undefined;
+        const dueSettings = actionItem.dueAt ? await getOrCreateNotificationSettings(userId) : undefined;
+        const dueLabel = actionItem.dueAt && dueSettings ? ` ${formatDueLabelForChat(actionItem.dueAt, dueSettings.timezone)}` : "";
+        if (!created) {
+          return failed(operation.tool, `you already have "${actionItem.title}"${dueLabel} — I won't create a duplicate`);
+        }
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Created task "${created.title}"${created.dueAt && dueSettings ? ` ${formatDueLabelForChat(created.dueAt, dueSettings.timezone)}` : ""}.${goalLink.matchedGoalTitle ? ` Linked to your "${goalLink.matchedGoalTitle}" goal.` : ""}`,
-          result: created,
-          entities: [actionToEntity(created)]
+          summary: `Created task "${actionItem.title}"${dueLabel}.${goalLink.matchedGoalTitle ? ` Linked to your "${goalLink.matchedGoalTitle}" goal.` : ""}`,
+          result: actionItem,
+          entities: [actionToEntity(actionItem)]
         };
       }
 
@@ -3607,13 +3657,13 @@ const WHEN_NOUN: Record<"today" | "tomorrow" | "this_week", string> = {
 function formatActionListForChat(
   items: ActionItem[],
   totalMatching: number,
-  status: ActionItem["status"] | "all",
+  status: ActionItem["status"] | "all" | "active",
   overdueOnly: boolean,
   reminderByParentId: Map<string, ActionItem>,
   timezone: string,
   when?: "today" | "tomorrow" | "this_week"
 ): string {
-  const baseNoun = when ? "action" : overdueOnly ? "overdue action" : status === "all" ? "action" : `${status} action`;
+  const baseNoun = when ? "action" : overdueOnly ? "overdue action" : status === "all" || status === "active" ? "action" : `${status} action`;
 
   if (items.length === 0) {
     return when
@@ -4229,11 +4279,9 @@ function titlesLookSimilar(a: string, b: string): boolean {
 // this kind of fact as a memory.create'd "goal_context" entry so it survives past that window.
 // Deliberately scoped to resume/CV/portfolio specifically (the real reported instances), not a
 // generic "any stated fact" detector — that would be a much bigger, riskier feature than this
-// focused pass calls for.
-const RESUME_UP_TO_DATE_RE =
-  /\b(resume|cv|web cv|portfolio)\b[\s\S]{0,50}\b(already )?(up.?to.?date|current|updated)\b|\b(already )?(up.?to.?date|current|updated)\b[\s\S]{0,50}\b(resume|cv|web cv|portfolio)\b/i;
-const RESUME_UPDATE_SUGGESTION_RE =
-  /\b(update|customize|improve|tailor|revise|polish|refresh|prepare)\b[\s\S]{0,25}\b(resume|cv|web cv|portfolio)\b|\b(resume|cv|web cv|portfolio)\b[\s\S]{0,25}\b(update|customize|improve|tailor|revise|polish|refresh|prepare)\b/i;
+// focused pass calls for. RESUME_UP_TO_DATE_RE/RESUME_UPDATE_SUGGESTION_RE now live in
+// @operator-agent/core (fix/private-alpha-live-action-and-coaching-regressions) so the proactive
+// morning-brief LLM layer's own contradiction guard can never drift from this one.
 
 function recentlyStatedResumeUpToDate(context: ContextBundle): boolean {
   const recentUserText = context.session.messages

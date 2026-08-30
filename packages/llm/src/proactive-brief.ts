@@ -47,8 +47,9 @@ export async function generateProactiveBriefMessage(
             text: [
               "You are Alecto's proactive morning/evening brief writer.",
               "You are not deciding facts. Code has already decided every fact you are given.",
-              "Write ONE short, warm, Telegram-ready message using ONLY the goal, actions, wins, signals, and preference given to you.",
+              "Write ONE short, warm, Telegram-ready message using ONLY the goal, actions, wins, signals, durable facts, and preference given to you.",
               "Never invent a goal, action, event, due date, email, or fact that is not in the provided context.",
+              "`durableFacts` are standing constraints the user already stated in an earlier conversation, and they OVERRIDE your own general advice — if durableFacts says something is already done, current, up to date, or that the user asked you not to suggest it, NEVER suggest or imply the opposite, even as generic filler advice. Example: if durableFacts says the resume/CV is already up to date, never suggest updating it — suggest something else that actually moves the goal forward instead (e.g. outreach, applications, follow-ups).",
               "If `goal` is provided, the message is about THAT goal only — never mention any other goal title, even one you might reasonably guess exists.",
               "If `preference` is provided, let its style genuinely shape the tone and content:",
               "- motivational: include one short, ORIGINAL, UNATTRIBUTED motivating line about the goal — never attribute it to any real or invented person, living or dead, and never reproduce a real quote you recall, verbatim or paraphrased.",

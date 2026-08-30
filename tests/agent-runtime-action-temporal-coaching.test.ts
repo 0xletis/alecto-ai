@@ -112,8 +112,12 @@ test("2D: 'all actions' labels deferred (with date), completed, and archived ite
     await prisma.actionItem.update({ where: { id: dropped.id }, data: { status: "archived" } });
     void open;
 
+    // fix/private-alpha-live-action-and-coaching-regressions: a bare "show me all my actions" now
+    // deterministically means status "active" (open + deferred, never archived/completed) — the
+    // message must explicitly ask for completed/archived items too for the validator to allow
+    // status "all" through.
     mockPlan({ topic: "actions", intent: "list_all", operations: [op("action.list", { status: "all" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
-    const reply = await sendAgentMessage(server, userId, "show me all my actions");
+    const reply = await sendAgentMessage(server, userId, "show me all my actions, including completed and archived ones");
 
     // fix/private-alpha-temporal-action-copy-and-dedup: "snoozed" must never leak into
     // user-facing copy — a deferred item's line now says "moved to <date>" instead of
