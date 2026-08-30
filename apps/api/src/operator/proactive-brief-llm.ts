@@ -159,6 +159,12 @@ export function buildProactiveBriefContext(
     // legacy daily coach's DailyBriefContext) — left empty rather than invented, so validation
     // correctly treats ANY progress claim in the LLM's response as unsupported and rejects it.
     recentWins: [],
+    // fix/private-alpha-live-action-and-coaching-regressions: same recentMemorySummaries shape
+    // and cap planner.ts already uses for the chat path (all memory types, most-recent-15
+    // already applied by context-loader.ts, capped again here to 10) — a real incident found the
+    // morning brief LLM suggesting a resume update the day after the user said it was already
+    // current, because this context previously carried NO memories at all.
+    durableFacts: context.memories.slice(0, 10).map((memory) => memory.summary),
     gmailSignalLines: context.gmailReviews.length > 0 ? [`${context.gmailReviews.length} Gmail review${context.gmailReviews.length === 1 ? "" : "s"} pending.`] : [],
     deterministicFallbackMessage: decision.message,
     userOperatingProfile: {

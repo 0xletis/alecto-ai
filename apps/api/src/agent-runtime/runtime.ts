@@ -402,6 +402,18 @@ const ACTION_DUPLICATE_CLEANUP_TOPIC = "action_duplicate_cleanup";
 const ACTION_DUPLICATE_CLEANUP_CONFIRM_RE = /\byes\b|\bmerge (them|it)\b|\barchive (the duplicate|one|it|2|two)\b|\bkeep (the )?(first|1|one)\b|\bremove (2|two)\b/i;
 const ACTION_DUPLICATE_CLEANUP_CANCEL_RE = /\bshow both\b|\bkeep both\b|\bdon['’]?t (merge|archive)\b/i;
 
+// See the "fix/private-alpha-live-action-and-coaching-regressions (Task 4)" call site below for
+// the real transcript this closes. Deliberately wider than EXTENDED_CONFIRM_PHRASE_RE (which only
+// ever matches a short, whole-message confirm opener) — a pending action.create's own natural
+// confirm vocabulary reasonably includes trailing text ("yes do so and show me my actions"), and
+// unlike an arbitrary pending mutation, a pending action.create is always exactly ONE already-
+// resolved operation, so a wide match here is safe the same way ACTION_DUPLICATE_CLEANUP_CONFIRM_RE
+// above is.
+const ACTION_CREATION_CONFIRM_RE =
+  /\b(yes|yep|yeah|y|s[ií]|vale|va|confirm(ed)?|do it|do so|go ahead|create it|create this|make it|sure|ok|okay|perfect|perfecto|d['’]?acord|endavant)\b/i;
+const ACTION_CREATION_TRAILING_LIST_RE =
+  /\b(show|list|see|check)\b[\s\S]{0,20}\b(me )?(my )?actions?\b|\b(ver|mu[eé]strame|ense[ñn]ame)\b[\s\S]{0,20}\bmis acciones\b|\b(veure|mostra['’]?m)\b[\s\S]{0,20}\bmeves accions\b/i;
+
 /**
  * "none," "no action," "nothing," "never mind," "cancel," "i mean NO ACTION" — a direct answer
  * to Alecto's own "Which action do you mean?" clarification that means "don't do anything,"
@@ -846,6 +858,23 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     }
   }
 
+  // fix/private-alpha-live-action-and-coaching-regressions (Task 4): a real Telegram transcript
+  // found "Yes do so and show me my actions so i can verify" — a natural confirm PLUS a trailing
+  // list request in the SAME message, right after "schedule sending 3 CVs today" opened a pending
+  // action.create confirmation — landed on the general LLM planner instead of the deterministic
+  // confirm path below, since it matches neither the exact CONFIRM_WHITELIST nor
+  // EXTENDED_CONFIRM_PHRASE_RE (both only ever recognize a bare/short confirm OPENER, never a
+  // compound sentence). The planner then re-planned a brand-new action.create for the same title
+  // — reading "yes" as an instruction to create, not as confirming the one already pending —
+  // producing two duplicate "Send 3 CVs" actions. Mirrors the ACTION_DUPLICATE_CLEANUP_TOPIC
+  // recognizer above: a pending action.create gets its own topic-scoped, wider confirm
+  // vocabulary, and — since the real transcript's own confirm was itself compound — also runs a
+  // trailing action.list request in the same turn, applying the pending create exactly once
+  // either way.
+  if (pending?.topic === "action_creation" && ACTION_CREATION_CONFIRM_RE.test(message)) {
+    return finalizeActionCreationConfirmation(context, message);
+  }
+
   // fix/private-alpha-launch-hardening-flakes-and-pending-clarity: an open capability-proposal
   // queue is handled ENTIRELY here, self-contained — a whole-queue confirm/cancel, a selective
   // reply naming exactly one proposal (by alias or index), or a queue-specific clarification for
@@ -1236,7 +1265,8 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   }
 
   const { plan, plannerUsed } = await planMessage(message, context);
-  const reconciledOperations = reconcileExplicitGmailReviewIntentOperations(message, context, plan.operations);
+  const gmailReconciledOperations = reconcileExplicitGmailReviewIntentOperations(message, context, plan.operations);
+  const reconciledOperations = dropMutationOpsForCoachingJudgmentQuestion(message, context, gmailReconciledOperations);
 
   const validatedOps = validateOperations(reconciledOperations, context, message);
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
@@ -1769,6 +1799,34 @@ function gmailReviewVagueMutationClarification(message: string, context: Context
   return GMAIL_REVIEW_CLARIFICATION_REPLY;
 }
 
+// fix/private-alpha-live-action-and-coaching-regressions (Task 6): a real Telegram transcript
+// found "Is it okay? About the weekend thing" — a reflective, emotional question about whether a
+// rest weekend was fine, asked right after a recent action mutation — answered with a mechanical
+// "Action rescheduled: Send 3 CVs due: 31/08/2026, 23:59" instead of the coaching answer the
+// question actually asked for. A judgment/reassurance question like this is never itself an
+// instruction to move/snooze/complete/archive/create anything — the planner is told as much in
+// its own prompt (see planner.ts's response-mode-routing guidance), but this is the deterministic
+// backstop: whenever the raw message reads as this kind of question AND contains no explicit
+// mutation verb of its own, any action.reschedule/snooze/complete/archive/create the planner
+// still emitted is dropped before validation ever sees it — never replaced with a canned line,
+// so the planner's own real coaching replyDraft is exactly what's shown, same as it already is
+// for any other read-only turn.
+function dropMutationOpsForCoachingJudgmentQuestion(message: string, context: ContextBundle, operations: PlannedOperation[]): PlannedOperation[] {
+  if (!COACHING_JUDGMENT_QUESTION_RE.test(message) || EXPLICIT_MUTATION_VERB_RE.test(message)) {
+    return operations;
+  }
+  const filtered = operations.filter((op) => !COACHING_QUESTION_MUTATION_TOOLS.has(op.tool));
+  if (filtered.length === operations.length) {
+    return operations;
+  }
+  logAgentRuntimeDiagnostics({
+    phase: "coaching_judgment_question_mutation_dropped",
+    userId: context.session.userId,
+    note: `dropped ${operations.filter((op) => COACHING_QUESTION_MUTATION_TOOLS.has(op.tool)).map((op) => op.tool).join(", ")} for a coaching-judgment question`
+  });
+  return filtered;
+}
+
 function reconcileExplicitGmailReviewIntentOperations(
   message: string,
   context: ContextBundle,
@@ -2017,6 +2075,30 @@ const ACTION_SNOOZE_PATTERN =
  * planner/validator resolution path, not this shortcut, which exists only for the truly ambiguous
  * "it"/"that"/bare-word case a worker notification leaves the user replying to. */
 const GENERIC_ACTION_REFERENCE_PATTERN = /\b(it|that one|that|this one|this)\b/;
+
+// See dropMutationOpsForCoachingJudgmentQuestion's own doc comment (above, near the Gmail-review
+// reconciler it's modeled on) for the real transcript this closes.
+// Trailing \b right after an accented "é" never matches in a plain (non-unicode) JS regex — é
+// isn't a \w character, so there's no word/non-word transition between "é" and, say, a "," or "?"
+// right after it (both already read as non-word). Same fix validator.ts's own EXPLICIT_WHEN_SCOPE_RE
+// already uses for this identical problem with Catalan "demà".
+const COACHING_JUDGMENT_QUESTION_RE =
+  /\bis (it|that|this) (okay|ok)\b|\bwas (it|that|this) (okay|ok)\b|\b¿?est[aá] bien\b|\b¿?est[aà] b[ée](?![a-zA-Z])/i;
+const EXPLICIT_MUTATION_VERB_RE = new RegExp(
+  [
+    ACTION_SNOOZE_PATTERN.source,
+    ACTION_ARCHIVE_PATTERN.source,
+    ACTION_COMPLETION_PATTERN.source,
+    ACTION_DONE_PATTERN.source,
+    "\\breschedule\\b",
+    "\\bpostpone\\b",
+    "\\bcreate (a|an) (task|action|reminder)\\b",
+    "\\badd (a|an) (task|action|reminder)\\b",
+    "\\bschedule\\b"
+  ].join("|"),
+  "i"
+);
+const COACHING_QUESTION_MUTATION_TOOLS = new Set(["action.reschedule", "action.snooze", "action.complete", "action.archive", "action.create"]);
 
 // A deferral verb (ACTION_SNOOZE_PATTERN, defined below) paired with a genuinely vague "some day
 // this week" phrase and NO actual day named — "later this week"/"this week"/"later in the week"
@@ -3087,6 +3169,77 @@ async function finalizeDeterministicConfirmation(context: ContextBundle, message
   applyExecutionSideEffects(context.session, executedOps);
   if (!installedNewPendingOperation) {
     setPendingOperation(context.session, null);
+  }
+
+  const reply = composeReply({
+    replyDraft: "",
+    pendingConfirmationOps: [],
+    executedOps,
+    problemOps: brokenOps
+  });
+
+  const planningTrace = recordPlanningTrace(
+    {
+      message,
+      plannedOp: undefined,
+      validatedOp: readyOps[0] ?? brokenOps[0],
+      executedOp: executedOps.find((op) => isPlanningTool(op.tool)),
+      pendingOperationBefore,
+      visibleEntitiesBefore,
+      composerSource: inferComposerSource({ pendingConfirmationOps: [], executedOps, problemOps: brokenOps, replyDraft: "" })
+    },
+    context.session
+  );
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: pending.operations.map((op) => ({ tool: op.tool, args: op.args })),
+    executedOps,
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: brokenOps.length === 0,
+    topic: pending.topic,
+    planningTrace
+  });
+}
+
+/**
+ * fix/private-alpha-live-action-and-coaching-regressions (Task 4): applies a pending
+ * action.create exactly once — the same revalidate/execute/apply-side-effects shape as
+ * finalizeDeterministicConfirmation — and, only when the SAME message also asks to see the
+ * actions list (ACTION_CREATION_TRAILING_LIST_RE), runs one action.list right after in the same
+ * turn and folds both results into a single reply. Never calls the real LLM planner for either
+ * half, so there is no way for a second action.create to get re-planned for the same title the
+ * way the real transcript's duplicate bug happened.
+ */
+async function finalizeActionCreationConfirmation(context: ContextBundle, message: string): Promise<AgentMessageResponse> {
+  const { userId } = context.session;
+  const pending = context.session.pendingOperation as AgentPendingOperation;
+  const pendingOperationBefore = pending;
+  const visibleEntitiesBefore = context.session.visibleEntities;
+
+  const revalidated = pending.operations.map((op) => revalidateForExecution(op));
+  const readyOps = revalidated.filter((op) => op.status === "valid");
+  const brokenOps = revalidated.filter((op) => op.status !== "valid");
+
+  const executedOps = await Promise.all(readyOps.map((op) => executeOperation(userId, op, context, `[confirmed] ${pending.summary}`)));
+  const installedNewPendingOperation = executedOps.some((op) => op.pendingOperationUpdate !== undefined && op.pendingOperationUpdate !== null);
+  applyExecutionSideEffects(context.session, executedOps);
+  if (!installedNewPendingOperation) {
+    setPendingOperation(context.session, null);
+  }
+
+  // Only chains a trailing list request when the create itself didn't hand off to a brand-new
+  // pending operation of its own (e.g. a goal-link follow-up) — same reasoning as the pending-
+  // clear guard just above: something else is now waiting on a "yes," so a list here would talk
+  // past it.
+  if (!installedNewPendingOperation && ACTION_CREATION_TRAILING_LIST_RE.test(message)) {
+    const [listOp] = validateOperations([{ tool: "action.list", args: {} }], context, message);
+    if (listOp?.status === "valid") {
+      const executedListOp = await executeOperation(userId, listOp, context, message);
+      applyExecutionSideEffects(context.session, [executedListOp]);
+      executedOps.push(executedListOp);
+    }
   }
 
   const reply = composeReply({

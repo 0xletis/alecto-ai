@@ -66,6 +66,48 @@ const EVIDENCE_QUESTION_CLARIFICATION =
 // completed items just because the planner guessed differently or a recent turn mentioned "all".
 const EXPLICIT_NON_OPEN_ACTION_STATUS_RE = /\b(archived?|completed?|done|finished|history|every action|all (my |the )?(actions?|tasks?))\b/i;
 
+// fix/private-alpha-live-action-and-coaching-regressions: a real Telegram transcript found "show
+// me all actions" answered as if nothing existed — everything the user had was snoozed/deferred,
+// invisible to the tool's strict "open" status. A genuine "all actions" request (English "all
+// (my/the) actions/tasks", Spanish "todas (mis) (las) acciones", Catalan "totes (les) (meves)
+// accions") deterministically forces status to "active" (open + snoozed, never archived/completed
+// — that still needs EXPLICIT_NON_OPEN_ACTION_STATUS_RE above) regardless of what the planner
+// supplied, unless the message ALSO explicitly asks for archived/completed/everything-including-
+// done, which takes priority (a genuinely broader ask than "active" alone covers).
+const ALL_ACTIONS_SCOPE_RE = /\ball (my |the )?(actions?|tasks?)\b|\btodas (mis )?(las )?acciones\b|\btotes (les )?(meves )?accions\b/i;
+const EXPLICIT_ARCHIVED_OR_COMPLETED_RE = /\b(archived?|completed?|done|finished|history)\b/i;
+
+// See the "fix/private-alpha-live-action-and-coaching-regressions (Task 7)" call site below for
+// the real transcript this closes — a reflective, mixed-timing message ("I'll try," "when I get
+// there," "this week," "lock in"), never an actual scheduling instruction, must never be read as
+// one just because a mutation tool happened to be planned against it.
+const VAGUE_COMMITMENT_RE =
+  /\b(i'?ll try|i will try|will try)\b|\bmaybe\b|\bwhen i get there\b|\block(?:ing)? in\b|\b(later this week|later in the week|this week)\b|\bintentar[eé]\b|\bcuando llegue\b|\bquan hi arribi\b|\bmas adelante esta semana\b|\bmes endavant aquesta setmana\b/i;
+// A genuinely concrete day/time named ANYWHERE in the message (even alongside vague language
+// elsewhere in a longer message) means there IS a real answer already — "move it to Friday this
+// week" must still go through, unlike a bare "this week" with nothing concrete at all.
+const CONCRETE_DAY_OR_TIME_RE =
+  /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|tonight|\d{1,2}(:\d{2})?\s*(am|pm)|\d{1,2}\/\d{1,2})\b|\blunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|ma[ñn]ana\b|\bdilluns|dimarts|dimecres|dijous|divendres|dissabte|diumenge|dem[àa]\b/i;
+
+// fix/private-alpha-live-action-and-coaching-regressions: a real Telegram transcript found "show
+// me all actions" answered with "you don't have any actions scheduled for today" — the planner had
+// (incorrectly) set `when: "today"` for a plain "all actions" request, silently narrowing a
+// whole-list query down to one day. `status` already has the deterministic guard above (only ever
+// widens when explicitly asked); `when` had no equivalent (only ever narrows when explicitly
+// asked) — same shape of gap, same fix: unless the raw message itself actually names a day/date
+// scope, `when` is always cleared, regardless of what the planner supplied.
+// Trailing \b after an accented Catalan word ("demà") never matches in a plain (non-unicode) JS
+// regex — à isn't a \w character, so there's no word/non-word transition between "à" and, say, a
+// "?" right after it (both already read as non-word). Same fix executor.ts's own Catalan
+// due-text translation table already uses for this identical problem.
+const NOT_FOLLOWED_BY_LETTER = "(?![a-zA-Z])";
+const EXPLICIT_WHEN_SCOPE_RE = new RegExp(
+  "\\b(today|tonight|tomorrow|this week|later this week|later in the week)\\b" +
+    "|\\b(hoy|esta noche|mañana|esta semana|más tarde esta semana)\\b" +
+    `|\\b(avui|aquesta nit|dem[àa]${NOT_FOLLOWED_BY_LETTER}|aquesta setmana|més tard aquesta setmana)`,
+  "i"
+);
+
 export interface ValidateOperationsOptions {
   /**
    * True when `operations` came from one of this file's own deterministic shortcuts (runtime.ts)
@@ -547,6 +589,46 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
   // ever narrows toward the safe default, never guesses a broader status the user didn't ask for.
   if (tool.name === "action.list" && args.status !== "open" && !EXPLICIT_NON_OPEN_ACTION_STATUS_RE.test(message)) {
     args.status = "open";
+  }
+
+  // A genuine "all actions" ask (and ONLY that — not also "archived"/"completed"/"history", which
+  // stays whatever more specific status the user actually asked for) deterministically means
+  // "active": open + already-deferred/snoozed, never hiding a real action just because it was
+  // moved once. Runs after the "open" guard above so it can override that default specifically for
+  // this phrasing, without weakening the guard's own protection against archived/completed leaking
+  // into an unrelated request.
+  if (tool.name === "action.list" && ALL_ACTIONS_SCOPE_RE.test(message) && !EXPLICIT_ARCHIVED_OR_COMPLETED_RE.test(message)) {
+    args.status = "active";
+  }
+
+  if (tool.name === "action.list" && args.when !== undefined && !EXPLICIT_WHEN_SCOPE_RE.test(message)) {
+    delete args.when;
+  }
+
+  // fix/private-alpha-live-action-and-coaching-regressions (Task 7): a real Telegram transcript
+  // found a vague, reflective weekend update ("...will lock in will try to send some when I get
+  // there this night and also lot this week") silently rescheduled an action to "tomorrow 09:00"
+  // — the user never gave a real, concrete commitment, just a mix of "I'll try," "when I get
+  // there," and "this week," and the real LLM planner is not reliably able to resist turning that
+  // into SOME guessed date rather than asking. Deterministic, not left to planner judgment: for
+  // action.snooze/action.reschedule, if the raw message contains this kind of vague-commitment
+  // language, the op is always downgraded to a clarification proposing concrete options rather
+  // than silently picking one — regardless of what dueText/untilText the planner guessed. Never
+  // fires for an explicit, concrete instruction ("move it to tomorrow," "snooze it Friday") —
+  // VAGUE_COMMITMENT_RE only matches genuinely uncommitted phrasing, never a real day/time name.
+  if (
+    (tool.name === "action.snooze" || tool.name === "action.reschedule") &&
+    VAGUE_COMMITMENT_RE.test(message) &&
+    !CONCRETE_DAY_OR_TIME_RE.test(message)
+  ) {
+    return {
+      tool: tool.name,
+      args,
+      status: "needs_clarification",
+      requiresConfirmation: false,
+      clarificationQuestion: "That sounds like the timing's still up in the air — want me to move it to tonight, or hold it for tomorrow instead?",
+      rationale: operation.rationale
+    };
   }
 
   if (tool.name === "goal.log_evidence" && looksLikeBareEvidenceCountQuestion(message)) {
@@ -1258,9 +1340,19 @@ function resolveActionRef(args: { ref?: string }, context: ContextBundle): Actio
   const visibleActions = context.session.visibleEntities.filter((entity) => entity.type === "action");
 
   if (args.ref?.trim()) {
+    // fix/private-alpha-live-action-and-coaching-regressions: this resolver's own name and every
+    // caller's doc comment already claimed it "searches both visible and background actions by
+    // name" — true for open actions, but context.deferredActions (snoozed items) was never
+    // actually included. A real transcript found "do I have an action to send CVs? move it to
+    // today if so" answered "no" for an action that genuinely existed, just already snoozed —
+    // action.reschedule (the tool this resolves for) exists specifically to pull a deferred
+    // action back, so excluding deferred actions from its own ref search defeated its purpose.
     const candidates: EmailRuleSelectionCandidate[] = [
       ...visibleActions.map((entity) => ({ id: entity.id, name: entity.label, status: "open" })),
       ...context.openActions
+        .filter((action) => !visibleActions.some((entity) => entity.id === action.id))
+        .map((action) => ({ id: action.id, name: action.title, status: action.status })),
+      ...context.deferredActions
         .filter((action) => !visibleActions.some((entity) => entity.id === action.id))
         .map((action) => ({ id: action.id, name: action.title, status: action.status }))
     ];
@@ -1269,7 +1361,16 @@ function resolveActionRef(args: { ref?: string }, context: ContextBundle): Actio
     if (selected) {
       return { status: "resolved", actionId: selected.id };
     }
-    return { status: "needs_clarification", question: `I couldn't tell which task "${args.ref}" refers to — which one did you mean?` };
+    // fix/private-alpha-live-action-and-coaching-regressions (Task 3): covers BOTH "nothing at all
+    // looks like this" and "more than one thing could match" — selectEmailRuleCandidate collapses
+    // both into the same undefined result, so the honest answer here has to work for either: never
+    // claim outright that nothing exists (a real reported bug — "you don't have any actions
+    // scheduled for today" for an action that existed, just elsewhere), and never silently create
+    // anything either. Offers creating a new one as an option rather than only asking "which one."
+    return {
+      status: "needs_clarification",
+      question: `I don't see an open or deferred action that clearly matches "${args.ref}" — did you mean a different one, or want me to create it as a new action?`
+    };
   }
 
   const resolution = resolveSingleVisibleEntity(visibleActions, "action");
