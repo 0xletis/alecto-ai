@@ -12982,3 +12982,380 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-coach-first-response-routing: scenarios 357-368 --------------------------
+// Real-planner coverage for the coach-first response-mode routing fix and its two known-gap
+// fixes (action reference token matching, mixed overdue/this-week date scope) — every
+// deterministic backstop is already proven in its own dedicated test file (coach-first-response-
+// routing, action-reference-token-matching, mixed-date-action-scope, all using mockPlan); these
+// scenarios instead exercise the REAL planner's own tool-choice judgment for the same message
+// shapes. Tagged so `LLM_EVAL_TAGS=coach-first-response-routing,action-reference-matching,
+// mixed-date-action-scope pnpm test:llm` runs just this branch's own new coverage.
+
+test(
+  "357. weekend rest reassurance — 'I rested this weekend with friends, is that okay?' gets a real coaching answer, no mutation",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-357-${randomUUID()}`;
+    const trace = new EvalTrace("357-weekend-rest-reassurance", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high", dueAt: new Date(Date.now() + 12 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I rested this weekend with friends, is that okay?",
+          await sendAgentMessage(server, userId, "I rested this weekend with friends, is that okay?")
+        );
+        assertNoGenericAgentError(reply, "weekend rest reassurance");
+        trace.checkpoint("never a mechanical mutation-confirmation reply", !/action rescheduled|due:/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /action rescheduled|due:/i, `expected a real coaching answer — got: ${reply.reply}`);
+        assert.equal(reply.debug.mutationExecuted, false, `a reassurance question must never itself mutate anything — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt?.getTime(), action.dueAt?.getTime());
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "358. soft intention right after a coaching answer — 'I'll try to send CVs tonight and more this week' — coaching/planning reply, no mutation",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-358-${randomUUID()}`;
+    const trace = new EvalTrace("358-soft-intention-after-coaching", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high", dueAt: new Date(Date.now() + 6 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        trace.record("I rested this weekend with friends, is that okay?", await sendAgentMessage(server, userId, "I rested this weekend with friends, is that okay?"));
+
+        const before = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const reply = trace.record(
+          "I'll try to send CVs tonight and more this week",
+          await sendAgentMessage(server, userId, "I'll try to send CVs tonight and more this week")
+        );
+        assertNoGenericAgentError(reply, "soft intention after coaching");
+        trace.checkpoint("no silent mutation from a soft intention", reply.debug.mutationExecuted === false, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent reschedule — got: ${reply.reply}`);
+        trace.checkpoint("the reply reads like a coach, not a task receipt", !/^action rescheduled/i.test(reply.reply.trim()), reply.reply);
+        assert.doesNotMatch(reply.reply, /^action rescheduled/i);
+
+        const after = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(after?.dueAt?.getTime(), before?.dueAt?.getTime(), "the due date must stay exactly what it was");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "359. soft intention with an action already due today — anchors the existing action without changing it",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-359-${randomUUID()}`;
+    const trace = new EvalTrace("359-soft-intention-due-today", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high", dueAt: new Date(Date.now() + 3 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I'll try to send CVs tonight and more this week",
+          await sendAgentMessage(server, userId, "I'll try to send CVs tonight and more this week")
+        );
+        assertNoGenericAgentError(reply, "soft intention with due-today action");
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent mutation — got: ${reply.reply}`);
+        trace.checkpoint("the existing action is named as the anchor", /send cvs/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /send cvs/i, `expected the existing action to be referenced by name — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt?.getTime(), action.dueAt?.getTime());
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "360. explicit 'move it to tonight at 20:00' still mutates",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-360-${randomUUID()}`;
+    const trace = new EvalTrace("360-explicit-move-tonight", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("move it to tonight at 20:00", await sendAgentMessage(server, userId, "move it to tonight at 20:00"));
+        assertNoGenericAgentError(reply, "explicit move to tonight");
+        trace.checkpoint("an explicit instruction still mutates", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected the explicit command to work — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const actuallyMoved = Boolean(updated?.dueAt) || updated?.status === "snoozed";
+        assert.ok(actuallyMoved, `expected the action to actually move — got: ${JSON.stringify(updated)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "361. explicit 'reschedule it to tomorrow' still mutates",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-361-${randomUUID()}`;
+    const trace = new EvalTrace("361-explicit-reschedule-tomorrow", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("reschedule it to tomorrow", await sendAgentMessage(server, userId, "reschedule it to tomorrow"));
+        assertNoGenericAgentError(reply, "explicit reschedule tomorrow");
+        trace.checkpoint("an explicit instruction still mutates", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected the explicit command to work — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        const actuallyMoved = Boolean(updated?.dueAt) || updated?.status === "snoozed";
+        assert.ok(actuallyMoved, `expected the action to actually move — got: ${JSON.stringify(updated)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "362. 'I didn't do it but I'll lock in this week' gets coaching, never a mutation",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-362-${randomUUID()}`;
+    const trace = new EvalTrace("362-progress-report-with-soft-intention", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send CVs", priority: "high", dueAt: new Date(Date.now() - 2 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "I didn't do it but I'll lock in this week",
+          await sendAgentMessage(server, userId, "I didn't do it but I'll lock in this week")
+        );
+        assertNoGenericAgentError(reply, "progress report with soft intention tail");
+        trace.checkpoint("no silent mutation from a progress report + soft intention", reply.debug.mutationExecuted === false, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent mutation — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt?.getTime(), action.dueAt?.getTime());
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "363. Spanish soft intention — 'intentaré enviar CVs esta noche y más esta semana' — no mutation",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-363-${randomUUID()}`;
+    const trace = new EvalTrace("363-spanish-soft-intention", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("mostrar mis acciones", await sendAgentMessage(server, userId, "mostrar mis acciones"));
+        const reply = trace.record(
+          "intentaré enviar CVs esta noche y más esta semana",
+          await sendAgentMessage(server, userId, "intentaré enviar CVs esta noche y más esta semana")
+        );
+        assertNoGenericAgentError(reply, "Spanish soft intention");
+        trace.checkpoint("no silent mutation", reply.debug.mutationExecuted === false, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent mutation — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt, null);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "364. Catalan soft intention — 'intentaré enviar CVs aquesta nit i més aquesta setmana' — no mutation",
+  { ...llmEvalOptions(["coach-first-response-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-364-${randomUUID()}`;
+    const trace = new EvalTrace("364-catalan-soft-intention", ["coach-first-response-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("mostra les meves accions", await sendAgentMessage(server, userId, "mostra les meves accions"));
+        const reply = trace.record(
+          "intentaré enviar CVs aquesta nit i més aquesta setmana",
+          await sendAgentMessage(server, userId, "intentaré enviar CVs aquesta nit i més aquesta setmana")
+        );
+        assertNoGenericAgentError(reply, "Catalan soft intention");
+        trace.checkpoint("no silent mutation", reply.debug.mutationExecuted === false, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent mutation — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt, null);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "365. 'send CVs' resolves against a title with an embedded number — 'Send 3 CVs'",
+  { ...llmEvalOptions(["action-reference-matching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-365-${randomUUID()}`;
+    const trace = new EvalTrace("365-token-matching-embedded-number", ["action-reference-matching"], userId);
+
+    try {
+      await seedUser(userId);
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("move send CVs to today", await sendAgentMessage(server, userId, "move send CVs to today"));
+        assertNoGenericAgentError(reply, "token-matching embedded number");
+        trace.checkpoint("the action is actually found and moved", reply.debug.mutationExecuted === true, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, true, `expected the action to be found despite the embedded '3' — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.ok(updated?.dueAt);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "366. a genuinely unrelated action title is never falsely matched by the new token fallback",
+  { ...llmEvalOptions(["action-reference-matching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-366-${randomUUID()}`;
+    const trace = new EvalTrace("366-token-matching-no-false-positive", ["action-reference-matching"], userId);
+
+    try {
+      await seedUser(userId);
+      const unrelated = await createActionItem(userId, { source: "manual", title: "Book flights to Lisbon", priority: "medium" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("move send CVs to today", await sendAgentMessage(server, userId, "move send CVs to today"));
+        assertNoGenericAgentError(reply, "no false positive");
+        trace.checkpoint("no false-positive match against an unrelated action", reply.debug.mutationExecuted === false, reply.reply);
+        assert.equal(reply.debug.mutationExecuted, false, `expected an honest no-match, never a false positive — got: ${reply.reply}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: unrelated.id } });
+        assert.equal(updated?.dueAt, null, "the unrelated action must never be silently touched");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "367. 'yesterday or this week?' shows overdue AND this-week actions together",
+  { ...llmEvalOptions(["mixed-date-action-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-367-${randomUUID()}`;
+    const trace = new EvalTrace("367-mixed-overdue-and-week", ["mixed-date-action-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Follow up with recruiter", priority: "medium", dueAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) });
+      await createActionItem(userId, { source: "manual", title: "Call the bank", priority: "medium", dueAt: new Date(Date.now() + 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "what's overdue from yesterday or coming up this week?",
+          await sendAgentMessage(server, userId, "what's overdue from yesterday or coming up this week?")
+        );
+        assertNoGenericAgentError(reply, "mixed overdue and this-week scope");
+        trace.checkpoint("the overdue action is included", /follow up with recruiter/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /follow up with recruiter/i, `expected the overdue action to be listed — got: ${reply.reply}`);
+        trace.checkpoint("the this-week action is included", /call the bank/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /call the bank/i, `expected the this-week action to be listed — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "368. a plain 'what do I have this week?' stays scoped to this week only, unaffected by the mixed-scope fix",
+  { ...llmEvalOptions(["mixed-date-action-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-368-${randomUUID()}`;
+    const trace = new EvalTrace("368-plain-this-week-unaffected", ["mixed-date-action-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      await createActionItem(userId, { source: "manual", title: "Follow up with recruiter", priority: "medium", dueAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) });
+      await createActionItem(userId, { source: "manual", title: "Call the bank", priority: "medium", dueAt: new Date(Date.now() + 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const reply = trace.record("what do I have this week?", await sendAgentMessage(server, userId, "what do I have this week?"));
+        assertNoGenericAgentError(reply, "plain this-week scope");
+        trace.checkpoint("this-week item is shown", /call the bank/i.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /call the bank/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

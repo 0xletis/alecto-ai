@@ -5,14 +5,18 @@ import { createActionItem, prisma } from "../packages/db/src/index.ts";
 import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
- * fix/private-alpha-live-action-and-coaching-regressions (Task 7): a real Telegram transcript
- * found a rambling, mixed-timing weekend update ("...will lock in will try to send some when I
- * get there this night and also lot this week") silently rescheduled an action to "tomorrow
- * 09:00" — the user never actually committed to a time. Every test here deliberately mocks the
- * planner supplying a mutation op with a guessed dueText/untilText (exactly what a real planner
- * mistake looks like for this kind of message) and asserts the deterministic backstop in
- * validator.ts (VAGUE_COMMITMENT_RE) downgrades it to a clarification proposing concrete options
- * instead, leaving the action's real schedule completely untouched.
+ * fix/private-alpha-coach-first-response-routing (originally fix/private-alpha-live-action-and-
+ * coaching-regressions, Task 7 — superseded here since the escape valve that guard had is exactly
+ * what let a follow-up real bug through): a rambling, mixed-timing weekend update ("...will lock
+ * in will try to send some when I get there this night and also lot this week") silently
+ * rescheduled an action to "tomorrow 09:00" — the user never actually committed to a time. Every
+ * test here deliberately mocks the planner supplying a mutation op with a guessed dueText/
+ * untilText (exactly what a real planner mistake looks like for this kind of message) and asserts
+ * the deterministic backstop in runtime.ts (applyCoachFirstResponseRouting, via
+ * response-mode.ts's SOFT_INTENTION_RE) strips it before it can ever execute, leaving the
+ * planner's own real coaching/planning replyDraft as the reply and the action's real schedule
+ * completely untouched. Deliberately no "concrete day/time mentioned -> let it through" escape
+ * valve — mentioning a time is not the same as commanding a change (see test C).
  */
 
 // Puts the action into context.session.visibleEntities first (a real "show me my actions" turn)
@@ -85,7 +89,7 @@ test("B. \"I'll try to send them this week\" does not silently snooze the action
   }
 });
 
-test("C. a concrete day named alongside vague language still goes through ('I'll try, maybe Friday works')", async () => {
+test("C. mentioning a day alongside vague language still does NOT mutate ('I'll try, maybe Friday works') — mentioning a time is not enough", async () => {
   const server = buildServer();
   const userId = `vague-c-${randomUUID()}`;
   try {
@@ -93,19 +97,24 @@ test("C. a concrete day named alongside vague language still goes through ('I'll
     const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
     await makeActionVisible(server, userId);
 
+    // fix/private-alpha-coach-first-response-routing: the OLD guard (CONCRETE_DAY_OR_TIME_RE) let
+    // a message through the moment it mentioned ANY day/time word, even inside an explicitly
+    // hedged sentence — that escape valve is exactly what let the real reported bug through
+    // ("tonight" alone made a soft-intention message look concrete enough to mutate). Removed:
+    // "maybe Friday works" is still just a hedge, not a command, regardless of naming a real day.
     mockPlan({
       topic: "actions",
       intent: "reschedule",
       operations: [op("action.reschedule", { actionId: action.id, dueText: "friday" })],
       needsClarification: false,
       clarificationQuestion: null,
-      replyDraft: "Moved it to Friday."
+      replyDraft: "No rush — Friday could work, or want to lock in something sooner?"
     });
     const reply = await sendAgentMessage(server, userId, "I'll try, maybe Friday works for sending them");
 
-    assert.equal(reply.debug.mutationExecuted, true, "a genuinely concrete day named in the message must not be blocked");
+    assert.equal(reply.debug.mutationExecuted, false, "mentioning a day inside a hedge is still not a command");
     const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.ok(updated?.dueAt, "the reschedule must actually apply once a real day is named");
+    assert.equal(updated?.dueAt, null, "must never silently pick Friday just because it was mentioned");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

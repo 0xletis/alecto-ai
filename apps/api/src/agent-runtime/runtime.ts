@@ -17,6 +17,7 @@ import { composeGmailGoalUsageStatusReply, executeOperation, parentActionIdFromR
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
+import { COACH_CONVERSATION_RE, EXPLICIT_MUTATION_VERB_RE, RESPONSE_MODE_GATED_MUTATION_TOOLS, isCoachFirstMessage } from "./response-mode.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
@@ -1266,7 +1267,7 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
 
   const { plan, plannerUsed } = await planMessage(message, context);
   const gmailReconciledOperations = reconcileExplicitGmailReviewIntentOperations(message, context, plan.operations);
-  const reconciledOperations = dropMutationOpsForCoachingJudgmentQuestion(message, context, gmailReconciledOperations);
+  const reconciledOperations = applyCoachFirstResponseRouting(message, context, gmailReconciledOperations);
 
   const validatedOps = validateOperations(reconciledOperations, context, message);
   const toolValidationPassed = validatedOps.every((op) => op.status !== "invalid" && op.status !== "unsupported");
@@ -1799,32 +1800,61 @@ function gmailReviewVagueMutationClarification(message: string, context: Context
   return GMAIL_REVIEW_CLARIFICATION_REPLY;
 }
 
-// fix/private-alpha-live-action-and-coaching-regressions (Task 6): a real Telegram transcript
-// found "Is it okay? About the weekend thing" — a reflective, emotional question about whether a
-// rest weekend was fine, asked right after a recent action mutation — answered with a mechanical
-// "Action rescheduled: Send 3 CVs due: 31/08/2026, 23:59" instead of the coaching answer the
-// question actually asked for. A judgment/reassurance question like this is never itself an
-// instruction to move/snooze/complete/archive/create anything — the planner is told as much in
-// its own prompt (see planner.ts's response-mode-routing guidance), but this is the deterministic
-// backstop: whenever the raw message reads as this kind of question AND contains no explicit
-// mutation verb of its own, any action.reschedule/snooze/complete/archive/create the planner
-// still emitted is dropped before validation ever sees it — never replaced with a canned line,
-// so the planner's own real coaching replyDraft is exactly what's shown, same as it already is
-// for any other read-only turn.
-function dropMutationOpsForCoachingJudgmentQuestion(message: string, context: ContextBundle, operations: PlannedOperation[]): PlannedOperation[] {
-  if (!COACHING_JUDGMENT_QUESTION_RE.test(message) || EXPLICIT_MUTATION_VERB_RE.test(message)) {
+/**
+ * fix/private-alpha-coach-first-response-routing: a real Telegram transcript had a full coaching
+ * exchange work correctly ("I rested this weekend with friends, is that okay?" -> a genuine
+ * coaching answer validating the rest), then the very next turn — "I'll try to send CVs tonight
+ * and more this week," a soft, hedged intention continuing the SAME conversation, never a command
+ * — got "Action rescheduled: Send 3 CVs due: 31/08/2026, 20:00" instead of a coaching reply that
+ * anchors the already-due action without touching it. Two things are checked, either one enough
+ * to treat the turn as coach-first: (1) the message ITSELF reads as a reflective/reassurance
+ * question (COACH_CONVERSATION_RE) or a soft, uncommitted intention (SOFT_INTENTION_RE) — even
+ * when it also mentions a day/time word ("tonight," "this week"), since mentioning a time is not
+ * the same as commanding a change; or (2) the message doesn't read as either on its own, but the
+ * most recent prior USER turn was itself a coaching/reassurance question — a bare "yeah, thanks"
+ * or unlabeled follow-up right after "is that okay?" is still part of the same coaching thread.
+ * Either way, an explicit mutation verb (EXPLICIT_MUTATION_VERB_RE) in THIS message always wins
+ * and lets the mutation through regardless of context. When coach-first applies, any
+ * action.reschedule/snooze/complete/archive/create the planner still emitted is dropped before
+ * validation ever sees it — never replaced with a canned line, so the planner's own real
+ * coaching/planning replyDraft (guided by planner.ts's own response-mode-routing prompt) is
+ * exactly what's shown, same as any other read-only turn.
+ */
+function applyCoachFirstResponseRouting(message: string, context: ContextBundle, operations: PlannedOperation[]): PlannedOperation[] {
+  if (EXPLICIT_MUTATION_VERB_RE.test(message)) {
     return operations;
   }
-  const filtered = operations.filter((op) => !COACHING_QUESTION_MUTATION_TOOLS.has(op.tool));
+  if (!isCoachFirstMessage(message) && !hasRecentCoachingContext(context)) {
+    return operations;
+  }
+  const filtered = operations.filter((op) => !RESPONSE_MODE_GATED_MUTATION_TOOLS.has(op.tool));
   if (filtered.length === operations.length) {
     return operations;
   }
   logAgentRuntimeDiagnostics({
-    phase: "coaching_judgment_question_mutation_dropped",
+    phase: "coach_first_response_routing_mutation_dropped",
     userId: context.session.userId,
-    note: `dropped ${operations.filter((op) => COACHING_QUESTION_MUTATION_TOOLS.has(op.tool)).map((op) => op.tool).join(", ")} for a coaching-judgment question`
+    note: `dropped ${operations.filter((op) => RESPONSE_MODE_GATED_MUTATION_TOOLS.has(op.tool)).map((op) => op.tool).join(", ")} for a coach_conversation/soft_intention message`
   });
   return filtered;
+}
+
+/** The most recent prior USER turn (skipping this turn's own just-appended message and any
+ * assistant reply in between) was itself a coaching/reassurance question — "recent coaching
+ * context," so a bare, unlabeled follow-up right after "is that okay?" still reads as continuing
+ * that same thread rather than a fresh, unrelated request. Scoped to the last few turns only
+ * (never the whole conversation history), mirroring hasRecentGmailContext's own backward-scan
+ * shape elsewhere in this file. */
+function hasRecentCoachingContext(context: ContextBundle): boolean {
+  const messages = context.session.messages;
+  const searchFloor = Math.max(0, messages.length - 6);
+  for (let i = messages.length - 2; i >= searchFloor; i -= 1) {
+    const entry = messages[i];
+    if (entry.role === "user") {
+      return COACH_CONVERSATION_RE.test(entry.text);
+    }
+  }
+  return false;
 }
 
 function reconcileExplicitGmailReviewIntentOperations(
@@ -2076,29 +2106,11 @@ const ACTION_SNOOZE_PATTERN =
  * "it"/"that"/bare-word case a worker notification leaves the user replying to. */
 const GENERIC_ACTION_REFERENCE_PATTERN = /\b(it|that one|that|this one|this)\b/;
 
-// See dropMutationOpsForCoachingJudgmentQuestion's own doc comment (above, near the Gmail-review
-// reconciler it's modeled on) for the real transcript this closes.
-// Trailing \b right after an accented "é" never matches in a plain (non-unicode) JS regex — é
-// isn't a \w character, so there's no word/non-word transition between "é" and, say, a "," or "?"
-// right after it (both already read as non-word). Same fix validator.ts's own EXPLICIT_WHEN_SCOPE_RE
-// already uses for this identical problem with Catalan "demà".
-const COACHING_JUDGMENT_QUESTION_RE =
-  /\bis (it|that|this) (okay|ok)\b|\bwas (it|that|this) (okay|ok)\b|\b¿?est[aá] bien\b|\b¿?est[aà] b[ée](?![a-zA-Z])/i;
-const EXPLICIT_MUTATION_VERB_RE = new RegExp(
-  [
-    ACTION_SNOOZE_PATTERN.source,
-    ACTION_ARCHIVE_PATTERN.source,
-    ACTION_COMPLETION_PATTERN.source,
-    ACTION_DONE_PATTERN.source,
-    "\\breschedule\\b",
-    "\\bpostpone\\b",
-    "\\bcreate (a|an) (task|action|reminder)\\b",
-    "\\badd (a|an) (task|action|reminder)\\b",
-    "\\bschedule\\b"
-  ].join("|"),
-  "i"
-);
-const COACHING_QUESTION_MUTATION_TOOLS = new Set(["action.reschedule", "action.snooze", "action.complete", "action.archive", "action.create"]);
+// fix/private-alpha-coach-first-response-routing: the coaching/soft-intention mutation-gating
+// regexes (formerly COACHING_JUDGMENT_QUESTION_RE/EXPLICIT_MUTATION_VERB_RE/
+// COACHING_QUESTION_MUTATION_TOOLS, defined locally here) now live in the dependency-free
+// response-mode.ts module — see applyCoachFirstResponseRouting's own doc comment (above, near the
+// Gmail-review reconciler it's modeled on) for the current real transcript this closes.
 
 // A deferral verb (ACTION_SNOOZE_PATTERN, defined below) paired with a genuinely vague "some day
 // this week" phrase and NO actual day named — "later this week"/"this week"/"later in the week"
