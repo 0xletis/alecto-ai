@@ -224,13 +224,15 @@ test("G: after an overdue challenge, moving the action to tomorrow still works n
     mockPlan({ topic: "goals", intent: "next_action", operations: [op("goal.recommend_next_action", { recommendation: "Let's look." })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     await sendAgentMessage(server, userId, "what should I do next?");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { actionId: action.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // No mockPlan needed for the move itself — "move it to tomorrow..." (no digit) is
+    // intercepted by the deterministic shortcut before the planner is ever consulted, and it now
+    // builds action.reschedule, not action.snooze, so the action stays open.
     const reply = await sendAgentMessage(server, userId, "move it to tomorrow, I had a call today");
 
     assert.equal(reply.debug.mutationExecuted, true);
     assert.doesNotMatch(reply.reply, /avoiding|shrink it, move it, or archive it/i);
     const item = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.equal(item?.status, "snoozed");
+    assert.equal(item?.status, "open", "moving it must keep the action open, never hidden as snoozed");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

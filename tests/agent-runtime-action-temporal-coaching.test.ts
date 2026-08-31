@@ -36,21 +36,27 @@ function actionListPlan() {
 
 // --- Task 2: temporal action semantics -----------------------------------------------------------
 
-test("2A: 'show me my actions' defaults to active/open now, excluding a snoozed one", async () => {
+test("2A: 'show me my actions' includes a legacy-snoozed action too — Alecto actions are open/completed/archived, nothing else", async () => {
   const server = buildServer();
   const userId = `temporal-2a-${randomUUID()}`;
   try {
     await seedUser(userId);
     await createActionItem(userId, { source: "manual", title: "Renew passport" });
+    // fix/private-alpha-remove-user-facing-action-snooze: nothing NEW ever becomes "snoozed"
+    // anymore, but this old status can still exist on historical rows — snoozeActionItem itself
+    // is untouched (no schema migration, no data loss) and only used here to seed a legacy row.
+    // The product rule is that a plain "show me my actions" must never come back missing a real,
+    // still-open commitment just because of that old status — it must surface right alongside a
+    // plain open action, not be lost.
     const deferred = await createActionItem(userId, { source: "manual", title: "Book flights" });
     await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
 
     mockPlan(actionListPlan());
     const reply = await sendAgentMessage(server, userId, "show me my actions");
 
-    assert.match(reply.reply, /you have 1 open action:/i);
+    assert.match(reply.reply, /you have 2 open actions:/i);
     assert.match(reply.reply, /renew passport/i);
-    assert.doesNotMatch(reply.reply, /book flights/i);
+    assert.match(reply.reply, /book flights/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -133,7 +139,7 @@ test("2D: 'all actions' labels deferred (with date), completed, and archived ite
   }
 });
 
-test("2E: mutation-reply and footer copy say 'move'/'bring back', never 'snoozed'", async () => {
+test("2E: mutation-reply and footer copy say 'moved'/'rescheduled', never 'snoozed' or 'bring back'", async () => {
   const server = buildServer();
   const userId = `temporal-2e-${randomUUID()}`;
   try {
@@ -144,10 +150,17 @@ test("2E: mutation-reply and footer copy say 'move'/'bring back', never 'snoozed
     const listReply = await sendAgentMessage(server, userId, "show me my actions");
     assert.doesNotMatch(listReply.reply, /\bsnooze\b/i);
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { actionId: action.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
-    const snoozeReply = await sendAgentMessage(server, userId, "move it to tomorrow");
-    assert.doesNotMatch(snoozeReply.reply, /\bsnoozed\b/i);
-    assert.match(snoozeReply.reply, /bring "renew passport" back tomorrow/i);
+    // fix/private-alpha-remove-user-facing-action-snooze: "move it to tomorrow" is real-planner
+    // territory for action.reschedule now — action.snooze is deprecated and no longer offered in
+    // the tool catalog at all (tool-catalog.ts), so a well-behaved planner has no other choice for
+    // this vocabulary. The action stays open; the reply must say so honestly, never "bring back."
+    mockPlan({ topic: "actions", intent: "reschedule", operations: [op("action.reschedule", { actionId: action.id, dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    const moveReply = await sendAgentMessage(server, userId, "move it to tomorrow");
+    assert.doesNotMatch(moveReply.reply, /\bsnoozed\b/i);
+    assert.doesNotMatch(moveReply.reply, /bring .*back/i);
+    assert.match(moveReply.reply, /rescheduled/i);
+    const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(updated?.status, "open");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -180,7 +193,7 @@ test("3A: 'snooze it for later this week' with one visible action asks which day
   }
 });
 
-test("3B: 'move it to tomorrow' (bare, single visible action) applies directly, no clarification", async () => {
+test("3B: 'move it to tomorrow' (bare, single visible action) applies directly, no clarification, and stays open", async () => {
   const server = buildServer();
   const userId = `temporal-3b-${randomUUID()}`;
   try {
@@ -190,12 +203,17 @@ test("3B: 'move it to tomorrow' (bare, single visible action) applies directly, 
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // fix/private-alpha-remove-user-facing-action-snooze: no mockPlan for the move itself — a bare
+    // "move it to tomorrow" (no digit) is intercepted by the deterministic shortcut in runtime.ts
+    // BEFORE the planner is ever consulted (this file's own header comment explains why), so
+    // there's nothing for a planner mock to override here. That shortcut now builds an
+    // action.reschedule operation, not action.snooze, so the action stays open.
     const reply = await sendAgentMessage(server, userId, "move it to tomorrow");
 
     assert.equal(reply.debug.mutationExecuted, true);
     const item = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.equal(item?.status, "snoozed");
+    assert.equal(item?.status, "open");
+    assert.ok(item?.dueAt, "moving it must set a real dueAt");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -264,7 +282,8 @@ test("4A: 'ok do it' right after moving an action to tomorrow says already done,
 
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // No mockPlan needed for the move itself — intercepted by the deterministic shortcut (bare
+    // "move it to tomorrow", no digit), which now builds action.reschedule, not action.snooze.
     await sendAgentMessage(server, userId, "move it to tomorrow");
 
     const reply = await sendAgentMessage(server, userId, "ok do it");
@@ -273,7 +292,7 @@ test("4A: 'ok do it' right after moving an action to tomorrow says already done,
     assert.doesNotMatch(reply.reply, /don't have anything pending/i);
     assert.equal(reply.debug.mutationExecuted, false);
     const item = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.equal(item?.status, "snoozed", "must not have been mutated a second time");
+    assert.equal(item?.status, "open", "moving it must keep the action open, and must not have been mutated a second time");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -645,13 +664,14 @@ test("8B: 'not today, remind me tomorrow' does not hit avoidance and actually mo
     await sendAgentMessage(server, userId, "show me my actions");
 
     mockGuardrail(guardrailClassification({ conflict: "soft_warn", pattern: "avoidance" }));
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // Bare "not today, remind me tomorrow" (no digit) is also intercepted by the deterministic
+    // shortcut before the planner is consulted — no mockPlan override applies to it.
     const reply = await sendAgentMessage(server, userId, "not today, remind me tomorrow");
 
     assert.notEqual(reply.debug.conversationTopic, "guardrail");
     assert.equal(reply.debug.mutationExecuted, true);
     const item = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.equal(item?.status, "snoozed");
+    assert.equal(item?.status, "open", "reminding later must keep the action open, never hidden as snoozed");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

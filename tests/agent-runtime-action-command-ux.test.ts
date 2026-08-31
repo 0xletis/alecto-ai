@@ -173,7 +173,7 @@ test("2B: single visible action + 'I did it' completes it", async () => {
   }
 });
 
-test("2C: single visible action + 'remind me tomorrow' snoozes it", async () => {
+test("2C: single visible action + 'remind me tomorrow' moves it, keeping it open", async () => {
   const server = buildServer();
   const userId = `action-ux-natural-remindme-${randomUUID()}`;
   try {
@@ -181,10 +181,14 @@ test("2C: single visible action + 'remind me tomorrow' snoozes it", async () => 
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
 
+    // fix/private-alpha-remove-user-facing-action-snooze: "remind me tomorrow" (no digit) is
+    // intercepted by the deterministic shortcut before the planner is consulted — this mockPlan
+    // is unused, kept only to show what a real planner would ALSO produce now that action.snooze
+    // is deprecated: action.reschedule.
     mockPlan({
       topic: "actions",
-      intent: "snooze",
-      operations: [op("action.snooze", { untilText: "tomorrow" })],
+      intent: "reschedule",
+      operations: [op("action.reschedule", { dueText: "tomorrow" })],
       needsClarification: false,
       clarificationQuestion: null,
       replyDraft: ""
@@ -192,9 +196,9 @@ test("2C: single visible action + 'remind me tomorrow' snoozes it", async () => 
     const reply = await sendAgentMessage(server, userId, "remind me tomorrow");
 
     assert.equal(reply.debug.mutationExecuted, true);
-    assert.match(reply.reply, /bring "renew passport" back/i);
+    assert.match(reply.reply, /rescheduled/i);
     const item = await prisma.actionItem.findUnique({ where: { id: id! } });
-    assert.equal(item?.status, "snoozed");
+    assert.equal(item?.status, "open", "reminding later must keep the action open, never hidden as snoozed");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -323,7 +327,7 @@ test("3A: complete reply uses the executor-confirmed title, never the planner's 
   }
 });
 
-test("3B: snooze reply uses the executor-confirmed title and a real when-label, never the replyDraft", async () => {
+test("3B: move reply uses the executor-confirmed title and a real due date, never the replyDraft", async () => {
   const server = buildServer();
   const userId = `action-ux-grounded-snooze-${randomUUID()}`;
   try {
@@ -331,17 +335,20 @@ test("3B: snooze reply uses the executor-confirmed title and a real when-label, 
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
 
+    // "snooze it tomorrow" (no digit) is intercepted by the deterministic shortcut before the
+    // planner is consulted — this mockPlan is unused, kept only to show what a real planner
+    // would ALSO produce now that action.snooze is deprecated: action.reschedule.
     mockPlan({
       topic: "actions",
-      intent: "snooze",
-      operations: [op("action.snooze", { actionId: id, untilText: "tomorrow" })],
+      intent: "reschedule",
+      operations: [op("action.reschedule", { actionId: id, dueText: "tomorrow" })],
       needsClarification: false,
       clarificationQuestion: null,
       replyDraft: "Sure thing, pushed that back for you."
     });
     const reply = await sendAgentMessage(server, userId, "snooze it tomorrow");
 
-    assert.match(reply.reply, /bring "renew passport" back tomorrow/i);
+    assert.match(reply.reply, /action rescheduled: renew passport/i);
     assert.doesNotMatch(reply.reply, /pushed that back for you/i);
   } finally {
     clearAgentRuntimeMocks();

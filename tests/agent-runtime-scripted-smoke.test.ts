@@ -320,12 +320,15 @@ test("scripted smoke 4: clean up my actions -> snooze the overdue gym one -> cle
     const snoozeReply = await sendAgentMessage(server, userId, "snooze the overdue gym one to tomorrow");
     assertNoGenericErrorRaw(snoozeReply.reply);
     assert.equal(snoozeReply.debug.mutationExecuted, true);
-    assert.match(snoozeReply.reply, /snoozed/i);
+    // fix/private-alpha-remove-user-facing-action-snooze: the batch "snooze" decision still
+    // recognizes that word in the user's own reply, but no longer sets the hidden "snoozed"
+    // status — it reschedules and says "Moved ...", keeping the action open.
+    assert.match(snoozeReply.reply, /moved/i);
 
     mockPlan(hygieneStartPlan());
     const secondStartReply = await sendAgentMessage(server, userId, "clean up my actions");
     assertNoGenericErrorRaw(secondStartReply.reply);
-    // The gym item is snoozed to tomorrow (not due yet) — only the car item remains.
+    // The gym item was moved to tomorrow (not due yet, still open) — only the car item remains.
     assert.doesNotMatch(secondStartReply.reply, /strength sessions/i);
     assert.match(secondStartReply.reply, /car listings/i);
 
@@ -342,7 +345,7 @@ test("scripted smoke 4: clean up my actions -> snooze the overdue gym one -> cle
 
     const gymAfter = await prisma.actionItem.findUnique({ where: { id: gymAction.id } });
     const carAfter = await prisma.actionItem.findUnique({ where: { id: carAction.id } });
-    assert.equal(gymAfter?.status, "snoozed", "the gym item must only be snoozed, never archived");
+    assert.equal(gymAfter?.status, "open", "the gym item must only be moved (still open), never archived");
     assert.equal(carAfter?.status, "archived");
   } finally {
     clearAgentRuntimeMocks();

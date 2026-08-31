@@ -63,7 +63,11 @@ test("applyActionHygieneBatchOperations: archive, complete (with goal progress),
 
     assert.match(result.reply, /Archived Old task/);
     assert.match(result.reply, /Completed Finish report; goal progress logged for Ship the launch/);
-    assert.match(result.reply, /Snoozed Call Alex to/);
+    // fix/private-alpha-remove-user-facing-action-snooze: the batch "snooze" decision still
+    // recognizes that word in the user's own reply, but no longer sets the hidden "snoozed"
+    // status — it reschedules, keeping the action open (same as every other move/postpone
+    // command now does), and the reply says so honestly instead of "Snoozed ... to ...".
+    assert.match(result.reply, /Moved Call Alex to/);
     assert.match(result.reply, /Kept Review PR/);
 
     const archived = await prisma.actionItem.findUnique({ where: { id: toArchive.id } });
@@ -71,7 +75,7 @@ test("applyActionHygieneBatchOperations: archive, complete (with goal progress),
     const completed = await prisma.actionItem.findUnique({ where: { id: toComplete.id } });
     assert.equal(completed?.status, "completed");
     const snoozed = await prisma.actionItem.findUnique({ where: { id: toSnooze.id } });
-    assert.equal(snoozed?.status, "snoozed");
+    assert.equal(snoozed?.status, "open", "the batch 'snooze' decision must keep the action open, never hidden");
     const kept = await prisma.actionItem.findUnique({ where: { id: toKeep.id } });
     assert.equal(kept?.status, "open", "keep must not mutate the action");
 
@@ -103,7 +107,7 @@ test("applyActionHygieneBatchOperations: skips actions no longer found, already 
 
     assert.match(result.reply, /Ghost task: no longer found/);
     assert.match(result.reply, /Gone already: already archived/);
-    assert.match(result.reply, /Needs a time: missing snooze time/);
+    assert.match(result.reply, /Needs a time: missing new due time/);
     assert.doesNotMatch(result.reply, /^Done:/);
   } finally {
     await prisma.user.deleteMany({ where: { id: userId } });

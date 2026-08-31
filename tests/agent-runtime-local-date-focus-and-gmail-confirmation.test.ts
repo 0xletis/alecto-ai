@@ -96,7 +96,11 @@ test("1C: date-scoped 'today' includes an action created moments earlier", async
     mockPlan(actionListPlan({ when: "today" }));
     const reply = await sendAgentMessage(server, userId, "show todays actions");
 
-    assert.match(reply.reply, /send 6 cvs today/i);
+    // fix/private-alpha-remove-user-facing-action-snooze: action.list's per-item title cleaning
+    // now applies to every item (not just overdue/snoozed ones), so a redundant trailing "today"
+    // is stripped when the line already shows "due today" right next to it — a display-only
+    // cleanup, the stored title itself is untouched.
+    assert.match(reply.reply, /send 6 cvs — due today/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -187,11 +191,15 @@ test("3A: create an action, then 'move it to tomorrow' works without listing act
     mockPlan({ topic: "actions", intent: "create", operations: [op("action.create", { title: "Send 6 CVs today" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     await sendAgentMessage(server, userId, "send 6 CVs today");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // "move it to tomorrow" (no digit) is intercepted by the deterministic shortcut before the
+    // planner is consulted — this mockPlan is unused, kept only to show what a real planner
+    // would ALSO produce now that action.snooze is deprecated: action.reschedule.
+    mockPlan({ topic: "actions", intent: "reschedule", operations: [op("action.reschedule", { dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "move it to tomorrow");
 
     assert.doesNotMatch(reply.reply, /which task|don't have one in view/i);
-    assert.match(reply.reply, /bring .* back tomorrow|moved/i);
+    assert.doesNotMatch(reply.reply, /bring .* back/i);
+    assert.match(reply.reply, /rescheduled|moved/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

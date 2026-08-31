@@ -2418,16 +2418,25 @@ const ACTION_ARCHIVE_PATTERN = /\b(archive|dismiss)\b/;
 // (literal "snooze" only) is a small subset of how a coach would actually phrase task deferral;
 // "move it," "bring it back," "park it," "push it," "defer," and "remind me" (+ Spanish/Catalan
 // equivalents, matched post-accent-stripping via normalizeIntentText) are all real reported/
-// expected phrasings for the exact same operation (action.snooze) — deferring something later.
-// Deliberately does NOT include "postpone"/"reschedule": those two are action.reschedule's own
-// established vocabulary (changing/correcting a due date while the action stays OPEN, a genuinely
-// different DB effect than snoozing it), and a bare "reschedule it to tomorrow" must still reach
-// that tool, not get silently redirected into a deferral. Still just a keyword shortcut, not full
+// expected phrasings for the exact same operation (now action.reschedule — see
+// fix/private-alpha-remove-user-facing-action-snooze below). Deliberately does NOT include
+// "postpone"/"reschedule": those two are action.reschedule's own established vocabulary
+// (changing/correcting a due date while the action stays OPEN, the same effect this whole pattern
+// now routes to anyway), and a bare "reschedule it to tomorrow" must still reach that tool through
+// its own normal path, not get silently redirected here. Still just a keyword shortcut, not full
 // NLP — a phrase this doesn't catch simply falls through to the real LLM planner (whose
 // tool-catalog.ts guidance covers the same vocabulary) rather than silently failing; this only
 // ever WIDENS what resolves deterministically before the guardrail.
+//
+// fix/private-alpha-remove-user-facing-action-snooze: "not now"/"not today" added after a real-LLM
+// eval caught "not now, tomorrow" (no other deferral keyword) falling all the way through to the
+// goal-avoidance guardrail's own LLM classifier, which sometimes misread an entirely ordinary task
+// reschedule as "avoiding the goal" and blocked it outright — the exact operation (action.reschedule)
+// never even ran. Matching this deterministically here, like every other deferral phrase already
+// does, gives it the same guardrail-skip privilege ("domain shortcut matched" — see the call site
+// below) instead of leaving it to a per-call, occasionally-wrong LLM judgment.
 const ACTION_SNOOZE_PATTERN =
-  /\bsnooze\b|\bmove (it|this|that)\b|\bbring (it|this|that) back\b|\bpark (it|this|that)\b|\bpush (it|this|that)\b|\bdefer\b|\bremind me\b|\bmuevelo\b|\bpasalo\b|\brecuerdamelo\b|\bmou-ho\b|\bpassa-ho\b|\brecorda-m['’]ho\b/;
+  /\bsnooze\b|\bmove (it|this|that)\b|\bbring (it|this|that) back\b|\bpark (it|this|that)\b|\bpush (it|this|that)\b|\bdefer\b|\bremind me\b|\bnot now\b|\bnot today\b|\bmuevelo\b|\bpasalo\b|\brecuerdamelo\b|\bmou-ho\b|\bpassa-ho\b|\brecorda-m['’]ho\b/;
 /** Generic pronoun/bare-acknowledgement reference only — a message that names something by its
  * own specific words ("complete the Nietzsche book goal") should still go through the normal
  * planner/validator resolution path, not this shortcut, which exists only for the truly ambiguous
@@ -2518,28 +2527,38 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
     return undefined;
   }
 
-  let tool: "action.complete" | "action.archive" | "action.snooze" | undefined;
-  let untilText: string | undefined;
+  let tool: "action.complete" | "action.archive" | "action.reschedule" | undefined;
+  let dueText: string | undefined;
 
   if (ACTION_SNOOZE_PATTERN.test(text)) {
-    untilText = extractNaturalDueTextFromMessage(text);
-    // action.snooze's untilText is required — without one to extract, fall through rather than
-    // plan an operation the validator can only reject.
-    if (!untilText) {
+    dueText = extractNaturalDueTextFromMessage(text);
+    // "not now"/"not today" always extract their OWN literal word first ("now"/"today" appears
+    // before any later date named in the same message — extractNaturalDueTextFromMessage's regex
+    // finds the leftmost match) — the opposite of what they mean: "not now" means "later," not
+    // "due this instant." Tomorrow is the natural default (matches tool-catalog.ts's own
+    // established rule for the same phrasing when it reaches the real planner instead), UNLESS a
+    // real later date follows in the same message ("not now, tomorrow"), which wins here exactly
+    // because it's the more specific, user-stated target.
+    if (dueText === "now" || dueText === "today") {
+      const laterDate = text.match(
+        /\bnot\s+(?:now|today)\b[\s,]*((?:tomorrow|tonight)(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)\b/
+      );
+      dueText = laterDate?.[1]?.trim() ?? "tomorrow";
+    }
+    // The deterministic shortcut still needs a real due-date phrase to extract — without one,
+    // fall through rather than plan an operation the validator can only reject.
+    if (!dueText) {
       return undefined;
     }
-    // "move it back to today"/"bring it back today" is a real reported case where this pattern's
-    // OWN vocabulary ("move"/"bring back") collides with its own extracted date — deferring
-    // something UNTIL today is a contradiction (a snooze is always meant to push something
-    // LATER), and doing it anyway would set status "snoozed" with snoozedUntil=today, which is
-    // invisible to a plain "show me my actions" until some later reminder notices it's due — the
-    // opposite of what "pull it back to today" actually means. That phrase is action.reschedule's
-    // job (dueText 'today', keeps the action OPEN) — falls through to the real planner here,
-    // whose tool-catalog.ts guidance already covers exactly this "pull it back to today" phrasing.
-    if (/^today\b/i.test(untilText)) {
-      return undefined;
-    }
-    tool = "action.snooze";
+    // fix/private-alpha-remove-user-facing-action-snooze: this used to build an action.snooze
+    // operation, which set status "snoozed" — invisible to a plain "show me my actions" until it
+    // came back due. A real Telegram transcript found exactly this: "move it to tomorrow 20:00"
+    // made the action vanish from every normal list view even though nothing was completed or
+    // archived. action.reschedule updates dueAt and keeps the action open, matching the product
+    // rule that moving/postponing/reminding later must never hide a real, still-open commitment.
+    // No more "today" carve-out needed either — action.reschedule already handles pulling a date
+    // BACK to today correctly (previously only true of action.reschedule, never action.snooze).
+    tool = "action.reschedule";
   } else if (ACTION_ARCHIVE_PATTERN.test(text)) {
     tool = "action.archive";
   } else if (ACTION_COMPLETION_PATTERN.test(text) || ACTION_DONE_PATTERN.test(text)) {
@@ -2548,7 +2567,7 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
     return undefined;
   }
 
-  if (tool !== "action.snooze" && !GENERIC_ACTION_REFERENCE_PATTERN.test(text) && !ACTION_DONE_PATTERN.test(text)) {
+  if (tool !== "action.reschedule" && !GENERIC_ACTION_REFERENCE_PATTERN.test(text) && !ACTION_DONE_PATTERN.test(text)) {
     return undefined;
   }
 
@@ -2564,7 +2583,7 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
 
   return {
     tool,
-    args: { actionId: resolved.actionId, ...(untilText ? { untilText } : {}) },
+    args: { actionId: resolved.actionId, ...(dueText ? { dueText } : {}) },
     rationale: "user replied generically about the most recently notified/visible task, not a Gmail review"
   };
 }

@@ -31,7 +31,6 @@ import {
   rescheduleActionItem,
   selfHealDailyLoopEnabled,
   setGoalStatus,
-  snoozeActionItem,
   updateEmailSignalRule,
   updateIntegrationConnection,
   updateIntegrationConnectionConfig,
@@ -243,8 +242,18 @@ export async function executeOperation(
         // because the only status this tool understood for "everything actionable" was strict
         // "open," which hides anything already snoozed/deferred. Never includes archived/completed
         // — those still require asking for them explicitly (status "archived"/"completed"/"all").
+        //
+        // fix/private-alpha-remove-user-facing-action-snooze: "open" (including the plain default,
+        // no status/when at all — the exact shape of a bare "show me my actions") now gets this
+        // SAME widening. Alecto actions are commitments — open, completed, or archived, nothing
+        // else — so a plain open-actions view must never come back empty just because an action
+        // happens to carry the old "snoozed" status. Nothing NEW ever becomes "snoozed" anymore
+        // (action.snooze is deprecated for user-facing goal actions), but real historical rows
+        // created before this change still exist and must stay visible, not lost, until they're
+        // naturally moved again (which now always resolves them back to "open"). An explicit
+        // status:"snoozed"/"completed"/"archived"/"all" request still narrows normally below.
         const pool =
-          when || status === "active"
+          when || status === "active" || status === "open"
             ? (await getActionItems(userId, { status: "all", limit: ACTION_LIST_POOL_CAP })).filter(
                 (item) => item.status === "open" || item.status === "snoozed"
               )
@@ -487,15 +496,16 @@ export async function executeOperation(
       }
 
       case "action.snooze": {
+        // fix/private-alpha-remove-user-facing-action-snooze: Alecto actions are commitments —
+        // open, completed, or archived, nothing else. action.snooze is deprecated for user-facing
+        // goal actions and removed from the planner's own tool catalog (tool-catalog.ts); this
+        // case only remains as a defense-in-depth alias for any caller that somehow still
+        // constructs one (a stale pending operation, a future regression, etc.). It now behaves
+        // exactly like action.reschedule — updates dueAt, keeps the action OPEN and visible in
+        // every normal list — instead of the old "snoozed" status that hid a real Telegram user's
+        // moved action from "show me my actions" entirely (the exact reported bug this closes).
         const actionId = args.actionId as string;
         const untilText = args.untilText as string;
-        // fix/private-alpha-conversation-kernel-context-routing: a real reported bug — "move it
-        // to tomorrow 23:59" (routed to action.snooze by the real planner, not action.reschedule)
-        // silently landed near "now" instead of the requested 23:59. This call never passed the
-        // user's own timezone/`now` at all (unlike action.reschedule's equivalent call just below
-        // in this file, which always has), so it parsed "tomorrow at 23:59" against the SERVER's
-        // default timezone instead of the user's real one — a real, pre-existing gap, not
-        // specific to the end-of-day default work in this branch.
         const settings = await getOrCreateNotificationSettings(userId);
         const parsedDate = parseActionDueDate(untilText, {
           timezone: settings.timezone,
@@ -503,38 +513,30 @@ export async function executeOperation(
           preferences: settings
         });
         if (!parsedDate.dueAt) {
-          return failed(operation.tool, parsedDate.clarification ?? `Couldn't understand the snooze target "${untilText}".`);
+          return failed(operation.tool, parsedDate.clarification ?? `Couldn't understand the new due time "${untilText}".`);
         }
-        const updated = await snoozeActionItem(userId, actionId, parsedDate.dueAt);
+        const action = await getActionItem(userId, actionId);
+        if (!action || action.status === "archived") {
+          return failed(operation.tool, "That task no longer exists or is archived.");
+        }
+        const updated = await rescheduleActionItem(userId, actionId, parsedDate.dueAt);
         if (!updated) {
           return failed(operation.tool, "That task no longer exists or is archived.");
         }
-        // "bring it back tomorrow" reads like a coach, not a scheduler — reuses the exact same
-        // today/tomorrow/full-date phrasing action.list's own due lines already use, minus the
-        // "due " prefix, which only makes sense next to a task title, not a person.
-        const whenLabel = updated.snoozedUntil ? formatDueLabelForChat(updated.snoozedUntil, settings.timezone).replace(/^due /, "") : "later";
+        const whenLabel = formatDueLabelForChat(parsedDate.dueAt, settings.timezone).replace(/^due /, "");
         const foundNote = operation.actionOutsideVisiblePage ? "Found it outside your last shown list (an exact title match). " : "";
-        // Repeated-postponement coaching (fix/private-alpha-action-temporal-coaching): the FIRST
-        // move of any action is completely ordinary rescheduling, never challenged. The second
-        // gets a genuine, non-accusatory question — real life does sometimes need two moves — and
-        // only the third-plus gets stronger, concrete coaching. Grounded entirely in
-        // postponeCount (packages/db's own persistent counter, incremented by snoozeActionItem
-        // itself), never guessed from conversation history, and never blocks the move itself —
-        // the action is always actually moved first, this is only ever appended after.
-        const coachingNote =
-          updated.postponeCount === 2
-            ? " I can move it, but this is the second time. Is today genuinely blocked, or are you avoiding this?"
-            : updated.postponeCount >= 3
-              ? " You've moved this several times. We should either shrink it, do a 10-minute version, or archive it."
-              : "";
-        // fix/private-alpha-temporal-action-copy-and-dedup: a real transcript found this reply
-        // saying '...bring "Apply to 3 more remote Web3 roles today" back tomorrow' — the
-        // title's own stale "today" contradicting the "tomorrow" right next to it. Same display-
-        // only cleanup as action.list's per-item line, never the stored title.
+        // Mirrors rescheduleActionItem's own isDeferral rule (packages/db) exactly, so the note
+        // shown here always agrees with whether postponeCount was actually just incremented.
+        const isDeferral = action.status === "snoozed" || (Boolean(action.dueAt) && parsedDate.dueAt.getTime() > action.dueAt!.getTime());
+        const coachingNote = isDeferral ? postponeCoachingNote(updated.postponeCount) : "";
+        // fix/private-alpha-temporal-action-copy-and-dedup: a real transcript found the old
+        // "bring X back" reply saying '...bring "Apply to 3 more remote Web3 roles today" back
+        // tomorrow' — the title's own stale "today" contradicting the "tomorrow" right next to
+        // it. Same display-only cleanup as action.list's per-item line, never the stored title.
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${foundNote}Okay — I'll bring "${cleanedTitleForDateDisplay(updated.title)}" back ${whenLabel}.${coachingNote}`,
+          summary: `${foundNote}Done — moved "${cleanedTitleForDateDisplay(updated.title)}" to ${whenLabel}.${coachingNote}`,
           result: updated
         };
       }
@@ -851,13 +853,35 @@ export async function executeOperation(
           reminderUpdates.length > 0
             ? `\nReminder updated: ${reminderUpdates.map((item) => formatLocalDateTime(item.dueAt, settings.timezone)).join(", ")}.`
             : "";
+        // fix/private-alpha-remove-user-facing-action-snooze: action.reschedule is now the ONLY
+        // user-facing way to push a due date later (action.snooze no longer does this for normal
+        // chat), so the repeated-postponement coaching note moves here too — same postponeCoachingNote
+        // helper action.snooze's own defense-in-depth alias uses, only ever appended for a genuine
+        // push-later (never a tightening/correction, which never reaches this far, or a plain
+        // pull-forward, which isn't the "avoidance" pattern this coaching exists to notice).
+        // Mirrors rescheduleActionItem's own isDeferral rule (packages/db) exactly, so the note
+        // shown here always agrees with whether postponeCount was actually just incremented.
+        const isDeferral = action.status === "snoozed" || (Boolean(action.dueAt) && parsedDate.getTime() > action.dueAt!.getTime());
+        const coachingNote = isDeferral ? postponeCoachingNote(updated.postponeCount) : "";
+
+        // fix/private-alpha-remove-user-facing-action-snooze: setVisibleEntities merges PER TYPE
+        // (conversation-session.ts) — since a rescheduled action is still open, not terminal, it
+        // stays referenceable, but naively returning just this one action entity here replaces
+        // the ENTIRE numbered action list with it, wiping every sibling's index. A real reported
+        // regression: "show my actions" (3 items) -> "move 2 to tomorrow" -> "archive 3" failed
+        // with "I only showed 0 actions" because index 3 no longer existed anywhere. Every other
+        // previously-visible action entity is preserved here, unchanged, alongside the updated one.
+        const otherVisibleActionEntities = context.session.visibleEntities.filter(
+          (entity) => entity.type === "action" && entity.id !== updated.id
+        );
+        const updatedIndex = context.session.visibleEntities.find((entity) => entity.type === "action" && entity.id === updated.id)?.index;
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Action rescheduled: ${updated.title}\ndue: ${formatLocalDateTime(updated.dueAt, settings.timezone)}.${reminderLine}`,
+          summary: `Action rescheduled: ${cleanedTitleForDateDisplay(updated.title)}\ndue: ${formatLocalDateTime(updated.dueAt, settings.timezone)}.${reminderLine}${coachingNote}`,
           result: updated,
-          entities: [actionToEntity(updated), ...reminderUpdates.map(actionToEntity)]
+          entities: [...otherVisibleActionEntities, actionToEntity(updated, updatedIndex), ...reminderUpdates.map(actionToEntity)]
         };
       }
 
@@ -3972,11 +3996,14 @@ function formatActionListForChat(
   items.forEach((item, index) => {
     const effectiveDate = actionEffectiveDate(item);
     const health = assessTemporalHealth(item, now, timezone);
-    // A snoozed/overdue item's OWN title can carry a now-stale temporal word ("...roles today"
-    // moved to tomorrow, or now overdue) — cleanedTitleForDateDisplay strips only a recognized
-    // TRAILING phrase for display, never touching the stored row or anything mid-title. Left
-    // completely alone for a normal on-track item, where the title's own wording is still true.
-    const displayTitle = health.kind === "overdue" || item.status === "snoozed" ? cleanedTitleForDateDisplay(item.title) : item.title;
+    // An item's OWN title can carry a now-stale temporal word ("...roles today" moved to
+    // tomorrow, now overdue, or — fix/private-alpha-remove-user-facing-action-snooze — simply
+    // rescheduled while staying open, which no longer has its own distinct "snoozed" status to
+    // key off of) — cleanedTitleForDateDisplay strips only a recognized TRAILING phrase for
+    // display, never touching the stored row or anything mid-title, and safely leaves an
+    // on-track item's title untouched when nothing trails it. Applied unconditionally here so
+    // every item's date line is honest, regardless of which status produced it.
+    const displayTitle = cleanedTitleForDateDisplay(item.title);
     // Temporal health (fix/private-alpha-action-temporal-coaching) wins over the plain date line
     // for an overdue item — "due Mon 18 Aug" for something 4 days late reads as a normal
     // upcoming task, not a problem; "overdue by 4 days" is the honest version. A snoozed item
@@ -4072,6 +4099,23 @@ const TRAILING_TEMPORAL_PHRASE_RE = /\s*[-–—]?\s*(today|tomorrow|tonight|thi
 function cleanedTitleForDateDisplay(title: string): string {
   const cleaned = title.replace(TRAILING_TEMPORAL_PHRASE_RE, "").trim();
   return cleaned.length >= 3 ? cleaned : title;
+}
+
+/** Repeated-postponement coaching (originally fix/private-alpha-action-temporal-coaching, now
+ * shared by action.reschedule's own genuine-deferral case and action.snooze's defense-in-depth
+ * alias — fix/private-alpha-remove-user-facing-action-snooze): the FIRST move of any action is
+ * completely ordinary rescheduling, never challenged. The second gets a genuine, non-accusatory
+ * question — real life does sometimes need two moves — and only the third-plus gets stronger,
+ * concrete coaching. Grounded entirely in postponeCount (packages/db's own persistent counter,
+ * now incremented by rescheduleActionItem itself for a genuine push-later), never guessed from
+ * conversation history, and never blocks the move itself — the action is always actually moved
+ * first, this is only ever appended after. */
+function postponeCoachingNote(postponeCount: number): string {
+  return postponeCount === 2
+    ? " I can move it, but this is the second time. Is today genuinely blocked, or are you avoiding this?"
+    : postponeCount >= 3
+      ? " You've moved this several times. We should either shrink it, do a 10-minute version, or archive it."
+      : "";
 }
 
 /** Short parent-action metadata line for a linked pre-due reminder — "Reminder: 30 minutes

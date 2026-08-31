@@ -236,17 +236,20 @@ test("multiple visible actions, no recent reminder: 'snooze it' (planner-routed)
     mockPlan({ topic: "actions", intent: "list_actions", operations: [op("action.list", { status: "open" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     await sendAgentMessage(server, userId, "show my open tasks");
 
-    // "snooze it" has no time phrase, so the deterministic shortcut itself can't resolve it
-    // (untilText is required); it always reaches the planner. Mocked here to simulate a
-    // reasonable planner call (untilText known, actionId genuinely unknown) so the validator's
-    // own ACTION_REFERENCE_TOOLS ambiguity check is what's actually being tested.
+    // fix/private-alpha-remove-user-facing-action-snooze: action.snooze is deprecated and no
+    // longer offered in the planner's tool catalog — a real planner now emits action.reschedule
+    // for "snooze it until tomorrow" too. With two actions visible and no recent worker
+    // notification, the deterministic shortcut can't resolve which one either, so it always
+    // reaches the planner; mocked here to simulate a reasonable planner call (dueText known,
+    // actionId genuinely unknown) so action.reschedule's own ref-based ambiguity check
+    // (resolveActionRef) is what's actually being tested.
     mockPlan({
       topic: "actions",
-      intent: "snooze",
-      operations: [op("action.snooze", { untilText: "tomorrow" })],
+      intent: "reschedule",
+      operations: [op("action.reschedule", { dueText: "tomorrow" })],
       needsClarification: false,
       clarificationQuestion: null,
-      replyDraft: "I'll snooze that to tomorrow."
+      replyDraft: "I'll move that to tomorrow."
     });
     const reply = await sendAgentMessage(server, userId, "snooze it until tomorrow");
     assertNoGenericAgentError(reply);

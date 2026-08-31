@@ -100,7 +100,11 @@ test("C. a genuinely vague 'show me my actions' (no day named) keeps the determi
     const reply = await sendAgentMessage(server, userId, "show me my actions");
 
     assert.match(reply.reply, /call the bank/i, `expected the open action to be listed — got: ${reply.reply}`);
-    assert.doesNotMatch(reply.reply, /book flights/i, "a bare 'my actions' request (no 'all') stays strictly open, unchanged");
+    // fix/private-alpha-remove-user-facing-action-snooze: a bare "my actions" request (no "all")
+    // still stays strictly non-archived/non-completed, but now DOES include the legacy-deferred
+    // "book flights" fixture too — Alecto actions are open/completed/archived, nothing else, so a
+    // plain open-actions view must never come back missing a real, still-open commitment.
+    assert.match(reply.reply, /book flights/i, "a bare 'my actions' request must still surface a legacy-deferred action, not lose it");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

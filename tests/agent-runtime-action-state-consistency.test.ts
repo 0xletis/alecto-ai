@@ -243,7 +243,7 @@ test("3C: complete an action -> it's excluded from goal.recommend_next_action's 
   }
 });
 
-test("3D: snooze an action to tomorrow -> next 'show my actions' hides it from the open-now list", async () => {
+test("3D: moving an action to tomorrow -> next 'show my actions' still shows it, open", async () => {
   const server = buildServer();
   const userId = `state-3d-${randomUUID()}`;
   try {
@@ -253,13 +253,21 @@ test("3D: snooze an action to tomorrow -> next 'show my actions' hides it from t
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show my actions");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { actionId: action.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // fix/private-alpha-remove-user-facing-action-snooze: "move it to tomorrow" (no digit) is
+    // intercepted by the deterministic shortcut before the planner is consulted, and it now
+    // builds action.reschedule, not action.snooze — this mockPlan is unused, kept only to show
+    // what a real planner would ALSO produce for this vocabulary now.
+    mockPlan({ topic: "actions", intent: "reschedule", operations: [op("action.reschedule", { actionId: action.id, dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     await sendAgentMessage(server, userId, "move it to tomorrow");
 
     mockPlan(actionListPlan());
     const reply = await sendAgentMessage(server, userId, "show my actions");
 
-    assert.doesNotMatch(reply.reply, /apply to 3 more remote web3 roles/i);
+    // Alecto actions are commitments — open, completed, or archived, nothing else. Moving it must
+    // never make it disappear from a plain "show my actions" the way the old "snoozed" status did.
+    assert.match(reply.reply, /apply to 3 more remote web3 roles/i);
+    const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(updated?.status, "open");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

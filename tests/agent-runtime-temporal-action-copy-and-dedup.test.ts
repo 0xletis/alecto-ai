@@ -117,15 +117,21 @@ test("2A: moving a title that says 'today' to tomorrow never displays 'today —
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { actionId: action.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // "move it to tomorrow" (no digit) is intercepted by the deterministic shortcut before the
+    // planner is consulted — this mockPlan is unused, kept only to show what a real planner
+    // would ALSO produce now that action.snooze is deprecated: action.reschedule.
+    mockPlan({ topic: "actions", intent: "reschedule", operations: [op("action.reschedule", { actionId: action.id, dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const snoozeReply = await sendAgentMessage(server, userId, "move it to tomorrow");
-    assert.doesNotMatch(snoozeReply.reply, /today.*tomorrow|today.*back/i, "the snooze reply must not show the stale 'today' next to the new date");
-    assert.match(snoozeReply.reply, /apply to 3 more remote web3 roles" back tomorrow/i);
+    assert.doesNotMatch(snoozeReply.reply, /today.*tomorrow|today.*back/i, "the move reply must not show the stale 'today' next to the new date");
+    assert.match(snoozeReply.reply, /action rescheduled: apply to 3 more remote web3 roles\b/i);
 
     mockPlan(actionListPlan({ when: "tomorrow" }));
     const listReply = await sendAgentMessage(server, userId, "do i have something to do tomorrow?");
-    assert.doesNotMatch(listReply.reply, /today/i, "the list line must not show the stale 'today' next to 'moved to tomorrow'");
-    assert.match(listReply.reply, /apply to 3 more remote web3 roles — moved to tomorrow/i);
+    assert.doesNotMatch(listReply.reply, /today/i, "the list line must not show the stale 'today' next to the new due date");
+    // fix/private-alpha-remove-user-facing-action-snooze: a moved action stays open (never
+    // "snoozed"), so it shows the same plain "due <date>" line as any other open action now —
+    // there's no separate "moved to" wording needed once nothing is hidden.
+    assert.match(listReply.reply, /apply to 3 more remote web3 roles — due tomorrow/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -143,11 +149,14 @@ test("2B: moving a title that says 'by the end of the week' to tomorrow is displ
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { actionId: action.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // "move it to tomorrow" (no digit) is intercepted by the deterministic shortcut before the
+    // planner is consulted — this mockPlan is unused, kept only to show what a real planner
+    // would ALSO produce now that action.snooze is deprecated: action.reschedule.
+    mockPlan({ topic: "actions", intent: "reschedule", operations: [op("action.reschedule", { actionId: action.id, dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "move it to tomorrow");
 
     assert.doesNotMatch(reply.reply, /end of the week/i);
-    assert.match(reply.reply, /apply to 3 more remote web3 roles" back tomorrow/i);
+    assert.match(reply.reply, /action rescheduled: apply to 3 more remote web3 roles\b/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -167,7 +176,7 @@ test("2C: title-cleaning never rewrites unrelated words, only a recognized trail
     mockPlan(actionListPlan());
     await sendAgentMessage(server, userId, "show me my actions");
 
-    mockPlan({ topic: "actions", intent: "snooze", operations: [op("action.snooze", { actionId: action.id, untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    mockPlan({ topic: "actions", intent: "reschedule", operations: [op("action.reschedule", { actionId: action.id, dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const reply = await sendAgentMessage(server, userId, "move it to tomorrow");
 
     assert.match(reply.reply, /read the today show recap/i, "a mid-title word must never be stripped, even if it happens to be a temporal word");

@@ -14707,12 +14707,19 @@ test(
 );
 
 test(
-  "406. show one action -> 'move it to tomorrow 23:59' resolves 'it' and applies the exact time",
-  { ...llmEvalOptions(["visible-surface-reference-resolution", "action-due-time-defaults"]), timeout: EVAL_TIMEOUT_MS },
+  "406. show one action -> 'move it to tomorrow 23:59 as 9am makes no sense' resolves 'it', applies the exact time, stays open (task 9-B)",
+  {
+    ...llmEvalOptions(["visible-surface-reference-resolution", "action-due-time-defaults", "action-snooze-deprecation", "action-move-reschedule-semantics"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
   async () => {
     const server = buildServer();
     const userId = `llm-eval-406-${randomUUID()}`;
-    const trace = new EvalTrace("406-move-it-2359", ["visible-surface-reference-resolution", "action-due-time-defaults"], userId);
+    const trace = new EvalTrace(
+      "406-move-it-2359",
+      ["visible-surface-reference-resolution", "action-due-time-defaults", "action-snooze-deprecation", "action-move-reschedule-semantics"],
+      userId
+    );
 
     try {
       await seedUser(userId);
@@ -14730,13 +14737,14 @@ test(
         assert.doesNotMatch(reply.reply, /only showed 1 action/i);
 
         const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
-        // The real planner may reasonably reach for EITHER action.reschedule (updates dueAt
-        // directly) or action.snooze ("bring it back at X" — updates snoozedUntil, dueAt itself
-        // stays as-is until the action becomes due again) for "move it to X" — both are correct,
-        // equally valid tools for this message, so check whichever one actually got set.
-        const effective = updated!.snoozedUntil ?? updated!.dueAt!;
-        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(effective);
-        trace.checkpoint("due/snooze time is 23:59", local === "23:59", local);
+        // fix/private-alpha-remove-user-facing-action-snooze: action.snooze is deprecated and no
+        // longer offered in the planner's tool catalog at all — a real planner now has only
+        // action.reschedule available for "move it to X", which always updates dueAt directly and
+        // keeps the action open (never the old snoozedUntil/"snoozed" status).
+        trace.checkpoint("action stays open, never snoozed", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
+        trace.checkpoint("due time is 23:59", local === "23:59", local);
         assert.equal(local, "23:59");
       });
     } finally {
@@ -14893,6 +14901,253 @@ test(
         const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
         trace.checkpoint("the action was completed", updated?.status === "completed", updated?.status ?? "missing");
         assert.equal(updated?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// fix/private-alpha-remove-user-facing-action-snooze (Task 9): real-LLM coverage that the
+// planner never reaches for action.snooze anymore for ordinary "move it"/"remind me"/"bring it
+// back" language — it's removed from the tool catalog entirely, so the only live question is
+// whether the planner correctly reaches for action.reschedule instead, keeps the action open, and
+// never produces "bring it back" copy. Scenario B (the "9am makes no sense" correction) is test
+// 406 above.
+
+test(
+  "412. 'move it to tomorrow 20:00' keeps the action open with the exact time (task 9-A)",
+  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-412-${randomUUID()}`;
+    const trace = new EvalTrace("412-move-it-2000", ["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 10 CVs", priority: "high", dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("move it to tomorrow 20:00", await sendAgentMessage(server, userId, "move it to tomorrow 20:00"));
+        assertNoGenericAgentError(reply, "move it to tomorrow 20:00");
+        trace.checkpoint("no 'bring back' copy", !/bring.*back/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /bring.*back/i);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
+        trace.checkpoint("due time is 20:00", local === "20:00", local);
+        assert.equal(local, "20:00");
+
+        const listReply = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.checkpoint("moved action still visible in a plain list", /send 10 cvs/i.test(listReply.reply), listReply.reply);
+        assert.match(listReply.reply, /send 10 cvs/i);
+        assert.doesNotMatch(listReply.reply, /you don't have any open actions/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "413. 'bring it back tomorrow' keeps the action open, never hidden as snoozed (task 9-C)",
+  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move", "action-due-time-defaults"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-413-${randomUUID()}`;
+    const trace = new EvalTrace(
+      "413-bring-it-back-tomorrow",
+      ["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move", "action-due-time-defaults"],
+      userId
+    );
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("bring it back tomorrow", await sendAgentMessage(server, userId, "bring it back tomorrow"));
+        assertNoGenericAgentError(reply, "bring it back tomorrow");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open, no hidden snoozed state", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        assert.equal(updated?.snoozedUntil, null, "must never populate the legacy snoozedUntil field for a new move");
+        trace.checkpoint("dueAt was set", Boolean(updated?.dueAt), String(updated?.dueAt));
+        assert.ok(updated?.dueAt);
+
+        const listReply = trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.checkpoint("moved action still visible in a plain list", /send 10 cvs/i.test(listReply.reply), listReply.reply);
+        assert.match(listReply.reply, /send 10 cvs/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "414. 'remind me tomorrow' is honest — moves dueAt, keeps the action open (task 9-D)",
+  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-414-${randomUUID()}`;
+    const trace = new EvalTrace("414-remind-me-tomorrow", ["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("remind me tomorrow", await sendAgentMessage(server, userId, "remind me tomorrow"));
+        assertNoGenericAgentError(reply, "remind me tomorrow");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        trace.checkpoint("dueAt was set (no separate reminder metadata exists yet)", Boolean(updated?.dueAt), String(updated?.dueAt));
+        assert.ok(updated?.dueAt);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "415. 'not now, tomorrow' keeps the action open with a real due date (task 9-E)",
+  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "action-due-time-defaults"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-415-${randomUUID()}`;
+    const trace = new EvalTrace("415-not-now-tomorrow", ["action-snooze-deprecation", "action-move-reschedule-semantics", "action-due-time-defaults"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record("not now, tomorrow", await sendAgentMessage(server, userId, "not now, tomorrow"));
+        assertNoGenericAgentError(reply, "not now, tomorrow");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        // Default tomorrow due time is 23:59 unless morning/time is specified.
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
+        trace.checkpoint("defaults to end of day, 23:59", local === "23:59", local);
+        assert.equal(local, "23:59");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "416. 'show tomorrow's actions' finds the action right after it was moved there (task 9-F)",
+  { ...llmEvalOptions(["action-visibility-after-move", "action-move-reschedule-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-416-${randomUUID()}`;
+    const trace = new EvalTrace("416-show-tomorrow-after-move", ["action-visibility-after-move", "action-move-reschedule-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.record("move it to tomorrow 20:00", await sendAgentMessage(server, userId, "move it to tomorrow 20:00"));
+
+        const tomorrowReply = trace.record("show tomorrow's actions", await sendAgentMessage(server, userId, "show tomorrow's actions"));
+        assertNoGenericAgentError(tomorrowReply, "show tomorrow's actions");
+        trace.checkpoint("moved action appears in tomorrow's list", /send 10 cvs/i.test(tomorrowReply.reply), tomorrowReply.reply);
+        assert.match(tomorrowReply.reply, /send 10 cvs/i);
+        assert.doesNotMatch(tomorrowReply.reply, /you don't have any actions scheduled for tomorrow/i);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.status, "open");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "417. Spanish: 'muévela a mañana a las 20:00' keeps the action open with the exact time (task 9-G)",
+  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-417-${randomUUID()}`;
+    const trace = new EvalTrace("417-muevela-manana-2000-es", ["action-snooze-deprecation", "action-move-reschedule-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("muéstrame mis tareas", await sendAgentMessage(server, userId, "muéstrame mis tareas"));
+        const reply = trace.record("muévela a mañana a las 20:00", await sendAgentMessage(server, userId, "muévela a mañana a las 20:00"));
+        assertNoGenericAgentError(reply, "Spanish move to tomorrow 20:00");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
+        trace.checkpoint("due time is 20:00", local === "20:00", local);
+        assert.equal(local, "20:00");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "418. Catalan: 'mou-la a demà a les 20:00' keeps the action open with the exact time (task 9-H)",
+  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-418-${randomUUID()}`;
+    const trace = new EvalTrace("418-moula-dema-2000-ca", ["action-snooze-deprecation", "action-move-reschedule-semantics"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("mostra'm les meves tasques", await sendAgentMessage(server, userId, "mostra'm les meves tasques"));
+        const reply = trace.record("mou-la a demà a les 20:00", await sendAgentMessage(server, userId, "mou-la a demà a les 20:00"));
+        assertNoGenericAgentError(reply, "Catalan move to tomorrow 20:00");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
+        trace.checkpoint("due time is 20:00", local === "20:00", local);
+        assert.equal(local, "20:00");
       });
     } finally {
       await server.close();
