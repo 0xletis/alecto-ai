@@ -17,7 +17,14 @@ import { composeGmailGoalUsageStatusReply, executeOperation, parentActionIdFromR
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
-import { COACH_CONVERSATION_RE, EXPLICIT_MUTATION_VERB_RE, RESPONSE_MODE_GATED_MUTATION_TOOLS, isCoachFirstMessage } from "./response-mode.js";
+import {
+  COACH_CONVERSATION_RE,
+  EXPLICIT_MUTATION_VERB_RE,
+  RESPONSE_MODE_GATED_GMAIL_TOOLS,
+  RESPONSE_MODE_GATED_MUTATION_TOOLS,
+  isCoachFirstMessage,
+  isGreetingWithoutGmailIntent
+} from "./response-mode.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import { runExclusive } from "./user-lock.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
@@ -1813,28 +1820,44 @@ function gmailReviewVagueMutationClarification(message: string, context: Context
  * the same as commanding a change; or (2) the message doesn't read as either on its own, but the
  * most recent prior USER turn was itself a coaching/reassurance question — a bare "yeah, thanks"
  * or unlabeled follow-up right after "is that okay?" is still part of the same coaching thread.
- * Either way, an explicit mutation verb (EXPLICIT_MUTATION_VERB_RE) in THIS message always wins
- * and lets the mutation through regardless of context. When coach-first applies, any
- * action.reschedule/snooze/complete/archive/create the planner still emitted is dropped before
- * validation ever sees it — never replaced with a canned line, so the planner's own real
- * coaching/planning replyDraft (guided by planner.ts's own response-mode-routing prompt) is
- * exactly what's shown, same as any other read-only turn.
+ * An explicit mutation verb (EXPLICIT_MUTATION_VERB_RE) in THIS message always wins and lets a
+ * mutation through regardless of context. When coach-first applies, any action.reschedule/
+ * snooze/complete/archive/create the planner still emitted is dropped before validation ever
+ * sees it — never replaced with a canned line, so the planner's own real coaching/planning
+ * replyDraft (guided by planner.ts's own response-mode-routing prompt) is exactly what's shown,
+ * same as any other read-only turn.
+ *
+ * fix/private-alpha-gm-greeting-vs-gmail-routing: a SEPARATE, independent gate on top of the
+ * above — a bare greeting ("gm," "good morning," "morning") with no explicit Gmail/email language
+ * of its own is never Gmail intent, no matter what the rest of the message goes on to say about
+ * the user's goal (a real transcript found "Gm will send anything web3 dev that fits my style"
+ * routed to gmail.goal_watcher.propose_enable's "already covered" reply — no deterministic regex
+ * anywhere matched "gm" as Gmail; this was the real LLM planner free-associating the greeting with
+ * Gmail, primed by its own "Gmail is goal-driven by default for a job-search goal" instruction).
+ * Deliberately independent of the mutation-verb bypass above — an explicit ACTION command doesn't
+ * imply explicit GMAIL intent, so it must never accidentally let a Gmail tool through too.
  */
 function applyCoachFirstResponseRouting(message: string, context: ContextBundle, operations: PlannedOperation[]): PlannedOperation[] {
-  if (EXPLICIT_MUTATION_VERB_RE.test(message)) {
+  const blockActionMutation = !EXPLICIT_MUTATION_VERB_RE.test(message) && (isCoachFirstMessage(message) || hasRecentCoachingContext(context));
+  const blockGmail = isGreetingWithoutGmailIntent(message);
+
+  if (!blockActionMutation && !blockGmail) {
     return operations;
   }
-  if (!isCoachFirstMessage(message) && !hasRecentCoachingContext(context)) {
-    return operations;
-  }
-  const filtered = operations.filter((op) => !RESPONSE_MODE_GATED_MUTATION_TOOLS.has(op.tool));
+
+  const gatedTools = new Set<string>([
+    ...(blockActionMutation ? RESPONSE_MODE_GATED_MUTATION_TOOLS : []),
+    ...(blockGmail ? RESPONSE_MODE_GATED_GMAIL_TOOLS : [])
+  ]);
+  const filtered = operations.filter((op) => !gatedTools.has(op.tool));
   if (filtered.length === operations.length) {
     return operations;
   }
+  const dropped = operations.filter((op) => gatedTools.has(op.tool)).map((op) => op.tool);
   logAgentRuntimeDiagnostics({
     phase: "coach_first_response_routing_mutation_dropped",
     userId: context.session.userId,
-    note: `dropped ${operations.filter((op) => RESPONSE_MODE_GATED_MUTATION_TOOLS.has(op.tool)).map((op) => op.tool).join(", ")} for a coach_conversation/soft_intention message`
+    note: `dropped ${dropped.join(", ")} for a ${blockGmail ? "greeting-without-gmail-intent" : "coach_conversation/soft_intention"} message`
   });
   return filtered;
 }
