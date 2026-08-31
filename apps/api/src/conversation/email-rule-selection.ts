@@ -196,6 +196,28 @@ export function selectEmailRuleCandidate(
     );
   });
 
+  if (matches.length === 0) {
+    // fix/private-alpha-coach-first-response-routing (a known gap carried over from the previous
+    // branch): the substring tier above is a literal contiguous CONTAINS check, so a real,
+    // specific reference like "send CVs" never matches a title like "Send 3 CVs" — the embedded
+    // "3 " breaks contiguity even though every real word of the reference genuinely is present.
+    // Only reached when the tiers above found NOTHING AT ALL — never overrides a real
+    // exact/substring match, and an ambiguous 2+-way match there still falls through unresolved
+    // exactly as before; this is purely a fallback for the "zero matches" case. Requires EVERY
+    // significant word of the (already stopword-stripped) ref to appear as its own whole word
+    // somewhere in the candidate's name, order-independent — deliberately stricter than a bare
+    // overlap score, so a short/generic ref can't falsely light up an unrelated candidate just by
+    // sharing one word with it.
+    const refWords = key.split(" ").filter((word) => word.length > 0);
+    if (refWords.length > 0) {
+      const tokenMatches = prepared.filter((item) => {
+        const nameWords = new Set(item.cleanNameKey.split(" ").filter((word) => word.length > 0));
+        return refWords.every((word) => nameWords.has(word));
+      });
+      return tokenMatches.length === 1 ? tokenMatches[0].candidate : undefined;
+    }
+  }
+
   return matches.length === 1 ? matches[0].candidate : undefined;
 }
 

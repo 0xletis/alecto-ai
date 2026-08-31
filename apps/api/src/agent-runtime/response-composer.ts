@@ -105,6 +105,7 @@ export function composeReply(input: ComposeReplyInput): string {
 const GROUND_TRUTH_ONLY_TOOLS = new Set([
   "operator.recent_changes",
   "action.reschedule",
+  "action.reschedule_stricter_propose",
   "action.create_pre_due_reminders",
   "action.reminder_list",
   "gmail.sync",

@@ -181,7 +181,7 @@ export async function executeOperation(
         const status = (args.status as ActionItem["status"] | "all" | "active" | undefined) ?? "open";
         const limit = (args.limit as number | undefined) ?? 10;
         const overdueOnly = Boolean(args.overdueOnly);
-        const when = args.when as "today" | "tomorrow" | "this_week" | undefined;
+        const when = args.when as "today" | "tomorrow" | "this_week" | "this_week_and_overdue" | undefined;
         const settings = await getOrCreateNotificationSettings(userId);
         const now = new Date();
 
@@ -768,6 +768,37 @@ export async function executeOperation(
             summary: `It's already scheduled for ${formatDueLabelForChat(action.dueAt, settings.timezone).replace(/^due /, "")}. I can change the time if you want.`,
             result: action,
             entities: [actionToEntity(action)]
+          };
+        }
+
+        // fix/private-alpha-coach-first-response-routing: "if a mutation would make the deadline
+        // stricter/earlier, require explicit confirmation" — tightening a deadline is a bigger
+        // deal than pushing it later or pulling a deferred item forward from nothing, so it gets
+        // its own real pending confirmation rather than applying silently, even for an otherwise-
+        // explicit reschedule command. `[confirmed] ` is the exact prefix finalizeDeterministicConfirmation
+        // (runtime.ts) always uses for the message it passes to a re-run confirmed operation — checked
+        // here instead of a new schema field so the SAME action.reschedule case can safely re-run on
+        // confirmation without asking the same question again indefinitely.
+        const isConfirmedReplay = message.startsWith("[confirmed] ");
+        if (!isConfirmedReplay && action.dueAt && parsedDate.getTime() < action.dueAt.getTime()) {
+          const currentLabel = formatDueLabelForChat(action.dueAt, settings.timezone).replace(/^due /, "");
+          const newLabel = formatDueLabelForChat(parsedDate, settings.timezone).replace(/^due /, "");
+          return {
+            tool: "action.reschedule_stricter_propose",
+            status: "executed",
+            summary: `That would move "${action.title}" EARLIER — from ${currentLabel} to ${newLabel}. Want me to actually tighten the deadline, or leave it as is?`,
+            pendingOperationUpdate: {
+              topic: "action_reschedule_stricter",
+              summary: `move "${action.title}" earlier, to ${newLabel}`,
+              operations: [
+                {
+                  tool: "action.reschedule",
+                  args: { actionId: action.id, ...(dueText ? { dueText } : {}), ...(timeText ? { timeText } : {}) },
+                  status: "valid",
+                  requiresConfirmation: false
+                }
+              ]
+            }
           };
         }
 
@@ -3613,9 +3644,31 @@ function actionEffectiveDate(item: ActionItem): Date | undefined {
 /** "actions for today/tomorrow" (task fix/private-alpha-action-temporal-coaching) — a date-scoped
  * query is answered from BOTH open and snoozed items (see the action.list case's own pool-widening
  * comment), matched against each item's own actionEffectiveDate in the user's real timezone. */
-function actionMatchesWhenWindow(item: ActionItem, when: "today" | "tomorrow" | "this_week", now: Date, timezone: string): boolean {
+function actionMatchesWhenWindow(
+  item: ActionItem,
+  when: "today" | "tomorrow" | "this_week" | "this_week_and_overdue",
+  now: Date,
+  timezone: string
+): boolean {
   const todayLocal = formatDateInTimezone(now, timezone);
   const effective = actionEffectiveDate(item);
+
+  // fix/private-alpha-coach-first-response-routing (known gap from the previous branch): a mixed
+  // query like "yesterday or this week?" was previously only answerable as a plain "this_week"
+  // list, which silently drops anything overdue from BEFORE today — this_week's own window starts
+  // at todayLocal. Same window as this_week otherwise (through this week's Sunday, inclusive), just
+  // with no lower bound at all, so anything overdue by any amount is included alongside it.
+  if (when === "this_week_and_overdue") {
+    if (item.status === "open" && !item.dueAt) {
+      return true;
+    }
+    if (!effective) {
+      return false;
+    }
+    const effectiveLocal = formatDateInTimezone(effective, timezone);
+    const weekEnd = addDaysToLocalDateString(startOfLocalWeek(todayLocal), 6);
+    return effectiveLocal <= weekEnd;
+  }
 
   if (when === "today") {
     // An open action with no due date at all is still part of "today" — it's actionable right
@@ -3648,10 +3701,11 @@ function actionMatchesWhenWindow(item: ActionItem, when: "today" | "tomorrow" | 
   return effectiveLocal >= todayLocal && effectiveLocal <= weekEnd;
 }
 
-const WHEN_NOUN: Record<"today" | "tomorrow" | "this_week", string> = {
+const WHEN_NOUN: Record<"today" | "tomorrow" | "this_week" | "this_week_and_overdue", string> = {
   today: "today",
   tomorrow: "tomorrow",
-  this_week: "later this week"
+  this_week: "later this week",
+  this_week_and_overdue: "this week, including anything overdue"
 };
 
 function formatActionListForChat(
@@ -3661,7 +3715,7 @@ function formatActionListForChat(
   overdueOnly: boolean,
   reminderByParentId: Map<string, ActionItem>,
   timezone: string,
-  when?: "today" | "tomorrow" | "this_week"
+  when?: "today" | "tomorrow" | "this_week" | "this_week_and_overdue"
 ): string {
   const baseNoun = when ? "action" : overdueOnly ? "overdue action" : status === "all" || status === "active" ? "action" : `${status} action`;
 

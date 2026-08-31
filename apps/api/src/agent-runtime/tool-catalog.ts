@@ -39,14 +39,14 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "action.list",
     description:
-      "List the user's real action items — never a 'remind me before' reminder companion row, which is shown as a short metadata line on its parent action instead, not as its own list entry. Optionally filtered by status, and by overdueOnly for 'do i have any overdue actions', 'what tasks are overdue?' (open, past due only — never future or already-handled items). For a genuinely UNSCOPED request — 'show me all actions', 'show all my actions', 'what actions do I have?', 'list actions' (no specific day/date named) — use status 'active': it means every currently-actionable item (open AND already-deferred/snoozed), excluding archived/completed clutter the user didn't ask for. Do NOT use plain 'open' for these — 'open' alone hides anything already snoozed, which is exactly the real reported bug this status exists to fix ('show me all actions' must never come back as if nothing existed just because everything happened to be snoozed). For a DATE-SCOPED query, set `when` instead — 'do i have actions for tomorrow?', 'what actions do i have tomorrow?', 'show tomorrow's actions', 'any actions tomorrow?', 'what do i have scheduled tomorrow?' -> when 'tomorrow'; 'actions today', 'what do i have today?' -> when 'today'; 'actions for later this week', 'what's coming up this week?' -> when 'this_week'. Same in Spanish ('tengo acciones para mañana?', 'qué acciones tengo mañana?', 'acciones de hoy') and Catalan ('tinc accions per demà?', 'quines accions tinc demà?', 'accions d'avui'). `when` automatically looks at BOTH currently-open actions and ones already moved/deferred to a later date (it answers 'what's coming back tomorrow', not just 'what's due tomorrow') — never plan a plain status:'open' list for a date-scoped question, that would miss anything already moved there.",
+      "List the user's real action items — never a 'remind me before' reminder companion row, which is shown as a short metadata line on its parent action instead, not as its own list entry. Optionally filtered by status, and by overdueOnly for 'do i have any overdue actions', 'what tasks are overdue?' (open, past due only — never future or already-handled items). For a genuinely UNSCOPED request — 'show me all actions', 'show all my actions', 'what actions do I have?', 'list actions' (no specific day/date named) — use status 'active': it means every currently-actionable item (open AND already-deferred/snoozed), excluding archived/completed clutter the user didn't ask for. Do NOT use plain 'open' for these — 'open' alone hides anything already snoozed, which is exactly the real reported bug this status exists to fix ('show me all actions' must never come back as if nothing existed just because everything happened to be snoozed). For a DATE-SCOPED query, set `when` instead — 'do i have actions for tomorrow?', 'what actions do i have tomorrow?', 'show tomorrow's actions', 'any actions tomorrow?', 'what do i have scheduled tomorrow?' -> when 'tomorrow'; 'actions today', 'what do i have today?' -> when 'today'; 'actions for later this week', 'what's coming up this week?' -> when 'this_week'. For a MIXED request spanning overdue/yesterday AND this week in the same question — 'yesterday or this week?', 'what's overdue or coming up this week?', 'anything from yesterday plus what's ahead this week?' — use when 'this_week_and_overdue': everything already late (any day in the past, not just yesterday) PLUS the rest of this week, together in one list; never plan a plain 'this_week' for these, that would silently drop the overdue half of the question. Same in Spanish ('tengo acciones para mañana?', 'qué acciones tengo mañana?', 'acciones de hoy') and Catalan ('tinc accions per demà?', 'quines accions tinc demà?', 'accions d'avui'). `when` automatically looks at BOTH currently-open actions and ones already moved/deferred to a later date (it answers 'what's coming back tomorrow', not just 'what's due tomorrow') — never plan a plain status:'open' list for a date-scoped question, that would miss anything already moved there.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       status: z.enum(["open", "active", "completed", "snoozed", "archived", "all"]).optional(),
       limit: z.number().int().positive().max(50).optional(),
       overdueOnly: z.boolean().optional(),
-      when: z.enum(["today", "tomorrow", "this_week"]).optional()
+      when: z.enum(["today", "tomorrow", "this_week", "this_week_and_overdue"]).optional()
     })
   },
   {
@@ -145,6 +145,19 @@ export const toolCatalog: ToolDefinition[] = [
           "A full natural-language due date/time, e.g. 'tomorrow afternoon'. If the user stated a weekday ALONGSIDE a day-of-month (e.g. 'Thursday 26 August', 'jueves 26 de agosto', 'dijous 26 d'agost'), pass BOTH exactly as said — never drop or 'correct' the weekday yourself, even if it looks inconsistent with the day number. The deterministic parser checks that the two actually match on the real calendar and asks the user to clarify if they don't; silently dropping one side here would hide a real contradiction instead of catching it."
         ),
       timeText: z.string().min(1).optional().describe("A time-only correction, e.g. '12pm'. Uses the action's existing local date.")
+    })
+  },
+  {
+    name: "action.reschedule_stricter_propose",
+    description:
+      "Internal: proposes a reschedule that would make an action's deadline STRICTER/EARLIER than it already is — never plan this tool directly. Detected automatically by action.reschedule's own executor whenever the resolved new due date is earlier than the action's current one, per the product rule that tightening a deadline always needs explicit confirmation, unlike a normal push-later or pull-forward-from-nothing reschedule.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({
+      actionId: actionIdField,
+      dueText: z.string().min(1).optional(),
+      timeText: z.string().min(1).optional()
     })
   },
   {

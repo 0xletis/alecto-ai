@@ -109,7 +109,10 @@ test("D. an explicit instruction alongside the judgment question still mutates (
   const userId = `coaching-d-${randomUUID()}`;
   try {
     await seedUser(userId);
-    const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+    // Deliberately no dueAt — this test is about the explicit-mutation-verb override, not the
+    // separate "stricter deadline needs confirmation" rule, which only ever compares against a
+    // REAL existing due date.
+    const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
     await makeActionVisible(server, userId);
 
     mockPlan(reschedulePlanWithCoachingDraft(action.id, "Sure — moved to tomorrow."));
@@ -130,7 +133,8 @@ test("E. an ordinary action.reschedule with no judgment-question language is com
   const userId = `coaching-e-${randomUUID()}`;
   try {
     await seedUser(userId);
-    const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+    // Deliberately no dueAt — see test D's own comment on why.
+    const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
     await makeActionVisible(server, userId);
 
     mockPlan(reschedulePlanWithCoachingDraft(action.id, "Moved to tomorrow."));

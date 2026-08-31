@@ -3,6 +3,7 @@ import type { EmailSignalRule } from "@operator-agent/db";
 import { selectEmailRuleCandidate, type EmailRuleSelectionCandidate } from "../conversation/email-rule-selection.js";
 import { computeLighterPlanRemoval, readPendingNextWeekPlanSuggestions, resolvePlanSuggestionRef } from "../planning/next-week.js";
 import type { NextWeekPlanSuggestion } from "../server-types.js";
+import { isCoachFirstMessage } from "./response-mode.js";
 import { getToolDefinition } from "./tool-catalog.js";
 import type { AgentEntity, ContextBundle, PlannedOperation, ValidatedOperation } from "./types.js";
 
@@ -77,17 +78,13 @@ const EXPLICIT_NON_OPEN_ACTION_STATUS_RE = /\b(archived?|completed?|done|finishe
 const ALL_ACTIONS_SCOPE_RE = /\ball (my |the )?(actions?|tasks?)\b|\btodas (mis )?(las )?acciones\b|\btotes (les )?(meves )?accions\b/i;
 const EXPLICIT_ARCHIVED_OR_COMPLETED_RE = /\b(archived?|completed?|done|finished|history)\b/i;
 
-// See the "fix/private-alpha-live-action-and-coaching-regressions (Task 7)" call site below for
-// the real transcript this closes — a reflective, mixed-timing message ("I'll try," "when I get
-// there," "this week," "lock in"), never an actual scheduling instruction, must never be read as
-// one just because a mutation tool happened to be planned against it.
-const VAGUE_COMMITMENT_RE =
-  /\b(i'?ll try|i will try|will try)\b|\bmaybe\b|\bwhen i get there\b|\block(?:ing)? in\b|\b(later this week|later in the week|this week)\b|\bintentar[eé]\b|\bcuando llegue\b|\bquan hi arribi\b|\bmas adelante esta semana\b|\bmes endavant aquesta setmana\b/i;
-// A genuinely concrete day/time named ANYWHERE in the message (even alongside vague language
-// elsewhere in a longer message) means there IS a real answer already — "move it to Friday this
-// week" must still go through, unlike a bare "this week" with nothing concrete at all.
-const CONCRETE_DAY_OR_TIME_RE =
-  /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday|tomorrow|tonight|\d{1,2}(:\d{2})?\s*(am|pm)|\d{1,2}\/\d{1,2})\b|\blunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo|ma[ñn]ana\b|\bdilluns|dimarts|dimecres|dijous|divendres|dissabte|diumenge|dem[àa]\b/i;
+// fix/private-alpha-coach-first-response-routing: VAGUE_COMMITMENT_RE/CONCRETE_DAY_OR_TIME_RE
+// (the earlier version of this guard, defined locally here) are gone — CONCRETE_DAY_OR_TIME_RE's
+// own "but a mentioned day/time makes it real" escape valve was exactly what let the real
+// reported bug through ("I'll try to send CVs tonight and more this week" read as concrete enough
+// to mutate, purely because "tonight" appeared in it). The replacement lives in response-mode.ts
+// (isCoachFirstMessage/EXPLICIT_MUTATION_VERB_RE) and is used just below, scoped only to
+// deterministic-shortcut-sourced operations — see that check's own doc comment for why.
 
 // fix/private-alpha-live-action-and-coaching-regressions: a real Telegram transcript found "show
 // me all actions" answered with "you don't have any actions scheduled for today" — the planner had
@@ -102,9 +99,24 @@ const CONCRETE_DAY_OR_TIME_RE =
 // due-text translation table already uses for this identical problem.
 const NOT_FOLLOWED_BY_LETTER = "(?![a-zA-Z])";
 const EXPLICIT_WHEN_SCOPE_RE = new RegExp(
-  "\\b(today|tonight|tomorrow|this week|later this week|later in the week)\\b" +
-    "|\\b(hoy|esta noche|mañana|esta semana|más tarde esta semana)\\b" +
-    `|\\b(avui|aquesta nit|dem[àa]${NOT_FOLLOWED_BY_LETTER}|aquesta setmana|més tard aquesta setmana)`,
+  "\\b(today|tonight|tomorrow|yesterday|overdue|this week|later this week|later in the week)\\b" +
+    "|\\b(hoy|esta noche|mañana|ayer|atrasad[oa]s?|esta semana|más tarde esta semana)\\b" +
+    `|\\b(avui|aquesta nit|dem[àa]${NOT_FOLLOWED_BY_LETTER}|ahir|endarrerid[ae]s?|aquesta setmana|més tard aquesta setmana)`,
+  "i"
+);
+
+// fix/private-alpha-coach-first-response-routing (a known gap carried over from the previous
+// branch): "yesterday or this week?" got answered as a plain this_week list, silently dropping
+// the overdue/yesterday half of the question — this_week's own window never looks earlier than
+// today. A genuine mixed request (English "yesterday"/"overdue" paired with "this week" either
+// order, Spanish "ayer"/"atrasadas" + "esta semana", Catalan "ahir"/"endarrerides" + "aquesta
+// setmana") deterministically forces `when` to the new "this_week_and_overdue" value regardless
+// of what the planner supplied — same forcing pattern ALL_ACTIONS_SCOPE_RE already uses for
+// status below, just for `when` instead.
+const MIXED_OVERDUE_AND_WEEK_RE = new RegExp(
+  "\\b(yesterday|overdue)\\b[\\s\\S]{0,60}\\bthis week\\b|\\bthis week\\b[\\s\\S]{0,60}\\b(yesterday|overdue)\\b" +
+    "|\\b(ayer|atrasad[oa]s?)\\b[\\s\\S]{0,60}\\besta semana\\b|\\besta semana\\b[\\s\\S]{0,60}\\b(ayer|atrasad[oa]s?)\\b" +
+    `|\\b(ahir|endarrerid[ae]s?)\\b[\\s\\S]{0,60}\\baquesta setmana\\b|\\baquesta setmana\\b[\\s\\S]{0,60}\\b(ahir|endarrerid[ae]s?)\\b`,
   "i"
 );
 
@@ -605,28 +617,39 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
     delete args.when;
   }
 
-  // fix/private-alpha-live-action-and-coaching-regressions (Task 7): a real Telegram transcript
-  // found a vague, reflective weekend update ("...will lock in will try to send some when I get
-  // there this night and also lot this week") silently rescheduled an action to "tomorrow 09:00"
-  // — the user never gave a real, concrete commitment, just a mix of "I'll try," "when I get
-  // there," and "this week," and the real LLM planner is not reliably able to resist turning that
-  // into SOME guessed date rather than asking. Deterministic, not left to planner judgment: for
-  // action.snooze/action.reschedule, if the raw message contains this kind of vague-commitment
-  // language, the op is always downgraded to a clarification proposing concrete options rather
-  // than silently picking one — regardless of what dueText/untilText the planner guessed. Never
-  // fires for an explicit, concrete instruction ("move it to tomorrow," "snooze it Friday") —
-  // VAGUE_COMMITMENT_RE only matches genuinely uncommitted phrasing, never a real day/time name.
+  if (tool.name === "action.list" && MIXED_OVERDUE_AND_WEEK_RE.test(message)) {
+    args.when = "this_week_and_overdue";
+    // A real-LLM eval run caught this: the planner sometimes ALSO sets overdueOnly:true for this
+    // exact phrasing ("what's overdue from yesterday or coming up this week?" reasonably reads as
+    // partly about overdue items) — but overdueOnly and `when` are ANDed together as two separate
+    // filters in the executor, so leaving it on would silently narrow the mixed window back down
+    // to "overdue AND also this week," dropping the today/this-week half of the very question
+    // this scope exists to answer. this_week_and_overdue's own window already includes every
+    // overdue item, so overdueOnly is redundant here at best and actively wrong at worst — always
+    // cleared once the mixed scope is forced.
+    delete args.overdueOnly;
+  }
+
+  // fix/private-alpha-coach-first-response-routing: a safety net, not the primary guard — the
+  // primary one (runtime.ts's applyCoachFirstResponseRouting) already strips a coach_conversation/
+  // soft_intention-shaped mutation BEFORE it ever reaches validateOperations, for any operation
+  // sourced from a real LLM planner call, so the planner's own real coaching/planning replyDraft
+  // survives untouched. This only ever fires for a DIFFERENT source: a deterministic shortcut
+  // (options.deterministicSource — e.g. actionCompletionShortcutOperation's own bare "move it"/
+  // "snooze it" pattern match) that never went through the planner at all and so has no LLM-
+  // authored text to fall back on — a clarification-shaped reply here genuinely is the honest,
+  // necessary option, not a robotic replacement for a real answer that could have been shown.
   if (
+    options.deterministicSource &&
     (tool.name === "action.snooze" || tool.name === "action.reschedule") &&
-    VAGUE_COMMITMENT_RE.test(message) &&
-    !CONCRETE_DAY_OR_TIME_RE.test(message)
+    isCoachFirstMessage(message)
   ) {
     return {
       tool: tool.name,
       args,
       status: "needs_clarification",
       requiresConfirmation: false,
-      clarificationQuestion: "That sounds like the timing's still up in the air — want me to move it to tonight, or hold it for tomorrow instead?",
+      clarificationQuestion: "That sounds more like a plan than a done deal — want me to actually move it, or leave it as is for now?",
       rationale: operation.rationale
     };
   }
