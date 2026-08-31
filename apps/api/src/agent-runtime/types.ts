@@ -221,6 +221,16 @@ export interface AgentEntity {
    * entities not shown as part of a numbered list.
    */
   index?: number;
+  /**
+   * fix/private-alpha-conversation-kernel-context-routing: ISO timestamp stamped by
+   * setVisibleEntities (conversation-session.ts) whenever this entity was (re-)surfaced — never
+   * set by callers directly. Lets mostRecentVisibleSurfaceType derive "which surface did the user
+   * see most recently" (action list vs. Gmail review list vs. goal) from session.visibleEntities
+   * itself, now that setVisibleEntities merges per-type instead of wholesale-replacing — see that
+   * function's own doc comment for the real reported bug (a goal-progress reply's single `goal`
+   * entity used to silently wipe out an already-visible numbered action list) this closes.
+   */
+  surfacedAt?: string;
 }
 
 export interface AgentMutationRecord {

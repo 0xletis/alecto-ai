@@ -684,12 +684,18 @@ test("6D: an explicit 'today at 01:30' still uses 01:30, unaffected by the end-o
   assert.equal(local, "01:30");
 });
 
-test("6E: 'tomorrow' date-only remains sensible (still defaults to 9am, unaffected)", () => {
+// fix/private-alpha-conversation-kernel-context-routing: a real reported bug — "tomorrow" (no
+// time, no day-part) defaulting to 9am read as an oddly specific morning appointment for a
+// day-level task like "send 10 CVs tomorrow." Now uses the SAME end-of-day default this file's
+// own 6A-6D tests already established for bare "today" — this test's name/expectation updated to
+// match; "tomorrow morning"/"tomorrow at 9" (an explicit day-part or time) are unaffected, see the
+// dedicated action-default-due-time-policy.test.ts for that coverage.
+test("6E: bare 'tomorrow' (no time, no day-part) now defaults to end of day, same as 'today'", () => {
   const now = new Date("2026-08-25T23:11:00Z"); // 01:11 local
   const parsed = parseActionDueDate("tomorrow", { now, timezone: MADRID });
   assert.ok(parsed.dueAt);
   const local = new Intl.DateTimeFormat("en-GB", { timeZone: MADRID, hour: "2-digit", minute: "2-digit", hour12: false }).format(parsed.dueAt);
-  assert.equal(local, "09:00");
+  assert.equal(local, "23:59");
 });
 
 test("6F: the action list / chat due label for an end-of-day 'today' action reads clearly", () => {

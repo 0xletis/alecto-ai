@@ -81,8 +81,58 @@ function stripUndefinedValues(value: unknown): unknown {
   return value;
 }
 
+/**
+ * fix/private-alpha-conversation-kernel-context-routing: a real reported bug — "show my actions"
+ * (visibleEntities: 1 action) followed by "show my goal progress" (goal.status's own executed op
+ * sets entities: [the one matched goal] — no action entities at all) used to WIPE OUT the action
+ * from session.visibleEntities entirely, because this function was a wholesale replace: `session.
+ * visibleEntities = entities`. The very next "complete the open action"/"complete action 1" then
+ * had nothing to resolve against ("I only showed 0 actions") even though the action was still
+ * real, open, and had been shown just two turns ago. Now merges PER TYPE instead: only entity
+ * types actually present in this turn's `entities` get replaced; every other type's previously
+ * surfaced entities (a numbered action list, a Gmail review list, ...) survives untouched — each
+ * surface (action/gmail_review/goal/...) keeps its own last-shown list independently, matching
+ * how session.focusedEntities (a single entity per type) already behaved. Each entity is stamped
+ * with `surfacedAt` here (never by callers) so mostRecentVisibleSurfaceType can tell which surface
+ * the user actually saw most recently when a reply like "remove all" doesn't name one explicitly.
+ */
 export function setVisibleEntities(session: AgentSessionState, entities: AgentEntity[]): void {
-  session.visibleEntities = entities;
+  const surfacedAt = new Date().toISOString();
+  const stamped = entities.map((entity) => ({ ...entity, surfacedAt }));
+  const incomingTypes = new Set(stamped.map((entity) => entity.type));
+  const preserved = session.visibleEntities.filter((entity) => !incomingTypes.has(entity.type));
+  session.visibleEntities = [...preserved, ...stamped];
+}
+
+/**
+ * A genuine full reset — every type, not just one. Calling setVisibleEntities(session, []) would
+ * NOT do this under its own per-type-merge semantics above (an empty `entities` array names no
+ * types to replace, so it would preserve everything, the opposite of a reset) — this is the
+ * explicit, separate primitive for the few real "wipe all visible-entity context" moments (e.g.
+ * cancelling a pending operation whose entities were specific to that now-abandoned flow).
+ */
+export function clearAllVisibleEntities(session: AgentSessionState): void {
+  session.visibleEntities = [];
+}
+
+/**
+ * The AgentEntity type most recently surfaced (highest surfacedAt) across every type currently in
+ * session.visibleEntities — "which surface did the user actually see last," used to resolve an
+ * ambiguous bare "remove all"/"reject all" (no explicit "actions"/"reviews"/"mail" qualifier)
+ * against the right one instead of whichever type happens to still have entries in the array.
+ * Entities persisted before this field existed (surfacedAt absent) sort last, never first.
+ */
+export function mostRecentVisibleSurfaceType(session: AgentSessionState): AgentEntity["type"] | undefined {
+  let bestType: AgentEntity["type"] | undefined;
+  let bestAt = "";
+  for (const entity of session.visibleEntities) {
+    const at = entity.surfacedAt ?? "";
+    if (at > bestAt) {
+      bestAt = at;
+      bestType = entity.type;
+    }
+  }
+  return bestType;
 }
 
 /**

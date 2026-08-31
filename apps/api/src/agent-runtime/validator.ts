@@ -217,6 +217,42 @@ function numbersConsumedByDatePhrase(message: string): Set<number> {
   return matchedText ? new Set([...matchedText.matchAll(/\d+/g)].map((match) => Number(match[0]))) : new Set();
 }
 
+// fix/private-alpha-conversation-kernel-context-routing (Part 6): parseActionDueDate's own
+// `matchedText` only ever names the ONE date/time phrase it locked onto as the actual due-date
+// target — a real reported bug had "move it to tomorrow 23:59 as 9 am makes no sense" (comparing
+// the new time against a rejected old one, both real times) leave "9" unconsumed (only "tomorrow
+// 23:59" was the recognized target phrase), so with exactly one visible action it was wrongly
+// treated as "action 9 doesn't exist" instead of resolving via the single visible action. Any
+// number written as a genuine time-of-day mention (an am/pm suffix, or an H:MM pattern) anywhere
+// in the message is never a list-index reference — a real index is always a bare small integer.
+const TIME_OF_DAY_MENTION_RE = /\b(\d{1,2})(?::(\d{2}))?\s*(?:am|pm)\b|\b(\d{1,2}):(\d{2})\b/gi;
+function numbersConsumedByTimeOfDayMention(message: string): Set<number> {
+  const consumed = new Set<number>();
+  for (const match of message.matchAll(TIME_OF_DAY_MENTION_RE)) {
+    for (const group of [match[1], match[2], match[3], match[4]]) {
+      if (group) consumed.add(Number(group));
+    }
+  }
+  return consumed;
+}
+
+// fix/private-alpha-conversation-kernel-context-routing (Part 6): a real reported bug —
+// "complete the open action as I did send 15 already today" (with the action itself already
+// visible from an earlier turn) got blocked as "15 isn't in the shown list" — the SAME class of
+// bug numbersConsumedByDatePhrase above already exists to prevent, just for a different kind of
+// phrase. A number directly reported as a quantity just sent/logged/applied is never a list-index
+// reference, no matter how many actions happen to be visible.
+const QUANTITY_PHRASE_RE = /\b(?:sent|send|applied|logged|did)\s+(\d+)\b/gi;
+
+/** "the open action"/"my open action"/"this open action"/"the action" — an explicit, definite
+ * reference, deliberately distinct from a bare "done"/"it"/"complete it" acknowledgement (which
+ * must keep asking honestly when nothing is visible — see its own call site's doc comment). */
+const EXPLICIT_OPEN_ACTION_REFERENCE_RE =
+  /\b(?:the|my|this)\s+open\s+action\b|\bthe\s+action\b|\bla\s+acci[oó]n\s+abierta\b|\bl['’]?acci[oó]\s+oberta\b/i;
+function numbersConsumedByQuantityPhrase(message: string): Set<number> {
+  return new Set([...message.matchAll(QUANTITY_PHRASE_RE)].map((match) => Number(match[1])));
+}
+
 function resolveExplicitActionIndexReferences(operations: PlannedOperation[], context: ContextBundle, message: string): ExplicitActionIndexResolution {
   const actionRefOpIndices = operations.map((op, i) => (ACTION_REFERENCE_TOOLS.has(op.tool) ? i : -1)).filter((i) => i >= 0);
 
@@ -224,8 +260,25 @@ function resolveExplicitActionIndexReferences(operations: PlannedOperation[], co
     return { applicable: false };
   }
 
+  // fix/private-alpha-conversation-kernel-context-routing (Part 6): a real reported bug —
+  // "complete the open action as I did send 15 already today" (no numbered action list shown
+  // anywhere in this conversation) was blocked with "I only showed 0 actions" because THIS
+  // function unconditionally treated the "15" in "sent 15 already" as an attempted list-index
+  // reference. There is no list to index into with zero visible actions — any digit here is
+  // essentially always unrelated content (a count, a date, a time), never a real index reference,
+  // so this backs off entirely and lets resolveActionRef's ref/pronoun-based resolution (including
+  // its own single-globally-open-action fallback) take over instead of guessing wrong.
+  const visibleActionCount = context.session.visibleEntities.filter((entity) => entity.type === "action").length;
+  if (visibleActionCount === 0) {
+    return { applicable: false };
+  }
+
   const dateConsumedNumbers = numbersConsumedByDatePhrase(message);
-  const referencedNumbers = [...message.matchAll(/\d+/g)].map((match) => Number(match[0])).filter((num) => !dateConsumedNumbers.has(num));
+  const quantityConsumedNumbers = numbersConsumedByQuantityPhrase(message);
+  const timeOfDayConsumedNumbers = numbersConsumedByTimeOfDayMention(message);
+  const referencedNumbers = [...message.matchAll(/\d+/g)]
+    .map((match) => Number(match[0]))
+    .filter((num) => !dateConsumedNumbers.has(num) && !quantityConsumedNumbers.has(num) && !timeOfDayConsumedNumbers.has(num));
   if (referencedNumbers.length === 0) {
     return { applicable: false };
   }
@@ -678,6 +731,19 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
 
     if (resolution.status === "resolved") {
       args.actionId = resolution.entity.id;
+    } else if (resolution.status === "none" && context.openActions.length === 1 && EXPLICIT_OPEN_ACTION_REFERENCE_RE.test(message)) {
+      // fix/private-alpha-conversation-kernel-context-routing (Part 6): a real reported bug —
+      // "complete the open action as I did send 15 already today" had no numbered action list
+      // ever shown in this conversation, so there was nothing in session.visibleEntities to
+      // resolve against, even though the user has exactly ONE real open action globally.
+      // Deliberately gated on the message's own wording actually naming "the open action" —
+      // action.complete/snooze/archive have no `ref` field at all (see their own tool-catalog
+      // descriptions: "with none [visible] it asks honestly"), so this is the only signal
+      // available to tell a genuine explicit reference apart from a bare, ambiguous "done"/"it"
+      // acknowledgement, which must keep asking honestly exactly as it already did — a real
+      // pre-existing test (agent-runtime-action-command-ux.test.ts, "2G") depends on a bare "done"
+      // with one real-but-never-shown action still asking rather than guessing, and stays correct.
+      args.actionId = context.openActions[0]!.id;
     } else if (resolution.status === "none") {
       return {
         tool: tool.name,

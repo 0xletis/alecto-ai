@@ -313,7 +313,17 @@ export function parseActionDueDate(
     )
   );
   if (tomorrow) {
-    return parsedDateResult(addDaysAt(now, 1, hour, minute, preferences.timezone), tomorrow[0], tomorrow[0], preferences, Boolean(explicitTime));
+    // fix/private-alpha-conversation-kernel-context-routing: a real reported bug — "send 10 CVs
+    // tomorrow" (no time, no day-part) defaulted to preferences.defaultActionTimeMinutes (9am),
+    // which reads as an oddly specific morning appointment for what's really a whole-day task
+    // deadline. Mirrors the "today" branch's own existing END_OF_DAY_TIME_MINUTES fallback just
+    // above — a bare day word with neither an explicit time NOR a day-part ("tomorrow morning"/
+    // "tomorrow at 9" keep their own already-intentional value) now defaults to end of that day
+    // instead, the same "day-level task, not a specific moment" reading "today" alone already got.
+    const effectiveMinutes = explicitTime || dayPart ? minutes : END_OF_DAY_TIME_MINUTES;
+    const effectiveHour = Math.floor(effectiveMinutes / 60);
+    const effectiveMinute = effectiveMinutes % 60;
+    return parsedDateResult(addDaysAt(now, 1, effectiveHour, effectiveMinute, preferences.timezone), tomorrow[0], tomorrow[0], preferences, Boolean(explicitTime));
   }
 
   // Spanish "esta noche" / Catalan "aquesta nit" aren't recognized by parseDayPart's English-only

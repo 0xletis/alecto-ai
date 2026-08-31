@@ -473,7 +473,15 @@ export async function executeOperation(
       case "action.snooze": {
         const actionId = args.actionId as string;
         const untilText = args.untilText as string;
-        const parsedDate = parseActionDueDate(untilText);
+        // fix/private-alpha-conversation-kernel-context-routing: a real reported bug — "move it
+        // to tomorrow 23:59" (routed to action.snooze by the real planner, not action.reschedule)
+        // silently landed near "now" instead of the requested 23:59. This call never passed the
+        // user's own timezone/`now` at all (unlike action.reschedule's equivalent call just below
+        // in this file, which always has), so it parsed "tomorrow at 23:59" against the SERVER's
+        // default timezone instead of the user's real one — a real, pre-existing gap, not
+        // specific to the end-of-day default work in this branch.
+        const settings = await getOrCreateNotificationSettings(userId);
+        const parsedDate = parseActionDueDate(untilText, { timezone: settings.timezone, preferences: settings });
         if (!parsedDate.dueAt) {
           return failed(operation.tool, parsedDate.clarification ?? `Couldn't understand the snooze target "${untilText}".`);
         }
@@ -481,7 +489,6 @@ export async function executeOperation(
         if (!updated) {
           return failed(operation.tool, "That task no longer exists or is archived.");
         }
-        const settings = await getOrCreateNotificationSettings(userId);
         // "bring it back tomorrow" reads like a coach, not a scheduler — reuses the exact same
         // today/tomorrow/full-date phrasing action.list's own due lines already use, minus the
         // "due " prefix, which only makes sense next to a task title, not a person.
