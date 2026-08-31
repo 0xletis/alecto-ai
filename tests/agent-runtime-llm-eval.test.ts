@@ -14,7 +14,7 @@ import {
   upsertAgentConversationSession
 } from "../packages/db/src/index.ts";
 import { addDaysToLocalDate, formatLocalDate, localDateTimeToUtc } from "../packages/core/src/time.ts";
-import { encryptSecretJson } from "../packages/core/src/index.ts";
+import { encryptSecretJson, progressExamplesForGoals } from "../packages/core/src/index.ts";
 import { assertNoGenericAgentError, buildServer, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import { sendDueActionReminders } from "../apps/worker/src/action-reminders.ts";
 import { runV3ProactiveEveningCheckins, runV3ProactiveMorningBriefs } from "../apps/worker/src/v3-proactive-delivery.ts";
@@ -195,6 +195,40 @@ async function seedEvalGmailConnectionWithToken(userId: string) {
       }
     }
   });
+}
+
+/**
+ * gmail-account-switching scenarios need a REAL new-OAuth-connect round trip after a switch
+ * (not just the "here's a link" reply) to prove the watcher actually relinks — this intercepts
+ * only Google's own OAuth/profile endpoints (token exchange, revoke, profile lookup), same as
+ * installEvalGmailFetchMock intercepts only gmail.googleapis.com; everything else, including the
+ * real OpenAI calls this file's scenarios make, still reaches the real network.
+ */
+function installEvalGoogleOAuthFetchMock(profileEmail: string): () => void {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const urlText = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (urlText.startsWith("https://oauth2.googleapis.com/token")) {
+      return new Response(
+        JSON.stringify({ access_token: `eval-access-${randomUUID()}`, refresh_token: `eval-refresh-${randomUUID()}`, expires_in: 3600, token_type: "Bearer", scope: "gmail.readonly" }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    if (urlText.startsWith("https://oauth2.googleapis.com/revoke")) {
+      return new Response("", { status: 200 });
+    }
+    if (urlText.startsWith("https://gmail.googleapis.com/gmail/v1/users/me/profile")) {
+      return new Response(JSON.stringify({ emailAddress: profileEmail }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    return previousFetch(input, init);
+  }) as typeof fetch;
+  return () => {
+    globalThis.fetch = previousFetch;
+  };
+}
+
+function evalOauthState(userId: string): string {
+  return Buffer.from(JSON.stringify({ userId }), "utf8").toString("base64url");
 }
 
 function installEvalGmailEncryptionKey(): () => void {
@@ -13535,6 +13569,386 @@ test(
         assert.ok(reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), `expected explicit Gmail/mail language to still work — got: ${JSON.stringify(reply.operationsExecuted)}`);
       });
     } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// --- fix/private-alpha-gmail-account-switch-and-personalized-examples: Gmail account lifecycle
+// (disconnect/switch/scheduled-hourly, real LLM planner, no deterministic mocks) + personalized
+// progress-example wiring, exercised end to end through the same real /agent/message path as
+// every other scenario in this file. ------------------------------------------------------------
+
+test(
+  "375. disconnect Gmail asks for confirmation quoting the real account, then actually disconnects",
+  { ...llmEvalOptions(["gmail-disconnect-reconnect"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-375-${randomUUID()}`;
+    const trace = new EvalTrace("375-disconnect-gmail", ["gmail-disconnect-reconnect"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const t1 = trace.record("disconnect Gmail", await sendAgentMessage(server, userId, "disconnect Gmail"));
+        assertNoGenericAgentError(t1, "disconnect propose");
+        trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+        assert.equal(t1.needsConfirmation, true, "disconnect must never happen without confirmation");
+        trace.checkpoint("proposal quotes the real connected account", t1.reply.includes("letis@example.com"), t1.reply);
+        assert.match(t1.reply, /letis@example\.com/);
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("mutation actually executed", t2.debug.mutationExecuted, String(t2.debug.mutationExecuted));
+        assert.equal(t2.debug.mutationExecuted, true);
+
+        const afterConnection = await prisma.integrationConnection.findUnique({ where: { id: connection.id } });
+        trace.checkpoint("connection no longer active after confirming disconnect", afterConnection?.status !== "active", afterConnection?.status ?? "missing");
+        assert.notEqual(afterConnection?.status, "active", "the disconnected account must stop being usable immediately");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "376. switching Gmail accounts asks for confirmation, stops the old account, and hands back a real connect link",
+  { ...llmEvalOptions(["gmail-account-switching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-376-${randomUUID()}`;
+    const trace = new EvalTrace("376-switch-gmail-account", ["gmail-account-switching"], userId);
+    const restoreOAuth = installGmailOAuthEnv();
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to switch Gmail accounts", await sendAgentMessage(server, userId, "I want to switch Gmail accounts"));
+        assertNoGenericAgentError(t1, "switch propose");
+        trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+        assert.equal(t1.needsConfirmation, true);
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("mutation actually executed", t2.debug.mutationExecuted, String(t2.debug.mutationExecuted));
+        assert.equal(t2.debug.mutationExecuted, true);
+        trace.checkpoint("hands back a real Google OAuth connect link", /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/.test(t2.reply), t2.reply);
+        assert.match(t2.reply, /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/);
+
+        const oldConnection = await prisma.integrationConnection.findUnique({ where: { id: connection.id } });
+        trace.checkpoint("old account no longer active", oldConnection?.status !== "active", oldConnection?.status ?? "missing");
+        assert.notEqual(oldConnection?.status, "active", "the old account must never sync again once a switch is confirmed");
+      });
+    } finally {
+      restoreKey();
+      restoreOAuth();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "377. 'connect my job email for job search' with no Gmail connected yet hands back a connect link directly",
+  { ...llmEvalOptions(["gmail-account-switching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-377-${randomUUID()}`;
+    const trace = new EvalTrace("377-connect-job-mail", ["gmail-account-switching"], userId);
+    const restoreOAuth = installGmailOAuthEnv();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("connect my job email for job search", await sendAgentMessage(server, userId, "connect my job email for job search"));
+        assertNoGenericAgentError(reply, "connect job mail, nothing connected yet");
+        trace.checkpoint("hands back a real Google OAuth connect link", /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/, "nothing was connected yet, so this should be a direct link, not a confirmation");
+      });
+    } finally {
+      restoreOAuth();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "378. scheduling hourly Gmail checks is confirmation-backed, then shows up in status",
+  { ...llmEvalOptions(["gmail-scheduled-hourly"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-378-${randomUUID()}`;
+    const trace = new EvalTrace("378-hourly-gmail-checks", ["gmail-scheduled-hourly"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      // A connection with no active rule at all never shows a sync-cadence line in status —
+      // seed a real active watcher first (mirrors the deterministic gmail-account-lifecycle.test.ts
+      // fix for the same trap).
+      await prisma.emailSignalRule.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          goalId: goalResult.goal.id,
+          adapterId: "job_search_email",
+          name: "Job search emails",
+          status: "active",
+          fetchStrategy: "query",
+          classifierMode: "rules",
+          lookbackDays: 30,
+          maxMessagesPerSync: 25,
+          maxEventsPerSync: 10,
+          minAutoLogConfidence: 0.9,
+          minReviewConfidence: 0.65,
+          domain: "career",
+          notifyPolicy: "notify",
+          createdBy: "user"
+        }
+      });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("check my job Gmail every hour", await sendAgentMessage(server, userId, "check my job Gmail every hour"));
+        assertNoGenericAgentError(t1, "hourly propose");
+        trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+        assert.equal(t1.needsConfirmation, true, "scheduled sync must never enable silently");
+
+        const t2 = trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        trace.checkpoint("mutation actually executed", t2.debug.mutationExecuted, String(t2.debug.mutationExecuted));
+        assert.equal(t2.debug.mutationExecuted, true);
+
+        const t3 = trace.record("gmail status", await sendAgentMessage(server, userId, "gmail status"));
+        trace.checkpoint("status reflects the hourly schedule", /hour/i.test(t3.reply), t3.reply);
+        assert.match(t3.reply, /hour/i);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "379. Gmail status stays honest through a full switch: paused mid-transition, then the new account once reconnected",
+  { ...llmEvalOptions(["gmail-account-switching", "gmail-disconnect-reconnect"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-379-${randomUUID()}`;
+    const trace = new EvalTrace("379-status-after-switch", ["gmail-account-switching", "gmail-disconnect-reconnect"], userId);
+    const restoreOAuth = installGmailOAuthEnv();
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreOAuthFetch = installEvalGoogleOAuthFetchMock("jobs@example.com");
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        trace.record("switch Gmail account", await sendAgentMessage(server, userId, "switch Gmail account"));
+        trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+        const callback = await server.inject({ method: "GET", url: `/oauth/gmail/callback?code=eval-auth-code&state=${evalOauthState(userId)}` });
+        trace.checkpoint("real OAuth callback connected the new account", callback.statusCode === 200 && callback.body.includes("jobs@example.com"), callback.body);
+        assert.equal(callback.statusCode, 200);
+
+        const t = trace.record("gmail status", await sendAgentMessage(server, userId, "gmail status"));
+        trace.checkpoint("status now shows the new account", /jobs@example\.com/.test(t.reply), t.reply);
+        assert.match(t.reply, /jobs@example\.com/, "status must reflect the new account once the OAuth round trip finished");
+      });
+    } finally {
+      restoreOAuthFetch();
+      restoreKey();
+      restoreOAuth();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "380. personalized progress examples: a job-search-only user gets job-search-shaped examples, never gym/fitness wording",
+  { ...llmEvalOptions(["personalized-progress-examples"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-380-${randomUUID()}`;
+    const trace = new EvalTrace("380-job-search-examples", ["personalized-progress-examples"], userId);
+
+    try {
+      await seedUser(userId);
+      const t1 = trace.record(
+        "I want to find a fully remote developer job",
+        await sendAgentMessage(server, userId, "I want to find a fully remote developer job")
+      );
+      trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+      assert.equal(t1.needsConfirmation, true);
+      trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+      const goal = await prisma.goal.findFirst({ where: { userId, status: "active" } });
+      trace.checkpoint("job-search goal was actually created", Boolean(goal), goal?.title ?? "none");
+      assert.ok(goal, "the job-search goal must have been created");
+
+      await trace.guard(async () => {
+        const examples = progressExamplesForGoals([goal as any]);
+        trace.checkpoint("examples are job-search-shaped", /job-search/.test(examples), examples);
+        assert.match(examples, /job-search/);
+        trace.checkpoint("examples never invent gym/fitness wording for a job-search goal", !/gym|steps|slept/.test(examples), examples);
+        assert.doesNotMatch(examples, /gym|steps|slept/);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "381. personalized progress examples: a life-meaning goal gets journaling/mindfulness-shaped examples",
+  { ...llmEvalOptions(["personalized-progress-examples"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-381-${randomUUID()}`;
+    const trace = new EvalTrace("381-life-meaning-examples", ["personalized-progress-examples"], userId);
+
+    try {
+      await seedUser(userId);
+      const t1 = trace.record(
+        "I want to journal daily and have more meaningful conversations",
+        await sendAgentMessage(server, userId, "I want to journal daily and have more meaningful conversations")
+      );
+      trace.checkpoint("proposal needs confirmation", t1.needsConfirmation, String(t1.needsConfirmation));
+      assert.equal(t1.needsConfirmation, true);
+      trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+
+      const goal = await prisma.goal.findFirst({ where: { userId, status: "active" } });
+      trace.checkpoint("meaning goal was actually created", Boolean(goal), goal?.title ?? "none");
+      assert.ok(goal, "the meaning goal must have been created");
+
+      await trace.guard(async () => {
+        const examples = progressExamplesForGoals([goal as any]);
+        trace.checkpoint("examples are meaning-shaped", /meaning/.test(examples), examples);
+        assert.match(examples, /meaning/);
+        trace.checkpoint("examples never invent job-search wording for a meaning goal", !/CVs?|recruiter|interview/i.test(examples), examples);
+        assert.doesNotMatch(examples, /CVs?|recruiter|interview/i);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "382. personalized progress examples: no active goals gets the honest fallback prompt, never an invented category example",
+  { ...llmEvalOptions(["personalized-progress-examples"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const userId = `llm-eval-382-${randomUUID()}`;
+    const trace = new EvalTrace("382-no-active-goal-examples", ["personalized-progress-examples"], userId);
+
+    try {
+      await seedUser(userId);
+      await trace.guard(async () => {
+        const examples = progressExamplesForGoals([]);
+        trace.checkpoint("honest no-goal fallback text, not a fabricated example", examples === "Tell me what you did, and I'll help log it against the right goal.", examples);
+        assert.equal(examples, "Tell me what you did, and I'll help log it against the right goal.");
+      });
+    } finally {
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "383. Spanish: 'usa mi correo de trabajo para buscar empleo' switches Gmail accounts for the job search",
+  { ...llmEvalOptions(["gmail-account-switching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-383-${randomUUID()}`;
+    const trace = new EvalTrace("383-switch-es", ["gmail-account-switching"], userId);
+    const restoreOAuth = installGmailOAuthEnv();
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "usa mi correo de trabajo para buscar empleo",
+          await sendAgentMessage(server, userId, "usa mi correo de trabajo para buscar empleo")
+        );
+        assertNoGenericAgentError(reply, "Spanish switch-account phrase");
+        trace.checkpoint(
+          "Spanish phrase either opens a switch confirmation or hands back a real connect link",
+          reply.needsConfirmation || /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/.test(reply.reply),
+          reply.reply
+        );
+        assert.ok(
+          reply.needsConfirmation || /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/.test(reply.reply),
+          `expected either a real switch confirmation or a direct connect link — got: ${reply.reply}`
+        );
+      });
+    } finally {
+      restoreKey();
+      restoreOAuth();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "384. Catalan: 'fes servir el meu correu de feina per buscar feina' switches Gmail accounts for the job search",
+  { ...llmEvalOptions(["gmail-account-switching"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-384-${randomUUID()}`;
+    const trace = new EvalTrace("384-switch-ca", ["gmail-account-switching"], userId);
+    const restoreOAuth = installGmailOAuthEnv();
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "fes servir el meu correu de feina per buscar feina",
+          await sendAgentMessage(server, userId, "fes servir el meu correu de feina per buscar feina")
+        );
+        assertNoGenericAgentError(reply, "Catalan switch-account phrase");
+        trace.checkpoint(
+          "Catalan phrase either opens a switch confirmation or hands back a real connect link",
+          reply.needsConfirmation || /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/.test(reply.reply),
+          reply.reply
+        );
+        assert.ok(
+          reply.needsConfirmation || /accounts\.google\.com\/o\/oauth2\/v2\/auth\?/.test(reply.reply),
+          `expected either a real switch confirmation or a direct connect link — got: ${reply.reply}`
+        );
+      });
+    } finally {
+      restoreKey();
+      restoreOAuth();
       await server.close();
       await prisma.user.deleteMany({ where: { id: userId } });
     }

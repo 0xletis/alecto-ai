@@ -1056,6 +1056,21 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, bulkActionCleanupShortcut, "actions");
   }
 
+  // Gated on !pending (unlike the read-only gmailConnectionShortcut right below, which never opens
+  // a confirmation of its own): both of these open a REAL pending proposal, so running them while
+  // a different confirmation is already open would silently overwrite it rather than requiring an
+  // explicit cancel first — the same reasoning bulkActionCleanupShortcut/gmailNudgeSettingsShortcut
+  // above already follow for the identical reason.
+  const gmailDisconnectShortcut = !pending ? gmailDisconnectShortcutOperation(message) : undefined;
+  if (gmailDisconnectShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailDisconnectShortcut, "gmail_disconnect");
+  }
+
+  const gmailSwitchAccountShortcut = !pending ? gmailSwitchAccountShortcutOperation(message) : undefined;
+  if (gmailSwitchAccountShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailSwitchAccountShortcut, "gmail_switch_account");
+  }
+
   const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
   if (gmailConnectionShortcut) {
     return finalizeDeterministicOperation(context, message, gmailConnectionShortcut, "gmail_status");
@@ -2728,6 +2743,42 @@ function detectGmailConnectionIntent(message: string, context: ContextBundle): {
 function gmailConnectionShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
   const detected = detectGmailConnectionIntent(message, context);
   return detected ? { tool: "gmail.status", args: { includeLink: detected.includeLink }, rationale: "user asked for Gmail connection or reconnect help" } : undefined;
+}
+
+// fix/private-alpha-gmail-account-switch-and-personalized-examples: disconnect is a real,
+// consequential mutation (stops syncing, best-effort revokes the token at Google) — left entirely
+// to the real LLM planner's own judgment, a message this unambiguous ("disconnect Gmail," "remove
+// Gmail," "unlink Gmail," "stop using this Gmail account") deserves the same deterministic
+// backstop every other consequential Gmail-domain intent in this file already gets, rather than
+// depending on the model reliably picking gmail.disconnect_propose over, say, gmail.rule.propose_
+// update every single time. Deliberately excludes any message also containing "for" — "stop using
+// Gmail FOR my job search" names a specific goal/rule, not the whole account, and belongs to
+// gmail.rule.propose_update instead; a real disconnect never names what it's "for."
+const GMAIL_DISCONNECT_RE =
+  /\b(disconnect|remove|unlink)\b[\s\S]{0,20}\b(gmail|mail|email)\b|\bstop using\b[\s\S]{0,15}\bgmail\b[\s\S]{0,15}\baccount\b/i;
+const GMAIL_DISCONNECT_GOAL_SCOPED_RE = /\bfor\b/i;
+
+function gmailDisconnectShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_DISCONNECT_RE.test(text) || GMAIL_DISCONNECT_GOAL_SCOPED_RE.test(text)) {
+    return undefined;
+  }
+  return { tool: "gmail.disconnect_propose", args: {}, rationale: "user asked to disconnect/remove/unlink Gmail" };
+}
+
+// Only the crystal-clear, unambiguous "switch the whole account" phrasings — "use my job mail for
+// this goal"/"connect my job email for job search"-shaped requests are inherently goal-driven and
+// stay with the real planner (guided by gmail.switch_account_propose's own catalog description,
+// which tells it explicitly to check whether Gmail is already connected to a plausibly different
+// account before choosing between this and a fresh gmail.goal_watcher.propose_enable).
+const GMAIL_SWITCH_ACCOUNT_RE = /\b(change|switch)\b[\s\S]{0,15}\bgmail\b[\s\S]{0,15}\baccount\b|\buse\b[\s\S]{0,10}\ba different\b[\s\S]{0,10}\bgmail\b[\s\S]{0,10}\baccount\b/i;
+
+function gmailSwitchAccountShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_SWITCH_ACCOUNT_RE.test(text)) {
+    return undefined;
+  }
+  return { tool: "gmail.switch_account_propose", args: {}, rationale: "user asked to change/switch their connected Gmail account" };
 }
 
 // fix/private-alpha-pending-action-refinement-and-gmail-rule-ux: a real Telegram transcript had a

@@ -1390,6 +1390,32 @@ export async function reassignActiveEmailSignalRulesToConnection(
   return result.count;
 }
 
+// fix/private-alpha-gmail-account-switch-and-personalized-examples: a real disconnect must stop
+// every rule still watching through the connection being disconnected — otherwise gmail.status/
+// the worker's own eligibility check keep reporting "N active rules" against a connection that's
+// now archived, and (worse) a LATER reconnect with a genuinely different account would silently
+// inherit those rules via the existing single-candidate reassignment fallback, watching the new
+// mailbox with config the user never re-approved for it. A genuine account SWITCH (as opposed to
+// a plain disconnect) deliberately does NOT call this — it wants the existing reconnect-relink
+// flow to carry rules forward onto the new connection, which only works while they're still
+// "active" on the old one.
+export async function pauseActiveEmailSignalRulesForConnection(userId: string, connectionId: string): Promise<number> {
+  await ensureUser(userId);
+
+  const result = await prisma.emailSignalRule.updateMany({
+    where: {
+      userId,
+      connectionId,
+      status: "active"
+    },
+    data: {
+      status: "paused"
+    }
+  });
+
+  return result.count;
+}
+
 export async function updateEmailSignalRuleDefinition(
   userId: string,
   ruleId: string,

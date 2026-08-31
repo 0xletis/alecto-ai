@@ -88,3 +88,30 @@ export function decodeGmailOAuthState(state: string): string | undefined {
 export function gmailOAuthMissingConfigMessage(): string {
   return "Gmail OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GMAIL_REDIRECT_URI.";
 }
+
+/**
+ * fix/private-alpha-gmail-account-switch-and-personalized-examples: best-effort revocation of a
+ * Gmail OAuth grant at Google's own revoke endpoint — there was no precedent for this anywhere in
+ * the codebase before this branch (disconnect previously only ever flipped a local DB status, the
+ * refresh token stayed live at Google indefinitely). Accepts either a refresh token (revokes the
+ * whole grant, preferred) or an access token (revokes just that token) — whichever the caller has
+ * on hand. Deliberately never throws: a disconnect must always succeed locally even if Google's
+ * endpoint is unreachable or the token was already invalid/expired — the local archive is the
+ * source of truth for "is Alecto still using this account," not Google's own revocation state.
+ * Never logs the token value itself, only the boolean outcome.
+ */
+export async function revokeGoogleOAuthToken(token: string): Promise<boolean> {
+  if (!token) {
+    return false;
+  }
+  try {
+    const response = await fetch("https://oauth2.googleapis.com/revoke", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token })
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}

@@ -3,6 +3,7 @@ import {
   approveEmailReviewItem,
   archiveActionItem,
   archiveEmailSignalRule,
+  archiveIntegrationConnection,
   completeActionItem,
   createActionItem,
   createActionItemIfNotExists,
@@ -19,17 +20,20 @@ import {
   getEventsSince,
   getGoals,
   getIntegrationConnection,
+  getIntegrationConnections,
   getMostRecentNotificationLog,
   getOrCreateNotificationSettings,
   getOrCreateUserOperatingProfile,
   getNotificationLog,
   getProactiveBriefPreferences,
   hasNotificationLog,
+  pauseActiveEmailSignalRulesForConnection,
   rescheduleActionItem,
   selfHealDailyLoopEnabled,
   setGoalStatus,
   snoozeActionItem,
   updateEmailSignalRule,
+  updateIntegrationConnection,
   updateIntegrationConnectionConfig,
   updateNotificationSettings,
   updateUserOperatingProfile,
@@ -60,6 +64,8 @@ import {
   proactiveOperatorAllowlistActiveFromEnv,
   proactiveOperatorAllowlistFromEnv,
   proactiveOperatorDeliveryEnabledFromEnv,
+  decryptSecretJson,
+  isEncryptedSecretJsonEnvelope,
   readGmailAutonomyPreferences,
   resolveActiveGoalReference,
   resolveProactiveBriefPreference,
@@ -88,7 +94,13 @@ import {
   isGmailRuleAlreadyInTargetState,
   type GmailRuleOperation
 } from "../gmail/gmail-rule-management.js";
-import { buildGmailOAuthUrl, gmailOAuthConfig, gmailOAuthLocalhostCallbackWarning, gmailOAuthMissingConfigMessage } from "../gmail/oauth.js";
+import {
+  buildGmailOAuthUrl,
+  gmailOAuthConfig,
+  gmailOAuthLocalhostCallbackWarning,
+  gmailOAuthMissingConfigMessage,
+  revokeGoogleOAuthToken
+} from "../gmail/oauth.js";
 import {
   buildGmailAutonomyState,
   gmailRecommendationKindForGoal,
@@ -1665,6 +1677,153 @@ export async function executeOperation(
             : `Done — Gmail scheduled checks are now on every ${formatIntervalMinutes(effectiveInterval)}.`;
 
         return { tool: operation.tool, status: "executed", summary, result: updated };
+      }
+
+      // fix/private-alpha-gmail-account-switch-and-personalized-examples: no disconnect flow
+      // existed anywhere before this branch — the only precedent was archiveIntegrationConnection
+      // (a generic soft-delete used by a REST-only route), never wired into the chat/tool layer,
+      // never revoking anything at Google, and never touching the connection's own rules (which
+      // would otherwise sit there forever reporting "N active rules" against an account Alecto no
+      // longer has permission to read). This proposes it — a real pending confirmation, never
+      // applied silently — quoting the actual connected email so the user knows exactly what
+      // they're disconnecting.
+      case "gmail.disconnect_propose": {
+        const state = await buildGmailAutonomyState(userId);
+        if (!state.gmailConnected || !state.primaryConnection) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "Gmail isn't connected right now — nothing to disconnect.",
+            result: state
+          };
+        }
+        const emailSuffix = state.gmailAccount ? ` as ${state.gmailAccount}` : "";
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `You're currently connected${emailSuffix}. Disconnect it? I'll stop syncing this account. Historical logged progress and reviews stay in your history.`,
+          result: state,
+          pendingOperationUpdate: {
+            topic: "gmail_disconnect",
+            summary: `disconnect Gmail${emailSuffix}`,
+            operations: [
+              {
+                tool: "gmail.disconnect_apply",
+                args: { connectionId: state.primaryConnection.id },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "gmail.disconnect_apply": {
+        const connectionId = args.connectionId as string;
+        const connection = await getIntegrationConnection(userId, connectionId);
+        if (!connection) {
+          return failed(operation.tool, "That Gmail connection no longer exists.");
+        }
+        // Best-effort — a disconnect must always succeed locally even if Google's own revoke
+        // endpoint is unreachable or the token was already stale; see revokeGoogleOAuthToken's
+        // own doc comment. Never surfaced as a failure to the user either way.
+        await bestEffortRevokeGmailConnectionToken(connection);
+        const archived = await archiveIntegrationConnection(userId, connectionId);
+        if (!archived) {
+          return failed(operation.tool, "That Gmail connection no longer exists.");
+        }
+        // Stops every rule still watching through this connection from counting as "active" —
+        // never deletes them (archiveEmailSignalRule is a different, harsher operation this
+        // deliberately does NOT call) and never touches a single historical event/review row.
+        const pausedCount = await pauseActiveEmailSignalRulesForConnection(userId, connectionId);
+        const emailSuffix = typeof connection.config.email === "string" && connection.config.email.trim() ? ` (${connection.config.email.trim()})` : "";
+        const watcherNote = pausedCount > 0 ? ` and paused ${pausedCount} watcher${pausedCount === 1 ? "" : "s"} that were using it` : "";
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Gmail disconnected${emailSuffix}. I've stopped syncing this account${watcherNote}. Your historical logged progress and reviews are still in your history. Say "connect Gmail" any time to reconnect.`,
+          result: archived
+        };
+      }
+
+      // A genuine account SWITCH — different from a plain disconnect in exactly one way: it never
+      // pauses the connection's active rules, so the existing OAuth-callback reconnect logic
+      // (preserveActiveGmailRulesForOAuthReconnect, apps/api/src/server.ts) can carry them forward
+      // onto the new connection once the user finishes the new OAuth round-trip. If Gmail isn't
+      // connected at all yet, there's nothing to disconnect first — this just hands back the
+      // connect link directly, no confirmation needed.
+      case "gmail.switch_account_propose": {
+        const state = await buildGmailAutonomyState(userId);
+        if (!state.gmailConnected || !state.primaryConnection) {
+          const config = gmailOAuthConfig();
+          if (!config) {
+            return failed(operation.tool, gmailOAuthMissingConfigMessage());
+          }
+          const url = buildGmailOAuthUrl(userId, config);
+          const warning = gmailOAuthLocalhostCallbackWarning(config);
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `Gmail isn't connected yet — here's the connect link: ${url}${warning ? ` ${warning}` : ""} Access is readonly — I can't send emails or change labels.`,
+            result: state
+          };
+        }
+        const emailSuffix = state.gmailAccount ? ` as ${state.gmailAccount}` : "";
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `You're currently connected${emailSuffix}. To use a different account, I'll disconnect this one first, then you can connect the new Gmail account. Historical progress stays. Continue?`,
+          result: state,
+          pendingOperationUpdate: {
+            topic: "gmail_switch_account",
+            summary: `switch Gmail account (currently${emailSuffix})`,
+            operations: [
+              {
+                tool: "gmail.switch_account_apply",
+                args: { connectionId: state.primaryConnection.id },
+                status: "valid",
+                requiresConfirmation: false
+              }
+            ]
+          }
+        };
+      }
+
+      case "gmail.switch_account_apply": {
+        const connectionId = args.connectionId as string;
+        const connection = await getIntegrationConnection(userId, connectionId);
+        if (!connection) {
+          return failed(operation.tool, "That Gmail connection no longer exists.");
+        }
+        await bestEffortRevokeGmailConnectionToken(connection);
+        // Deliberately "paused," not "archived" — preserveActiveGmailRulesForOAuthReconnect (the
+        // existing relink logic the new OAuth callback runs below) only ever considers NON-archived
+        // connections as candidates to carry active rules FROM, so archiving here would silently
+        // strand every watcher on this account instead of carrying it forward. "Paused" already
+        // means "not connected, sync will never run" everywhere gmail.status/gmail.sync/the
+        // worker's own eligibility check look — the safety property (old account never syncs
+        // again) holds exactly the same either way.
+        const paused = await updateIntegrationConnection(userId, connectionId, { status: "paused" });
+        if (!paused) {
+          return failed(operation.tool, "That Gmail connection no longer exists.");
+        }
+        const config = gmailOAuthConfig();
+        if (!config) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "Old Gmail account disconnected. Gmail OAuth isn't configured right now, so I can't give you a connect link yet — set it up and try again.",
+            result: paused
+          };
+        }
+        const url = buildGmailOAuthUrl(userId, config);
+        const warning = gmailOAuthLocalhostCallbackWarning(config);
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Old Gmail account disconnected. Connect the new one here: ${url}${warning ? ` ${warning}` : ""} Your existing goal watchers will pick up the new account automatically once it's connected. Access is readonly — I can't send emails or change labels.`,
+          result: paused
+        };
       }
 
       case "gmail.rule.list": {
@@ -4785,6 +4944,28 @@ function formatGmailAutonomyStatusForChat(state: Awaited<ReturnType<typeof build
   }
 
   return [gmailSyncModeSentence(state), `Gmail alerts are ${state.reviewNotificationEnabled ? "on" : "off"}.`].join("\n");
+}
+
+/** Best-effort token extraction + revocation for a Gmail disconnect/switch — see
+ * revokeGoogleOAuthToken's own doc comment for why this never throws or blocks the local
+ * disconnect. Tolerates both the normal encrypted-token shape (EncryptedSecretJsonEnvelope) and a
+ * legacy plaintext shape (same fallback readGmailToken/server.ts already tolerates elsewhere),
+ * without needing to import that private, self-healing helper — revocation only needs a raw
+ * token value, not the full read/refresh/self-heal machinery. */
+async function bestEffortRevokeGmailConnectionToken(connection: IntegrationConnection): Promise<boolean> {
+  try {
+    const rawToken = (connection.config as Record<string, unknown> | undefined)?.token;
+    const decoded = isEncryptedSecretJsonEnvelope(rawToken)
+      ? decryptSecretJson<{ accessToken?: string; refreshToken?: string }>(rawToken)
+      : (rawToken as { accessToken?: string; refreshToken?: string } | undefined);
+    const tokenToRevoke = decoded?.refreshToken || decoded?.accessToken;
+    if (!tokenToRevoke) {
+      return false;
+    }
+    return await revokeGoogleOAuthToken(tokenToRevoke);
+  } catch {
+    return false;
+  }
 }
 
 function formatGmailConnectionStatusForChat(

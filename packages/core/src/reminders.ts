@@ -1,5 +1,6 @@
 import type { Goal } from "./goals.js";
 import type { StoredEvent } from "./events.js";
+import { progressExampleCategoryForGoal, type ProgressExampleCategory } from "./progress-examples.js";
 import type { UserOperatingProfile } from "./user-operating-profile.js";
 
 export interface BuildDailyCheckinPromptInput {
@@ -11,8 +12,14 @@ export interface BuildDailyCheckinPromptInput {
 export function buildDailyCheckinPrompt(input: BuildDailyCheckinPromptInput): string {
   const sections = new Set<string>();
   const customSections: string[] = [];
+  const exampleCategories = new Set<ProgressExampleCategory>();
 
   for (const goal of input.activeGoals) {
+    const category = progressExampleCategoryForGoal(goal);
+    if (category) {
+      exampleCategories.add(category);
+    }
+
     if (!goal.templateId && goal.checkInConfig?.[0]) {
       customSections.push(`${goal.title}: ${goal.checkInConfig[0].question}`);
       continue;
@@ -43,7 +50,7 @@ export function buildDailyCheckinPrompt(input: BuildDailyCheckinPromptInput): st
     ...goalLines,
     "",
     "Reply naturally, for example:",
-    exampleForSections(sections),
+    exampleForSections(sections, exampleCategories),
     "",
     "Or use structured format:",
     "/checkin energy=6 anxiety=4 focus=7 gambling=2 applications=2 workout=45 reading=30 sleep=7 notes=Felt okay today"
@@ -102,15 +109,23 @@ function isDirectProfile(profile?: UserOperatingProfile): boolean {
   return Boolean(profile && (profile.directness >= 5 || profile.motivationalStyle === "tough_love"));
 }
 
-function exampleForSections(sections: Set<string>): string {
+/**
+ * fix/private-alpha-gmail-account-switch-and-personalized-examples (Part B): a real reported gap —
+ * this used to show "sent 2 CVs"/"trained 40 min" for EVERY user with a matching section, even one
+ * with only a finance/travel/meaning goal and nothing to do with a gym or a job search. Examples
+ * now come from progress-examples.ts's deterministic goal-category classification (exampleCategories,
+ * computed once per active goal in buildDailyCheckinPrompt) instead of being hardcoded here, so a
+ * goal category only ever contributes an example that's actually plausible for it.
+ */
+function exampleForSections(sections: Set<string>, exampleCategories: Set<ProgressExampleCategory>): string {
   const examples = ["slept 6h", "energy 5", "anxiety 7"];
 
-  if (hasSection(sections, "Job search")) {
+  if (exampleCategories.has("job_search")) {
     examples.push("sent 2 CVs");
   }
 
-  if (hasSection(sections, "Health")) {
-    examples.push("trained 40 min");
+  if (exampleCategories.has("fitness")) {
+    examples.push("45 min gym");
   }
 
   if (hasSection(sections, "Reading")) {
@@ -119,6 +134,18 @@ function exampleForSections(sections: Set<string>): string {
 
   if (hasSection(sections, "Risk")) {
     examples.push("gambling impulse 2");
+  }
+
+  if (exampleCategories.has("life_meaning")) {
+    examples.push("journaled 10 minutes");
+  }
+
+  if (exampleCategories.has("finance_admin")) {
+    examples.push("paid one bill");
+  }
+
+  if (exampleCategories.has("travel")) {
+    examples.push("checked flight update");
   }
 
   if (examples.length === 3) {
