@@ -1343,12 +1343,22 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // ISN'T already a clear, unambiguous domain action — exactly the set of messages that reach
   // this point without an earlier shortcut having already handled them. This never widens what
   // the guardrail blocks, only narrows which messages are even offered to it.
+  // fix/private-alpha-goal-avoidance-action-bypass: explicit action-management language ("move it,"
+  // "muévela," "canvia-la") is never itself a signal of goal avoidance — see
+  // isExplicitActionMutationGuardrailBypass's own doc comment for the real reported bug this
+  // closes. Skips ONLY the guardrail LLM call; the real planner, validator, and execution pipeline
+  // below run exactly as they would for any other allowed message, so this can never let an LLM
+  // mutate state directly, and any goal-abandonment wording in the same message unconditionally
+  // disqualifies the bypass.
+  const actionMutationBypassesGuardrail = isExplicitActionMutationGuardrailBypass(message, context);
   logAgentRuntimeDiagnostics({
     phase: "guardrail_check",
     userId,
-    note: "no domain shortcut matched; message reaches goal-avoidance guardrail"
+    note: actionMutationBypassesGuardrail
+      ? "explicit action-mutation command with a resolvable action target — goal-avoidance guardrail bypassed"
+      : "no domain shortcut matched; message reaches goal-avoidance guardrail"
   });
-  const guardrail = await checkGoalGuardrail(message, context);
+  const guardrail = actionMutationBypassesGuardrail ? ACTION_MUTATION_GUARDRAIL_BYPASS_RESULT : await checkGoalGuardrail(message, context);
   if (guardrail.decision !== "allow") {
     // hard_block/soft_warn are real, detected conflicts worth a durable trace (feeds existing
     // insight/daily-review pipelines that already read risk_pattern memories); ask_clarification
@@ -3400,6 +3410,71 @@ const GOAL_LIFECYCLE_DONT_WANT_ANYMORE_RE = /\b(don'?t|dont) (?:want|wanna)[\s\S
 const GOAL_WORD_RE = /\b(goal|goals|objetivo|objetivos|meta|metas|objectiu|objectius)\b/;
 const GOAL_LIFECYCLE_BARE_PRONOUN_COMMAND_RE =
   /^(?:okay|ok|vale|va)?[,.\s]*(pause|archive|delete|remove|pausa|pausar|archiva|archivar|elimina|eliminar|borra|borrar)\s+(it|that|this|lo|la|ho)\.?$/;
+
+// fix/private-alpha-goal-avoidance-action-bypass: a real-LLM eval caught "muévela a mañana a las
+// 20:00" (an ordinary explicit action reschedule, carrying a digit so it skips
+// actionCompletionShortcutOperation's own bare-pronoun shortcut by design) reaching the
+// goal-avoidance guardrail's separate LLM classifier and getting misread as "pulling you away from
+// your goal" — consistently, for this Spanish phrasing specifically, across repeated real-model
+// runs. English and Catalan equivalents mostly passed, but only because the classifier's own
+// judgment happened to land correctly more often for them; nothing deterministic protected any of
+// them. Explicit action maintenance ("move it," "reschedule it," "muévela," "canvia-la") is never
+// itself a signal of abandoning the underlying goal — the guardrail's classification prompt has no
+// way to know that distinction reliably in every language, so this is caught deterministically
+// instead, the same way every other unambiguous operational command already skips the guardrail
+// (see goalLifecycleShortcutOperation and the Gmail domain shortcuts above). Narrow on purpose:
+// matches only explicit action-mutation vocabulary, requires either a real visible action to attach
+// to or an explicit "the action"/"la acción"/"l'acció" reference, and is unconditionally disqualified
+// by ANY goal-abandonment wording — so a message like "archive the goal" or "ya no quiero este
+// objetivo" is never affected (those are already handled by goalLifecycleShortcutOperation above,
+// or correctly still reach the real guardrail here). This only ever NARROWS what reaches the
+// guardrail, exactly like every other domain shortcut in this file — never widens what it blocks.
+const ACTION_MUTATION_GUARDRAIL_BYPASS_RESULT: GuardrailResult = {
+  decision: "allow",
+  reply: null,
+  matchedGoalId: null,
+  matchedGoalTitle: null,
+  matchedTrigger: null,
+  pattern: null,
+  reason: "explicit_action_mutation_bypass",
+  llmAttempted: false
+};
+const ACTION_MUTATION_LANGUAGE_RE =
+  /\b(move|reschedule|postpone|remind)\b|\bset it\b|\bset (?:this|that)\b|\bchange (?:the )?due\b|\bcomplete (?:it|this|that|the action)\b|\barchive (?:it|this|that|the action)\b|\bremove (?:it|this|that|the action)\b|\bmuevela\b|\bmuevelo\b|\bmoverla\b|\bmoverlo\b|\breprograma(?:rla|rlo)?\b|\bcambia(?:rla|rlo)?\b|\bpon(?:la|lo|erla|erlo)\b|\bmou-l[ao]\b|\bmou-ho\b|\bcanvia-l[ao]\b|\bcanvia-ho\b|\bposa-l[ao]\b|\bposa-ho\b/;
+const ACTION_TARGET_REFERENCE_RE = /\b(the action|this action|that action|la accion|esta accion|l'?accio|aquesta accio)\b/;
+
+/**
+ * Deterministic "this is explicit action maintenance, not goal avoidance" bypass, checked
+ * immediately before the goal-avoidance guardrail call at the main call site below. Never resolves
+ * an operation itself (unlike the other domain shortcuts in this file) — it only decides whether
+ * the goal-avoidance LLM classifier gets a turn at all; the real planner + validator + execution
+ * pipeline runs completely unchanged either way, so nothing here ever mutates state directly.
+ */
+function isExplicitActionMutationGuardrailBypass(message: string, context: ContextBundle): boolean {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return false;
+  }
+
+  // Any goal-abandonment signal disqualifies the bypass unconditionally — explicit action
+  // maintenance language is never allowed to override a real "I want to stop pursuing this."
+  if (
+    GOAL_WORD_RE.test(text) ||
+    GOAL_LIFECYCLE_DONT_WANT_ANYMORE_RE.test(text) ||
+    GOAL_LIFECYCLE_STOP_TRACKING_RE.test(text) ||
+    GOAL_LIFECYCLE_STOP_FOLLOWING_RE.test(text) ||
+    GOAL_LIFECYCLE_NOT_IMPORTANT_RE.test(text)
+  ) {
+    return false;
+  }
+
+  if (!ACTION_MUTATION_LANGUAGE_RE.test(text)) {
+    return false;
+  }
+
+  const hasVisibleAction = context.session.visibleEntities.some((entity) => entity.type === "action");
+  return hasVisibleAction || ACTION_TARGET_REFERENCE_RE.test(text);
+}
 
 /**
  * Deterministic goal-lifecycle intent shortcut — checked BEFORE the goal-avoidance guardrail (see

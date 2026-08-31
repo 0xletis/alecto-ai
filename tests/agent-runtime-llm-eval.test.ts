@@ -14918,11 +14918,18 @@ test(
 
 test(
   "412. 'move it to tomorrow 20:00' keeps the action open with the exact time (task 9-A)",
-  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move"]), timeout: EVAL_TIMEOUT_MS },
+  {
+    ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move", "goal-avoidance-action-bypass"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
   async () => {
     const server = buildServer();
     const userId = `llm-eval-412-${randomUUID()}`;
-    const trace = new EvalTrace("412-move-it-2000", ["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move"], userId);
+    const trace = new EvalTrace(
+      "412-move-it-2000",
+      ["action-snooze-deprecation", "action-move-reschedule-semantics", "action-visibility-after-move", "goal-avoidance-action-bypass"],
+      userId
+    );
 
     try {
       await seedUser(userId);
@@ -14935,6 +14942,8 @@ test(
         assertNoGenericAgentError(reply, "move it to tomorrow 20:00");
         trace.checkpoint("no 'bring back' copy", !/bring.*back/i.test(reply.reply), reply.reply);
         assert.doesNotMatch(reply.reply, /bring.*back/i);
+        trace.checkpoint("never treated as goal avoidance", reply.debug.conversationTopic !== "guardrail", reply.debug.conversationTopic ?? "null");
+        assert.notEqual(reply.debug.conversationTopic, "guardrail", "explicit action rescheduling must never be misread as goal avoidance");
 
         const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
         trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
@@ -15093,12 +15102,19 @@ test(
 );
 
 test(
-  "417. Spanish: 'muévela a mañana a las 20:00' keeps the action open with the exact time (task 9-G)",
-  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  "417. Spanish: 'muévela a mañana a las 20:00' keeps the action open with the exact time (task 9-G / goal-avoidance-action-bypass A)",
+  {
+    ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "goal-avoidance-action-bypass"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
   async () => {
     const server = buildServer();
     const userId = `llm-eval-417-${randomUUID()}`;
-    const trace = new EvalTrace("417-muevela-manana-2000-es", ["action-snooze-deprecation", "action-move-reschedule-semantics"], userId);
+    const trace = new EvalTrace(
+      "417-muevela-manana-2000-es",
+      ["action-snooze-deprecation", "action-move-reschedule-semantics", "goal-avoidance-action-bypass"],
+      userId
+    );
 
     try {
       await seedUser(userId);
@@ -15109,6 +15125,14 @@ test(
         trace.record("muéstrame mis tareas", await sendAgentMessage(server, userId, "muéstrame mis tareas"));
         const reply = trace.record("muévela a mañana a las 20:00", await sendAgentMessage(server, userId, "muévela a mañana a las 20:00"));
         assertNoGenericAgentError(reply, "Spanish move to tomorrow 20:00");
+        // fix/private-alpha-goal-avoidance-action-bypass: this exact phrase used to fail here —
+        // the goal-avoidance guardrail's own LLM classifier read it as "pulling you away from your
+        // goal" and blocked it before action.reschedule ever ran. isExplicitActionMutationGuardrailBypass
+        // (runtime.ts) now skips the guardrail call entirely for explicit action-mutation language
+        // like this, regardless of the digit that used to force it past the deterministic
+        // bare-pronoun shortcut and into the guardrail's path.
+        trace.checkpoint("never treated as goal avoidance", reply.debug.conversationTopic !== "guardrail", reply.debug.conversationTopic ?? "null");
+        assert.notEqual(reply.debug.conversationTopic, "guardrail", "explicit action rescheduling must never be misread as goal avoidance");
 
         const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
         trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
@@ -15125,12 +15149,19 @@ test(
 );
 
 test(
-  "418. Catalan: 'mou-la a demà a les 20:00' keeps the action open with the exact time (task 9-H)",
-  { ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics"]), timeout: EVAL_TIMEOUT_MS },
+  "418. Catalan: 'mou-la a demà a les 20:00' keeps the action open with the exact time (task 9-H / goal-avoidance-action-bypass C)",
+  {
+    ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "goal-avoidance-action-bypass"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
   async () => {
     const server = buildServer();
     const userId = `llm-eval-418-${randomUUID()}`;
-    const trace = new EvalTrace("418-moula-dema-2000-ca", ["action-snooze-deprecation", "action-move-reschedule-semantics"], userId);
+    const trace = new EvalTrace(
+      "418-moula-dema-2000-ca",
+      ["action-snooze-deprecation", "action-move-reschedule-semantics", "goal-avoidance-action-bypass"],
+      userId
+    );
 
     try {
       await seedUser(userId);
@@ -15141,6 +15172,8 @@ test(
         trace.record("mostra'm les meves tasques", await sendAgentMessage(server, userId, "mostra'm les meves tasques"));
         const reply = trace.record("mou-la a demà a les 20:00", await sendAgentMessage(server, userId, "mou-la a demà a les 20:00"));
         assertNoGenericAgentError(reply, "Catalan move to tomorrow 20:00");
+        trace.checkpoint("never treated as goal avoidance", reply.debug.conversationTopic !== "guardrail", reply.debug.conversationTopic ?? "null");
+        assert.notEqual(reply.debug.conversationTopic, "guardrail", "explicit action rescheduling must never be misread as goal avoidance");
 
         const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
         trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
@@ -15148,6 +15181,129 @@ test(
         const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
         trace.checkpoint("due time is 20:00", local === "20:00", local);
         assert.equal(local, "20:00");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// fix/private-alpha-goal-avoidance-action-bypass (Task 5): broader real-LLM multilingual coverage
+// for the same fix — explicit action-mutation language must reach action.reschedule regardless of
+// phrasing/language, and genuine goal-abandonment language must still reach the guardrail
+// regardless of language. Scenarios A/C/D of the task's own list are 417/418/412 above.
+
+test(
+  "419. Spanish: 'reprograma la acción para mañana a las 20:00' keeps the action open (goal-avoidance-action-bypass B)",
+  {
+    ...llmEvalOptions(["action-snooze-deprecation", "action-move-reschedule-semantics", "goal-avoidance-action-bypass"]),
+    timeout: EVAL_TIMEOUT_MS
+  },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-419-${randomUUID()}`;
+    const trace = new EvalTrace(
+      "419-reprograma-manana-2000-es",
+      ["action-snooze-deprecation", "action-move-reschedule-semantics", "goal-avoidance-action-bypass"],
+      userId
+    );
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("muéstrame mis tareas", await sendAgentMessage(server, userId, "muéstrame mis tareas"));
+        const reply = trace.record(
+          "reprograma la acción para mañana a las 20:00",
+          await sendAgentMessage(server, userId, "reprograma la acción para mañana a las 20:00")
+        );
+        assertNoGenericAgentError(reply, "Spanish reprograma the action for tomorrow 20:00");
+        trace.checkpoint("never treated as goal avoidance", reply.debug.conversationTopic !== "guardrail", reply.debug.conversationTopic ?? "null");
+        assert.notEqual(reply.debug.conversationTopic, "guardrail", "explicit action rescheduling must never be misread as goal avoidance");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open");
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(updated!.dueAt!);
+        trace.checkpoint("due time is 20:00", local === "20:00", local);
+        assert.equal(local, "20:00");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "420. Spanish: 'quiero dejar este objetivo' still reaches the real avoidance guardrail, no action touched (goal-avoidance-action-bypass E)",
+  { ...llmEvalOptions(["goal-avoidance-action-bypass"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-420-${randomUUID()}`;
+    const trace = new EvalTrace("420-quiero-dejar-objetivo-es", ["goal-avoidance-action-bypass"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("muéstrame mis tareas", await sendAgentMessage(server, userId, "muéstrame mis tareas"));
+        const reply = trace.record("quiero dejar este objetivo", await sendAgentMessage(server, userId, "quiero dejar este objetivo"));
+        assertNoGenericAgentError(reply, "Spanish genuine goal abandonment");
+        // Never silently treated as an action-mutation bypass — either the guardrail intervenes
+        // directly, or the deterministic goal-lifecycle path (its own real confirmation) handles
+        // it; either is a genuine "still guarded" outcome. What must never happen is the action
+        // getting touched as if this were an ordinary reschedule/archive command.
+        trace.checkpoint(
+          "reaches goal guardrail or goal-lifecycle path, not an action tool",
+          reply.debug.conversationTopic === "guardrail" || reply.debug.conversationTopic === "goal_lifecycle" || reply.debug.conversationTopic === "goals",
+          reply.debug.conversationTopic ?? "null"
+        );
+        assert.notEqual(reply.debug.conversationTopic, "action_cleanup", "genuine goal abandonment must never be routed as an action command");
+        assert.doesNotMatch(reply.reply, /action rescheduled|action archived/i);
+
+        const untouched = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(untouched?.status, "open", "the unrelated action must never be mutated by a goal-abandonment message");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "421. Catalan: 'vull deixar aquest objectiu' still reaches the real avoidance guardrail, no action touched (goal-avoidance-action-bypass F)",
+  { ...llmEvalOptions(["goal-avoidance-action-bypass"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-421-${randomUUID()}`;
+    const trace = new EvalTrace("421-vull-deixar-objectiu-ca", ["goal-avoidance-action-bypass"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 10 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("mostra'm les meves tasques", await sendAgentMessage(server, userId, "mostra'm les meves tasques"));
+        const reply = trace.record("vull deixar aquest objectiu", await sendAgentMessage(server, userId, "vull deixar aquest objectiu"));
+        assertNoGenericAgentError(reply, "Catalan genuine goal abandonment");
+        trace.checkpoint(
+          "reaches goal guardrail or goal-lifecycle path, not an action tool",
+          reply.debug.conversationTopic === "guardrail" || reply.debug.conversationTopic === "goal_lifecycle" || reply.debug.conversationTopic === "goals",
+          reply.debug.conversationTopic ?? "null"
+        );
+        assert.notEqual(reply.debug.conversationTopic, "action_cleanup", "genuine goal abandonment must never be routed as an action command");
+        assert.doesNotMatch(reply.reply, /action rescheduled|action archived/i);
+
+        const untouched = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(untouched?.status, "open", "the unrelated action must never be mutated by a goal-abandonment message");
       });
     } finally {
       await server.close();
