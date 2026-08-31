@@ -4,7 +4,9 @@ import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetim
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import {
   appendMessage,
+  clearAllVisibleEntities,
   createPendingOperationRecord,
+  mostRecentVisibleSurfaceType,
   recordDeferredCapabilityProposal,
   recordMutation,
   removeVisibleEntities,
@@ -110,6 +112,13 @@ const CANCEL_WHITELIST = new Set([
   "no per ara",
   "cancel·la"
 ]);
+
+// fix/private-alpha-conversation-kernel-context-routing (Part 4): "cancel, I mean X"/"no, actually
+// X"/"cancel, X" — a leading cancel word followed by a real correction, as opposed to CANCEL_
+// WHITELIST above (which only ever matches the cancel word ALONE, nothing else in the message).
+// The connector ("i mean"/"actually"/"instead") is deliberately optional — a bare "cancel, X" is
+// just as clear a correction as "cancel, I mean X."
+const CANCEL_WITH_CORRECTION_RE = /^(?:cancel|no|nevermind|never mind|forget it|stop)\b[\s,.:;-]*(?:i mean|actually|instead)?[\s,.:;-]*/i;
 
 // A real Telegram smoke test found "yes create it" rejected — only the bare CONFIRM_WHITELIST
 // phrases above matched, so a clear, unambiguous affirmative got no special handling and fell
@@ -979,8 +988,27 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     // safely resets any visible-entity context (e.g. a numbered action-hygiene list), so a
     // stray later "complete 1" can't resolve against stale state. action.hygiene_apply never
     // requires confirmation, so there is nothing to reject, only this defensive reset.
-    setVisibleEntities(context.session, []);
+    clearAllVisibleEntities(context.session);
     return finalizeNoPendingReply(context, "confirmation.cancel");
+  }
+
+  // fix/private-alpha-conversation-kernel-context-routing (Part 4): "cancel, I mean X"/"no,
+  // actually X" must cancel the pending operation AND route X in the SAME turn — a real reported
+  // bug had this trapped behind "You still have a pending confirmation…" because only an EXACT
+  // "cancel"/"no" (the whitelist check just above) is recognized at all; anything with trailing
+  // text past the cancel word falls straight through to the pending-operation firewall further
+  // down, which can only ever confirm/cancel/re-explain the SAME stale pending operation, never
+  // reinterpret the message as something new. Persists the cancellation before recursing — the
+  // recursive call reloads context fresh from DB, so the corrected request is never blocked by
+  // the very pending operation this turn just cleared.
+  if (pending) {
+    const correctionMatch = message.trim().match(CANCEL_WITH_CORRECTION_RE);
+    const remainder = correctionMatch ? message.trim().slice(correctionMatch[0].length).trim() : "";
+    if (correctionMatch && remainder.length > 0) {
+      setPendingOperation(context.session, null);
+      await saveSession(context.session);
+      return processAgentMessageInner({ ...request, message: remainder });
+    }
   }
 
   const pendingGoalProposalBeingRefined =
@@ -1010,6 +1038,21 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const gmailGoalUsageStatus = await gmailGoalUsageStatusResponse(context, message);
   if (gmailGoalUsageStatus) {
     return gmailGoalUsageStatus;
+  }
+
+  // fix/private-alpha-conversation-kernel-context-routing: checked BEFORE every other Gmail/action
+  // shortcut below — a real reported bug had "remove all as I already counted them" (Gmail reviews
+  // the ONLY thing just shown) route to action.archive_all_propose instead (bulkActionCleanupShort
+  // cutOperation's own `hasVisibleActions` check only asks "does ANY action entity exist somewhere
+  // in visibleEntities," never "is that actually the surface being talked about" — a stale action
+  // entity from much earlier in the conversation was enough to win), and a follow-up "remove all
+  // mail reviews" route to gmail.disconnect_propose instead (GMAIL_DISCONNECT_RE matches
+  // "remove...mail" with no idea "mail reviews" means the review QUEUE, not the account). Checked
+  // here, gated on !pending same as the other confirmation-relevant shortcuts, so a genuinely
+  // Gmail-review-scoped bulk instruction always wins the race over both.
+  const gmailReviewBulkTriageResponse = !pending ? await gmailReviewBulkTriageShortcut(message, context) : undefined;
+  if (gmailReviewBulkTriageResponse) {
+    return gmailReviewBulkTriageResponse;
   }
 
   // fix/private-alpha-gmail-review-llm-instruction-routing: checked BEFORE gmail.sync — a real
@@ -1668,8 +1711,10 @@ async function finalizeDeterministicOperations(
 
 function looksLikeGmailReviewListRequest(text: string, context?: ContextBundle): boolean {
   return (
-    /\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b[\s\S]{0,50}\b(email reviews?|gmail reviews?|emails? to review|items? to review)\b/.test(text) ||
-    /\b(email reviews?|gmail reviews?|emails? to review|items? to review)\b[\s\S]{0,50}\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b/.test(text) ||
+    // "mail reviews" (bare "mail," not just "email"/"gmail") — a real requested phrasing: "show
+    // me mail reviews" means the review queue exactly like "show me email reviews" does.
+    /\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b[\s\S]{0,50}\b(mail reviews?|email reviews?|gmail reviews?|emails? to review|items? to review)\b/.test(text) ||
+    /\b(mail reviews?|email reviews?|gmail reviews?|emails? to review|items? to review)\b[\s\S]{0,50}\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b/.test(text) ||
     /^email reviews?$/.test(text) ||
     /\bwhat emails? need (my )?attention\b/.test(text) ||
     (/^show me (?:the )?reviews?$/.test(text) && Boolean(context && (context.gmailReviews.length > 0 || hasRecentGmailContext(context)))) ||
@@ -1829,6 +1874,75 @@ const VAGUE_GMAIL_REVIEW_MUTATION_PATTERNS = [
   /\bclean\s+(it|them|these|those|this)(\s+\w+)?\s+up\b/,
   /\bclean\s+up\s+(it|them|these|those|this)\b/
 ];
+
+// fix/private-alpha-conversation-kernel-context-routing (Part 5): explicit wording always wins
+// regardless of which surface was last shown — "remove/reject/clear/delete all mail/gmail/email
+// reviews" unambiguously means the review QUEUE, never the Gmail ACCOUNT (that requires actual
+// account/connect/disconnect/switch/authorize wording — see gmailDisconnectShortcutOperation).
+const GMAIL_REVIEW_BULK_EXPLICIT_RE =
+  /\b(remove|reject|clear|delete|ignore)\b[\s\S]{0,15}\ball\b[\s\S]{0,25}\b(gmail|mail|email)\b[\s\S]{0,10}\breviews?\b|\b(borra|elimina|rechaza|quita)[a-z]*\b[\s\S]{0,15}\b(todas?|totes?)\b[\s\S]{0,20}\b(revisiones|revisions|reviews?)\b[\s\S]{0,20}\b(correos?|correus?|mail|email)\b|\b(esborra|rebutja)[a-z]*\b[\s\S]{0,15}\btotes?\b[\s\S]{0,20}\b(revisions|reviews?)\b[\s\S]{0,20}\b(correus?|mail|email)\b/i;
+// A bare "remove all"/"reject all"/"clear all" with no explicit domain word — only means Gmail
+// reviews when that's genuinely the surface the user was just looking at (see
+// mostRecentVisibleSurfaceType's own call site below), and explicitly excludes "all
+// actions/tasks" wording so it never steals a message actually meant for bulkActionCleanup.
+const BARE_BULK_REMOVE_RE = /\b(remove|reject|clear|delete|ignore)\b[\s\S]{0,10}\ball\b(?![\s\S]{0,15}\b(actions?|tasks?)\b)/i;
+
+function gmailReviewBulkTriageShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
+  const visibleReviews = context.session.visibleEntities.filter(
+    (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+  );
+  if (visibleReviews.length === 0) {
+    return [];
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return [];
+  }
+
+  const explicitReviewWording = GMAIL_REVIEW_BULK_EXPLICIT_RE.test(text);
+  const bareBulkWording = BARE_BULK_REMOVE_RE.test(text);
+  const gmailReviewsAreTheActiveSurface = mostRecentVisibleSurfaceType(context.session) === "gmail_review";
+
+  if (!explicitReviewWording && !(bareBulkWording && gmailReviewsAreTheActiveSurface)) {
+    return [];
+  }
+
+  return visibleReviews.map((entity) => ({
+    tool: "gmail.review.reject",
+    args: { index: entity.index },
+    rationale: "user asked to remove/reject/clear all visible Gmail reviews — this only decides Alecto's own review queue, never the real mailbox"
+  }));
+}
+
+/** True when the user's own wording explains WHY they're clearing the queue (e.g. "I already
+ * counted them when I sent the update") — surfaced back in the reply so the response is specific
+ * to what they actually said, not a generic receipt. */
+function extractBulkReviewDismissalReason(message: string): string | undefined {
+  const text = message.toLowerCase();
+  if (/\balready (counted|logged|reported|sent|included|tracked)\b/.test(text)) {
+    return "Since you already counted/logged that separately, I won't count these again.";
+  }
+  return undefined;
+}
+
+async function gmailReviewBulkTriageShortcut(message: string, context: ContextBundle): Promise<AgentMessageResponse | undefined> {
+  const operations = gmailReviewBulkTriageShortcutOperation(message, context);
+  if (operations.length === 0) {
+    return undefined;
+  }
+
+  const count = operations.length;
+  const response = await finalizeDeterministicOperations(context, message, operations, "gmail_reviews");
+  const allSucceeded = response.operationsExecuted.length > 0 && response.operationsExecuted.every((op) => op.status === "executed");
+  if (!allSucceeded) {
+    return response;
+  }
+
+  const reasonNote = extractBulkReviewDismissalReason(message);
+  const reply = `Got it — ignored the ${count} visible Gmail review${count === 1 ? "" : "s"}.${reasonNote ? ` ${reasonNote}` : ""} I did not delete any emails.`;
+  return { ...response, reply };
+}
 
 const GMAIL_REVIEW_CLARIFICATION_REPLY = "I can ignore them, turn them into tasks, keep them for later, or show more detail. Which should I do?";
 
@@ -2933,10 +3047,16 @@ function gmailConnectionShortcutOperation(message: string, context: ContextBundl
 const GMAIL_DISCONNECT_RE =
   /\b(disconnect|remove|unlink)\b[\s\S]{0,20}\b(gmail|mail|email)\b|\bstop using\b[\s\S]{0,15}\bgmail\b[\s\S]{0,15}\baccount\b/i;
 const GMAIL_DISCONNECT_GOAL_SCOPED_RE = /\bfor\b/i;
+// fix/private-alpha-conversation-kernel-context-routing: defense-in-depth only — the new
+// gmailReviewBulkTriageShortcut above already claims "remove all mail reviews"-shaped messages
+// before this function is ever reached, but this exclusion keeps this function itself honest
+// (and safe on its own) in case something ever changes the dispatch order — "mail/email/gmail
+// reviews" always means the review QUEUE, never the account.
+const GMAIL_DISCONNECT_REVIEW_SCOPED_RE = /\breviews?\b/i;
 
 function gmailDisconnectShortcutOperation(message: string): PlannedOperation | undefined {
   const text = normalizeIntentText(message);
-  if (!text || !GMAIL_DISCONNECT_RE.test(text) || GMAIL_DISCONNECT_GOAL_SCOPED_RE.test(text)) {
+  if (!text || !GMAIL_DISCONNECT_RE.test(text) || GMAIL_DISCONNECT_GOAL_SCOPED_RE.test(text) || GMAIL_DISCONNECT_REVIEW_SCOPED_RE.test(text)) {
     return undefined;
   }
   return { tool: "gmail.disconnect_propose", args: {}, rationale: "user asked to disconnect/remove/unlink Gmail" };
@@ -3798,7 +3918,7 @@ async function finalizeDeterministicCancellation(context: ContextBundle, message
   // visible entities really were specific to that now-cancelled flow.
   const clearedVisibleEntities = pending.topic !== ACTION_CLARIFICATION_TOPIC;
   if (clearedVisibleEntities) {
-    setVisibleEntities(context.session, []);
+    clearAllVisibleEntities(context.session);
   }
   logAgentRuntimeDiagnostics({
     phase: "cancellation",

@@ -14520,3 +14520,383 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-conversation-kernel-context-routing: typed visible surfaces, pending-
+// confirmation supersede, Gmail-review-vs-action/account routing, action pronoun resolution, and
+// default due-time policy. Real LLM planner, no deterministic mocks. -----------------------------
+
+test(
+  "401. after Gmail reviews, 'remove all as I already counted them' routes to review triage, never action archive",
+  { ...llmEvalOptions(["conversation-kernel-routing", "gmail-review-context-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-401-${randomUUID()}`;
+    const trace = new EvalTrace("401-remove-all-reviews", ["conversation-kernel-routing", "gmail-review-context-routing"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+      for (let i = 0; i < 5; i++) {
+        await seedEvalReview(userId, connection.id, rule.id, { subject: `Recruiter note ${i}`, from: "x@example.com", proposedEventType: "career.recruiter_reply_received" });
+      }
+
+      await trace.guard(async () => {
+        trace.record("show me email reviews", await sendAgentMessage(server, userId, "show me email reviews"));
+        const reply = trace.record(
+          "remove all as I already counted them when I sent the update",
+          await sendAgentMessage(server, userId, "remove all as I already counted them when I sent the update")
+        );
+        assertNoGenericAgentError(reply, "remove all after reviews");
+        trace.checkpoint("never routes to action archive", !reply.operationsExecuted.some((o) => o.tool.startsWith("action.archive")), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool.startsWith("action.archive")), `expected no action-archive route — got: ${JSON.stringify(reply.operationsExecuted)}`);
+
+        const action = await prisma.actionItem.findFirst({ where: { userId } });
+        trace.checkpoint("the unrelated action stayed open", action?.status === "open", action?.status ?? "missing");
+        assert.equal(action?.status, "open");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "402. 'cancel, I mean remove all mail reviews' cancels the pending confirmation AND routes the corrected request",
+  { ...llmEvalOptions(["pending-confirmation-supersede", "gmail-review-context-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-402-${randomUUID()}`;
+    const trace = new EvalTrace("402-cancel-and-correct", ["pending-confirmation-supersede", "gmail-review-context-routing"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Recruiter note", from: "x@example.com", proposedEventType: "career.recruiter_reply_received" });
+
+      await trace.guard(async () => {
+        trace.record("show me email reviews", await sendAgentMessage(server, userId, "show me email reviews"));
+        // Open a real, unrelated pending confirmation to correct away from.
+        trace.record("disconnect Gmail", await sendAgentMessage(server, userId, "disconnect Gmail"));
+
+        const reply = trace.record("cancel, I mean remove all mail reviews", await sendAgentMessage(server, userId, "cancel, I mean remove all mail reviews"));
+        assertNoGenericAgentError(reply, "cancel and correct");
+        trace.checkpoint("no longer has the disconnect pending", reply.debug.pendingOperation === false || reply.operationsExecuted.some((o) => o.tool === "gmail.review.reject"), JSON.stringify(reply));
+        assert.ok(
+          !reply.reply.match(/still have a pending confirmation/i),
+          `must never stay trapped behind the cancelled pending confirmation — got: ${reply.reply}`
+        );
+
+        const connectionAfter = await prisma.integrationConnection.findUnique({ where: { id: connection.id } });
+        trace.checkpoint("Gmail account itself was never disconnected", connectionAfter?.status === "active", connectionAfter?.status ?? "missing");
+        assert.equal(connectionAfter?.status, "active");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "403. 'remove all mail reviews' routes to review triage, never Gmail account disconnect",
+  { ...llmEvalOptions(["gmail-review-context-routing", "conversation-kernel-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-403-${randomUUID()}`;
+    const trace = new EvalTrace("403-remove-all-mail-reviews", ["gmail-review-context-routing", "conversation-kernel-routing"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Recruiter note", from: "x@example.com", proposedEventType: "career.recruiter_reply_received" });
+
+      await trace.guard(async () => {
+        trace.record("show me email reviews", await sendAgentMessage(server, userId, "show me email reviews"));
+        const reply = trace.record("remove all mail reviews", await sendAgentMessage(server, userId, "remove all mail reviews"));
+        assertNoGenericAgentError(reply, "remove all mail reviews");
+        trace.checkpoint("never routes to gmail disconnect", !reply.operationsExecuted.some((o) => o.tool === "gmail.disconnect_propose"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool === "gmail.disconnect_propose"));
+
+        const connectionAfter = await prisma.integrationConnection.findUnique({ where: { id: connection.id } });
+        assert.equal(connectionAfter?.status, "active");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "404. 'complete the open action as I did send 15 already today' resolves to the single open action",
+  { ...llmEvalOptions(["action-pronoun-resolution", "conversation-kernel-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-404-${randomUUID()}`;
+    const trace = new EvalTrace("404-complete-open-action", ["action-pronoun-resolution", "conversation-kernel-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "complete the open action as I did send 15 already today",
+          await sendAgentMessage(server, userId, "complete the open action as I did send 15 already today")
+        );
+        assertNoGenericAgentError(reply, "complete open action");
+        trace.checkpoint("never says 0 actions shown", !/only showed 0 actions/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /only showed 0 actions/i);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the action was completed", updated?.status === "completed", updated?.status ?? "missing");
+        assert.equal(updated?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "405. show actions -> show progress -> complete action 1 still resolves (goal.status must not erase the action list)",
+  { ...llmEvalOptions(["visible-surface-reference-resolution", "action-pronoun-resolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-405-${randomUUID()}`;
+    const trace = new EvalTrace("405-progress-then-complete-1", ["visible-surface-reference-resolution", "action-pronoun-resolution"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        trace.record("show my goal progress", await sendAgentMessage(server, userId, "show my goal progress"));
+        const reply = trace.record("complete action 1", await sendAgentMessage(server, userId, "complete action 1"));
+        assertNoGenericAgentError(reply, "complete action 1 after progress");
+        trace.checkpoint("never says 0 actions shown", !/only showed 0 actions/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /only showed 0 actions/i);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the action was completed", updated?.status === "completed", updated?.status ?? "missing");
+        assert.equal(updated?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "406. show one action -> 'move it to tomorrow 23:59' resolves 'it' and applies the exact time",
+  { ...llmEvalOptions(["visible-surface-reference-resolution", "action-due-time-defaults"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-406-${randomUUID()}`;
+    const trace = new EvalTrace("406-move-it-2359", ["visible-surface-reference-resolution", "action-due-time-defaults"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Send 10 CVs", priority: "high", dueAt: new Date(Date.now() + 24 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        trace.record("show me my actions", await sendAgentMessage(server, userId, "show me my actions"));
+        const reply = trace.record(
+          "move it to tomorrow 23:59 as 9 am makes no sense",
+          await sendAgentMessage(server, userId, "move it to tomorrow 23:59 as 9 am makes no sense")
+        );
+        assertNoGenericAgentError(reply, "move it to 23:59");
+        trace.checkpoint("never says only 1 action shown", !/only showed 1 action/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /only showed 1 action/i);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        // The real planner may reasonably reach for EITHER action.reschedule (updates dueAt
+        // directly) or action.snooze ("bring it back at X" — updates snoozedUntil, dueAt itself
+        // stays as-is until the action becomes due again) for "move it to X" — both are correct,
+        // equally valid tools for this message, so check whichever one actually got set.
+        const effective = updated!.snoozedUntil ?? updated!.dueAt!;
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(effective);
+        trace.checkpoint("due/snooze time is 23:59", local === "23:59", local);
+        assert.equal(local, "23:59");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "407. 'make tomorrow sending 10 more' creates a new action due tomorrow at end of day, not 9am",
+  { ...llmEvalOptions(["action-due-time-defaults"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-407-${randomUUID()}`;
+    const trace = new EvalTrace("407-make-tomorrow-10-more", ["action-due-time-defaults"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("make tomorrow sending 10 more", await sendAgentMessage(server, userId, "make tomorrow sending 10 more"));
+        assertNoGenericAgentError(t1, "make tomorrow sending 10 more");
+        if (t1.needsConfirmation) {
+          trace.record("yes", await sendAgentMessage(server, userId, "yes"));
+        }
+
+        const action = await prisma.actionItem.findFirst({ where: { userId, status: "open" }, orderBy: { createdAt: "desc" } });
+        trace.checkpoint("a new action was created", Boolean(action), action?.title ?? "none");
+        assert.ok(action, "expected a new action to have been created");
+        const local = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Madrid", hour: "2-digit", minute: "2-digit", hour12: false }).format(action!.dueAt!);
+        trace.checkpoint("due time defaults to end of day, not 9am", local === "23:59", local);
+        assert.equal(local, "23:59", `expected the new action to default to 23:59 for a bare "tomorrow" — got ${local}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "408. Spanish: 'borra todas las reviews del mail' routes to review triage",
+  { ...llmEvalOptions(["gmail-review-context-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-408-${randomUUID()}`;
+    const trace = new EvalTrace("408-borra-reviews-es", ["gmail-review-context-routing"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Recruiter note", from: "x@example.com", proposedEventType: "career.recruiter_reply_received" });
+
+      await trace.guard(async () => {
+        trace.record("muestra las revisiones de correo", await sendAgentMessage(server, userId, "muestra las revisiones de correo"));
+        const reply = trace.record("borra todas las reviews del mail", await sendAgentMessage(server, userId, "borra todas las reviews del mail"));
+        assertNoGenericAgentError(reply, "Spanish bulk review removal");
+        trace.checkpoint("never routes to gmail disconnect", !reply.operationsExecuted.some((o) => o.tool === "gmail.disconnect_propose"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool === "gmail.disconnect_propose"));
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "409. Catalan: 'elimina totes les revisions del correu' routes to review triage",
+  { ...llmEvalOptions(["gmail-review-context-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-409-${randomUUID()}`;
+    const trace = new EvalTrace("409-elimina-revisions-ca", ["gmail-review-context-routing"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Recruiter note", from: "x@example.com", proposedEventType: "career.recruiter_reply_received" });
+
+      await trace.guard(async () => {
+        trace.record("mostra les revisions de correu", await sendAgentMessage(server, userId, "mostra les revisions de correu"));
+        const reply = trace.record("elimina totes les revisions del correu", await sendAgentMessage(server, userId, "elimina totes les revisions del correu"));
+        assertNoGenericAgentError(reply, "Catalan bulk review removal");
+        trace.checkpoint("never routes to gmail disconnect", !reply.operationsExecuted.some((o) => o.tool === "gmail.disconnect_propose"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool === "gmail.disconnect_propose"));
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "410. Spanish: 'completa la accion abierta, ya envie 15 CVs' resolves to the single open action",
+  { ...llmEvalOptions(["action-pronoun-resolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-410-${randomUUID()}`;
+    const trace = new EvalTrace("410-completa-accion-es", ["action-pronoun-resolution"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "completa la accion abierta, ya envie 15 CVs",
+          await sendAgentMessage(server, userId, "completa la accion abierta, ya envie 15 CVs")
+        );
+        assertNoGenericAgentError(reply, "Spanish complete open action");
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the action was completed", updated?.status === "completed", updated?.status ?? "missing");
+        assert.equal(updated?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "411. Catalan: 'completa l'accio oberta, ja he enviat 15 CVs' resolves to the single open action",
+  { ...llmEvalOptions(["action-pronoun-resolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-411-${randomUUID()}`;
+    const trace = new EvalTrace("411-completa-accio-ca", ["action-pronoun-resolution"], userId);
+
+    try {
+      await seedUser(userId);
+      await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      const action = await createActionItem(userId, { source: "manual", title: "Enviar 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "completa l'accio oberta, ja he enviat 15 CVs",
+          await sendAgentMessage(server, userId, "completa l'accio oberta, ja he enviat 15 CVs")
+        );
+        assertNoGenericAgentError(reply, "Catalan complete open action");
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("the action was completed", updated?.status === "completed", updated?.status ?? "missing");
+        assert.equal(updated?.status, "completed");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

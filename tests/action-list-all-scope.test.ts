@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, prisma, snoozeActionItem } from "../packages/db/src/index.ts";
-import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+import { buildServer, clearAgentRuntimeMocks, mockNow, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+
+// fix/private-alpha-conversation-kernel-context-routing (flake fix): the "today" fixture below
+// used to be seeded relative to real Date.now(), which silently rolled onto tomorrow's local date
+// whenever the suite ran within an hour of local midnight (Europe/Madrid) — a real, observed
+// failure. Pinned to a fixed midday instant, safely away from any local-midnight boundary, and
+// shared with the executor's own `now` via mockNow so both sides always agree on what "today" is.
+const FIXED_NOW = new Date("2026-08-31T10:00:00.000Z"); // 12:00 Europe/Madrid (CEST, UTC+2)
 
 /**
  * fix/private-alpha-live-action-and-coaching-regressions (Task 2): a real Telegram transcript
@@ -22,11 +29,11 @@ import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, se
  * by the tagged LLM eval scenarios.
  */
 
-async function seedFullActionSpread(userId: string) {
-  const overdue = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", dueAt: new Date(Date.now() - 24 * 60 * 60 * 1000) });
-  const today = await createActionItem(userId, { source: "manual", title: "Call the bank", priority: "medium", dueAt: new Date(Date.now() + 60 * 60 * 1000) });
+async function seedFullActionSpread(userId: string, now: Date = FIXED_NOW) {
+  const overdue = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", dueAt: new Date(now.getTime() - 24 * 60 * 60 * 1000) });
+  const today = await createActionItem(userId, { source: "manual", title: "Call the bank", priority: "medium", dueAt: new Date(now.getTime() + 60 * 60 * 1000) });
   const deferred = await createActionItem(userId, { source: "manual", title: "Book flights", priority: "low" });
-  await snoozeActionItem(userId, deferred.id, new Date(Date.now() + 24 * 60 * 60 * 1000));
+  await snoozeActionItem(userId, deferred.id, new Date(now.getTime() + 24 * 60 * 60 * 1000));
   const archived = await createActionItem(userId, { source: "manual", title: "Old idea", priority: "low" });
   await prisma.actionItem.update({ where: { id: archived.id }, data: { status: "archived" } });
   return { overdue, today, deferred, archived };
@@ -41,6 +48,7 @@ test("A. 'show all actions' lists overdue + today + deferred, even when the plan
   const userId = `all-scope-a-${randomUUID()}`;
   try {
     await seedUser(userId);
+    mockNow(FIXED_NOW.toISOString());
     await seedFullActionSpread(userId);
 
     // Simulates the exact real-transcript planner mistake: `when: "today"` supplied for a plain
@@ -64,6 +72,7 @@ test("B. 'show me today's actions' stays scoped to today even when the planner m
   const userId = `all-scope-b-${randomUUID()}`;
   try {
     await seedUser(userId);
+    mockNow(FIXED_NOW.toISOString());
     await seedFullActionSpread(userId);
 
     mockPlan(actionListPlan({ when: "today" }));
@@ -83,6 +92,7 @@ test("C. a genuinely vague 'show me my actions' (no day named) keeps the determi
   const userId = `all-scope-c-${randomUUID()}`;
   try {
     await seedUser(userId);
+    mockNow(FIXED_NOW.toISOString());
     await seedFullActionSpread(userId);
 
     // Planner mistakenly carries over `when: "this_week"` from an earlier turn.
@@ -103,6 +113,7 @@ test("D. archived/completed items are shown only when explicitly requested, neve
   const userId = `all-scope-d-${randomUUID()}`;
   try {
     await seedUser(userId);
+    mockNow(FIXED_NOW.toISOString());
     await seedFullActionSpread(userId);
 
     mockPlan(actionListPlan({ status: "all" }));
@@ -124,6 +135,7 @@ test("E. no misleading 'scheduled for today' copy for an all-actions query with 
   const userId = `all-scope-e-${randomUUID()}`;
   try {
     await seedUser(userId);
+    mockNow(FIXED_NOW.toISOString());
     await seedFullActionSpread(userId);
 
     mockPlan(actionListPlan({ when: "today" }));
@@ -142,6 +154,7 @@ test("exact live regression: 'And showme all actions' (the tester's real typo'd 
   const userId = `all-scope-live-${randomUUID()}`;
   try {
     await seedUser(userId);
+    mockNow(FIXED_NOW.toISOString());
     await seedFullActionSpread(userId);
 
     mockPlan(actionListPlan({ when: "today" }));

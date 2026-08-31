@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createActionItem, prisma } from "../packages/db/src/index.ts";
-import { buildServer, clearAgentRuntimeMocks, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
+import { buildServer, clearAgentRuntimeMocks, mockNow, mockPlan, op, sendAgentMessage, seedUser } from "./helpers/agent-runtime-test-helpers.ts";
 
 /**
  * fix/private-alpha-coach-first-response-routing: the exact live transcript this fix closes —
@@ -93,6 +93,12 @@ test("E. explicit 'move it to tonight at 20:00' still mutates", async () => {
   const userId = `coach-first-e-${randomUUID()}`;
   try {
     await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid" } });
+    // fix/private-alpha-conversation-kernel-context-routing (flake fix): "tonight at 20:00" is only
+    // in the future if the suite happens to run before 20:00 Europe/Madrid — pin `now` to a fixed
+    // instant well before that (12:00 Madrid) so this test is deterministic at any real wall-clock
+    // hour. See the dedicated after-20:00 test below for the case where the target time has passed.
+    mockNow("2026-08-31T10:00:00.000Z"); // 12:00 Europe/Madrid (CEST, UTC+2)
     const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
     await makeActionVisible(server, userId);
 
@@ -102,6 +108,36 @@ test("E. explicit 'move it to tonight at 20:00' still mutates", async () => {
     assert.equal(reply.debug.mutationExecuted, true, "an explicit, unambiguous instruction must still mutate");
     const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
     assert.ok(updated?.dueAt);
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("E2. after 20:00 Europe/Madrid, 'move it to tonight at 20:00' is rejected, not silently scheduled into the past", async () => {
+  const server = buildServer();
+  const userId = `coach-first-e2-${randomUUID()}`;
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid" } });
+    // Pin `now` PAST the target hour (21:00 Europe/Madrid) — "tonight at 20:00" is now an explicit
+    // time that has already passed today. The product rule (packages/core/src/action-intake.ts,
+    // pastExplicitDateResult / invalidReason "past_explicit_time") deliberately refuses to silently
+    // schedule an explicit time into the past; the executor surfaces that as a failed operation with
+    // a clarification instead of a phantom "rescheduled" mutation. This is the safest of the three
+    // candidate behaviors (ask / roll to tomorrow / reject) since it never guesses the user's intent.
+    mockNow("2026-08-31T19:00:00.000Z"); // 21:00 Europe/Madrid (CEST, UTC+2)
+    const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+    await makeActionVisible(server, userId);
+
+    mockPlan(reschedulePlan(action.id, "tonight at 20:00", "Moved it to tonight at 20:00."));
+    const reply = await sendAgentMessage(server, userId, "move it to tonight at 20:00");
+
+    assert.equal(reply.debug.mutationExecuted, false, "an explicit time that has already passed today must never silently mutate");
+    assert.match(reply.reply, /couldn't understand|understand the new due time/i);
+    const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(updated?.dueAt, null, "the action must stay untouched, not silently scheduled into the past");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -223,6 +259,11 @@ test("supplementary: an explicit reschedule that would TIGHTEN an already-due de
   const userId = `coach-first-stricter-${randomUUID()}`;
   try {
     await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid" } });
+    // fix/private-alpha-conversation-kernel-context-routing (flake fix): "today at 18:00" is only
+    // in the future — and only earlier than the action's 23:59 deadline — if the suite happens to
+    // run before 18:00 Europe/Madrid. Pin `now` so this is deterministic at any real wall-clock hour.
+    mockNow("2026-08-31T10:00:00.000Z"); // 12:00 Europe/Madrid (CEST, UTC+2)
     const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", dueAt: new Date("2026-08-31T23:59:00.000Z") });
     await makeActionVisible(server, userId);
 
@@ -239,6 +280,69 @@ test("supplementary: an explicit reschedule that would TIGHTEN an already-due de
     assert.equal(confirmed.debug.mutationExecuted, true, "confirming must actually apply the tightened deadline");
     const applied = await prisma.actionItem.findUnique({ where: { id: action.id } });
     assert.ok(applied?.dueAt && applied.dueAt.getTime() < untouched!.dueAt!.getTime());
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("K. stricter-deadline guard (a): due tomorrow 23:59, 'move it to tomorrow 20:00' tightens — needs confirmation", async () => {
+  const server = buildServer();
+  const userId = `coach-first-stricter-a-${randomUUID()}`;
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid" } });
+    mockNow("2026-08-31T10:00:00.000Z"); // 12:00 Europe/Madrid (CEST, UTC+2)
+    const action = await createActionItem(userId, {
+      source: "manual",
+      title: "Send 3 CVs",
+      priority: "high",
+      dueAt: new Date("2026-09-01T21:59:00.000Z") // tomorrow 23:59 Europe/Madrid
+    });
+    await makeActionVisible(server, userId);
+
+    mockPlan(reschedulePlan(action.id, "tomorrow at 20:00", "Moved it to tomorrow 20:00."));
+    const reply = await sendAgentMessage(server, userId, "move it to tomorrow at 20:00");
+
+    assert.equal(reply.debug.mutationExecuted, false, "moving a deadline earlier must require confirmation");
+    assert.equal(reply.debug.pendingOperation, true);
+    const untouched = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(untouched?.dueAt?.toISOString(), "2026-09-01T21:59:00.000Z");
+
+    const confirmed = await sendAgentMessage(server, userId, "yes");
+    assert.equal(confirmed.debug.mutationExecuted, true, "confirming must apply the tightened deadline");
+    const applied = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.ok(applied?.dueAt && applied.dueAt.getTime() < untouched!.dueAt!.getTime());
+  } finally {
+    clearAgentRuntimeMocks();
+    await server.close();
+    await prisma.user.deleteMany({ where: { id: userId } });
+  }
+});
+
+test("L. stricter-deadline guard (b): due tomorrow 09:00, 'move it to tomorrow 23:59' loosens — applies without confirmation", async () => {
+  const server = buildServer();
+  const userId = `coach-first-stricter-b-${randomUUID()}`;
+  try {
+    await seedUser(userId);
+    await prisma.notificationSettings.create({ data: { userId, timezone: "Europe/Madrid" } });
+    mockNow("2026-08-31T10:00:00.000Z"); // 12:00 Europe/Madrid (CEST, UTC+2)
+    const action = await createActionItem(userId, {
+      source: "manual",
+      title: "Send 3 CVs",
+      priority: "high",
+      dueAt: new Date("2026-09-01T07:00:00.000Z") // tomorrow 09:00 Europe/Madrid
+    });
+    await makeActionVisible(server, userId);
+
+    mockPlan(reschedulePlan(action.id, "tomorrow at 23:59", "Moved it to tomorrow 23:59."));
+    const reply = await sendAgentMessage(server, userId, "move it to tomorrow at 23:59");
+
+    assert.equal(reply.debug.mutationExecuted, true, "moving a deadline later must apply immediately, no confirmation needed");
+    assert.equal(reply.debug.pendingOperation, false);
+    const applied = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(applied?.dueAt?.toISOString(), "2026-09-01T21:59:00.000Z");
   } finally {
     clearAgentRuntimeMocks();
     await server.close();

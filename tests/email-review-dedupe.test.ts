@@ -7164,7 +7164,10 @@ test("natural action due parser supports day parts and explicit times", () => {
     tonightTimeMinutes: 1260
   };
 
-  assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow", { now, preferences }).dueAt), 540);
+  // fix/private-alpha-conversation-kernel-context-routing: a bare "tomorrow" (no time, no
+  // day-part) now defaults to end of day (23:59 = minute 1439), not defaultActionTimeMinutes —
+  // the same "day-level task, not a specific moment" treatment "today" alone already got.
+  assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow", { now, preferences }).dueAt), 23 * 60 + 59);
   assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow afternoon", { now, preferences }).dueAt), 900);
   assert.equal(localMinutes(parseActionDueDate("call Alex tomorrow evening", { now, preferences }).dueAt), 1140);
   assert.equal(localMinutes(parseActionDueDate("send CV tonight", { now, preferences }).dueAt), 1260);
@@ -9374,7 +9377,8 @@ test("action hygiene ignores future snoozed actions and updates daily loop hygie
       payload: { userId: hygieneUserId, message: "snooze 1 tomorrow" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Action snoozed until 05\/08\/2026, 09:00: Write YouTube script/);
+    // fix/private-alpha-conversation-kernel-context-routing: bare "tomorrow" now defaults to 23:59.
+    assert.match(response.json().reply, /Action snoozed until 05\/08\/2026, 23:59: Write YouTube script/);
     const snoozed = await prisma.actionItem.findUniqueOrThrow({ where: { id: action.id } });
     assert.equal(snoozed.status, "snoozed");
 
@@ -9538,7 +9542,12 @@ test("action hygiene sessions stay active and never fake snooze success", async 
       payload: { userId: hygieneUserId, message: "snooze 2 tomorrow" }
     });
     assert.equal(response.statusCode, 200);
-    assert.match(response.json().reply, /Action snoozed until 11\/08\/2026, 09:00: Review homepage/);
+    // fix/private-alpha-conversation-kernel-context-routing: a bare "tomorrow" (no time, no
+    // day-part) for a due-by action now defaults to end of day (23:59), not a specific 9am
+    // appointment — the same "day-level task, not a precise moment" reasoning parseActionDueDate's
+    // "today" branch already applied, extended to "tomorrow." Snoozing an action to "tomorrow"
+    // is the same due-by concept, so this is a deliberate, expected change, not a regression.
+    assert.match(response.json().reply, /Action snoozed until 11\/08\/2026, 23:59: Review homepage/);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: secondAction.id } })).status, "snoozed");
   } finally {
     await server.close();
