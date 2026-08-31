@@ -1,5 +1,6 @@
 import type { ActionItem, EmailReviewItem } from "@operator-agent/db";
-import type { NotificationSettings, StoredEvent } from "@operator-agent/core";
+import type { Goal, NotificationSettings, StoredEvent } from "@operator-agent/core";
+import { progressExamplePhraseForGoal } from "@operator-agent/core";
 import { GOAL_ANCHOR_NUDGE_REPLY } from "../agent-runtime/runtime.js";
 import type { AgentEntity, ContextBundle } from "../agent-runtime/types.js";
 import { resolveActiveGoalIdsForGmailRule } from "../conversation/gmail-autonomy.js";
@@ -332,6 +333,24 @@ function describeGmailSignalsForBrief(goalLinkedReviews: EmailReviewItem[], goal
   return lines;
 }
 
+/**
+ * fix/private-alpha-gmail-account-switch-and-personalized-examples (Part B): a real reported gap —
+ * the evening nudge always suggested "gym 45m and sent 2 CVs" verbatim, even for a user whose only
+ * active goal was finance/travel/meaning-shaped and had nothing to do with a gym or a job search.
+ * Picks the first untracked/no-metric goal's own deterministic example category
+ * (progress-examples.ts); falls back to a generic phrase only when none of the given goals
+ * classify into a known category.
+ */
+function exampleReplyForGoals(goals: Goal[]): string {
+  for (const goal of goals) {
+    const phrase = progressExamplePhraseForGoal(goal);
+    if (phrase) {
+      return phrase;
+    }
+  }
+  return "made progress on my main goal";
+}
+
 function buildEveningCheckin(
   context: ContextBundle,
   settings: NotificationSettings,
@@ -407,13 +426,14 @@ function buildEveningCheckin(
       return null;
     }
     const goalPhrases = goalsWithNoTrackableMetric.map((goal) => goal.title.toLowerCase());
+    const example = exampleReplyForGoals(goalsWithNoTrackableMetric);
     return {
       decision: "proposed_message",
       type: "evening_checkin",
       title: "Evening check-in",
-      message: `Evening check-in: Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "gym 45m and sent 2 CVs" is enough.`,
+      message: `Evening check-in: Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "${example}" is enough.`,
       reasons: goalsWithNoTrackableMetric.map((goal) => `active goal, no trackable metric configured: "${goal.title}"`),
-      suggestedReplies: ["gym 45m and sent 2 CVs", "nothing today"],
+      suggestedReplies: [example, "nothing today"],
       dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
       priority: 2,
       safeToSend: true
@@ -429,7 +449,7 @@ function buildEveningCheckin(
   }
   if (untrackedGoals.length > 0) {
     const goalPhrases = untrackedGoals.map((goal) => goal.title.toLowerCase());
-    parts.push(`Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "gym 45m and sent 2 CVs" is enough.`);
+    parts.push(`Did you make progress on ${joinNaturally(goalPhrases)} today? Reply naturally — "${exampleReplyForGoals(untrackedGoals)}" is enough.`);
   }
   parts.push(...gmailLines);
   const message = `Evening check-in: ${parts.join(" ")}`;
@@ -445,7 +465,10 @@ function buildEveningCheckin(
       ...goalLinkedEventsToday.map((event) => `gmail event logged today: ${event.type}`),
       ...(goalLinkedReviews.length > 0 ? [`${goalLinkedReviews.length} pending goal-linked gmail review(s)`] : [])
     ],
-    suggestedReplies: missedDueTodayActions.length > 0 ? ["move it to tomorrow", "archive it", "gym 45m and sent 2 CVs"] : ["gym 45m and sent 2 CVs", "nothing today"],
+    suggestedReplies:
+      missedDueTodayActions.length > 0
+        ? ["move it to tomorrow", "archive it", exampleReplyForGoals(untrackedGoals)]
+        : [exampleReplyForGoals(untrackedGoals), "nothing today"],
     dedupeKey: EVENING_CHECKIN_DEDUPE_KEY,
     priority: 2,
     safeToSend: true

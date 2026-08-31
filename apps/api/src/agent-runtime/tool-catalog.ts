@@ -441,6 +441,42 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "gmail.disconnect_propose",
+    description:
+      "Propose disconnecting Gmail entirely — stops all syncing for the currently connected account, quotes the real connected email, and makes clear historical logged progress/reviews are kept, never deleted. Use for 'disconnect Gmail', 'remove Gmail', 'stop using this Gmail account', 'unlink Gmail', 'disconnect user@gmail.com' (naming the account is fine, it always resolves to whichever account is actually connected — never a different tool). If Gmail isn't connected, says so honestly instead of proposing anything. Opens a pending confirmation; never disconnects anything until confirmed. Never plan gmail.disconnect_apply directly. Different from gmail.switch_account_propose — use THIS one when the user wants to stop using Gmail, not move to a different account.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({})
+  },
+  {
+    name: "gmail.disconnect_apply",
+    description: "Internal: applies the confirmed Gmail disconnect. This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      connectionId: z.string().min(1)
+    })
+  },
+  {
+    name: "gmail.switch_account_propose",
+    description:
+      "Propose switching to a DIFFERENT Gmail account — disconnects the currently connected one (quoting its real email, making clear historical progress stays) and, once confirmed, hands back a fresh OAuth connect link for the new account; existing goal watchers automatically pick up the new account once it's connected, no separate relinking step needed. Use for 'change my Gmail account', 'use a different Gmail account', 'switch Gmail account', 'use my job mail for this goal' / 'connect my job email for job search' WHEN GMAIL IS ALREADY CONNECTED to a different account (check context — if Gmail is already connected to an account that plausibly ISN'T the one being asked for, this is a switch, not a fresh gmail.goal_watcher.propose_enable). If Gmail is not connected at all yet, this hands back the connect link directly with no confirmation needed (nothing to disconnect first) — same as a normal first-time connect. Opens a pending confirmation only when there's an existing connection to replace; never plan gmail.switch_account_apply directly.",
+    mutates: false,
+    requiresConfirmation: false,
+    opensPendingProposal: true,
+    argsSchema: z.object({})
+  },
+  {
+    name: "gmail.switch_account_apply",
+    description: "Internal: applies the confirmed Gmail account switch (disconnects the old account and returns the new connect link). This is invoked automatically when the user confirms (e.g. 'yes'); never plan this tool directly.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      connectionId: z.string().min(1)
+    })
+  },
+  {
     name: "gmail.rule.list",
     description: "List the user's active Gmail tracking rules.",
     mutates: false,

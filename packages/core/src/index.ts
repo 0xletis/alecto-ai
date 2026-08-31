@@ -29,6 +29,7 @@ export * from "./multi-intent.js";
 export * from "./notifications.js";
 export * from "./proactive-brief-preference.js";
 export * from "./proactive-brief-llm.js";
+export * from "./progress-examples.js";
 export * from "./reminders.js";
 export * from "./response-composer.js";
 export * from "./risk.js";
