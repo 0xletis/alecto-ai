@@ -15,6 +15,12 @@ import {
 } from "./conversation-session.js";
 import { composeGmailGoalUsageStatusReply, executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
+import {
+  buildVisibleReviewSummaries,
+  composeGmailReviewInstructionReply,
+  parseGmailReviewInstructionWithLLM,
+  validateGmailReviewInstructionOperations
+} from "./gmail-review-instruction-parser.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import {
@@ -1006,6 +1012,27 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return gmailGoalUsageStatus;
   }
 
+  // fix/private-alpha-gmail-review-llm-instruction-routing: checked BEFORE gmail.sync — a real
+  // reported bug had "I wanna disconnect my mail and connect a new one" (unambiguous
+  // disconnect/switch intent) matched by gmailSyncShortcutOperation's own bare "mail...new"
+  // disjunct instead, running a full sync when the user never asked for one. Account-lifecycle
+  // intent (disconnect/switch) always outranks a plain sync/check request — a message can only
+  // mean one or the other, and "disconnect"/"switch accounts" is the far more specific, far less
+  // reversible-sounding of the two. Gated on !pending, same reasoning as the other confirmation-
+  // opening shortcuts below. Switch is checked BEFORE plain disconnect: "disconnect my mail and
+  // connect a new one" satisfies GMAIL_DISCONNECT_RE too (it does say "disconnect... mail"), but
+  // it also explicitly asks to reconnect a new one — strictly more specific than a bare
+  // disconnect, so it must win the race, not get truncated into "disconnect and stop" alone.
+  const gmailSwitchAccountShortcut = !pending ? gmailSwitchAccountShortcutOperation(message) : undefined;
+  if (gmailSwitchAccountShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailSwitchAccountShortcut, "gmail_switch_account");
+  }
+
+  const gmailDisconnectShortcut = !pending ? gmailDisconnectShortcutOperation(message) : undefined;
+  if (gmailDisconnectShortcut) {
+    return finalizeDeterministicOperation(context, message, gmailDisconnectShortcut, "gmail_disconnect");
+  }
+
   const gmailSyncDebugShortcut = gmailSyncDebugShortcutOperation(message);
   if (gmailSyncDebugShortcut) {
     return finalizeDeterministicOperation(context, message, gmailSyncDebugShortcut, "gmail_sync_debug");
@@ -1054,21 +1081,6 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const bulkActionCleanupShortcut = !pending ? bulkActionCleanupShortcutOperation(message, context) : undefined;
   if (bulkActionCleanupShortcut) {
     return finalizeDeterministicOperation(context, message, bulkActionCleanupShortcut, "actions");
-  }
-
-  // Gated on !pending (unlike the read-only gmailConnectionShortcut right below, which never opens
-  // a confirmation of its own): both of these open a REAL pending proposal, so running them while
-  // a different confirmation is already open would silently overwrite it rather than requiring an
-  // explicit cancel first — the same reasoning bulkActionCleanupShortcut/gmailNudgeSettingsShortcut
-  // above already follow for the identical reason.
-  const gmailDisconnectShortcut = !pending ? gmailDisconnectShortcutOperation(message) : undefined;
-  if (gmailDisconnectShortcut) {
-    return finalizeDeterministicOperation(context, message, gmailDisconnectShortcut, "gmail_disconnect");
-  }
-
-  const gmailSwitchAccountShortcut = !pending ? gmailSwitchAccountShortcutOperation(message) : undefined;
-  if (gmailSwitchAccountShortcut) {
-    return finalizeDeterministicOperation(context, message, gmailSwitchAccountShortcut, "gmail_switch_account");
   }
 
   const gmailConnectionShortcut = gmailConnectionShortcutOperation(message, context);
@@ -1161,14 +1173,39 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       return finalizeDeterministicOperations(context, message, gmailAutonomyCompoundShortcuts, "gmail_autonomy");
     }
 
-    const gmailReviewTriageShortcuts = gmailReviewExplicitTriageShortcutOperations(message, context);
-    if (gmailReviewTriageShortcuts.length > 0) {
-      return finalizeDeterministicOperations(context, message, gmailReviewTriageShortcuts, "gmail_reviews");
+    // fix/private-alpha-gmail-review-llm-instruction-routing (Task 2): computed ONCE, before
+    // either deterministic review-triage extractor below — a real reported bug had "1 is a real
+    // recruiter reply, reject 2" silently DROP the "1 is a recruiter reply" half entirely: the old
+    // extractor found a partial match ("reject 2") and both call sites below claimed victory on
+    // ANY non-empty result, never checking whether it covered every number the message actually
+    // mentioned. Now computed up front — when any mentioned review number has no confident
+    // deterministic entry, BOTH narrow extractors below are skipped entirely and the LLM-backed
+    // parser (which sees the whole message at once) handles it instead, rather than one silently
+    // acting on half a message.
+    const gmailReviewVisibleEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+    const gmailReviewNeedsLLMInstruction = gmailReviewInstructionNeedsLLMParsing(message, gmailReviewVisibleEntities);
+
+    if (!gmailReviewNeedsLLMInstruction) {
+      const gmailReviewTriageShortcuts = gmailReviewExplicitTriageShortcutOperations(message, context);
+      if (gmailReviewTriageShortcuts.length > 0) {
+        return finalizeDeterministicOperations(context, message, gmailReviewTriageShortcuts, "gmail_reviews");
+      }
+
+      const gmailReviewToActionShortcuts = gmailReviewToActionShortcutOperations(message, context);
+      if (gmailReviewToActionShortcuts.length > 0) {
+        return finalizeDeterministicOperations(context, message, gmailReviewToActionShortcuts, "gmail_reviews");
+      }
     }
 
-    const gmailReviewToActionShortcuts = gmailReviewToActionShortcutOperations(message, context);
-    if (gmailReviewToActionShortcuts.length > 0) {
-      return finalizeDeterministicOperations(context, message, gmailReviewToActionShortcuts, "gmail_reviews");
+    // Checked after every cheap, fully-confident deterministic review-triage shortcut above has
+    // had first chance to resolve the message on its own — this only ever fires for the messages
+    // those couldn't already handle cleanly (a real network+LLM call, so it's deliberately not
+    // tried first).
+    const gmailReviewInstructionLLMResponse = gmailReviewNeedsLLMInstruction
+      ? await gmailReviewInstructionLLMShortcut(message, context, gmailReviewVisibleEntities)
+      : undefined;
+    if (gmailReviewInstructionLLMResponse) {
+      return gmailReviewInstructionLLMResponse;
     }
 
     const gmailReviewVagueClarification = gmailReviewVagueMutationClarification(message, context);
@@ -1822,6 +1859,132 @@ function gmailReviewVagueMutationClarification(message: string, context: Context
   return GMAIL_REVIEW_CLARIFICATION_REPLY;
 }
 
+const GMAIL_REVIEW_INSTRUCTION_ACTION_TOOLS: Record<string, string> = {
+  approve: "gmail.review.approve",
+  reject: "gmail.review.reject",
+  to_action: "gmail.review.to_action",
+  keep: "gmail.review.keep"
+};
+
+/**
+ * fix/private-alpha-gmail-review-llm-instruction-routing (Task 2): whenever the message names
+ * specific visible review numbers in a way the narrow deterministic extractor above
+ * (extractExplicitGmailReviewIntentEntries) can't fully and confidently resolve on its own — a
+ * mixed message like "1 and 2 are CVs I sent today, 3 and 4 are nothing, delete them" is the
+ * textbook case: the regex extractor has no "approve" intent at all, and (after the digit-guard
+ * fix above) correctly declines to guess at ANY of the four numbers rather than blindly rejecting
+ * every one of them. This checks whether every review number the message actually MENTIONS has a
+ * confident deterministic entry; if any doesn't, the LLM-backed parser (gmail-review-instruction-
+ * parser.ts) takes over instead. Never fires for a message that mentions no review number at all —
+ * that's either the vague-pronoun clarification above, or genuinely unrelated to the reviews.
+ */
+// Requires either real DECLARATIVE content ("1 IS a recruiter reply", "these ARE CVs I sent" —
+// the exact shape of the originally reported bug) or the word "approve" (the one intent the old
+// regex extractor below never recognized at all, even alone — "approve 1, reject 2 and 3" used to
+// silently drop the "approve 1" half exactly like the declarative case). Genuinely distinct from a
+// plain multi-verb instruction like "delete 1 and keep 2"/"turn 2 into a task and reject 1" (no
+// declarative content and no "approve" — see the pre-existing adversarial-validation.test.ts/v3-
+// smoke-transcripts.test.ts coverage this must never regress: those deliberately keep falling
+// through to the real planner, or get silently, safely left alone for whatever a partial
+// deterministic match didn't cover, exactly as before this change). Combined with the >=2-numbers
+// requirement below, "approve review 1" alone (a single number, already correctly handled by the
+// real planner today) is still safely excluded — only a genuinely MIXED "approve X, ... Y" message
+// reaches this gate at all. Spanish/Catalan review triage (no English words at all) never matches
+// either branch, so it keeps falling through to the real planner exactly as before too.
+const GMAIL_REVIEW_DECLARATIVE_CONTENT_RE = /\b(is|are|'s|approve)\b/;
+
+function gmailReviewInstructionNeedsLLMParsing(message: string, visibleReviews: AgentEntity[]): boolean {
+  if (visibleReviews.length === 0) {
+    return false;
+  }
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_REVIEW_DECLARATIVE_CONTENT_RE.test(text)) {
+    return false;
+  }
+  const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index).filter((index): index is number => typeof index === "number"));
+  const mentionedNumbers = extractIndexesFromText(text, visibleIndexSet);
+  // Needs at least two real, valid review numbers to be a genuinely "mixed" message — a single-
+  // number declarative statement ("1 is a recruiter reply" alone, nothing else) has no OTHER
+  // number that could get silently mishandled, so it's safe to leave exactly where it already
+  // correctly falls through (the real planner).
+  if (mentionedNumbers.length < 2) {
+    return false;
+  }
+  const deterministicEntries = extractExplicitGmailReviewIntentEntries(text, visibleIndexSet);
+  const covered = new Set(deterministicEntries.map((entry) => entry.index));
+  return !mentionedNumbers.every((index) => covered.has(index));
+}
+
+async function gmailReviewInstructionLLMShortcut(
+  message: string,
+  context: ContextBundle,
+  visibleReviews: AgentEntity[]
+): Promise<AgentMessageResponse | undefined> {
+  const reviewsById = new Map(context.gmailReviews.map((review) => [review.id, review] as const));
+  const orderedReviews = visibleReviews
+    .filter((entity): entity is AgentEntity & { index: number } => typeof entity.index === "number")
+    .sort((a, b) => a.index - b.index)
+    .map((entity) => reviewsById.get(entity.id))
+    .filter((review): review is NonNullable<typeof review> => Boolean(review));
+
+  if (orderedReviews.length === 0) {
+    return undefined;
+  }
+
+  const summaries = buildVisibleReviewSummaries(orderedReviews, context.gmailRules, context.activeGoals);
+  const askClarification = (question: string) =>
+    finalize(context, {
+      reply: question,
+      operationsPlanned: [],
+      executedOps: [],
+      plannerUsed: "none",
+      llmPlannerAttempted: true,
+      toolValidationPassed: true,
+      topic: "gmail_reviews"
+    });
+
+  let parsed;
+  try {
+    parsed = await parseGmailReviewInstructionWithLLM(message, summaries);
+  } catch {
+    // Task 2's own explicit rule: "if LLM fails, deterministic fallback should not over-reject;
+    // ask clarification instead" — never silently fall back to the unsafe blanket-reject regex
+    // path, and never pretend nothing happened either.
+    return askClarification("I couldn't safely work out what you meant for those reviews — could you say what to do with each one, by number?");
+  }
+
+  const validation = validateGmailReviewInstructionOperations(parsed, summaries);
+  if (validation.needsClarification) {
+    return askClarification(validation.clarificationQuestion);
+  }
+
+  const operations: PlannedOperation[] = [];
+  for (const op of validation.operations) {
+    operations.push({ tool: GMAIL_REVIEW_INSTRUCTION_ACTION_TOOLS[op.action]!, args: { index: op.reviewNumber }, rationale: op.reason });
+    if (op.alsoLogApplicationsSent) {
+      operations.push({
+        tool: "event.log_job_applications",
+        args: { count: op.alsoLogApplicationsSent },
+        rationale: "user's own message stated this many applications/CVs sent today, alongside approving the matching review(s)"
+      });
+    }
+  }
+
+  const response = await finalizeDeterministicOperations(context, message, operations, "gmail_reviews");
+  const reviewOpsAllSucceeded = response.operationsExecuted
+    .filter((op) => Object.values(GMAIL_REVIEW_INSTRUCTION_ACTION_TOOLS).includes(op.tool))
+    .every((op) => op.status === "executed");
+
+  // Only replace composeReply's default (a concatenation of each tool's own one-line receipt)
+  // with the natural, grouped summary when every review operation genuinely succeeded — a
+  // "review no longer exists" failure or an opened pending-confirmation needs its own honest,
+  // specific wording, which composeReply already produces correctly.
+  if (reviewOpsAllSucceeded && !response.needsConfirmation) {
+    return { ...response, reply: composeGmailReviewInstructionReply(validation.operations, summaries) };
+  }
+  return response;
+}
+
 /**
  * fix/private-alpha-coach-first-response-routing: a real Telegram transcript had a full coaching
  * exchange work correctly ("I rested this weekend with friends, is that okay?" -> a genuine
@@ -1968,6 +2131,19 @@ function buildExplicitGmailReviewIntentPlan(message: string, context: ContextBun
 function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: Set<number>): ExplicitGmailReviewIntentEntry[] {
   const candidates: ExplicitGmailReviewIntentEntry[] = [];
   let order = 0;
+  // fix/private-alpha-gmail-review-llm-instruction-routing: a real reported bug — "1 and 2 are
+  // CVs I sent today, 3 and 4 are nothing u can delete them" got ALL FOUR reviews rejected,
+  // because the plural "delete them" fallback below has no way to know "them" was only ever meant
+  // to refer to 3 and 4, not every visible review. The existing negative lookbehind only blocks
+  // the narrow "4 and 6 keep them" immediately-preceding-digit shape; it does nothing for a
+  // pronoun appearing later in a longer, mixed message. Tightened here instead: none of the three
+  // plural "them/these/those/both/all" fallbacks below may fire at all when the message mentions
+  // ANY other digit anywhere — a genuinely simple "keep them there for now"/"delete them" (no
+  // other numbers in the message) still works exactly as before, but a message that ALSO singles
+  // out specific numbers for something else now correctly falls through empty-handed rather than
+  // guessing wrong, so gmailReviewInstructionNeedsLLMParsing below routes it to the new
+  // LLM-backed parser instead of silently mis-triaging it.
+  const hasAnyDigit = /\d/.test(text);
   const addEntries = (intent: ExplicitGmailReviewIntent, position: number, rawIndexes: string) => {
     for (const index of extractIndexesFromText(rawIndexes, visibleIndexSet)) {
       candidates.push({ index, intent, position, order: order++ });
@@ -2043,7 +2219,7 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
   // separate "pending clarification" state needed: once the slang is recognized, this same
   // deterministic-shortcut-first architecture that already protects "check gmail every hour"
   // from the guardrail protects this too.
-  {
+  if (!hasAnyDigit) {
     const match = text.match(/(?<!\d\s)\b(?:keep|leave)\s+(?:them|these|those|both|all(?:\s+of\s+them)?|'?em)\b/);
     if (match) {
       addAllVisibleEntries("keep", match.index ?? 0);
@@ -2052,7 +2228,7 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
   // Spanish: "deja los dos para luego", "mantén ambos en revisión", "deja estos para luego"
   // (accents already stripped by normalizeIntentText, so "mantén" arrives as "manten" and
   // "revisión" as "revision").
-  {
+  if (!hasAnyDigit) {
     const match = text.match(
       /\b(?:deja|dejalo|dejalos|dejalas|manten|mantenlo|mantenlos|mantenlas|guarda|guardalo|guardalos|guardalas)\b[\s\S]{0,20}\b(?:los\s+dos|las\s+dos|ambos|ambas|todos|todas|estos|estas)\b/
     );
@@ -2062,7 +2238,7 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
   }
   // Catalan: "deixa'ls per després" — the pronoun is fused onto the verb ("-ls" = "them"), so
   // this alone already means "leave them," no separate quantifier word needed.
-  {
+  if (!hasAnyDigit) {
     const match = text.match(/\bdeixa'?ls\b/);
     if (match) {
       addAllVisibleEntries("keep", match.index ?? 0);
@@ -2072,13 +2248,13 @@ function extractExplicitGmailReviewIntentEntries(text: string, visibleIndexSet: 
   // Plural/all quantifier for ignore/task intents too, English only for now — mirrors the keep
   // case above so "ignore them"/"delete both"/"turn both into tasks" don't hit the same
   // ambiguous-ref bug the keep phrasing did.
-  {
+  if (!hasAnyDigit) {
     const match = text.match(/(?<!\d\s)\b(?:ignore|ifnore|reject|skip|delete|remove|discard)\s+(?:them|these|those|both|all(?:\s+of\s+them)?|'?em)\b/);
     if (match) {
       addAllVisibleEntries("ignore", match.index ?? 0);
     }
   }
-  {
+  if (!hasAnyDigit) {
     const match = text.match(/(?<!\d\s)\b(?:turn|convert|make|create|add)\s+(?:them|these|those|both|all(?:\s+of\s+them)?|'?em)\s+(?:into|to|as)\s+(?:a\s+|an\s+)?(?:tasks?|actions?|reminders?)\b/);
     if (match) {
       addAllVisibleEntries("task", match.index ?? 0);
@@ -2771,7 +2947,19 @@ function gmailDisconnectShortcutOperation(message: string): PlannedOperation | u
 // stay with the real planner (guided by gmail.switch_account_propose's own catalog description,
 // which tells it explicitly to check whether Gmail is already connected to a plausibly different
 // account before choosing between this and a fresh gmail.goal_watcher.propose_enable).
-const GMAIL_SWITCH_ACCOUNT_RE = /\b(change|switch)\b[\s\S]{0,15}\bgmail\b[\s\S]{0,15}\baccount\b|\buse\b[\s\S]{0,10}\ba different\b[\s\S]{0,10}\bgmail\b[\s\S]{0,10}\baccount\b/i;
+// fix/private-alpha-gmail-review-llm-instruction-routing: widened for two real reported gaps —
+// (1) "change my MAIL account"/"switch my EMAIL account" (not literally "gmail") were missed
+// entirely since the old first disjunct required the literal word "gmail"; (2) "I wanna
+// disconnect my mail and connect a new one" is unambiguous switch intent (disconnect the old,
+// connect a new one) but has neither "switch"/"change" nor "different account" wording — the
+// 3rd/4th disjuncts below catch this compound "disconnect ... connect (a) new one" shape and the
+// bare "connect (a) new gmail/mail/email" shape respectively. This function has no connection-
+// state context to check, but that's fine: gmail.switch_account_propose's own executor already
+// handles "nothing was connected yet" gracefully (a direct connect link, no confirmation needed —
+// see the "switch when Gmail is not connected at all" test), so routing here is always safe
+// regardless of current state.
+const GMAIL_SWITCH_ACCOUNT_RE =
+  /\b(change|switch)\b[\s\S]{0,15}\b(gmail|mail|email)\b[\s\S]{0,15}\baccount\b|\buse\b[\s\S]{0,10}\ba different\b[\s\S]{0,10}\bgmail\b[\s\S]{0,10}\baccount\b|\bdisconnect\b[\s\S]{0,15}\b(gmail|mail|email)\b[\s\S]{0,30}\bconnect\b[\s\S]{0,20}\b(a\s+)?(new|different|another)\s+one\b|\bconnect\b[\s\S]{0,10}\b(a\s+)?new\b[\s\S]{0,10}\b(gmail|mail|email)\b/i;
 
 function gmailSwitchAccountShortcutOperation(message: string): PlannedOperation | undefined {
   const text = normalizeIntentText(message);
@@ -2968,11 +3156,22 @@ function gmailSyncShortcutOperation(message: string): PlannedOperation | undefin
     return undefined;
   }
 
+  // fix/private-alpha-gmail-review-llm-instruction-routing: the last disjunct used to allow "new"/
+  // "now"/"ahora" to appear ANYWHERE within 35 characters after a bare mail-word, with no check on
+  // what "new" actually modified — "I wanna disconnect my mail and connect a NEW ONE" matched
+  // purely because "mail" and "new" both appear in the sentence, even though "new" describes a new
+  // ACCOUNT, not new mail. "new"/"nuevos" must now directly modify a mail-word (adjacent, "new
+  // email"/"nuevos correos"), and "now"/"ahora" keep a much tighter gap — genuine urgency wording
+  // ("check gmail now") is always close to the mail-word, unlike an unrelated noun elsewhere in a
+  // longer sentence. Gated on the switch/disconnect shortcuts running first either way (see their
+  // own call sites above), so this is deliberately belt-and-suspenders, not the only fix.
   const explicitSync =
     /\b(sync|refresh|update)\b[\s\S]{0,30}\b(gmail|email|emails|correo|correos|mail|mails)\b/.test(text) ||
     /\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,30}\b(sync|refresh|update)\b/.test(text) ||
     /\b(check|look for|buscar|busca|revisar|revisa)\b[\s\S]{0,35}\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,25}\b(now|new|nuevos?|ahora)?\b/.test(text) ||
-    /\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,35}\b(now|new|nuevos?|ahora)\b/.test(text);
+    /\bnew\s+(gmail|emails?|correos?|mails?)\b|\bnuevos?\s+correos?\b/.test(text) ||
+    /\b(gmail|email|emails|correo|correos|mail|mails)\b[\s\S]{0,10}\b(now|ahora)\b/.test(text) ||
+    /\b(now|ahora)\b[\s\S]{0,10}\b(gmail|email|emails|correo|correos|mail|mails)\b/.test(text);
 
   if (!explicitSync) {
     return undefined;

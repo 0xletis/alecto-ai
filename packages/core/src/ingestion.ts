@@ -327,27 +327,58 @@ function isApplicationActionRequired(text: string): boolean {
  * newsletter from being a newsletter; that's the entire point of one.
  */
 function isJobNewsletterOrPromotional(text: string): boolean {
-  return hasAny(text, [
-    "newsletter",
-    "unsubscribe",
-    "view in browser",
-    "view this email in your browser",
-    "top jobs this week",
-    "weekly jobs",
-    "job digest",
-    "jobs digest",
-    "job alert",
-    "job alerts",
-    "jobs newsletter",
-    "talent newsletter",
-    "sponsored",
-    "here are the top jobs",
-    "curated jobs for you",
-    "jobs curated for you",
-    "recommended jobs for you",
-    "browse more jobs",
-    "jobs board digest"
-  ]);
+  return (
+    hasAny(text, [
+      "newsletter",
+      "unsubscribe",
+      "view in browser",
+      "view this email in your browser",
+      "top jobs this week",
+      "weekly jobs",
+      "job digest",
+      "jobs digest",
+      "job alert",
+      "job alerts",
+      "jobs newsletter",
+      "talent newsletter",
+      "sponsored",
+      "here are the top jobs",
+      "curated jobs for you",
+      "jobs curated for you",
+      "recommended jobs for you",
+      "browse more jobs",
+      "jobs board digest",
+      // fix/private-alpha-gmail-review-llm-instruction-routing (Task 4): a real reported false
+      // positive — "Ciklum busca personal para el puesto de..." (a Spanish job-board listing/
+      // alert) was classified as a personal recruiter reply. Job listings/alerts are, like a
+      // newsletter, never a 1:1 message about the reader's own application.
+      "jobs you may be interested in",
+      "jobs for you",
+      "recommended jobs",
+      "new jobs matching",
+      "busca personal para el puesto",
+      "buscamos personal para",
+      "ofertas de empleo"
+    ]) ||
+    // A real reported false positive — a LinkedIn "X reacted to your post"/"ha reaccionado a esta
+    // publicación" social notification was classified as a high-priority job offer. A reaction/
+    // like/comment/connection-request notification is never a personal message from a company
+    // about the reader's own application, no matter what job-adjacent words appear nearby — so
+    // this is deliberately NOT gated behind any job-context check, unlike the marketing filter
+    // above.
+    hasAny(text, [
+      "reacted to your post",
+      "liked your post",
+      "commented on your post",
+      "shared your post",
+      "reacted to your profile",
+      "ha reaccionado a esta publicacion",
+      "ha comentado tu publicacion",
+      "comento tu publicacion",
+      "new connection request",
+      "wants to connect"
+    ])
+  );
 }
 
 function hasMarketingContext(text: string): boolean {

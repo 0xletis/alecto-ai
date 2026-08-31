@@ -13954,3 +13954,569 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-gmail-review-llm-instruction-routing: account-switch-vs-sync routing,
+// LLM-backed review-instruction parsing, classifier precision, status/list consistency, and
+// (addendum) progress read-after-write + action reconciliation + coach-after-progress. Real LLM
+// planner, no deterministic mocks. -----------------------------------------------------------
+
+async function seedEvalGmailRule(userId: string, connectionId: string, goalId?: string) {
+  return prisma.emailSignalRule.create({
+    data: {
+      userId,
+      connectionId,
+      goalId,
+      adapterId: "job_search_email",
+      name: "Job search emails",
+      status: "active",
+      fetchStrategy: "query",
+      classifierMode: "rules",
+      lookbackDays: 30,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 10,
+      minAutoLogConfidence: 0.9,
+      minReviewConfidence: 0.65,
+      domain: "career",
+      notifyPolicy: "notify",
+      createdBy: "user"
+    }
+  });
+}
+
+async function seedEvalReview(
+  userId: string,
+  connectionId: string,
+  ruleId: string,
+  input: { subject: string; from: string; proposedEventType?: string }
+) {
+  return prisma.emailReviewItem.create({
+    data: {
+      userId,
+      connectionId,
+      ruleId,
+      adapterId: "job_search_email",
+      provider: "gmail",
+      providerMessageId: `m-${randomUUID()}`,
+      externalId: `gmail-review:${ruleId}:${randomUUID()}`,
+      status: "pending",
+      subject: input.subject,
+      from: input.from,
+      snippet: input.subject,
+      evidence: input.subject,
+      confidence: 0.7,
+      reason: "rules_match",
+      proposedEventType: input.proposedEventType,
+      extracted: {}
+    }
+  });
+}
+
+test(
+  "385. 'I wanna disconnect my mail and connect a new one' proposes a Gmail switch, never runs a sync",
+  { ...llmEvalOptions(["gmail-account-switch-intent"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-385-${randomUUID()}`;
+    const trace = new EvalTrace("385-disconnect-connect-new-one", ["gmail-account-switch-intent"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const reply = trace.record("I wanna disconnect my mail and connect a new one", await sendAgentMessage(server, userId, "I wanna disconnect my mail and connect a new one"));
+        assertNoGenericAgentError(reply, "disconnect+connect-new-one");
+        trace.checkpoint("never runs gmail.sync", !reply.operationsExecuted.some((o) => o.tool === "gmail.sync"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool === "gmail.sync"), `expected no sync — got: ${JSON.stringify(reply.operationsExecuted)}`);
+        trace.checkpoint("opens a switch/disconnect confirmation", reply.needsConfirmation, String(reply.needsConfirmation));
+        assert.equal(reply.needsConfirmation, true);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "386. mixed 'X and Y are CVs I sent today, Z and W are nothing' approves the real ones and rejects the noise, never all four",
+  { ...llmEvalOptions(["gmail-review-instruction-parser", "gmail-review-mixed-operations"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-386-${randomUUID()}`;
+    const trace = new EvalTrace("386-mixed-approve-reject", ["gmail-review-instruction-parser", "gmail-review-mixed-operations"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      // Seeded in reverse of the desired displayed order (getEmailReviewItems sorts updatedAt desc).
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "LinkedIn job alert", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "LinkedIn reaction notification", from: "notifications@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Wintermute", from: "noreply@wintermute.com", proposedEventType: "career.application_confirmation_received" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Binance", from: "noreply@binance.com", proposedEventType: "career.application_confirmation_received" });
+
+      await trace.guard(async () => {
+        trace.record("show me the reviews", await sendAgentMessage(server, userId, "show me the reviews"));
+        const reply = trace.record(
+          "1 and 2 are CVs I sent today, 3 and 4 are nothing u can delete them",
+          await sendAgentMessage(server, userId, "1 and 2 are CVs I sent today, 3 and 4 are nothing u can delete them")
+        );
+        assertNoGenericAgentError(reply, "mixed CV approve/reject");
+
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const approvedCount = reviews.filter((r) => r.status === "approved").length;
+        const rejectedCount = reviews.filter((r) => r.status === "rejected").length;
+        trace.checkpoint("not all four rejected", rejectedCount < 4, `approved=${approvedCount} rejected=${rejectedCount}`);
+        assert.ok(rejectedCount < 4, `expected the real application confirmations to be approved, not all 4 rejected — approved=${approvedCount} rejected=${rejectedCount}`);
+        trace.checkpoint("at least one review approved", approvedCount >= 1, `approved=${approvedCount}`);
+        assert.ok(approvedCount >= 1, `expected at least one application confirmation approved — approved=${approvedCount}`);
+        assertNoBannedPhrases(reply.reply, ["deleted your email", "deleted the email"], "no real email deletion claim", trace);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "387. 'approve 1, reject 2 and 3' applies exactly that mixed instruction",
+  { ...llmEvalOptions(["gmail-review-instruction-parser", "gmail-review-mixed-operations"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-387-${randomUUID()}`;
+    const trace = new EvalTrace("387-approve-1-reject-2-3", ["gmail-review-instruction-parser", "gmail-review-mixed-operations"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Newsletter C", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Newsletter B", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Real recruiter note", from: "recruiter@company.com", proposedEventType: "career.recruiter_reply_received" });
+
+      await trace.guard(async () => {
+        trace.record("show me the reviews", await sendAgentMessage(server, userId, "show me the reviews"));
+        const reply = trace.record("approve 1, reject 2 and 3", await sendAgentMessage(server, userId, "approve 1, reject 2 and 3"));
+        assertNoGenericAgentError(reply, "approve 1 reject 2 3");
+
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        trace.checkpoint("exactly one approved", reviews.filter((r) => r.status === "approved").length === 1, JSON.stringify(reviews.map((r) => r.status)));
+        assert.equal(reviews.filter((r) => r.status === "approved").length, 1);
+        trace.checkpoint("exactly two rejected", reviews.filter((r) => r.status === "rejected").length === 2, JSON.stringify(reviews.map((r) => r.status)));
+        assert.equal(reviews.filter((r) => r.status === "rejected").length, 2);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "388. 'delete 3 and 4' means reject those reviews only, never a claim of deleting real email",
+  { ...llmEvalOptions(["gmail-review-instruction-parser"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-388-${randomUUID()}`;
+    const trace = new EvalTrace("388-delete-3-4-means-reject", ["gmail-review-instruction-parser"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id);
+      for (let i = 0; i < 4; i++) {
+        await seedEvalReview(userId, connection.id, rule.id, { subject: `Review ${i}`, from: "x@example.com", proposedEventType: "career.recruiter_reply_received" });
+      }
+
+      await trace.guard(async () => {
+        trace.record("show me the reviews", await sendAgentMessage(server, userId, "show me the reviews"));
+        const reply = trace.record("delete 3 and 4", await sendAgentMessage(server, userId, "delete 3 and 4"));
+        assertNoGenericAgentError(reply, "delete 3 and 4");
+        assertNoBannedPhrases(reply.reply, ["deleted your email", "deleted the email", "removed the email from your inbox"], "delete must mean reject, never real Gmail deletion", trace);
+
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        trace.checkpoint("exactly two rejected", reviews.filter((r) => r.status === "rejected").length === 2, JSON.stringify(reviews.map((r) => r.status)));
+        assert.equal(reviews.filter((r) => r.status === "rejected").length, 2);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "389. a LinkedIn 'reacted to your post' notification is never treated as a job offer",
+  { ...llmEvalOptions(["gmail-classifier-precision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const { classifyJobSearchEmail } = await import("../packages/core/src/email-classification.ts");
+    const trace = new EvalTrace("389-linkedin-reaction-not-offer", ["gmail-classifier-precision"], `llm-eval-389-${randomUUID()}`);
+    await trace.guard(async () => {
+      const result = classifyJobSearchEmail({ text: "Jay Maree - Co-Founder & CPO reacted to your post about remote Web3 roles" });
+      trace.checkpoint("not classified as offer", result.eventType !== "career.offer_received", JSON.stringify(result));
+      assert.notEqual(result.eventType, "career.offer_received");
+    });
+  }
+);
+
+test(
+  "390. Spanish 'busca personal para el puesto' job listing is never treated as a recruiter reply",
+  { ...llmEvalOptions(["gmail-classifier-precision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const { classifyJobSearchEmail } = await import("../packages/core/src/email-classification.ts");
+    const trace = new EvalTrace("390-spanish-job-alert-not-recruiter", ["gmail-classifier-precision"], `llm-eval-390-${randomUUID()}`);
+    await trace.guard(async () => {
+      const result = classifyJobSearchEmail({ text: "Ciklum busca personal para el puesto de Desarrollador En remoto" });
+      trace.checkpoint("not classified as recruiter reply", result.eventType !== "career.recruiter_reply_received", JSON.stringify(result));
+      assert.notEqual(result.eventType, "career.recruiter_reply_received");
+    });
+  }
+);
+
+test(
+  "391. Gmail status pending-review count matches gmail.review.list after real Gmail review triage",
+  { ...llmEvalOptions(["gmail-review-status-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-391-${randomUUID()}`;
+    const trace = new EvalTrace("391-status-list-consistency", ["gmail-review-status-consistency"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goalResult.duplicate ? undefined : goalResult.goal.id);
+      for (let i = 0; i < 3; i++) {
+        await seedEvalReview(userId, connection.id, rule.id, { subject: `Application confirmation ${i}`, from: "noreply@company.com", proposedEventType: "career.application_confirmation_received" });
+      }
+
+      await trace.guard(async () => {
+        const status = trace.record("gmail status", await sendAgentMessage(server, userId, "gmail status"));
+        const list = trace.record("show me the reviews", await sendAgentMessage(server, userId, "show me the reviews"));
+        const listedCount = (list.reply.match(/^\d+\./gm) ?? []).length;
+        trace.checkpoint("status mentions 3 pending reviews", /3 pending review/.test(status.reply), status.reply);
+        assert.match(status.reply, /3 pending review/);
+        trace.checkpoint("list shows the same 3 reviews", listedCount === 3, `listed=${listedCount}`);
+        assert.equal(listedCount, 3);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "392. Spanish: '1 y 2 son CVs que envié hoy, 3 y 4 bórralos' approves 1/2, rejects 3/4",
+  { ...llmEvalOptions(["gmail-review-instruction-parser"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-392-${randomUUID()}`;
+    const trace = new EvalTrace("392-mixed-es", ["gmail-review-instruction-parser"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Job alert 4", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Job alert 3", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Wintermute", from: "noreply@wintermute.com", proposedEventType: "career.application_confirmation_received" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Binance", from: "noreply@binance.com", proposedEventType: "career.application_confirmation_received" });
+
+      await trace.guard(async () => {
+        trace.record("muéstrame las revisiones", await sendAgentMessage(server, userId, "muéstrame las revisiones de Gmail"));
+        const reply = trace.record("1 y 2 son CVs que envié hoy, 3 y 4 bórralos", await sendAgentMessage(server, userId, "1 y 2 son CVs que envié hoy, 3 y 4 bórralos"));
+        assertNoGenericAgentError(reply, "Spanish mixed CV approve/reject");
+
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const rejectedCount = reviews.filter((r) => r.status === "rejected").length;
+        trace.checkpoint("not all four rejected", rejectedCount < 4, `rejected=${rejectedCount}`);
+        assert.ok(rejectedCount < 4, `Spanish mixed instruction must not blanket-reject everything — rejected=${rejectedCount}`);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "393. Catalan: '1 i 2 són CVs que he enviat avui, 3 i 4 elimina'ls' approves 1/2, rejects 3/4",
+  { ...llmEvalOptions(["gmail-review-instruction-parser"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-393-${randomUUID()}`;
+    const trace = new EvalTrace("393-mixed-ca", ["gmail-review-instruction-parser"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Job alert 4", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Job alert 3", from: "jobs@linkedin.com" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Wintermute", from: "noreply@wintermute.com", proposedEventType: "career.application_confirmation_received" });
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Binance", from: "noreply@binance.com", proposedEventType: "career.application_confirmation_received" });
+
+      await trace.guard(async () => {
+        trace.record("mostra les revisions de Gmail", await sendAgentMessage(server, userId, "mostra les revisions de Gmail"));
+        const reply = trace.record("1 i 2 són CVs que he enviat avui, 3 i 4 elimina'ls", await sendAgentMessage(server, userId, "1 i 2 són CVs que he enviat avui, 3 i 4 elimina'ls"));
+        assertNoGenericAgentError(reply, "Catalan mixed CV approve/reject");
+
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const rejectedCount = reviews.filter((r) => r.status === "rejected").length;
+        trace.checkpoint("not all four rejected", rejectedCount < 4, `rejected=${rejectedCount}`);
+        assert.ok(rejectedCount < 4, `Catalan mixed instruction must not blanket-reject everything — rejected=${rejectedCount}`);
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "394. 'I sent 3 CVs today' then 'show me my goal with progress' shows the progress immediately — read-after-write",
+  { ...llmEvalOptions(["progress-read-after-write"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-394-${randomUUID()}`;
+    const trace = new EvalTrace("394-read-after-write", ["progress-read-after-write"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job",
+        category: "career",
+        targetMetrics: [{ key: "applications_sent_weekly", label: "Applications sent", labelSingular: "Application sent", eventType: "career.application_sent", aggregation: "count", window: "weekly" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const t1 = trace.record("I sent 3 CVs today", await sendAgentMessage(server, userId, "I sent 3 CVs today"));
+        assertNoGenericAgentError(t1, "log 3 CVs");
+        trace.checkpoint("turn 1 says something was logged", /logged/i.test(t1.reply), t1.reply);
+        assert.match(t1.reply, /logged/i);
+
+        const t2 = trace.record("show me my goal with progress", await sendAgentMessage(server, userId, "show me my goal with progress"));
+        trace.checkpoint("progress view does not say no logged progress", !/no logged progress/i.test(t2.reply), t2.reply);
+        assert.doesNotMatch(t2.reply, /no logged progress/i, `expected real progress to show — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "395. 'I sent 1 CV today' against an open 'Send 3 CVs' action does not complete it",
+  { ...llmEvalOptions(["action-progress-reconciliation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-395-${randomUUID()}`;
+    const trace = new EvalTrace("395-partial-no-complete", ["action-progress-reconciliation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("I sent 1 CV today", await sendAgentMessage(server, userId, "I sent 1 CV today"));
+        assertNoGenericAgentError(reply, "partial CV count");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action stays open on a partial count", updated?.status === "open", updated?.status ?? "missing");
+        assert.equal(updated?.status, "open", "a partial count must never complete the full-target action");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "396. 'I sent 5 CVs today' against an open 'Send 3 CVs' action completes it and logs 5 sent",
+  { ...llmEvalOptions(["action-progress-reconciliation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-396-${randomUUID()}`;
+    const trace = new EvalTrace("396-overshoot-completes", ["action-progress-reconciliation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job",
+        category: "career",
+        targetMetrics: [{ key: "applications_sent_weekly", label: "Applications sent", labelSingular: "Application sent", eventType: "career.application_sent", aggregation: "count", window: "weekly" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const goal = goalResult.goal;
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high" });
+
+      await trace.guard(async () => {
+        const reply = trace.record("I sent 5 CVs today", await sendAgentMessage(server, userId, "I sent 5 CVs today"));
+        assertNoGenericAgentError(reply, "overshoot CV count");
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        trace.checkpoint("action completed on overshoot", updated?.status === "completed", updated?.status ?? "missing");
+        assert.equal(updated?.status, "completed");
+
+        await assertEvidenceCountedForGoal(userId, goal, 5, trace);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "397. 'how many CVs did I send this week?' agrees with the same count 'show progress' would give",
+  { ...llmEvalOptions(["goal-progress-status-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-397-${randomUUID()}`;
+    const trace = new EvalTrace("397-how-many-cvs-consistency", ["goal-progress-status-consistency"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job",
+        category: "career",
+        targetMetrics: [{ key: "applications_sent_weekly", label: "Applications sent", labelSingular: "Application sent", eventType: "career.application_sent", aggregation: "count", window: "weekly" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        trace.record("I sent 4 CVs today", await sendAgentMessage(server, userId, "I sent 4 CVs today"));
+        const reply = trace.record("how many CVs did I send this week?", await sendAgentMessage(server, userId, "how many CVs did I send this week?"));
+        assertNoGenericAgentError(reply, "how many CVs this week");
+        trace.checkpoint("answer mentions the real count", /4/.test(reply.reply), reply.reply);
+        assert.match(reply.reply, /4/, `expected the real logged count of 4 — got: ${reply.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "398. approved Gmail review evidence and a manual CV report do not double-count the same signal type",
+  { ...llmEvalOptions(["goal-progress-status-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-398-${randomUUID()}`;
+    const trace = new EvalTrace("398-no-double-count", ["goal-progress-status-consistency"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, {
+        title: "Find a fully remote developer job",
+        category: "career",
+        targetMetrics: [{ key: "applications_sent_weekly", label: "Applications sent", labelSingular: "Application sent", eventType: "career.application_sent", aggregation: "count", window: "weekly" }]
+      });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const goal = goalResult.goal;
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedEvalGmailRule(userId, connection.id, goal.id);
+      await seedEvalReview(userId, connection.id, rule.id, { subject: "Thank you for your application to Binance", from: "noreply@binance.com", proposedEventType: "career.application_confirmation_received" });
+
+      await trace.guard(async () => {
+        trace.record("show me the reviews", await sendAgentMessage(server, userId, "show me the reviews"));
+        const approveReply = trace.record("approve 1", await sendAgentMessage(server, userId, "approve 1"));
+        // gmail.review.approve can embed its own "want me to track this signal?" offer as a real
+        // pending confirmation (buildGoalTrackedSignalEvolutionOffer) — decline it first so it
+        // doesn't swallow the next, unrelated turn via the pending-operation firewall.
+        if (approveReply.needsConfirmation) {
+          trace.record("no", await sendAgentMessage(server, userId, "no"));
+        }
+        trace.record("I sent 1 CV today", await sendAgentMessage(server, userId, "I sent 1 CV today"));
+
+        const confirmationEvents = await prisma.event.count({ where: { userId, type: "career.application_confirmation_received" } });
+        const sentEvents = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("confirmation logged exactly once", confirmationEvents === 1, `confirmationEvents=${confirmationEvents}`);
+        assert.equal(confirmationEvents, 1);
+        trace.checkpoint("manual sent logged exactly once, not merged/duplicated into the confirmation", sentEvents === 1, `sentEvents=${sentEvents}`);
+        assert.equal(sentEvents, 1, "the two are ontologically distinct signals — each should be logged once, neither duplicated");
+      });
+    } finally {
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "399. Spanish: 'he enviado 3 CVs hoy' logs real progress that shows up immediately",
+  { ...llmEvalOptions(["progress-read-after-write"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-399-${randomUUID()}`;
+    const trace = new EvalTrace("399-cv-es", ["progress-read-after-write"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("he enviado 3 CVs hoy", await sendAgentMessage(server, userId, "he enviado 3 CVs hoy"));
+        assertNoGenericAgentError(reply, "Spanish CV log");
+        trace.checkpoint("a real Gmail/progress-logging tool actually ran", reply.operationsExecuted.some((o) => o.status === "executed"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(reply.operationsExecuted.some((o) => o.status === "executed"), `expected the Spanish phrase to actually log progress — got: ${JSON.stringify(reply.operationsExecuted)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "400. Catalan: 'he enviat 3 CVs avui' logs real progress that shows up immediately",
+  { ...llmEvalOptions(["progress-read-after-write"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-400-${randomUUID()}`;
+    const trace = new EvalTrace("400-cv-ca", ["progress-read-after-write"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("he enviat 3 CVs avui", await sendAgentMessage(server, userId, "he enviat 3 CVs avui"));
+        assertNoGenericAgentError(reply, "Catalan CV log");
+        trace.checkpoint("a real Gmail/progress-logging tool actually ran", reply.operationsExecuted.some((o) => o.status === "executed"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(reply.operationsExecuted.some((o) => o.status === "executed"), `expected the Catalan phrase to actually log progress — got: ${JSON.stringify(reply.operationsExecuted)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
