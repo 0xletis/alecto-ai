@@ -54,8 +54,53 @@ export const EXPLICIT_MUTATION_VERB_RE =
 /** The five tools a coach-first turn is never allowed to silently run. */
 export const RESPONSE_MODE_GATED_MUTATION_TOOLS = new Set(["action.reschedule", "action.snooze", "action.complete", "action.archive", "action.create"]);
 
-/** True when THIS message alone reads as coach_conversation or soft_intention — never true when
- * an explicit mutation verb is also present, which always wins regardless of anything else said. */
+// fix/private-alpha-gm-greeting-vs-gmail-routing: a real Telegram transcript found a user
+// replying to their morning coaching brief with "Gm will send anything web3 dev that fits my
+// style" — "Gm," a common good-morning greeting (especially in crypto/Web3 culture), never Gmail
+// — get routed to gmail.goal_watcher.propose_enable's "already covered" reply instead of
+// continuing the coaching conversation. Root cause: no deterministic regex shortcut matched "gm"
+// (confirmed — every Gmail-named regex in this codebase requires the full word "gmail"/"mail"/
+// "email"), so this was a genuine real-LLM tool-choice mistake, primed by planner.ts's own
+// "Gmail is goal-driven by default for a job-search goal" instruction combined with the message
+// happening to mention job-search-adjacent language ("web3 dev"). A greeting opener is not
+// evidence of Gmail intent no matter what else the message goes on to say about the user's goal —
+// only an explicit Gmail/mail/email/watch/sync/inbox word earns that. Requires the greeting at
+// (or very near) the START of the message — "I said gm to my coworker, now sync Gmail" is a real
+// Gmail request that merely happens to mention a greeting mid-sentence, not a greeting turn.
+export const GREETING_RE = /^\s*(gm|g\.\s?m\.?|good\s*morning|morning)\b/i;
+
+// The task's own literal list: "unless the user explicitly says Gmail/mail/email/watch/sync/
+// inbox." Deliberately wide (a bare "mail"/"watch"/"sync" anywhere in the message counts) — a
+// false POSITIVE here only ever means "let a real Gmail tool through," never "block one that was
+// wanted," so erring permissive is the safe direction.
+export const EXPLICIT_GMAIL_INTENT_RE = /\bgmail\b|\bmail\b|\be-?mail\b|\bwatch(ing)?\b|\bsync(ing)?\b|\binbox\b/i;
+
+/** Every Gmail tool that can start/report on Gmail usage for a goal or the mailbox connection —
+ * gated the exact same way action-mutation tools are: stripped before validation when the
+ * message is a bare greeting with no explicit Gmail language of its own, so the planner's real
+ * coaching reply is what's shown instead of a Gmail status/proposal line nobody asked for. */
+export const RESPONSE_MODE_GATED_GMAIL_TOOLS = new Set([
+  "gmail.goal_watcher.propose_enable",
+  "gmail.goal_watcher.apply_enable",
+  "gmail.status",
+  "gmail.rule.propose_update",
+  "gmail.rule.create",
+  "gmail.sync"
+]);
+
+/** True when the message opens with a greeting ("gm," "good morning," "morning") and contains no
+ * explicit Gmail/email language anywhere else in it — the one, narrow condition under which a
+ * Gmail tool must never be allowed through this turn. */
+export function isGreetingWithoutGmailIntent(message: string): boolean {
+  return GREETING_RE.test(message) && !EXPLICIT_GMAIL_INTENT_RE.test(message);
+}
+
+/** True when THIS message alone reads as coach_conversation, soft_intention, or a bare greeting
+ * with no explicit Gmail language — never true when an explicit mutation verb is also present,
+ * which always wins regardless of anything else said. */
 export function isCoachFirstMessage(message: string): boolean {
-  return (COACH_CONVERSATION_RE.test(message) || SOFT_INTENTION_RE.test(message)) && !EXPLICIT_MUTATION_VERB_RE.test(message);
+  return (
+    (COACH_CONVERSATION_RE.test(message) || SOFT_INTENTION_RE.test(message) || isGreetingWithoutGmailIntent(message)) &&
+    !EXPLICIT_MUTATION_VERB_RE.test(message)
+  );
 }

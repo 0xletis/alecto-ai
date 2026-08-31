@@ -13359,3 +13359,184 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-gm-greeting-vs-gmail-routing: scenarios 369-374 --------------------------
+// Real-planner coverage for the "gm" greeting misread as Gmail intent fix — the deterministic
+// backstop (applyCoachFirstResponseRouting's isGreetingWithoutGmailIntent gate) is already proven
+// in tests/gm-greeting-vs-gmail-routing.test.ts using mockPlan; these scenarios instead exercise
+// the REAL planner's own tool-choice judgment for the same message shapes, tagged so
+// `LLM_EVAL_TAGS=gm-greeting-routing,gmail-intent-disambiguation,morning-brief-reply-continuity
+// pnpm test:llm` runs just this branch's own new coverage.
+
+test(
+  "369. 'Gm will send anything web3 dev that fits my style' — never routes to Gmail, stays conversational",
+  { ...llmEvalOptions(["gm-greeting-routing", "morning-brief-reply-continuity"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-369-${randomUUID()}`;
+    const trace = new EvalTrace("369-gm-live-transcript", ["gm-greeting-routing", "morning-brief-reply-continuity"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", dueAt: new Date(Date.now() + 6 * 60 * 60 * 1000), goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        const reply = trace.record(
+          "Gm will send anything web3 dev that fits my style",
+          await sendAgentMessage(server, userId, "Gm will send anything web3 dev that fits my style")
+        );
+        assertNoGenericAgentError(reply, "gm greeting live transcript");
+        trace.checkpoint("never a Gmail reply", !/already using gmail|gmail is connected|watching in gmail/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /already using gmail|gmail is connected|watching in gmail/i, `expected a coaching reply, not Gmail — got: ${reply.reply}`);
+        trace.checkpoint("no Gmail operation executed", !reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), `expected no Gmail tool to run — got: ${JSON.stringify(reply.operationsExecuted)}`);
+        assert.equal(reply.debug.mutationExecuted, false, `expected no silent mutation — got: ${reply.reply}`);
+
+        const untouched = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(untouched?.dueAt?.getTime(), action.dueAt?.getTime());
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "370. a bare 'gm' never triggers Gmail",
+  { ...llmEvalOptions(["gm-greeting-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-370-${randomUUID()}`;
+    const trace = new EvalTrace("370-bare-gm", ["gm-greeting-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("gm", await sendAgentMessage(server, userId, "gm"));
+        assertNoGenericAgentError(reply, "bare gm");
+        trace.checkpoint("no Gmail operation executed", !reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), JSON.stringify(reply.operationsExecuted));
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), `expected no Gmail tool for a bare greeting — got: ${JSON.stringify(reply.operationsExecuted)}`);
+        assert.equal(reply.debug.mutationExecuted, false);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "371. 'GM, I'll send CVs today' stays conversational, no Gmail, no silent mutation",
+  { ...llmEvalOptions(["gm-greeting-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-371-${randomUUID()}`;
+    const trace = new EvalTrace("371-gm-send-cvs-today", ["gm-greeting-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const action = await createActionItem(userId, { source: "manual", title: "Send 3 CVs", priority: "high", goalId: goalResult.goal.id });
+
+      await trace.guard(async () => {
+        const reply = trace.record("GM, I'll send CVs today", await sendAgentMessage(server, userId, "GM, I'll send CVs today"));
+        assertNoGenericAgentError(reply, "gm send cvs today");
+        assert.ok(!reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), `expected no Gmail tool — got: ${JSON.stringify(reply.operationsExecuted)}`);
+
+        const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
+        assert.equal(updated?.dueAt, null, "must never silently reschedule the existing action just from a stated intention");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "372. 'good morning, gmail status' — explicit Gmail phrase still gets a real Gmail answer",
+  { ...llmEvalOptions(["gmail-intent-disambiguation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-372-${randomUUID()}`;
+    const trace = new EvalTrace("372-good-morning-gmail-status", ["gmail-intent-disambiguation"], userId);
+
+    try {
+      await seedUser(userId);
+
+      await trace.guard(async () => {
+        const reply = trace.record("good morning, gmail status", await sendAgentMessage(server, userId, "good morning, gmail status"));
+        assertNoGenericAgentError(reply, "good morning + gmail status");
+        trace.checkpoint("a real Gmail tool actually ran", reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), JSON.stringify(reply.operationsExecuted));
+        assert.ok(reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), `expected explicit Gmail language to still work — got: ${JSON.stringify(reply.operationsExecuted)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "373. 'sync Gmail' still syncs for real",
+  { ...llmEvalOptions(["gmail-intent-disambiguation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-373-${randomUUID()}`;
+    const trace = new EvalTrace("373-sync-gmail-still-works", ["gmail-intent-disambiguation"], userId);
+    const restoreOAuth = installGmailOAuthEnv();
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([]);
+
+    try {
+      await seedUser(userId);
+      await seedEvalGmailConnectionWithToken(userId);
+
+      await trace.guard(async () => {
+        const reply = trace.record("sync Gmail", await sendAgentMessage(server, userId, "sync Gmail"));
+        assertNoGenericAgentError(reply, "sync gmail still works");
+        trace.checkpoint("gmail.sync actually ran", reply.operationsExecuted.some((o) => o.tool === "gmail.sync"), JSON.stringify(reply.operationsExecuted));
+        assert.ok(reply.operationsExecuted.some((o) => o.tool === "gmail.sync"), `expected gmail.sync to run — got: ${JSON.stringify(reply.operationsExecuted)}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      restoreOAuth();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "374. 'are you using my mail for this goal?' still gets real Gmail-usage status",
+  { ...llmEvalOptions(["gmail-intent-disambiguation"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-374-${randomUUID()}`;
+    const trace = new EvalTrace("374-mail-for-goal-still-works", ["gmail-intent-disambiguation"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job, ideally in Web3", category: "career" });
+      if (goalResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const reply = trace.record("are you using my mail for this goal?", await sendAgentMessage(server, userId, "are you using my mail for this goal?"));
+        assertNoGenericAgentError(reply, "mail for this goal still works");
+        trace.checkpoint("a real Gmail-usage answer was given", reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), JSON.stringify(reply.operationsExecuted));
+        assert.ok(reply.operationsExecuted.some((o) => o.tool.startsWith("gmail.")), `expected explicit Gmail/mail language to still work — got: ${JSON.stringify(reply.operationsExecuted)}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
