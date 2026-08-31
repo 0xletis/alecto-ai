@@ -4258,6 +4258,34 @@ function gmailRuleMatchEventType(
     // no longer defaults an unmatched signal to "recruiter reply" — decision is always
     // "needs_review" either way (see below), so an honest "uncertain signal" review label
     // (proposedEventType left undefined) beats confidently guessing a specific bucket.
+    //
+    // fix/private-alpha-gmail-review-llm-instruction-routing (Task 4): two real reported false
+    // positives, checked FIRST and unconditionally — a LinkedIn "X reacted to your post"/"ha
+    // reaccionado a esta publicación" social notification was classified as a HIGH-PRIORITY JOB
+    // OFFER, and a "Ciklum busca personal para el puesto..." job-alert/listing email was
+    // classified as a RECRUITER REPLY. Neither is ever a real 1:1 message from a company about
+    // THIS user's own application — a social-network notification is never a job offer no matter
+    // what job-adjacent words happen to appear nearby, and a job alert/listing digest is never a
+    // personal recruiter reply, exactly the same reasoning isJobNewsletterOrPromotional/
+    // hasStrongJobContext already apply in ingestion.ts's classifyJobSearchText — mirrored here
+    // since this is a genuinely separate classification path (LLM-assisted rule match, not the
+    // rules-only classifier). Neither check is job-keyword-gated on purpose: a LinkedIn reaction
+    // email that ALSO happens to mention "job"/"role" nearby (a job-related post) is still a
+    // reaction notification, not an offer.
+    if (
+      /\b(reacted to|liked|commented on|shared) your (post|profile)\b|\bha reaccionado a esta publicaci[oó]n\b|\bha comentado tu publicaci[oó]n\b|\bcoment[oó] tu publicaci[oó]n\b|\bnew connection request\b|\bwants to connect\b/.test(
+        text
+      )
+    ) {
+      return undefined;
+    }
+    if (
+      /\bjob alert\b|\bjob alerts\b|\bjobs you may be interested in\b|\bjobs for you\b|\brecommended jobs\b|\bnew jobs matching\b|\bweekly job digest\b|\bjob digest\b|\bbusca personal para el puesto\b|\bbuscamos personal para\b|\boferta de empleo\b.{0,20}\bnewsletter\b/.test(
+        text
+      )
+    ) {
+      return undefined;
+    }
     if (/\b(schedule (an|your|a technical) interview|interview invitation|invite(d)? you to interview|book a (call|time)|calendar invite|phone screen|technical screen|onsite interview|interview scheduled)\b/.test(text)) {
       return "career.interview_scheduled";
     }

@@ -4,6 +4,7 @@ import {
   evaluateGmailBackgroundSyncEligibility,
   gmailReviewNotificationsEnabled,
   gmailScheduledSyncRuntimeFromEnv,
+  isProductionEnv,
   readGmailAutonomyPreferences,
   type GmailBackgroundSyncEligibility,
   type GmailScheduledSyncRuntime,
@@ -264,13 +265,26 @@ export function gmailRuleBehaviorLabel(rule: Pick<EmailSignalRule, "adapterId" |
   return rule.reviewBeforeLogging ? "review first" : "auto-log clear matches";
 }
 
+/**
+ * fix/private-alpha-gmail-review-llm-instruction-routing addendum (Task 7): "background sync is
+ * disabled in this local environment" used to be shown unconditionally whenever scheduledSyncEnabled
+ * was false — including in production/staging, where it's simply wrong (nothing about a Railway
+ * deployment is "local") and reads as confusing dev-internal leakage, the same class of bug
+ * fix/private-alpha-launch-config-sanity already fixed for other production-defaulted flags.
+ * INTEGRATION_SYNC_ENABLED's own default is intentionally left unchanged here (a broader, separate
+ * decision, not this task's scope) — only the WORDING now reflects where it's actually disabled.
+ */
+function backgroundSyncDisabledReason(): string {
+  return isProductionEnv() ? "disabled on this server" : "disabled in this local environment";
+}
+
 export function gmailSyncModeSentence(state: Pick<GmailAutonomyState, "syncMode" | "scheduledSyncEnabled" | "syncIntervalMinutes">): string {
   if (state.syncMode === "scheduled" && state.scheduledSyncEnabled) {
     return `Alecto checks active Gmail rules on the worker schedule, about every ${formatIntervalMinutes(state.syncIntervalMinutes)}.`;
   }
 
   if (state.syncMode === "scheduled") {
-    return `Gmail is set to scheduled checks every ${formatIntervalMinutes(state.syncIntervalMinutes)}, but background sync is disabled in this local environment.`;
+    return `Gmail is set to scheduled checks every ${formatIntervalMinutes(state.syncIntervalMinutes)}, but background sync is ${backgroundSyncDisabledReason()}.`;
   }
 
   return "Alecto checks Gmail when you say 'sync Gmail'.";

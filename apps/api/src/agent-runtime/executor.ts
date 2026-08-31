@@ -1164,11 +1164,33 @@ export async function executeOperation(
           }))
         );
         const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
+
+        // fix/private-alpha-gmail-review-llm-instruction-routing addendum (Task 3) — a real
+        // reported bug: "I sent 3 CVs today" said "logged" but the open action "Send 3 CVs" stayed
+        // open forever, and the goal progress view never mentioned it either. Reconciled here,
+        // deterministically, only against a real OPEN action whose title states its OWN concrete
+        // target count ("Send N CVs"/"apply to N jobs") — never guessed for a title with no number,
+        // never re-completes an already-completed/archived action (context.openActions excludes
+        // both by construction), and only auto-completes on a confident count match/overshoot; a
+        // partial count mentions what's left instead of completing anything, and more than one
+        // matching open action asks rather than guessing which one this was for.
+        const reconciliation = reconcileApplicationsSentWithOpenAction(count, context.openActions);
+        let completedAction: ActionItem | undefined;
+        if (reconciliation.kind === "complete") {
+          completedAction = await completeActionItem(userId, reconciliation.action.id);
+        }
+
+        // Task 4 (coach after progress) — a short, optional, non-mutating closing line rather than
+        // a sterile receipt. Deterministic (no second LLM call from inside a GROUND_TRUTH_ONLY
+        // tool) — never creates anything itself, only ever asks.
+        const coachingNote = completedAction || goalNote ? " Want me to line up another small job-search action for today?" : "";
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged ${created.length} job application${created.length === 1 ? "" : "s"} sent.${goalNote ? ` ${goalNote}` : ""}`,
-          result: created
+          summary: `Logged ${created.length} job application${created.length === 1 ? "" : "s"} sent.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}${coachingNote}`,
+          result: created,
+          entities: completedAction ? [actionToEntity(completedAction)] : undefined
         };
       }
 
@@ -1315,12 +1337,31 @@ export async function executeOperation(
         );
         const goalNote = describeGoalEvidenceMatch(matchedGoals);
         const signalLabel = describeSignalCount(matchedGoals[0], verifiedEventType, signalKey, created.length);
+
+        // fix/private-alpha-gmail-review-llm-instruction-routing addendum (Task 3/4) — a real-LLM
+        // eval run found the planner sometimes reaches for this general tool instead of
+        // event.log_job_applications for "sent N CVs today" (both are valid per its own catalog
+        // guidance). Reconciliation/coaching must not depend on which of the two equally-legitimate
+        // tools it happened to pick — see event.log_job_applications's own case for the full
+        // rationale, reused verbatim here rather than duplicated.
+        let completedAction: ActionItem | undefined;
+        let reconciliationNote = "";
+        let coachingNote = "";
+        if (verifiedEventType === "career.application_sent") {
+          const reconciliation = reconcileApplicationsSentWithOpenAction(created.length, context.openActions);
+          if (reconciliation.kind === "complete") {
+            completedAction = await completeActionItem(userId, reconciliation.action.id);
+          }
+          reconciliationNote = reconciliation.note;
+          coachingNote = completedAction || goalNote ? " Want me to line up another small job-search action for today?" : "";
+        }
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged ${signalLabel}${notes ? ` (${notes})` : ""}.${goalNote ? ` ${goalNote}` : ""}`,
+          summary: `Logged ${signalLabel}${notes ? ` (${notes})` : ""}.${goalNote ? ` ${goalNote}` : ""}${reconciliationNote}${coachingNote}`,
           result: created,
-          entities: matchedGoals[0] ? [goalToEntity(matchedGoals[0])] : undefined
+          entities: [...(matchedGoals[0] ? [goalToEntity(matchedGoals[0])] : []), ...(completedAction ? [actionToEntity(completedAction)] : [])]
         };
       }
 
@@ -1540,7 +1581,8 @@ export async function executeOperation(
             proposal?.line,
             context.activeGoals,
             context.gmailReviews,
-            state
+            state,
+            context.gmailRules
           ),
           result: connection,
           ...(proposal?.pendingOperationUpdate && canProposeRuleNow ? { pendingOperationUpdate: proposal.pendingOperationUpdate } : {})
@@ -4165,6 +4207,50 @@ function actionToEntity(action: ActionItem, index?: number): AgentEntity {
   return { type: "action", id: action.id, label: action.title, index };
 }
 
+const APPLICATION_ACTION_TARGET_COUNT_RE = /\b(?:send|submit|apply to)\s+(\d+)\s+(?:cvs?|applications?|jobs?)\b/i;
+
+/** The action's OWN stated target count ("Send 3 CVs" -> 3) — undefined for a title with no
+ * concrete number, which this reconciliation deliberately never guesses at. */
+function parseApplicationActionTargetCount(title: string): number | undefined {
+  const match = title.match(APPLICATION_ACTION_TARGET_COUNT_RE);
+  return match?.[1] ? Number.parseInt(match[1], 10) : undefined;
+}
+
+type ApplicationsSentReconciliation = { kind: "complete"; action: ActionItem; note: string } | { kind: "partial" | "ambiguous" | "none"; note: string };
+
+/**
+ * fix/private-alpha-gmail-review-llm-instruction-routing addendum (Task 3): "I sent 3 CVs today"
+ * completing the matching open "Send 3 CVs" action, deterministically. Only ever considers OPEN
+ * actions (context.openActions already excludes completed/archived/snoozed by construction) whose
+ * title states a real, concrete target count — never a guess for a vague title. A count that meets
+ * or exceeds the target auto-completes (private-alpha's chosen default — see the task); a lower
+ * count mentions what's left instead; more than one matching open action asks rather than picking
+ * one; zero matches logs progress with no reconciliation note at all.
+ */
+function reconcileApplicationsSentWithOpenAction(sentCount: number, openActions: ActionItem[]): ApplicationsSentReconciliation {
+  const matching = openActions
+    .map((action) => ({ action, target: parseApplicationActionTargetCount(action.title) }))
+    .filter((entry): entry is { action: ActionItem; target: number } => entry.target !== undefined);
+
+  if (matching.length === 0) {
+    return { kind: "none", note: "" };
+  }
+
+  if (matching.length > 1) {
+    return {
+      kind: "ambiguous",
+      note: ` You have a few open actions this could complete (${matching.map((entry) => `"${entry.action.title}"`).join(", ")}) — say which one to mark done.`
+    };
+  }
+
+  const { action, target } = matching[0]!;
+  if (sentCount >= target) {
+    return { kind: "complete", action, note: ` Marked "${action.title}" done.` };
+  }
+
+  return { kind: "partial", note: ` ${target - sentCount} more to go on "${action.title}".` };
+}
+
 function goalToEntity(goal: Goal): AgentEntity {
   return { type: "goal", id: goal.id, label: goal.title };
 }
@@ -4994,7 +5080,13 @@ function formatGmailConnectionStatusForChat(
   // the summary line can break the total down by priority, generically across every rule/domain,
   // not just job-search.
   pendingReviews: EmailReviewItem[] = [],
-  autonomyState?: Awaited<ReturnType<typeof buildGmailAutonomyState>>
+  autonomyState?: Awaited<ReturnType<typeof buildGmailAutonomyState>>,
+  // fix/private-alpha-gmail-review-llm-instruction-routing (Task 5): the caller's FULL,
+  // unfiltered rule list (active AND paused/archived — e.g. from an old Gmail account after a
+  // switch) — see buildGoalFirstGmailSupportLines's own doc comment for why the per-goal pending
+  // count needs this to stay consistent with gmail.review.list. Defaults to `rules` itself so any
+  // other caller that only ever had active rules to begin with keeps its exact old behavior.
+  allRules: EmailSignalRule[] = rules
 ): string {
   const oauthUrl = gmailOAuthUrlForUser(userId);
   const activeRules = rules.filter((rule) => rule.status === "active");
@@ -5004,7 +5096,7 @@ function formatGmailConnectionStatusForChat(
   // their goals without learning what a "rule" is. The full rule-level detail (name, domain,
   // exact per-rule tracking policy) still exists, just moved to the explicit "show Gmail rules"
   // advanced view (gmail.rule.list), unchanged by this.
-  const ruleLines = activeRules.length > 0 ? buildGoalFirstGmailSupportLines(activeRules, activeGoals, pendingReviews) : [];
+  const ruleLines = activeRules.length > 0 ? buildGoalFirstGmailSupportLines(activeRules, activeGoals, pendingReviews, allRules) : [];
   const highPriorityPendingCount = pendingReviews.filter((review) => review.priority === "high").length;
   const pendingReviewLine =
     activeRules.length > 0
@@ -5571,25 +5663,47 @@ function gmailRuleWatchSummary(rule: EmailSignalRule): string {
  * into one shared "General Gmail watch" bucket rather than being silently dropped, so a plain
  * custom rule (e.g. one created before any goal existed) still shows up honestly.
  */
-function buildGoalFirstGmailSupportLines(activeRules: EmailSignalRule[], activeGoals: Goal[], pendingReviews: EmailReviewItem[]): string[] {
+function buildGoalFirstGmailSupportLines(
+  activeRules: EmailSignalRule[],
+  activeGoals: Goal[],
+  pendingReviews: EmailReviewItem[],
+  // fix/private-alpha-gmail-review-llm-instruction-routing (Task 5): a real reported bug —
+  // "gmail status" said "Pending reviews: 1" while "show me the reviews" listed 4, right after a
+  // Gmail account switch. gmail.review.list/getEmailReviewItems was never rule-status-filtered —
+  // a pending review created by the OLD (now-paused) rule stays fully real and actionable — but
+  // this function used to count only reviews tied to a CURRENTLY active rule, silently excluding
+  // the switched-away rule's still-pending reviews from the per-goal total. `allRules` (the
+  // caller's full, unfiltered rule list — active AND paused/archived) closes that gap: every rule
+  // this goal has EVER owned now counts toward its pending total, matching exactly what
+  // gmail.review.list itself shows, never silently losing a real pending review from the count.
+  allRules: EmailSignalRule[]
+): string[] {
   const groupOrder: string[] = [];
-  const groups = new Map<string, { label: string; rules: EmailSignalRule[] }>();
+  const groups = new Map<string, { label: string; rules: EmailSignalRule[]; countedRuleIds: Set<string> }>();
 
   for (const rule of activeRules) {
     const linkedGoal = resolveLinkedGoalForDisplay(rule, activeGoals);
     const key = linkedGoal ? linkedGoal.id : "__general__";
     const label = linkedGoal ? linkedGoal.title : "General Gmail watch";
     if (!groups.has(key)) {
-      groups.set(key, { label, rules: [] });
+      groups.set(key, { label, rules: [], countedRuleIds: new Set() });
       groupOrder.push(key);
     }
-    groups.get(key)!.rules.push(rule);
+    const group = groups.get(key)!;
+    group.rules.push(rule);
+    group.countedRuleIds.add(rule.id);
+  }
+
+  for (const rule of allRules) {
+    const linkedGoal = resolveLinkedGoalForDisplay(rule, activeGoals);
+    const key = linkedGoal ? linkedGoal.id : "__general__";
+    groups.get(key)?.countedRuleIds.add(rule.id);
   }
 
   const lines = ["", "Gmail support:"];
   for (const key of groupOrder) {
     const group = groups.get(key)!;
-    const pendingCount = pendingReviews.filter((review) => group.rules.some((rule) => rule.id === review.ruleId)).length;
+    const pendingCount = pendingReviews.filter((review) => group.countedRuleIds.has(review.ruleId)).length;
     const watchSummary = [...new Set(group.rules.map((rule) => gmailRuleWatchSummary(rule)))].join("; ");
     lines.push(`- ${group.label}: on — watches ${watchSummary}${pendingCount > 0 ? ` — ${pendingCount} pending review${pendingCount === 1 ? "" : "s"}` : ""}`);
   }
