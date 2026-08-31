@@ -182,7 +182,10 @@ test("E. numbered replies after a normal action list operate on real parent acti
     const completeReply = await sendAgentMessage(server, userId, "complete 1");
     assert.equal(completeReply.debug.mutationExecuted, true);
 
-    mockPlan({ topic: "actions", intent: "snooze_numbered", operations: [op("action.snooze", { actionId: byIndex(2), untilText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
+    // fix/private-alpha-remove-user-facing-action-snooze: action.snooze is deprecated and no
+    // longer offered in the planner's tool catalog — a real planner now emits action.reschedule
+    // for "snooze 2 tomorrow" too, which keeps the action OPEN instead of hiding it.
+    mockPlan({ topic: "actions", intent: "snooze_numbered", operations: [op("action.reschedule", { actionId: byIndex(2), dueText: "tomorrow" })], needsClarification: false, clarificationQuestion: null, replyDraft: "" });
     const snoozeReply = await sendAgentMessage(server, userId, "snooze 2 tomorrow");
     assert.equal(snoozeReply.debug.mutationExecuted, true);
 
@@ -194,7 +197,7 @@ test("E. numbered replies after a normal action list operate on real parent acti
     const rowB = await prisma.actionItem.findUnique({ where: { id: byIndex(2) } });
     const rowC = await prisma.actionItem.findUnique({ where: { id: byIndex(3) } });
     assert.equal(rowA?.status, "completed");
-    assert.equal(rowB?.status, "snoozed");
+    assert.equal(rowB?.status, "open", "moving it must keep the action open, never hidden as snoozed");
     assert.equal(rowC?.status, "archived");
   } finally {
     clearAgentRuntimeMocks();

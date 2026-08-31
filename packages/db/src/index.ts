@@ -1826,13 +1826,29 @@ export async function rescheduleActionItem(userId: string, actionItemId: string,
     return undefined;
   }
 
+  // fix/private-alpha-remove-user-facing-action-snooze: action.reschedule is now the ONLY
+  // user-facing way to move a due date later (action.snooze no longer creates hidden state for
+  // normal chat commands), so the repeated-postponement coaching signal (postponeCount — see
+  // executor.ts's action.reschedule case for where the 2nd/3rd-time coaching note reads it) has
+  // to move here too, or it silently stops working. Two cases count as a genuine deferral: (1) a
+  // plain open action being pushed LATER than its own current due date — pulling a date closer or
+  // correcting a mistaken time is not the "avoidance" pattern this exists to notice, so that never
+  // counts; (2) an action that's still in the legacy "snoozed" state being moved AGAIN, regardless
+  // of the exact resulting date — mirrors the old snoozeActionItem's own semantics ("every real
+  // snooze counts, including a second/third move of the SAME already-snoozed action," never just
+  // the ones that happen to land later than the last one) so a legacy row's postponement history
+  // keeps counting correctly through the transition, not just future ones created after it.
+  const isDeferral =
+    existing.status === "snoozed" || (Boolean(existing.dueAt) && dueAt.getTime() > existing.dueAt!.getTime());
+
   const actionItem = await prisma.actionItem.update({
     where: { id: actionItemId },
     data: {
       status: "open",
       dueAt,
       snoozedUntil: null,
-      completedAt: null
+      completedAt: null,
+      ...(isDeferral ? { postponeCount: { increment: 1 } } : {})
     }
   });
 

@@ -338,8 +338,8 @@ test("3B/3C: 'done' and 'move it to tomorrow' after an overdue reminder resolve 
 
     const moved = await sendAgentMessage(server2, userId2, "move it to tomorrow");
     assert.equal(moved.debug.mutationExecuted, true);
-    const snoozed = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.equal(snoozed?.status, "snoozed");
+    const rescheduled = await prisma.actionItem.findUnique({ where: { id: action.id } });
+    assert.equal(rescheduled?.status, "open", "moving it must keep the action open, never hidden as snoozed");
     const goalStillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
     assert.equal(goalStillActive?.status, "active");
   } finally {

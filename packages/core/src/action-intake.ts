@@ -717,8 +717,19 @@ function minutesForDayPart(dayPart: ReturnType<typeof parseDayPart>, preferences
   return preferences.defaultActionTimeMinutes;
 }
 
+// fix/private-alpha-remove-user-facing-action-snooze: a real LLM-planner eval caught "move it to
+// tomorrow 20:00" (dueText passed with no "at") silently defaulting to end-of-day (23:59) instead
+// of the stated 20:00 — the "at" lead-in used to be required unconditionally. A real LLM omits it
+// constantly; requiring it made the parser strictly less capable than the very tool it's the
+// grounding for. Two safe widenings: (1) "at"/Spanish "a las"/Catalan "a les" as equivalent
+// lead-ins — same job, just multilingual; (2) a bare H:MM WITH a colon needs no lead-in word at
+// all, since a colon-delimited clock time ("20:00", "9:30pm") is unambiguous in this context —
+// nothing else in a due-date phrase is ever written that way. A bare hour with no colon and no
+// lead-in ("tomorrow 20") still requires "at"/"a las"/"a les", since a lone number without either
+// signal is genuinely ambiguous (a day-of-month, a quantity, ...).
 function parseExplicitTime(text: string): { minutes: number; matchedText: string } | undefined {
-  const match = text.match(/\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+  const match =
+    text.match(/\b(?:at|a\s+las|a\s+les)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/) ?? text.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)?\b/);
 
   if (!match) {
     return undefined;

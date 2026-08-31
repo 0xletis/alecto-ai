@@ -132,7 +132,9 @@ test("2. a later 'complete 1, snooze 2 tomorrow, archive 3' chat reply resolves 
     const rowB = await prisma.actionItem.findUnique({ where: { id: taskB.id } });
     const rowC = await prisma.actionItem.findUnique({ where: { id: taskC.id } });
     assert.equal(rowA?.status, "completed", "index 1 must resolve to the first bundled action, not require a raw UUID");
-    assert.equal(rowB?.status, "snoozed");
+    // fix/private-alpha-remove-user-facing-action-snooze: the batch "snooze" decision no longer
+    // sets the hidden "snoozed" status — it reschedules, keeping the action open.
+    assert.equal(rowB?.status, "open");
     assert.equal(rowC?.status, "archived");
   } finally {
     clearAgentRuntimeMocks();

@@ -289,6 +289,10 @@ test("agent/message: action cleanup golden transcript resolves 'it'", async () =
     const turn1 = await send(server, userId, "clean up my tasks");
     assert.match(turn1.reply, /Write YouTube script/i);
 
+    // fix/private-alpha-remove-user-facing-action-snooze: "snooze it to tomorrow" (no digit) is
+    // intercepted by the deterministic shortcut in runtime.ts before the planner is ever
+    // consulted — this mockPlan is unused, same as the shortcut's other bare-pronoun cases; the
+    // shortcut now builds action.reschedule, not action.snooze, so the action stays open.
     mockPlan({
       topic: "action_cleanup",
       intent: "snooze_referenced_action",
@@ -300,11 +304,11 @@ test("agent/message: action cleanup golden transcript resolves 'it'", async () =
     const turn2 = await send(server, userId, "snooze it to tomorrow");
     assert.equal(turn2.operationsExecuted.length, 1);
     assert.equal(turn2.operationsExecuted[0].status, "executed");
-    assert.match(turn2.reply, /bring "write youtube script" back/i);
+    assert.match(turn2.reply, /rescheduled/i);
 
     const updated = await prisma.actionItem.findUnique({ where: { id: action.id } });
-    assert.equal(updated?.status, "snoozed");
-    assert.ok(updated?.snoozedUntil);
+    assert.equal(updated?.status, "open", "moving it must keep the action open, never hidden as snoozed");
+    assert.ok(updated?.dueAt);
   } finally {
     clearMocks();
     await server.close();

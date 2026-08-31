@@ -1343,12 +1343,22 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   // ISN'T already a clear, unambiguous domain action — exactly the set of messages that reach
   // this point without an earlier shortcut having already handled them. This never widens what
   // the guardrail blocks, only narrows which messages are even offered to it.
+  // fix/private-alpha-goal-avoidance-action-bypass: explicit action-management language ("move it,"
+  // "muévela," "canvia-la") is never itself a signal of goal avoidance — see
+  // isExplicitActionMutationGuardrailBypass's own doc comment for the real reported bug this
+  // closes. Skips ONLY the guardrail LLM call; the real planner, validator, and execution pipeline
+  // below run exactly as they would for any other allowed message, so this can never let an LLM
+  // mutate state directly, and any goal-abandonment wording in the same message unconditionally
+  // disqualifies the bypass.
+  const actionMutationBypassesGuardrail = isExplicitActionMutationGuardrailBypass(message, context);
   logAgentRuntimeDiagnostics({
     phase: "guardrail_check",
     userId,
-    note: "no domain shortcut matched; message reaches goal-avoidance guardrail"
+    note: actionMutationBypassesGuardrail
+      ? "explicit action-mutation command with a resolvable action target — goal-avoidance guardrail bypassed"
+      : "no domain shortcut matched; message reaches goal-avoidance guardrail"
   });
-  const guardrail = await checkGoalGuardrail(message, context);
+  const guardrail = actionMutationBypassesGuardrail ? ACTION_MUTATION_GUARDRAIL_BYPASS_RESULT : await checkGoalGuardrail(message, context);
   if (guardrail.decision !== "allow") {
     // hard_block/soft_warn are real, detected conflicts worth a durable trace (feeds existing
     // insight/daily-review pipelines that already read risk_pattern memories); ask_clarification
@@ -2418,16 +2428,25 @@ const ACTION_ARCHIVE_PATTERN = /\b(archive|dismiss)\b/;
 // (literal "snooze" only) is a small subset of how a coach would actually phrase task deferral;
 // "move it," "bring it back," "park it," "push it," "defer," and "remind me" (+ Spanish/Catalan
 // equivalents, matched post-accent-stripping via normalizeIntentText) are all real reported/
-// expected phrasings for the exact same operation (action.snooze) — deferring something later.
-// Deliberately does NOT include "postpone"/"reschedule": those two are action.reschedule's own
-// established vocabulary (changing/correcting a due date while the action stays OPEN, a genuinely
-// different DB effect than snoozing it), and a bare "reschedule it to tomorrow" must still reach
-// that tool, not get silently redirected into a deferral. Still just a keyword shortcut, not full
+// expected phrasings for the exact same operation (now action.reschedule — see
+// fix/private-alpha-remove-user-facing-action-snooze below). Deliberately does NOT include
+// "postpone"/"reschedule": those two are action.reschedule's own established vocabulary
+// (changing/correcting a due date while the action stays OPEN, the same effect this whole pattern
+// now routes to anyway), and a bare "reschedule it to tomorrow" must still reach that tool through
+// its own normal path, not get silently redirected here. Still just a keyword shortcut, not full
 // NLP — a phrase this doesn't catch simply falls through to the real LLM planner (whose
 // tool-catalog.ts guidance covers the same vocabulary) rather than silently failing; this only
 // ever WIDENS what resolves deterministically before the guardrail.
+//
+// fix/private-alpha-remove-user-facing-action-snooze: "not now"/"not today" added after a real-LLM
+// eval caught "not now, tomorrow" (no other deferral keyword) falling all the way through to the
+// goal-avoidance guardrail's own LLM classifier, which sometimes misread an entirely ordinary task
+// reschedule as "avoiding the goal" and blocked it outright — the exact operation (action.reschedule)
+// never even ran. Matching this deterministically here, like every other deferral phrase already
+// does, gives it the same guardrail-skip privilege ("domain shortcut matched" — see the call site
+// below) instead of leaving it to a per-call, occasionally-wrong LLM judgment.
 const ACTION_SNOOZE_PATTERN =
-  /\bsnooze\b|\bmove (it|this|that)\b|\bbring (it|this|that) back\b|\bpark (it|this|that)\b|\bpush (it|this|that)\b|\bdefer\b|\bremind me\b|\bmuevelo\b|\bpasalo\b|\brecuerdamelo\b|\bmou-ho\b|\bpassa-ho\b|\brecorda-m['’]ho\b/;
+  /\bsnooze\b|\bmove (it|this|that)\b|\bbring (it|this|that) back\b|\bpark (it|this|that)\b|\bpush (it|this|that)\b|\bdefer\b|\bremind me\b|\bnot now\b|\bnot today\b|\bmuevelo\b|\bpasalo\b|\brecuerdamelo\b|\bmou-ho\b|\bpassa-ho\b|\brecorda-m['’]ho\b/;
 /** Generic pronoun/bare-acknowledgement reference only — a message that names something by its
  * own specific words ("complete the Nietzsche book goal") should still go through the normal
  * planner/validator resolution path, not this shortcut, which exists only for the truly ambiguous
@@ -2518,28 +2537,38 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
     return undefined;
   }
 
-  let tool: "action.complete" | "action.archive" | "action.snooze" | undefined;
-  let untilText: string | undefined;
+  let tool: "action.complete" | "action.archive" | "action.reschedule" | undefined;
+  let dueText: string | undefined;
 
   if (ACTION_SNOOZE_PATTERN.test(text)) {
-    untilText = extractNaturalDueTextFromMessage(text);
-    // action.snooze's untilText is required — without one to extract, fall through rather than
-    // plan an operation the validator can only reject.
-    if (!untilText) {
+    dueText = extractNaturalDueTextFromMessage(text);
+    // "not now"/"not today" always extract their OWN literal word first ("now"/"today" appears
+    // before any later date named in the same message — extractNaturalDueTextFromMessage's regex
+    // finds the leftmost match) — the opposite of what they mean: "not now" means "later," not
+    // "due this instant." Tomorrow is the natural default (matches tool-catalog.ts's own
+    // established rule for the same phrasing when it reaches the real planner instead), UNLESS a
+    // real later date follows in the same message ("not now, tomorrow"), which wins here exactly
+    // because it's the more specific, user-stated target.
+    if (dueText === "now" || dueText === "today") {
+      const laterDate = text.match(
+        /\bnot\s+(?:now|today)\b[\s,]*((?:tomorrow|tonight)(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?|(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?)\b/
+      );
+      dueText = laterDate?.[1]?.trim() ?? "tomorrow";
+    }
+    // The deterministic shortcut still needs a real due-date phrase to extract — without one,
+    // fall through rather than plan an operation the validator can only reject.
+    if (!dueText) {
       return undefined;
     }
-    // "move it back to today"/"bring it back today" is a real reported case where this pattern's
-    // OWN vocabulary ("move"/"bring back") collides with its own extracted date — deferring
-    // something UNTIL today is a contradiction (a snooze is always meant to push something
-    // LATER), and doing it anyway would set status "snoozed" with snoozedUntil=today, which is
-    // invisible to a plain "show me my actions" until some later reminder notices it's due — the
-    // opposite of what "pull it back to today" actually means. That phrase is action.reschedule's
-    // job (dueText 'today', keeps the action OPEN) — falls through to the real planner here,
-    // whose tool-catalog.ts guidance already covers exactly this "pull it back to today" phrasing.
-    if (/^today\b/i.test(untilText)) {
-      return undefined;
-    }
-    tool = "action.snooze";
+    // fix/private-alpha-remove-user-facing-action-snooze: this used to build an action.snooze
+    // operation, which set status "snoozed" — invisible to a plain "show me my actions" until it
+    // came back due. A real Telegram transcript found exactly this: "move it to tomorrow 20:00"
+    // made the action vanish from every normal list view even though nothing was completed or
+    // archived. action.reschedule updates dueAt and keeps the action open, matching the product
+    // rule that moving/postponing/reminding later must never hide a real, still-open commitment.
+    // No more "today" carve-out needed either — action.reschedule already handles pulling a date
+    // BACK to today correctly (previously only true of action.reschedule, never action.snooze).
+    tool = "action.reschedule";
   } else if (ACTION_ARCHIVE_PATTERN.test(text)) {
     tool = "action.archive";
   } else if (ACTION_COMPLETION_PATTERN.test(text) || ACTION_DONE_PATTERN.test(text)) {
@@ -2548,7 +2577,7 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
     return undefined;
   }
 
-  if (tool !== "action.snooze" && !GENERIC_ACTION_REFERENCE_PATTERN.test(text) && !ACTION_DONE_PATTERN.test(text)) {
+  if (tool !== "action.reschedule" && !GENERIC_ACTION_REFERENCE_PATTERN.test(text) && !ACTION_DONE_PATTERN.test(text)) {
     return undefined;
   }
 
@@ -2564,7 +2593,7 @@ async function actionCompletionShortcutOperation(message: string, context: Conte
 
   return {
     tool,
-    args: { actionId: resolved.actionId, ...(untilText ? { untilText } : {}) },
+    args: { actionId: resolved.actionId, ...(dueText ? { dueText } : {}) },
     rationale: "user replied generically about the most recently notified/visible task, not a Gmail review"
   };
 }
@@ -3381,6 +3410,71 @@ const GOAL_LIFECYCLE_DONT_WANT_ANYMORE_RE = /\b(don'?t|dont) (?:want|wanna)[\s\S
 const GOAL_WORD_RE = /\b(goal|goals|objetivo|objetivos|meta|metas|objectiu|objectius)\b/;
 const GOAL_LIFECYCLE_BARE_PRONOUN_COMMAND_RE =
   /^(?:okay|ok|vale|va)?[,.\s]*(pause|archive|delete|remove|pausa|pausar|archiva|archivar|elimina|eliminar|borra|borrar)\s+(it|that|this|lo|la|ho)\.?$/;
+
+// fix/private-alpha-goal-avoidance-action-bypass: a real-LLM eval caught "muévela a mañana a las
+// 20:00" (an ordinary explicit action reschedule, carrying a digit so it skips
+// actionCompletionShortcutOperation's own bare-pronoun shortcut by design) reaching the
+// goal-avoidance guardrail's separate LLM classifier and getting misread as "pulling you away from
+// your goal" — consistently, for this Spanish phrasing specifically, across repeated real-model
+// runs. English and Catalan equivalents mostly passed, but only because the classifier's own
+// judgment happened to land correctly more often for them; nothing deterministic protected any of
+// them. Explicit action maintenance ("move it," "reschedule it," "muévela," "canvia-la") is never
+// itself a signal of abandoning the underlying goal — the guardrail's classification prompt has no
+// way to know that distinction reliably in every language, so this is caught deterministically
+// instead, the same way every other unambiguous operational command already skips the guardrail
+// (see goalLifecycleShortcutOperation and the Gmail domain shortcuts above). Narrow on purpose:
+// matches only explicit action-mutation vocabulary, requires either a real visible action to attach
+// to or an explicit "the action"/"la acción"/"l'acció" reference, and is unconditionally disqualified
+// by ANY goal-abandonment wording — so a message like "archive the goal" or "ya no quiero este
+// objetivo" is never affected (those are already handled by goalLifecycleShortcutOperation above,
+// or correctly still reach the real guardrail here). This only ever NARROWS what reaches the
+// guardrail, exactly like every other domain shortcut in this file — never widens what it blocks.
+const ACTION_MUTATION_GUARDRAIL_BYPASS_RESULT: GuardrailResult = {
+  decision: "allow",
+  reply: null,
+  matchedGoalId: null,
+  matchedGoalTitle: null,
+  matchedTrigger: null,
+  pattern: null,
+  reason: "explicit_action_mutation_bypass",
+  llmAttempted: false
+};
+const ACTION_MUTATION_LANGUAGE_RE =
+  /\b(move|reschedule|postpone|remind)\b|\bset it\b|\bset (?:this|that)\b|\bchange (?:the )?due\b|\bcomplete (?:it|this|that|the action)\b|\barchive (?:it|this|that|the action)\b|\bremove (?:it|this|that|the action)\b|\bmuevela\b|\bmuevelo\b|\bmoverla\b|\bmoverlo\b|\breprograma(?:rla|rlo)?\b|\bcambia(?:rla|rlo)?\b|\bpon(?:la|lo|erla|erlo)\b|\bmou-l[ao]\b|\bmou-ho\b|\bcanvia-l[ao]\b|\bcanvia-ho\b|\bposa-l[ao]\b|\bposa-ho\b/;
+const ACTION_TARGET_REFERENCE_RE = /\b(the action|this action|that action|la accion|esta accion|l'?accio|aquesta accio)\b/;
+
+/**
+ * Deterministic "this is explicit action maintenance, not goal avoidance" bypass, checked
+ * immediately before the goal-avoidance guardrail call at the main call site below. Never resolves
+ * an operation itself (unlike the other domain shortcuts in this file) — it only decides whether
+ * the goal-avoidance LLM classifier gets a turn at all; the real planner + validator + execution
+ * pipeline runs completely unchanged either way, so nothing here ever mutates state directly.
+ */
+function isExplicitActionMutationGuardrailBypass(message: string, context: ContextBundle): boolean {
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return false;
+  }
+
+  // Any goal-abandonment signal disqualifies the bypass unconditionally — explicit action
+  // maintenance language is never allowed to override a real "I want to stop pursuing this."
+  if (
+    GOAL_WORD_RE.test(text) ||
+    GOAL_LIFECYCLE_DONT_WANT_ANYMORE_RE.test(text) ||
+    GOAL_LIFECYCLE_STOP_TRACKING_RE.test(text) ||
+    GOAL_LIFECYCLE_STOP_FOLLOWING_RE.test(text) ||
+    GOAL_LIFECYCLE_NOT_IMPORTANT_RE.test(text)
+  ) {
+    return false;
+  }
+
+  if (!ACTION_MUTATION_LANGUAGE_RE.test(text)) {
+    return false;
+  }
+
+  const hasVisibleAction = context.session.visibleEntities.some((entity) => entity.type === "action");
+  return hasVisibleAction || ACTION_TARGET_REFERENCE_RE.test(text);
+}
 
 /**
  * Deterministic goal-lifecycle intent shortcut — checked BEFORE the goal-avoidance guardrail (see

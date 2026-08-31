@@ -9618,7 +9618,10 @@ test("action hygiene batch replies use visible numbers, confirm before mutation,
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Done:/);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[0].actionId } })).status, "archived");
-    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[1].actionId } })).status, "snoozed");
+    // fix/private-alpha-remove-user-facing-action-snooze: the batch "snooze" decision (shared
+    // with the v3 chat flow's action.hygiene_apply via applyActionHygieneBatchOperations) no
+    // longer sets the hidden "snoozed" status — it reschedules, keeping the action open.
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[1].actionId } })).status, "open");
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: candidates[2].actionId } })).status, "archived");
 
     response = await server.inject({
@@ -9631,7 +9634,7 @@ test("action hygiene batch replies use visible numbers, confirm before mutation,
     });
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Last action changes:/);
-    assert.match(response.json().reply, /Archived|Snoozed/);
+    assert.match(response.json().reply, /Archived|Moved/);
     assert.doesNotMatch(response.json().reply, /email reviews/i);
   } finally {
     await server.close();
@@ -9716,7 +9719,9 @@ test("action hygiene all-except replies handle missing snooze time and safe batc
     assert.equal(response.statusCode, 200);
     assert.match(response.json().reply, /Done:/);
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: homepage.id } })).status, "archived");
-    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: read.id } })).status, "snoozed");
+    // fix/private-alpha-remove-user-facing-action-snooze: the batch "snooze" decision no longer
+    // sets the hidden "snoozed" status — it reschedules, keeping the action open.
+    assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: read.id } })).status, "open");
     assert.equal((await prisma.actionItem.findUniqueOrThrow({ where: { id: devJobs.id } })).status, "archived");
   } finally {
     await server.close();

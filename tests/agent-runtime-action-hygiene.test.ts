@@ -188,7 +188,7 @@ test("agent/message: 'complete 1' completes the correct action from the visible 
   }
 });
 
-test("agent/message: 'snooze 1 to tomorrow' snoozes the correct action from the visible hygiene list", async () => {
+test("agent/message: 'snooze 1 to tomorrow' moves the correct action from the visible hygiene list, keeping it open", async () => {
   const server = buildServer();
   const userId = `hygiene-snooze-${randomUUID()}`;
 
@@ -207,12 +207,12 @@ test("agent/message: 'snooze 1 to tomorrow' snoozes the correct action from the 
     hygieneApplyPlan([{ index: 1, decision: "snooze", snoozeUntilText: "tomorrow" }]);
     const reply = await send(server, userId, "snooze 1 to tomorrow");
 
-    assert.match(reply.reply, /snoozed/i);
+    assert.match(reply.reply, /moved/i);
     assert.equal(reply.debug.mutationExecuted, true);
 
     const updated = await prisma.actionItem.findUnique({ where: { id: overdue.id } });
-    assert.equal(updated?.status, "snoozed");
-    assert.ok(updated?.snoozedUntil);
+    assert.equal(updated?.status, "open", "the batch 'snooze' decision must keep the action open, never hidden");
+    assert.ok(updated?.dueAt);
   } finally {
     clearMocks();
     await server.close();
@@ -312,7 +312,10 @@ test("agent/message: 'complete 1, snooze 2 to Friday, archive 3' applies all thr
 
     assert.match(applyReply.reply, /done/i);
     assert.match(applyReply.reply, /completed/i);
-    assert.match(applyReply.reply, /snoozed/i);
+    // fix/private-alpha-remove-user-facing-action-snooze: the batch "snooze" decision still
+    // recognizes that word in the user's own reply, but no longer sets the hidden "snoozed"
+    // status — it reschedules and says "Moved ...", keeping the action open.
+    assert.match(applyReply.reply, /moved/i);
     assert.match(applyReply.reply, /archived/i);
     assert.equal(applyReply.operationsExecuted.length, 1, "one hygiene_apply operation batches all three decisions");
 
@@ -320,7 +323,7 @@ test("agent/message: 'complete 1, snooze 2 to Friday, archive 3' applies all thr
     const snoozed = await prisma.actionItem.findUnique({ where: { id: toSnooze.id } });
     const archived = await prisma.actionItem.findUnique({ where: { id: toArchive.id } });
     assert.equal(completed?.status, "completed");
-    assert.equal(snoozed?.status, "snoozed");
+    assert.equal(snoozed?.status, "open", "the batch 'snooze' decision must keep the action open, never hidden");
     assert.equal(archived?.status, "archived");
   } finally {
     clearMocks();

@@ -1,4 +1,4 @@
-import { archiveActionItem, completeActionItem, getActionItem, snoozeActionItem } from "@operator-agent/db";
+import { archiveActionItem, completeActionItem, getActionItem, rescheduleActionItem } from "@operator-agent/db";
 import { isRecord } from "../utils/records.js";
 import { formatLocalDateTime } from "../utils/datetime.js";
 import { createGoalProgressFromCompletedAction } from "./goal-progress.js";
@@ -108,13 +108,18 @@ export async function applyActionHygieneBatchOperations(
     if (operation.operation === "snooze") {
       const dueAt = operation.dueAt ? new Date(operation.dueAt) : undefined;
       if (!dueAt || Number.isNaN(dueAt.getTime())) {
-        skipped.push(`${action.title}: missing snooze time`);
+        skipped.push(`${action.title}: missing new due time`);
         continue;
       }
 
-      const updated = await snoozeActionItem(userId, action.id, dueAt);
+      // fix/private-alpha-remove-user-facing-action-snooze: this batch decision still recognizes
+      // the word "snooze" in a reply like "complete 1, snooze 2 to Friday, archive 3" (established
+      // vocabulary, unchanged), but no longer sets the hidden "snoozed" status — it reschedules,
+      // updating dueAt while keeping the action OPEN and visible, same as every other user-facing
+      // move/postpone command now does.
+      const updated = await rescheduleActionItem(userId, action.id, dueAt);
       if (updated) {
-        done.push(`Snoozed ${updated.title} to ${formatLocalDateTime(updated.snoozedUntil, timezone)}`);
+        done.push(`Moved ${updated.title} to ${formatLocalDateTime(updated.dueAt, timezone)}`);
       }
       continue;
     }
