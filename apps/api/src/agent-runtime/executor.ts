@@ -174,8 +174,17 @@ import { gmailSyncDebugForAgentRuntime, syncGmailForAgentRuntime } from "./servi
  * exact same pattern here, gated behind an env var only a test would ever set (never reachable from
  * a real chat message — the LLM planner's tool args never carry a raw "now"): unset in production,
  * so `new Date()` is the real, unaltered behavior every deployment actually gets.
+ *
+ * fix/private-alpha-conversation-kernel-context-routing (follow-up): renamed from
+ * resolveDiagnosisNow and widened to the action.create/reschedule/snooze date-parsing call sites
+ * too — those previously always called parseActionDueDate with no `now` at all, so a real reported
+ * flake had "move it to tonight at 20:00" (and the deadline-tightening confirmation test) fail
+ * whenever the suite happened to run after the target hour, since "tonight at 20:00" genuinely IS
+ * in the past once real wall-clock time passes 20:00. The product rule itself (an explicit past
+ * time is correctly refused) was never wrong — only the tests had no way to pin "now" before the
+ * target time, exactly the same gap this function already existed to close for proactive checks.
  */
-function resolveDiagnosisNow(): Date {
+function resolveAgentRuntimeNow(): Date {
   return parseOptionalNow(process.env.AGENT_RUNTIME_TEST_NOW) ?? new Date();
 }
 
@@ -195,7 +204,14 @@ export async function executeOperation(
         const overdueOnly = Boolean(args.overdueOnly);
         const when = args.when as "today" | "tomorrow" | "this_week" | "this_week_and_overdue" | undefined;
         const settings = await getOrCreateNotificationSettings(userId);
-        const now = new Date();
+        // fix/private-alpha-conversation-kernel-context-routing (flake fix): same class of bug as
+        // the action.reschedule/snooze/create date-parsing call sites above — this used to always
+        // call `new Date()` directly, so the "today" window (actionMatchesWhenWindow) had no way
+        // for a test to pin "now," making a test with a "due in 1 hour" fixture flake whenever the
+        // suite happened to run within an hour of local midnight (the fixture's dueAt silently
+        // rolled onto tomorrow's local date). Real production behavior is unaffected: the env var
+        // is unset outside tests, so this still resolves to the real, unaltered current time.
+        const now = resolveAgentRuntimeNow();
 
         // "Reminder" companion rows (actionType "reminder" — the "remind me N minutes before"
         // stubs action.create_pre_due_reminders creates) share the same ActionItem table/status
@@ -400,7 +416,7 @@ export async function executeOperation(
         // when dueText is absent, and only its OWN found match is ever used — never a guessed or
         // invented date. A title with no temporal words at all (the common case) still gets no
         // dueAt, exactly as before.
-        const parsedDate = dueText ? parseActionDueDate(dueText) : parseActionDueDate(title);
+        const parsedDate = dueText ? parseActionDueDate(dueText, { now: resolveAgentRuntimeNow() }) : parseActionDueDate(title, { now: resolveAgentRuntimeNow() });
         // Task 3/4 (launch-readiness): an EXPLICIT dueText (as opposed to the best-effort title
         // scan used when no dueText is given at all) that fails to resolve to a real date — a
         // weekday/day-of-month contradiction ("Thursday 26 August" when the 26th is a Wednesday),
@@ -481,7 +497,11 @@ export async function executeOperation(
         // default timezone instead of the user's real one — a real, pre-existing gap, not
         // specific to the end-of-day default work in this branch.
         const settings = await getOrCreateNotificationSettings(userId);
-        const parsedDate = parseActionDueDate(untilText, { timezone: settings.timezone, preferences: settings });
+        const parsedDate = parseActionDueDate(untilText, {
+          timezone: settings.timezone,
+          now: resolveAgentRuntimeNow(),
+          preferences: settings
+        });
         if (!parsedDate.dueAt) {
           return failed(operation.tool, parsedDate.clarification ?? `Couldn't understand the snooze target "${untilText}".`);
         }
@@ -3400,7 +3420,7 @@ export async function executeOperation(
 
       case "proactive.diagnose_morning_brief": {
         const settings = await selfHealDailyLoopEnabled(await getOrCreateNotificationSettings(userId));
-        const now = resolveDiagnosisNow();
+        const now = resolveAgentRuntimeNow();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const morningKey = MORNING_BRIEF_DEDUPE_KEY;
         const [v3SentLog, legacyDailyLoopLog] = await Promise.all([
@@ -3432,7 +3452,7 @@ export async function executeOperation(
 
       case "proactive.diagnose_evening_checkin": {
         const settings = await selfHealDailyLoopEnabled(await getOrCreateNotificationSettings(userId));
-        const now = resolveDiagnosisNow();
+        const now = resolveAgentRuntimeNow();
         const sentForDate = formatDateInTimezone(now, settings.timezone);
         const eveningKey = EVENING_CHECKIN_DEDUPE_KEY;
         const [v3SentLog, legacyDailyLoopLog] = await Promise.all([
@@ -3629,6 +3649,7 @@ function parseActionRescheduleDate(
     const existingTimeMinutes = action.dueAt ? minutesOfDayInTimezone(action.dueAt, input.timezone) : undefined;
     const parsed = parseActionDueDate(input.dueText, {
       timezone: input.timezone,
+      now: resolveAgentRuntimeNow(),
       preferences: existingTimeMinutes !== undefined ? { defaultActionTimeMinutes: existingTimeMinutes } : undefined
     });
     return { dueAt: parsed.invalidReason ? undefined : parsed.dueAt ?? undefined, clarification: parsed.clarification };
@@ -3636,7 +3657,10 @@ function parseActionRescheduleDate(
 
   if (input.timeText?.trim() && action.dueAt) {
     const localDate = formatDateInTimezone(action.dueAt, input.timezone);
-    const parsed = parseActionDueDate(`${localDate} ${input.timeText}`, { timezone: input.timezone });
+    const parsed = parseActionDueDate(`${localDate} ${input.timeText}`, {
+      timezone: input.timezone,
+      now: resolveAgentRuntimeNow()
+    });
     return { dueAt: parsed.invalidReason ? undefined : parsed.dueAt ?? undefined, clarification: parsed.clarification };
   }
 
