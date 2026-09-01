@@ -99,6 +99,12 @@ export interface GmailRuleMatchMessage {
   subject?: string;
   date?: string;
   snippet?: string;
+  /** fix/private-alpha-email-review-detail-and-general-mail-understanding (generic sweep full-body
+   * follow-up): already cleaned/redacted by the caller (packages/core's cleanEmailBodyForDisplay) —
+   * never raw MIME/HTML. Optional because a body fetch can fail or be skipped (a message the cheap
+   * noise prefilter would reject anyway) — the classifier falls back to subject/snippet-only
+   * judgment, with correspondingly lower confidence, exactly as it did before this field existed. */
+  bodyExcerpt?: string;
 }
 
 export interface ClassifyGmailMessageAgainstRulesInput {
@@ -256,7 +262,8 @@ function sanitizeGmailRuleMatchInput(input: ClassifyGmailMessageAgainstRulesInpu
       to: truncateEmailText(input.message.to ?? "", 220),
       subject: truncateEmailText(input.message.subject ?? "", 220),
       date: truncateEmailText(input.message.date ?? "", 120),
-      snippet: truncateEmailText(input.message.snippet ?? "", 700)
+      snippet: truncateEmailText(input.message.snippet ?? "", 700),
+      ...(input.message.bodyExcerpt ? { bodyExcerpt: truncateEmailText(input.message.bodyExcerpt, 3000) } : {})
     },
     rules: input.rules.slice(0, 20).map((rule) => ({
       id: truncateEmailText(rule.id, 120),
@@ -348,7 +355,9 @@ function buildGmailRuleMatchPrompt(): string {
     "You classify one recent Gmail message against Alecto's active Gmail tracking rules.",
     "Return JSON only matching the schema. Choose at most one matched rule.",
     "Use only the provided safe fields: sender, recipients, subject, date, snippet, active rules, and active goal titles.",
-    "Do not assume access to the full email body. Do not request mailbox writes. This is review-first only.",
+    "When bodyExcerpt is present, it is the real email body — already cleaned of HTML/tracking noise and with any security code/password/token already redacted as [redacted]. Use it as your primary evidence: many real signals (an invoice amount and due date, a flight's new time, an insurance claim update, an admin appointment or deadline) only appear in the body, never in the subject or the short snippet alone — do not guess from subject/snippet wording when a fuller bodyExcerpt is available and says something different or more specific.",
+    "When bodyExcerpt is absent, classify from subject/snippet only, exactly as before, and calibrate confidence accordingly (do not claim high confidence from a short snippet alone).",
+    "Do not request mailbox writes. This is review-first only.",
     "The active rules are generic. They may describe work actions, recruiter/job-search mail, invoices or bills, calendar/meeting mail, government/legal/tax admin, security/account alerts, shipping/refunds, personal/family admin, or any custom user-defined category.",
     "If the email clearly matches one active rule, set shouldCreateReview true, return that rule id/name, a calibrated confidence, a concise reason, and a useful review title.",
     "If no active rule matches, set shouldCreateReview false, matchedRuleId/name null, and skipReason explaining the non-match.",
@@ -356,7 +365,7 @@ function buildGmailRuleMatchPrompt(): string {
     "Do not invent rule ids, rule names, goals, facts, dates, or deadlines.",
     "Keep suggestedReviewTitle specific and useful, for example: 'Upgrade Node.js to 24', 'Review Endesa bill', 'Reply to recruiter about frontend role', 'Check apartment viewing appointment'.",
     "Only when shouldCreateReview is true, also set priority and signalKind. priority is high only for something genuinely time-sensitive or consequential if missed (a cancelled/changed flight, an insurance policy about to lapse, an overdue bill, a legal/tax deadline, a real job offer or interview) — normal for most matches, low for minor/optional items. Never mark a newsletter, promotion, or routine confirmation high priority. signalKind is a short snake_case label for what this specific email is (e.g. flight_cancellation, insurance_renewal_deadline, invoice_due, appointment_scheduled, recruiter_reply) — leave both null when shouldCreateReview is false.",
-    "Never treat marketing/promotional bulk content (newsletter, unsubscribe, view in browser, sponsored, digest) as a match UNLESS the matched rule's own name or description explicitly says it wants that kind of content (e.g. a rule literally about tracking newsletters).",
+    "Never treat marketing/promotional bulk content (newsletter, unsubscribe, view in browser, sponsored, digest) as a match UNLESS the matched rule's own name or description explicitly says it wants that kind of content (e.g. a rule literally about tracking newsletters). A subject line that merely LOOKS relevant to an active rule is not enough by itself — if bodyExcerpt is present and reveals the actual content is bulk marketing/newsletter content unrelated to the user's own situation, treat it as not matching, regardless of the subject.",
     "Never treat a bare login/account security code, 2FA code, or password-reset email as a match UNLESS the matched rule's own name or description explicitly asks for security/verification codes."
   ].join("\n");
 }

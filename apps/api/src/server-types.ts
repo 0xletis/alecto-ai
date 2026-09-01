@@ -87,6 +87,12 @@ export interface EmailRuleSyncSummary {
   aiRuleMatchSkipped: number;
   aiRuleMatchUnavailable: number;
   aiRuleMatchErrors: number;
+  /** fix/private-alpha-email-review-detail-and-general-mail-understanding (generic sweep full-body
+   * follow-up): how many candidates in this sync got a real, successful readonly full-body fetch
+   * (only ever attempted for a message that already passed the cheap subject/snippet noise
+   * prefilter) vs. how many attempts failed and fell back to subject/snippet-only classification. */
+  aiBodyFetched: number;
+  aiBodyFetchFailed: number;
   reviewItemsCreated: number;
   reviewItemsAlreadyPending: number;
   reviewItemsRejectedDeduped: number;

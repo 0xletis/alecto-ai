@@ -16568,3 +16568,402 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-email-review-detail-and-general-mail-understanding (generic sweep full-
+// body follow-up): a real reported gap — the generic AI rule-match sweep (custom/general-domain
+// Gmail tracking rules: invoices, travel, insurance, car/admin) only ever saw headers + a short
+// snippet, so real signal living in the body (an invoice amount and due date, a flight's new time,
+// an insurance claim update, an admin deadline) could be missed entirely, and Alecto could never
+// create a review for it — meaning the review-detail command built earlier on this branch would
+// have nothing to explain. generic-email-rule-full-body/email-full-context-understanding/general-
+// email-intelligence/email-review-detail-safety exercise the REAL classifyGmailMessageAgainstRules
+// call now receiving a cleaned, redacted bodyExcerpt, general across domains, never job-search-only.
+
+interface GenericSweepEvalMessage {
+  id: string;
+  subject: string;
+  from: string;
+  body: string;
+  isHtml?: boolean;
+}
+
+/** Gated to the generic sweep's own newer_than:Nd search pattern (unlike the shared
+ * installEvalGmailFetchMock above, which answers any query) so the PRIMARY per-rule sync never
+ * independently discovers these custom-rule messages through its own, differently-queried search —
+ * only the generic AI rule-match sweep this scenario set is actually testing ever sees them. */
+function installGenericSweepEvalFetchMock(messages: GenericSweepEvalMessage[], failMessageIds: string[] = []): () => void {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const urlText = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url = new URL(urlText);
+    if (url.hostname !== "gmail.googleapis.com") {
+      return previousFetch(input, init);
+    }
+
+    if (url.pathname === "/gmail/v1/users/me/messages") {
+      const query = url.searchParams.get("q") ?? "";
+      const matchesSweepSearch = /^newer_than:\d+d$/.test(query);
+      return new Response(JSON.stringify({ messages: matchesSweepSearch ? messages.map((message) => ({ id: message.id })) : [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    const messageId = url.pathname.split("/").pop() ?? "";
+    if (failMessageIds.includes(messageId)) {
+      return new Response("simulated transient failure", { status: 500 });
+    }
+    const message = messages.find((candidate) => candidate.id === messageId);
+    if (!message) {
+      return new Response("not found", { status: 404 });
+    }
+
+    return new Response(
+      JSON.stringify({
+        id: message.id,
+        threadId: `thread-${message.id}`,
+        snippet: message.body.slice(0, 100),
+        payload: {
+          mimeType: message.isHtml ? "text/html" : "text/plain",
+          headers: [
+            { name: "Subject", value: message.subject },
+            { name: "From", value: message.from },
+            { name: "Date", value: "Thu, 20 Aug 2026 09:00:00 +0200" }
+          ],
+          body: { data: Buffer.from(message.body, "utf8").toString("base64url") }
+        }
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+
+  return () => {
+    globalThis.fetch = previousFetch;
+  };
+}
+
+async function seedGenericSweepRule(userId: string, connectionId: string, name: string, description: string, goalId?: string) {
+  return prisma.emailSignalRule.create({
+    data: {
+      userId,
+      connectionId,
+      goalId,
+      adapterId: "custom_email_review",
+      name,
+      description,
+      status: "active",
+      fetchStrategy: "query",
+      query: `${name} tracking rule query that will not match the newer_than sweep search`,
+      classifierMode: "hybrid",
+      lookbackDays: 30,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 10,
+      minAutoLogConfidence: 0.9,
+      minReviewConfidence: 0.55,
+      reviewBeforeLogging: true,
+      createdBy: "user"
+    }
+  });
+}
+
+test(
+  "450. an invoice's amount/due-date signal, present only in the body, is detected by the generic sweep (generic-email-rule-full-body A)",
+  { ...llmEvalOptions(["generic-email-rule-full-body", "email-full-context-understanding"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-450-${randomUUID()}`;
+    const trace = new EvalTrace("450-invoice-body-only-signal", ["generic-email-rule-full-body", "email-full-context-understanding"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-450-invoice",
+        subject: "Your monthly statement",
+        from: "billing@utilityco.example",
+        body: "Your invoice #7734 for August is ready. Amount due: 84.20 EUR. Payment is due by September 15. Please pay via the linked portal to avoid a late fee."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      await seedGenericSweepRule(userId, connection.id, "Invoices", "Invoices, bills, and payment due notices");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("the invoice signal (only in the body) was detected as a review or event", reviews.length + events > 0, `reviews=${reviews.length} events=${events}`);
+        assert.ok(reviews.length + events > 0, "expected the invoice's body-only amount/due-date signal to be detected by the generic sweep");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "451. a flight-change signal, present only in the body, is detected by the generic sweep (generic-email-rule-full-body B)",
+  { ...llmEvalOptions(["generic-email-rule-full-body", "general-email-intelligence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-451-${randomUUID()}`;
+    const trace = new EvalTrace("451-flight-change-body-only-signal", ["generic-email-rule-full-body", "general-email-intelligence"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-451-flight",
+        subject: "An update about your upcoming trip",
+        from: "notifications@airline.example",
+        body: "Important update: your flight BA456 on September 3rd has been rescheduled. New departure time: 14:20 (was 11:05). Please check in again."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const goal = await createGoal(userId, { title: "Plan the Lisbon trip", category: "travel" });
+      await seedGenericSweepRule(userId, connection.id, "Travel", "Flight and hotel booking updates", goal.duplicate ? undefined : goal.goal.id);
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("the flight-change signal (only in the body) was detected", reviews.length + events > 0, `reviews=${reviews.length} events=${events}`);
+        assert.ok(reviews.length + events > 0, "expected the flight time-change body-only signal to be detected");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "452. an insurance/admin update, present only in the body, is detected by the generic sweep (generic-email-rule-full-body C)",
+  { ...llmEvalOptions(["generic-email-rule-full-body", "general-email-intelligence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-452-${randomUUID()}`;
+    const trace = new EvalTrace("452-insurance-admin-body-only-signal", ["generic-email-rule-full-body", "general-email-intelligence"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-452-insurance",
+        subject: "An update on your recent request",
+        from: "claims@insureco.example",
+        body: "Your car insurance claim #C-88231 has been reviewed. We need one more document (the repair estimate) before September 20 or the claim will be closed."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      await seedGenericSweepRule(userId, connection.id, "Insurance", "Insurance policy and claim updates");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("the insurance claim/deadline signal (only in the body) was detected", reviews.length + events > 0, `reviews=${reviews.length} events=${events}`);
+        assert.ok(reviews.length + events > 0, "expected the insurance claim deadline body-only signal to be detected");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "453. a job application confirmation, present only in the body, is detected by a generic (non-built-in) rule (generic-email-rule-full-body D)",
+  { ...llmEvalOptions(["generic-email-rule-full-body", "general-email-intelligence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-453-${randomUUID()}`;
+    const trace = new EvalTrace("453-job-confirmation-body-only-signal", ["generic-email-rule-full-body", "general-email-intelligence"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-453-job",
+        subject: "Following up",
+        from: "talent@innovationlabs.example",
+        body: "Thank you for applying to Innovation Labs. We have received your application for the Front-End Engineer role and our team will review it shortly."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const goal = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      await seedGenericSweepRule(userId, connection.id, "Job applications", "Recruiter/job-application emails", goal.duplicate ? undefined : goal.goal.id);
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("the job application confirmation (only in the body) was still detected", reviews.length + events > 0, `reviews=${reviews.length} events=${events}`);
+        assert.ok(reviews.length + events > 0, "expected the job-search domain to still work through the generic sweep, not just the primary path");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "454. a marketing email with a relevant-looking subject but unrelated body is not promoted to review (email-review-detail-safety E)",
+  { ...llmEvalOptions(["email-review-detail-safety", "generic-email-rule-full-body"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-454-${randomUUID()}`;
+    const trace = new EvalTrace("454-marketing-relevant-subject-unrelated-body", ["email-review-detail-safety", "generic-email-rule-full-body"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-454-marketing",
+        subject: "Your invoice is here! (plus 30% off everything)",
+        from: "deals@retailer.example",
+        body: "Huge weekend sale — 30% off everything storewide! Shop now before it's gone. Free shipping on orders over $50. Unsubscribe anytime."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      await seedGenericSweepRule(userId, connection.id, "Invoices", "Invoices, bills, and payment due notices");
+
+      await trace.guard(async () => {
+        const reply = await sendAgentMessage(server, userId, "sync Gmail");
+        assertNoGenericAgentError(reply, "marketing email with relevant-looking subject");
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("marketing content is never auto-logged as real invoice progress", events === 0, `events=${events}`);
+        assert.equal(events, 0, "a marketing email must never auto-log as progress just because its subject looks relevant");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "455. a body-fetch failure falls back honestly and does not crash the sync (email-review-detail-safety F)",
+  { ...llmEvalOptions(["email-review-detail-safety", "generic-email-rule-full-body"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-455-${randomUUID()}`;
+    const trace = new EvalTrace("455-body-fetch-failure-fallback", ["email-review-detail-safety", "generic-email-rule-full-body"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock(
+      [{ id: "eval-455-invoice", subject: "Your invoice #6612 is ready", from: "billing@utilityco.example", body: "Your invoice #6612 is ready. Amount due: 40 EUR." }],
+      ["eval-455-invoice"]
+    );
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      await seedGenericSweepRule(userId, connection.id, "Invoices", "Invoices, bills, and payment due notices");
+
+      await trace.guard(async () => {
+        const reply = await sendAgentMessage(server, userId, "sync Gmail");
+        assertNoGenericAgentError(reply, "body fetch failure fallback");
+        trace.checkpoint("the sync completes honestly without claiming a crash", !/unexpected problem/i.test(reply.reply), reply.reply);
+        assert.doesNotMatch(reply.reply, /unexpected problem/i);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "456. Spanish: an invoice/admin email is detected via the generic sweep's body content (generic-email-rule-full-body E)",
+  { ...llmEvalOptions(["generic-email-rule-full-body", "general-email-intelligence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-456-${randomUUID()}`;
+    const trace = new EvalTrace("456-spanish-invoice-admin", ["generic-email-rule-full-body", "general-email-intelligence"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-456-factura",
+        subject: "Actualización de tu cuenta",
+        from: "facturacion@energia.example",
+        body: "Tu factura de electricidad de agosto ya está disponible. Importe a pagar: 62,50 EUR. Fecha límite de pago: 20 de septiembre."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      await seedGenericSweepRule(userId, connection.id, "Facturas", "Facturas y avisos de pago pendiente");
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("the Spanish invoice signal (only in the body) was detected", reviews.length + events > 0, `reviews=${reviews.length} events=${events}`);
+        assert.ok(reviews.length + events > 0, "expected the Spanish invoice body-only signal to be detected");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "457. Catalan: a travel/admin email is detected via the generic sweep's body content (generic-email-rule-full-body F)",
+  { ...llmEvalOptions(["generic-email-rule-full-body", "general-email-intelligence"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-457-${randomUUID()}`;
+    const trace = new EvalTrace("457-catalan-travel-admin", ["generic-email-rule-full-body", "general-email-intelligence"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installGenericSweepEvalFetchMock([
+      {
+        id: "eval-457-vol",
+        subject: "Informació sobre el teu proper viatge",
+        from: "notificacions@aerolinia.example",
+        body: "El teu vol BA456 del 3 de setembre ha canviat. Nova hora de sortida: 14:20 (abans 11:05). Si us plau, torna a fer el check-in."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const goal = await createGoal(userId, { title: "Planificar el viatge a Lisboa", category: "travel" });
+      await seedGenericSweepRule(userId, connection.id, "Viatges", "Actualitzacions de vols i reserves", goal.duplicate ? undefined : goal.goal.id);
+
+      await trace.guard(async () => {
+        await sendAgentMessage(server, userId, "sync Gmail");
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const events = await prisma.event.count({ where: { userId, source: "gmail" } });
+        trace.checkpoint("the Catalan flight-change signal (only in the body) was detected", reviews.length + events > 0, `reviews=${reviews.length} events=${events}`);
+        assert.ok(reviews.length + events > 0, "expected the Catalan flight-change body-only signal to be detected");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

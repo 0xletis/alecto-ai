@@ -3934,6 +3934,8 @@ function createEmailRuleSyncSummary(rule: EmailSignalRule): EmailRuleSyncSummary
     aiRuleMatchSkipped: 0,
     aiRuleMatchUnavailable: 0,
     aiRuleMatchErrors: 0,
+    aiBodyFetched: 0,
+    aiBodyFetchFailed: 0,
     reviewItemsCreated: 0,
     reviewItemsAlreadyPending: 0,
     reviewItemsRejectedDeduped: 0,
@@ -3992,10 +3994,18 @@ async function syncGmailRecentMessagesAgainstActiveRules(input: {
   const fallbackSummary = input.summaries[0];
   const anyRuleAllowsNewsletters = input.rules.some((rule) => ruleAllowsNewsletterEmails(rule));
   const anyRuleAllowsSecurityCodes = input.rules.some((rule) => ruleAllowsSecurityAuthAccountEmails(rule));
+  // fix/private-alpha-email-review-detail-and-general-mail-understanding (generic sweep full-body
+  // follow-up, Task 5): an explicit, separate cap on how many candidates get a SECOND (full-body)
+  // fetch this sync — distinct from maxMessages (which caps the candidate list itself) since only
+  // a subset of candidates ever reach this point (most get filtered by the cheap prefilter above
+  // or matched/rejected from subject+snippet alone). Defaults to the same value as maxMessages, so
+  // by default every surviving candidate can still get one, but this stays independently tunable.
+  const maxBodyFetches = Math.min(Number(process.env.GMAIL_RULE_MATCH_MAX_BODY_FETCHES_PER_SYNC ?? maxMessages) || maxMessages, maxMessages);
+  let bodyFetchesUsed = 0;
 
   for (const messageId of candidateIds) {
-    const message = await withGmailStage("gmail_message_fetch", () => getGmailMessageMetadata(input.accessToken, messageId));
-    const fields = gmailMessageRuleMatchFields(message);
+    let message = await withGmailStage("gmail_message_fetch", () => getGmailMessageMetadata(input.accessToken, messageId));
+    let fields = gmailMessageRuleMatchFields(message);
     fallbackSummary.aiMessagesChecked += 1;
     input.processedMessageIds.add(message.id);
 
@@ -4014,6 +4024,22 @@ async function syncGmailRecentMessagesAgainstActiveRules(input: {
       fallbackSummary.aiRuleMatchSkipped += 1;
       fallbackSummary.syncDecisionDebug.push(gmailSyncDecisionDebug(message, { decision: "skipped", skipReason: "generic security/verification code prefilter" }));
       continue;
+    }
+
+    // Only reached by a candidate the cheap prefilter above did NOT already reject — this is the
+    // one place the generic sweep pays for a second (format=full) fetch, gated by its own explicit
+    // per-sync cap. A fetch failure here is caught and logged, never thrown — the message still
+    // gets classified from subject/snippet alone, exactly as it would have before this existed.
+    if (bodyFetchesUsed < maxBodyFetches) {
+      const bodyResult = await fetchGmailBodyExcerptForRuleMatch(input.accessToken, messageId);
+      bodyFetchesUsed += 1;
+      if (bodyResult) {
+        message = bodyResult.fullMessage;
+        fields = gmailMessageRuleMatchFields(message, bodyResult.bodyExcerpt);
+        fallbackSummary.aiBodyFetched += 1;
+      } else {
+        fallbackSummary.aiBodyFetchFailed += 1;
+      }
     }
 
     try {
@@ -4351,15 +4377,39 @@ function gmailRuleMatchEventType(
   return undefined;
 }
 
-function gmailMessageRuleMatchFields(message: GmailMessage) {
+function gmailMessageRuleMatchFields(message: GmailMessage, bodyExcerpt?: string) {
   return {
     id: message.id,
     from: getGmailHeader(message, "from"),
     to: getGmailHeader(message, "to"),
     subject: getGmailHeader(message, "subject"),
     date: getGmailHeader(message, "date"),
-    snippet: message.snippet ?? ""
+    snippet: message.snippet ?? "",
+    ...(bodyExcerpt ? { bodyExcerpt } : {})
   };
+}
+
+/**
+ * fix/private-alpha-email-review-detail-and-general-mail-understanding (generic sweep full-body
+ * follow-up): the ONLY place the generic AI rule-match sweep gets real body content — a second,
+ * conditional readonly fetch (format=full) for a message that already passed the cheap subject/
+ * snippet noise prefilter, reusing the exact same decode/clean pipeline (decodeGmailBodyDetailed +
+ * cleanEmailBodyForDisplay) the primary per-rule sync and the review-detail command already use.
+ * Never fetched for every candidate — only for ones the cheap prefilter didn't already reject —
+ * and any fetch failure here is caught locally so the sweep honestly falls back to subject/snippet-
+ * only classification for that one message instead of aborting the whole sync.
+ */
+async function fetchGmailBodyExcerptForRuleMatch(accessToken: string, messageId: string): Promise<{ fullMessage: GmailMessage; bodyExcerpt?: string } | undefined> {
+  try {
+    const fullMessage = await withGmailStage("gmail_message_fetch", () => getGmailMessage(accessToken, messageId));
+    const decoded = decodeGmailBodyDetailed(fullMessage.payload);
+    const bodyExcerpt = decoded.text
+      ? cleanEmailBodyForDisplay(decoded.text, { isHtml: decoded.isHtml, maxLength: CLASSIFIER_BODY_LENGTH })
+      : undefined;
+    return { fullMessage, bodyExcerpt };
+  } catch {
+    return undefined;
+  }
 }
 
 function gmailSyncDecisionDebug(
