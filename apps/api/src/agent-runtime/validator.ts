@@ -27,6 +27,7 @@ export const ACTION_CLARIFICATION_ELIGIBLE_TOOLS = new Set([...ACTION_REFERENCE_
 const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
   "gmail.review.reject",
   "gmail.review.inspect",
+  "gmail.review.detail",
   "gmail.review.to_action",
   "gmail.review.keep",
   "gmail.review.approve"
@@ -1715,6 +1716,21 @@ function resolveGmailReviewRef(args: { index?: number; ref?: string }, context: 
   }
 
   if (args.ref) {
+    // fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 8): a bare
+    // pronoun ("this"/"it"/"that", "esto"/"eso"/"això") after gmail.review.detail refers to the
+    // review just detailed, not to any visible item's own subject/sender wording — resolved
+    // against session.focusedEntities.gmail_review (the same general "last touched entity of this
+    // type" mechanism goal pronoun resolution already relies on), but only when that focused review
+    // is still genuinely in the current visible list, never a stale id from an earlier turn.
+    if (GMAIL_REVIEW_PRONOUN_RE.test(args.ref.trim())) {
+      const focused = context.session.focusedEntities?.gmail_review;
+      const stillVisible = focused ? visibleReviews.find((entity) => entity.id === focused.id) : undefined;
+      if (stillVisible) {
+        return { status: "resolved", reviewId: stillVisible.id };
+      }
+      return { status: "needs_clarification", question: "Which email review do you mean? Say \"details for 3\" first, or give me a number." };
+    }
+
     const candidates: EmailRuleSelectionCandidate[] = visibleReviews.map((entity) => ({ id: entity.id, name: entity.label, status: "pending" }));
     const selected = selectEmailRuleCandidate(args.ref, candidates);
     if (selected) {
@@ -1725,6 +1741,8 @@ function resolveGmailReviewRef(args: { index?: number; ref?: string }, context: 
 
   return { status: "needs_clarification", question: "Which email review do you mean?" };
 }
+
+const GMAIL_REVIEW_PRONOUN_RE = /^(this|it|that( one)?|esto|eso|est[ae]|aix[oò]|ho|el mateix)$/i;
 
 interface NextWeekEditChangeArgs {
   index?: number;

@@ -771,6 +771,69 @@ export async function findGmailSemanticDuplicateEvent(
   return duplicate ? toStoredEvent(duplicate) : undefined;
 }
 
+export interface CompanyRoleDayDuplicateEventInput {
+  userId: string;
+  eventType: StoredEvent["type"];
+  company?: string;
+  role?: string;
+  referenceDate: Date;
+  since?: Date;
+}
+
+/**
+ * fix/private-alpha-gmail-review-quality-and-dedupe (Task 6): a real LLM-eval-caught gap —
+ * findGmailSemanticDuplicateEvent above requires an exact-normalized subject AND sender match, but
+ * two real duplicate application-confirmation emails for the same job (an ATS auto-reply and a
+ * recruiter's own confirmation) routinely have DIFFERENT subjects/senders and, at high classifier
+ * confidence, auto-log directly — never touching the review-queue dedupe
+ * (findCompanyRoleDayDuplicateReviewItem) at all. Same loose same-day/company/(role-when-both-
+ * present) matching, applied to already-logged StoredEvent rows instead of pending review rows.
+ */
+export async function findCompanyRoleDayDuplicateEvent(input: CompanyRoleDayDuplicateEventInput): Promise<StoredEvent | undefined> {
+  await ensureUser(input.userId);
+
+  const company = normalizeSemanticText(input.company);
+  if (!company) {
+    return undefined;
+  }
+  const role = normalizeSemanticText(input.role);
+  const day = input.referenceDate.toISOString().slice(0, 10);
+
+  const events = await prisma.event.findMany({
+    where: {
+      userId: input.userId,
+      type: input.eventType,
+      source: "gmail",
+      provider: "gmail",
+      status: "active",
+      timestamp: {
+        gte: input.since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      }
+    },
+    orderBy: { timestamp: "desc" }
+  });
+
+  const duplicate = events.find((event) => {
+    if (event.timestamp.toISOString().slice(0, 10) !== day) {
+      return false;
+    }
+
+    const data = toRecord(event.data);
+    if (normalizeSemanticText(readString(data.company)) !== company) {
+      return false;
+    }
+
+    const eventRole = normalizeSemanticText(readString(data.role));
+    if (role && eventRole && role !== eventRole) {
+      return false;
+    }
+
+    return true;
+  });
+
+  return duplicate ? toStoredEvent(duplicate) : undefined;
+}
+
 export async function findGmailSemanticDuplicateReviewItem(
   input: GmailSemanticReviewDedupeInput
 ): Promise<EmailReviewItem | undefined> {
@@ -821,6 +884,70 @@ export async function findGmailSemanticDuplicateReviewItem(
     matches.find((item) => normalizeEmailReviewStatus(item.status) === "approved");
 
   return duplicate ? toEmailReviewItem(duplicate) : undefined;
+}
+
+export interface CompanyRoleDayDuplicateReviewInput {
+  userId: string;
+  proposedEventType: string;
+  company?: string;
+  role?: string;
+  referenceDate: Date;
+  since?: Date;
+}
+
+/**
+ * fix/private-alpha-gmail-review-quality-and-dedupe (Task 6): findGmailSemanticDuplicateReviewItem
+ * above requires an exact-normalized subject AND sender match — real duplicate application
+ * confirmations for the same job often arrive with different subject lines or sender addresses
+ * (an ATS auto-reply vs. a recruiter's own confirmation), so that exact key alone let two Innovation
+ * Labs review items through as separate pending reviews in a real live-testing report. This is a
+ * deliberately looser, application-confirmation-only fallback: same user, same company, same
+ * calendar day, and — only when BOTH sides have one — the same role. When only one side has a role
+ * extracted, it still counts as a match (better to ask/merge than to silently double-count).
+ */
+export async function findCompanyRoleDayDuplicateReviewItem(
+  input: CompanyRoleDayDuplicateReviewInput
+): Promise<EmailReviewItem | undefined> {
+  await ensureUser(input.userId);
+
+  const company = normalizeSemanticText(input.company);
+  if (!company) {
+    return undefined;
+  }
+  const role = normalizeSemanticText(input.role);
+  const day = input.referenceDate.toISOString().slice(0, 10);
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: {
+      userId: input.userId,
+      provider: "gmail",
+      proposedEventType: input.proposedEventType,
+      createdAt: {
+        gte: input.since ?? new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+      }
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  const match = items.find((item) => {
+    if (item.createdAt.toISOString().slice(0, 10) !== day) {
+      return false;
+    }
+
+    const extracted = toRecord(item.extracted);
+    if (normalizeSemanticText(readString(extracted.company)) !== company) {
+      return false;
+    }
+
+    const itemRole = normalizeSemanticText(readString(extracted.role));
+    if (role && itemRole && role !== itemRole) {
+      return false;
+    }
+
+    return true;
+  });
+
+  return match ? toEmailReviewItem(match) : undefined;
 }
 
 export async function approvePendingGmailReviewItemsForSemanticEvent(input: {

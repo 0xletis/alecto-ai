@@ -44,8 +44,11 @@ import {
 } from "@operator-agent/db";
 import {
   buildOpenActionCommandFooter,
+  cleanEmailBodyForDisplay,
   countEvidenceForMetric,
   CUSTOM_SIGNAL_EVENT_TYPE,
+  DEFAULT_EMAIL_DETAIL_LENGTH,
+  FULL_EMAIL_DETAIL_LENGTH,
   describeGoalEvidenceMatch,
   effectiveGmailSyncIntervalMinutes,
   ensureBookGoalProgressSignal,
@@ -80,6 +83,7 @@ import {
   type StoredEvent,
   type UserOperatingProfile
 } from "@operator-agent/core";
+import { understandEmail, validateEmailUnderstanding } from "@operator-agent/llm";
 import { inferActionGoalLink } from "../utils/action-goal-link.js";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
@@ -115,9 +119,13 @@ import {
   approveEmailReviewForUser,
   createActionItemFromEmailReview,
   formatEmailReviewDetailsForContext,
+  formatGmailReviewDetailResponse,
   formatGmailReviewListForChat,
   gmailReviewChatLabel,
+  gmailReviewSignalTypeLabel,
+  humanEmailKindLabel,
   humanEmailReviewEventLabel,
+  humanSuggestedActionLabel,
   rejectEmailReviewForUser
 } from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
@@ -161,7 +169,7 @@ import { getUserTimezone } from "../utils/user-timezone.js";
 import { wasCapabilityProposalRecentlyDeferred } from "./conversation-session.js";
 import type { AgentEntity, AgentPendingOperation, ContextBundle, ExecutedOperation, ValidatedOperation } from "./types.js";
 import { findExistingCustomGmailRule, type HygieneApplySelectionArgs } from "./validator.js";
-import { gmailSyncDebugForAgentRuntime, syncGmailForAgentRuntime } from "./services.js";
+import { gmailSyncDebugForAgentRuntime, refetchGmailReviewContentForAgentRuntime, syncGmailForAgentRuntime } from "./services.js";
 
 /**
  * fix/private-alpha-launch-hardening-flakes-and-pending-clarity: proactive.diagnose_morning_brief/
@@ -2422,6 +2430,100 @@ export async function executeOperation(
           status: "executed",
           summary: formatGmailReviewQuestionAnswer(review, args.question as string | undefined),
           result: { details: await formatEmailReviewDetailsForContext(userId, review.id) }
+        };
+      }
+
+      case "gmail.review.detail": {
+        const reviewId = args.reviewId as string;
+        const review = await getEmailReviewItems(userId, { status: "pending", limit: 50 }).then((items) =>
+          items.find((item) => item.id === reviewId)
+        );
+        if (!review) {
+          return failed(operation.tool, "That email review no longer exists or was already decided.");
+        }
+
+        const visibleReviewEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+        const existingEntity = visibleReviewEntities.find((entity) => entity.id === review.id);
+        const number = existingEntity?.index ?? visibleReviewEntities.length + 1;
+        const fullText = args.fullText === true;
+
+        const rule = context.gmailRules.find((item) => item.id === review.ruleId);
+        const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
+        const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+
+        const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
+        const maxLength = fullText ? FULL_EMAIL_DETAIL_LENGTH : DEFAULT_EMAIL_DETAIL_LENGTH;
+        const usedLiveContent = refetch.status === "ok" && Boolean(refetch.content.rawBodyText);
+        const rawSubject = usedLiveContent ? refetch.content.subject : review.subject ?? "";
+        const rawBody = usedLiveContent
+          ? refetch.content.rawBodyText
+          : [review.snippet, review.evidence].filter(Boolean).join("\n");
+        const cleanedSubject = cleanEmailBodyForDisplay(rawSubject, { maxLength: 300 });
+        const cleanedBody = cleanEmailBodyForDisplay(rawBody, { isHtml: usedLiveContent && refetch.status === "ok" ? refetch.content.isHtml : false, maxLength });
+        const senderDomain = (usedLiveContent ? refetch.content.from : review.from ?? "").split("@").pop()?.replace(/[>\s]+$/g, "") ?? "";
+
+        let understandingResult: ReturnType<typeof validateEmailUnderstanding> | undefined;
+        try {
+          const raw = await understandEmail({
+            subject: cleanedSubject,
+            bodyExcerpt: cleanedBody,
+            senderDomain,
+            date: usedLiveContent && refetch.status === "ok" ? refetch.content.date : undefined,
+            linkedGoal: linkedGoal ? { title: linkedGoal.title, category: linkedGoal.category ?? undefined } : undefined,
+            activeWatcherDescription: rule?.description || rule?.name,
+            currentCandidateClassification: review.reason
+          });
+          understandingResult = validateEmailUnderstanding(raw, `${cleanedSubject} ${cleanedBody}`);
+        } catch {
+          understandingResult = undefined;
+        }
+
+        const title = truncateForChat(cleanedSubject || gmailReviewChatLabel(review, context.gmailRules), 100);
+        const importantText = cleanedBody || "I don't have enough content to show for this email.";
+
+        if (!understandingResult || !understandingResult.understanding) {
+          const summary = formatGmailReviewDetailResponse({
+            number,
+            title,
+            currentClassification: gmailReviewSignalTypeLabel(review),
+            linkedGoalTitle: linkedGoal?.title,
+            whyItMatters: "I couldn't confidently work out why this matters — here's the important text so you can decide.",
+            importantText,
+            suggestedAction: humanSuggestedActionLabel("ask_clarification")
+          });
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary,
+            result: { review, refetchStatus: refetch.status },
+            entities: [...visibleReviewEntities.filter((entity) => entity.id !== review.id), reviewToEntity(review, number, context.gmailRules)]
+          };
+        }
+
+        const understanding = understandingResult.understanding;
+        const whyItMatters = understanding.why.length > 0 ? understanding.why.join("; ") : understanding.summary;
+        const currentClassification =
+          understanding.emailKind !== "unknown" ? humanEmailKindLabel(understanding.emailKind) : gmailReviewSignalTypeLabel(review);
+        const suggestedAction = humanSuggestedActionLabel(
+          understandingResult.status === "needs_clarification" ? "ask_clarification" : understanding.suggestedUserAction
+        );
+
+        const summary = formatGmailReviewDetailResponse({
+          number,
+          title,
+          currentClassification,
+          linkedGoalTitle: linkedGoal?.title,
+          whyItMatters,
+          importantText,
+          suggestedAction
+        });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary,
+          result: { review, understanding, refetchStatus: refetch.status },
+          entities: [...visibleReviewEntities.filter((entity) => entity.id !== review.id), reviewToEntity(review, number, context.gmailRules)]
         };
       }
 

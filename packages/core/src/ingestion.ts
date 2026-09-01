@@ -167,6 +167,17 @@ registerIngestionAdapter(jobSearchTextAdapter);
 function classifyJobSearchText(text: string, source: IngestionSource): string {
   const gmail = source === "gmail";
 
+  // fix/private-alpha-gmail-review-quality-and-dedupe: checked before everything else, including
+  // the newsletter filter — a real live-testing report showed verification/authentication code
+  // emails (from a recruiting platform like micro1) reaching the LLM classifier and getting
+  // mislabeled as a personal recruiter reply. A security/auth code is never job-search progress
+  // signal no matter which platform sent it, so this is a hard, unconditional exclusion — no
+  // exception for application-flow codes (see classifySecurityAuthEmailNoise's own note in
+  // server.ts, which this function's isSecurityOrAuthEmail helper now backs).
+  if (gmail && isSecurityOrAuthEmail(text)) {
+    return "security_auth";
+  }
+
   // fix/private-alpha-gmail-classifier-precision-and-proactive-diagnostics: checked BEFORE the
   // hasStrongJobContext escape hatch below, and unconditionally — a job/career newsletter is, BY
   // DEFINITION, dense with job-related vocabulary (recruiter, applying, hiring, role...), so the
@@ -183,6 +194,15 @@ function classifyJobSearchText(text: string, source: IngestionSource): string {
 
   if (gmail && hasMarketingContext(text) && !hasStrongJobContext(text)) {
     return "filtered_marketing";
+  }
+
+  // fix/private-alpha-gmail-review-quality-and-dedupe (Task 5): a welcome/setup/onboarding email
+  // ("Welcome to Twine! Let's get you set up") is not job-search progress and is not a recruiter
+  // reply — it only counts when it ALSO clearly confirms a submitted application or a real
+  // recruiter reply, which isApplicationConfirmation/isRecruiterReply already detect, so this check
+  // explicitly steps aside for those rather than racing them.
+  if (gmail && isOnboardingOrWelcomeEmail(text) && !isApplicationConfirmation(text) && !isRecruiterReply(text)) {
+    return "onboarding_noise";
   }
 
   if (gmail && isApplicationActionRequired(text)) {
@@ -242,7 +262,7 @@ export const HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES: ReadonlySet<string> = new Set([
 ]);
 
 function confidenceForJobClassification(classification: string, source: IngestionSource): number {
-  if (classification === "filtered_marketing") {
+  if (classification === "filtered_marketing" || classification === "security_auth" || classification === "onboarding_noise") {
     return 0.1;
   }
 
@@ -275,7 +295,7 @@ function hasStrongJobContext(text: string): boolean {
     // own curated scheduling/invitation phrase list so this gate and that classification never
     // define "real interview content" two different ways.
     isInterviewScheduled(text) ||
-    hasAny(text, ["recruiter", "talent acquisition", "hiring team"]) ||
+    hasAny(text, ["recruiter", "recruiting team", "talent acquisition", "hiring team"]) ||
     hasAny(text, ["greenhouse", "lever", "workday", "ashby", "personio", "smartrecruiters", "comeet", "workable", "recruitee"]) ||
     hasAny(text, [
       "thank you for your application",
@@ -293,27 +313,148 @@ function hasStrongJobContext(text: string): boolean {
       "your application has been received",
       "application received",
       "not moving forward",
-      "move forward with other candidates"
+      "move forward with other candidates",
+      // fix/private-alpha-gmail-review-quality-and-dedupe (Task 3): "we received your resume/CV"
+      // is a real application-confirmation phrasing (Elastic's exact wording) that never mentions
+      // the word "application" — without this, the email never clears the strong-job-context gate
+      // at all and gets classified "unknown" instead of the application confirmation it actually is.
+      "we received your resume",
+      "we've received your resume",
+      "we have received your resume",
+      "your resume was received",
+      "your resume has been received",
+      "your cv was received",
+      "your cv has been received",
+      "we received your cv",
+      "se ha enviado tu solicitud",
+      "hemos recibido tu cv",
+      "hemos recibido tu curriculum"
     ]) ||
     (text.includes("unfortunately") && hasAny(text, ["application", "candidate", "position", "role", "job"])) ||
+    // fix/private-alpha-gmail-review-quality-and-dedupe (Task 3): explicit Spanish/Catalan
+    // negative-decision phrasings must reach isRejection too, not get stopped at "unknown" by this
+    // gate first — mirrors the English "unfortunately"+context carve-out above.
+    hasAny(text, [
+      "hemos decidido no continuar",
+      "no seguiremos adelante",
+      "no has sido seleccionado",
+      "no has estat seleccionat",
+      "no continuarem endavant",
+      "hemos decidido continuar con otros candidatos"
+    ]) ||
     isJobOffer(text)
   );
 }
 
 function isApplicationActionRequired(text: string): boolean {
   return hasAny(text, [
-    "security code",
-    "verification code",
-    "verify your email",
-    "confirm your email",
-    "copy and paste this code",
-    "enter the code",
     "resubmit your application",
     "complete your application",
     "finish your application",
     "action required",
     "required to submit"
   ]);
+}
+
+/**
+ * fix/private-alpha-gmail-review-quality-and-dedupe (Task 2): a real live-testing report — an
+ * "authentication code"/micro1 verification-code email was reaching the LLM classifier (because
+ * the old isApplicationActionRequired's "security code"/"verification code" phrases only routed to
+ * a needs_review "application_action_required" label, not an outright exclusion) and getting
+ * mislabeled as a personal recruiter reply. Every phrase here is a security/account-access signal
+ * that is never job-search progress, English and Spanish/Catalan (normalizeText already strips
+ * accents, so phrases are written in their unaccented form) — deliberately unconditional, no carve-
+ * out for application-flow codes (see classifySecurityAuthEmailNoise in server.ts, which mirrors
+ * this policy for the live Gmail sync path). Exported so server.ts's live sync prefilter reuses
+ * this exact phrase list instead of maintaining its own copy that can drift out of sync — self-
+ * normalizes so it works on raw, un-normalized text from either caller.
+ */
+export function isSecurityOrAuthEmail(rawText: string): boolean {
+  const text = normalizeText(rawText);
+  return hasAny(text, [
+    "security code",
+    "verification code",
+    "authentication code",
+    "6-digit code",
+    "6 digit code",
+    "one-time code",
+    "one time code",
+    "onetime code",
+    "one-time passcode",
+    "one time passcode",
+    "otp",
+    "login code",
+    "sign-in code",
+    "sign in code",
+    "access code",
+    "confirmation code",
+    "code is valid for",
+    "valid for one-time use",
+    "code will expire",
+    "your one-time code",
+    "your verification code",
+    "your security code",
+    "your authentication code",
+    "copy and paste this code",
+    "enter the code",
+    "enter this code",
+    "verify your email",
+    "confirm your email",
+    "verify your identity",
+    "confirm your identity",
+    "two-factor",
+    "two factor",
+    "2fa",
+    "password reset",
+    "reset your password",
+    "account security",
+    "sign in alert",
+    "signin alert",
+    "suspicious login",
+    "account recovery",
+    "codigo de verificacion",
+    "codigo de seguridad",
+    "codigo de autenticacion",
+    "codigo de acceso",
+    "codigo de confirmacion",
+    "codigo de un solo uso",
+    "contrasena de un solo uso",
+    "codigo de inicio de sesion",
+    "verifica tu correo",
+    "verifica tu email",
+    "confirma tu correo",
+    "restablecer tu contrasena",
+    "restablece tu contrasena",
+    "codi de verificacio",
+    "codi de seguretat",
+    "codi d'acces",
+    "codi de confirmacio"
+  ]);
+}
+
+/**
+ * fix/private-alpha-gmail-review-quality-and-dedupe (Task 5): a welcome/onboarding/setup email is
+ * about the PLATFORM's own account setup, not the reader's job application — "Welcome to Twine!
+ * Let's get you set up" is not job-search progress. Callers must still check
+ * isApplicationConfirmation/isRecruiterReply first (or exclude them), since an email can legitimately
+ * open with "Welcome" and still explicitly confirm a submitted application.
+ */
+function isOnboardingOrWelcomeEmail(text: string): boolean {
+  return hasAny(text, [
+    "let's get you set up",
+    "lets get you set up",
+    "get set up in",
+    "complete your profile",
+    "set up your profile",
+    "finish setting up your account",
+    "finish setting up your profile",
+    "getting started with",
+    "welcome aboard",
+    "welcome to twine",
+    "steps to get started",
+    "here's how to get started",
+    "heres how to get started"
+  ]) || (hasAny(text, ["welcome to"]) && hasAny(text, ["get set up", "get started", "set up your account", "set up your profile", "complete your profile"]));
 }
 
 /**
@@ -358,8 +499,43 @@ function isJobNewsletterOrPromotional(text: string): boolean {
       "new jobs matching",
       "busca personal para el puesto",
       "buscamos personal para",
-      "ofertas de empleo"
+      "ofertas de empleo",
+      // fix/private-alpha-gmail-review-quality-and-dedupe (Task 4): more reported job-alert/
+      // listing/content-post phrasings — a role-listing subject like "Fullstack Developer en Hire
+      // Feed" or "Product Owner Crypto en Revolut" and a content-post announcement like "DeepRec.ai
+      // acaba de publicar contenido nuevo" are job-board/platform broadcasts, never a personal
+      // reply about the reader's own application.
+      "nuevos empleos similares",
+      "empleos similares",
+      "empleos recomendados",
+      "vacantes recomendadas",
+      "puede interesarte este empleo",
+      "te puede interesar este empleo",
+      "job recommendation",
+      "job recommendations for you",
+      "recommended job for you",
+      "jobs like this",
+      "similar jobs",
+      "acaba de publicar contenido nuevo",
+      "ha publicado contenido nuevo",
+      "publico contenido nuevo",
+      "compartio una publicacion",
+      "compartio un articulo",
+      "new opportunity matching your profile",
+      "matches your profile",
+      "opportunities matching your profile",
+      "jobs matching your profile",
+      "new job matches",
+      "your job alert",
+      "saved search alert",
+      "empleo que podria interesarte",
+      "empleo recomendado para ti",
+      "vacante recomendada para ti"
     ]) ||
+    // "is hiring" alone is too generic (a real recruiter can legitimately write "we are hiring for
+    // this role") — only treat it as a job-alert/content-post signal when paired with a LinkedIn-
+    // style post cue, never on its own.
+    (hasAny(text, ["is hiring"]) && hasAny(text, ["shared a post", "shared an update", "posted:", "new post from", "commented on this"])) ||
     // A real reported false positive — a LinkedIn "X reacted to your post"/"ha reaccionado a esta
     // publicación" social notification was classified as a high-priority job offer. A reaction/
     // like/comment/connection-request notification is never a personal message from a company
@@ -499,7 +675,15 @@ function isRejection(text: string): boolean {
       "will not be proceeding",
       "we won't be progressing",
       "we will not progress your application",
-      "hemos decidido continuar con otros candidatos"
+      "hemos decidido continuar con otros candidatos",
+      // fix/private-alpha-gmail-review-quality-and-dedupe (Task 3): explicit negative-decision
+      // Spanish phrasings from the task's own strong-rejection-signal list — none of these overlap
+      // with confirmation phrasing like "hemos recibido tu solicitud"/"se ha enviado tu solicitud".
+      "hemos decidido no continuar",
+      "no seguiremos adelante",
+      "no has sido seleccionado",
+      "no has estat seleccionat",
+      "no continuarem endavant"
     ])
   );
 }
@@ -525,7 +709,28 @@ function isApplicationConfirmation(text: string): boolean {
     "currently reviewing your application",
     "we will be in touch if your qualifications match",
     "gracias por aplicar",
-    "hemos recibido tu solicitud"
+    "hemos recibido tu solicitud",
+    // fix/private-alpha-gmail-review-quality-and-dedupe (Task 3): a real live-testing false
+    // positive — Elastic's "We received your resume... thank you" fell through this list (it only
+    // recognized "application", never "resume") past isRejection's own phrase list all the way to
+    // the unreliable LLM classifier, which mislabeled a neutral confirmation as a rejection. A
+    // resume/CV being received, with no negative decision language present, is an application
+    // confirmation, not a rejection.
+    "we received your resume",
+    "we've received your resume",
+    "we have received your resume",
+    "your resume was received",
+    "your resume has been received",
+    "your cv was received",
+    "your cv has been received",
+    "we received your cv",
+    "thank you for your interest in",
+    "se ha enviado tu solicitud",
+    "tu solicitud ha sido enviada",
+    "hemos recibido tu cv",
+    "hemos recibido tu curriculum",
+    "hem rebut la teva sollicitud",
+    "hem rebut el teu cv"
   ]);
 }
 
@@ -559,7 +764,18 @@ function isRecruiterReply(text: string): boolean {
 }
 
 function extractJobSearchFields(text: string): Record<string, unknown> {
-  const company = matchFirst(text, [/\bat\s+([A-Z][A-Za-z0-9&.\- ]{1,40}?)(?=[,.!?]|$|\s+(?:for|about|regarding|are|is|we)\b)/]);
+  // fix/private-alpha-gmail-review-quality-and-dedupe (Task 6): "at X" alone missed the common
+  // "applying to X" / "application to X" phrasing real ATS confirmation emails use ("Thank you for
+  // applying to Innovation Labs", "Your application to Innovation Labs has been received") — a real
+  // LLM-eval-caught gap where two same-day confirmations for the same company, phrased this way,
+  // never extracted a company at all, so the review-queue dedupe (which requires a company to
+  // compare) never had anything to match on and let both through as separate reviews.
+  const company = matchFirst(text, [
+    /\bat\s+([A-Z][A-Za-z0-9&.\- ]{1,40}?)(?=[,.!?]|$|\s+(?:for|about|regarding|are|is|we)\b)/,
+    /\bapplying to\s+([A-Z][A-Za-z0-9&.\- ]{1,40}?)(?=[,.!?]|$|\s+(?:for|about|regarding|are|is|we|has)\b)/,
+    /\bapplication to\s+([A-Z][A-Za-z0-9&.\- ]{1,40}?)(?=[,.!?]|$|\s+(?:for|about|regarding|are|is|we|has)\b)/,
+    /\byour interest in\s+([A-Z][A-Za-z0-9&.\- ]{1,40}?)(?=[,.!?]|$|\s+(?:for|about|regarding|are|is|we|has)\b)/
+  ]);
   const role = matchFirst(text, [
     /\bfor the\s+([A-Za-z0-9&.\- /]{2,60})\s+role\b/i,
     /\bfor the role of\s+([A-Za-z0-9&.\- /]{2,60})\b/i

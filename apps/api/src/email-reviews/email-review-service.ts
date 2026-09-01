@@ -17,6 +17,7 @@ import {
   type EmailReviewItem,
   type EmailSignalRule
 } from "@operator-agent/db";
+import type { EmailKind, EmailUnderstanding } from "@operator-agent/llm";
 import { resolveActiveGoalIdsForGmailRule } from "../conversation/gmail-autonomy.js";
 import { emailReviewKind, type EmailReviewKind } from "../utils/email-review.js";
 import { inferActionGoalLink } from "../utils/action-goal-link.js";
@@ -690,6 +691,47 @@ export function gmailReviewSignalTypeLabel(review: Pick<EmailReviewItem, "propos
   return review.proposedEventType ? humanEmailReviewEventLabel(review.proposedEventType) : "uncertain signal";
 }
 
+export type GmailReviewPresentationCategory = "confirmation" | "needs_review" | "noise";
+
+/**
+ * fix/private-alpha-gmail-review-quality-and-dedupe (Task 7): a real live-testing report — 10
+ * pending reviews dumped as one flat, undifferentiated list ("too raw") mixed a verification code,
+ * a welcome email, and a job alert in with genuine application confirmations and recruiter
+ * signals, with no way to act on them as a batch. This buckets each review by what it actually is,
+ * NOT by adapter/rule — recruiter replies, interviews, offers, and rejections always land in
+ * "needs_review" (never auto-groupable as noise or silently bulk-approved, per the explicit "do not
+ * hide important recruiter replies, interviews, offers, or rejections" rule); routine application
+ * confirmations get their own low-stakes, batch-approvable bucket; anything that reads as
+ * filtered/uncertain — a security code or onboarding email that reached review anyway (e.g. via a
+ * custom rule), or genuinely unclassifiable content — is "noise", batch-rejectable without touching
+ * anything real.
+ */
+export function gmailReviewPresentationCategory(review: Pick<EmailReviewItem, "reason" | "proposedEventType" | "confidence">): GmailReviewPresentationCategory {
+  const NOISE_REASONS = new Set(["security_auth", "onboarding_noise", "filtered_marketing", "filtered_non_action_email", "unknown"]);
+
+  if (review.reason === "application_confirmation") {
+    return "confirmation";
+  }
+
+  if (NOISE_REASONS.has(review.reason) && !review.proposedEventType) {
+    return "noise";
+  }
+
+  return "needs_review";
+}
+
+export function gmailReviewPresentationCategoryLabel(category: GmailReviewPresentationCategory): string {
+  if (category === "confirmation") {
+    return "Likely application confirmations";
+  }
+
+  if (category === "noise") {
+    return "Likely noise";
+  }
+
+  return "Needs review";
+}
+
 /**
  * Itemized (not bare-count) Gmail review list for normal V3 chat — each line grounded in that
  * review's own real subject/sender/snippet/evidence, numbered so a follow-up like "turn the
@@ -697,6 +739,9 @@ export function gmailReviewSignalTypeLabel(review: Pick<EmailReviewItem, "propos
  * list (see apps/api/src/agent-runtime/validator.ts's resolveGmailReviewRef). Also states the
  * classifier's own signal-type guess, received date, high-priority flag (offer/interview), and
  * linked goal when one resolves — enough for the user to decide without opening Gmail themselves.
+ * Grouped into confirmations/needs-review/noise (Task 7) so the user can act on a whole category
+ * at once ("log the application confirmations", "ignore the noise") instead of reading 10 raw rows
+ * — numbering stays global across groups so every existing numbered-reference command still works.
  */
 export function formatGmailReviewListForChat(
   reviews: EmailReviewItem[],
@@ -708,22 +753,42 @@ export function formatGmailReviewListForChat(
     return "No email reviews are waiting.";
   }
 
-  const lines = ["Pending Gmail reviews:"];
-  reviews.forEach((review, index) => {
-    const label = gmailReviewChatLabel(review, rules);
-    const description = gmailReviewChatDescription(review);
-    const signalType = gmailReviewSignalTypeLabel(review);
-    const received = formatDateInTimezone(review.createdAt, timezone);
-    const rule = rules.find((item) => item.id === review.ruleId);
-    const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0] : undefined;
-    const linkedGoal = linkedGoalId ? activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
-    const priorityPrefix = isHighPriorityGmailReview(review) ? "[High priority] " : "";
+  const numbered = reviews.map((review, index) => ({ review, number: index + 1 }));
+  const categoryOrder: GmailReviewPresentationCategory[] = ["confirmation", "noise", "needs_review"];
+  const groups = categoryOrder
+    .map((category) => ({
+      category,
+      label: gmailReviewPresentationCategoryLabel(category),
+      entries: numbered.filter(({ review }) => gmailReviewPresentationCategory(review) === category)
+    }))
+    .filter((group) => group.entries.length > 0);
 
-    lines.push(
-      `${index + 1}. ${priorityPrefix}${label}${description ? ` — ${description}` : ""} — ${signalType} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`
-    );
-  });
-  lines.push("", 'Reply naturally: "turn the recruiter one into a task", "reject the Endesa one", or reference by number.');
+  const lines = ["Pending Gmail reviews:"];
+
+  for (const group of groups) {
+    lines.push("", `${group.label}:`);
+
+    for (const { review, number } of group.entries) {
+      const label = gmailReviewChatLabel(review, rules);
+      const description = gmailReviewChatDescription(review);
+      const signalType = gmailReviewSignalTypeLabel(review);
+      const received = formatDateInTimezone(review.createdAt, timezone);
+      const rule = rules.find((item) => item.id === review.ruleId);
+      const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0] : undefined;
+      const linkedGoal = linkedGoalId ? activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+      const priorityPrefix = isHighPriorityGmailReview(review) ? "[High priority] " : "";
+
+      lines.push(
+        `${number}. ${priorityPrefix}${label}${description ? ` — ${description}` : ""} — ${signalType} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`
+      );
+    }
+  }
+
+  lines.push(
+    "",
+    'Say "details for 3" to see the important email text and why I classified it.',
+    'Reply naturally: "log the application confirmations", "ignore the noise", "turn the recruiter one into a task", "reject the Endesa one", or reference by number.'
+  );
 
   return lines.join("\n");
 }
@@ -751,6 +816,80 @@ export async function formatEmailReviewDetailsForContext(userId: string, reviewI
   ].filter(Boolean).join("\n");
 }
 
+// fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 4/7): a human label
+// for EmailUnderstanding's general emailKind enum — deliberately covers every domain the task lists
+// (travel, invoices, insurance, admin, subscriptions, personal mail), not just the career.* event
+// types humanEmailReviewEventLabel above already covers. Kept separate from that function rather
+// than merged into it: humanEmailReviewEventLabel labels a review's own STORED, already-decided
+// proposedEventType (a narrower, registered-event-type vocabulary); this labels the LLM
+// understanding layer's freshly-reasoned, broader emailKind for one specific "details for N" call.
+export function humanEmailKindLabel(kind: EmailKind): string {
+  const labels: Record<EmailKind, string> = {
+    application_confirmation: "application confirmation",
+    recruiter_reply: "recruiter reply",
+    interview: "interview",
+    offer: "job offer",
+    rejection: "rejection",
+    job_alert: "job alert / listing",
+    security_auth: "security / verification code",
+    onboarding: "welcome / account setup",
+    receipt: "receipt",
+    invoice: "invoice",
+    travel_booking: "travel booking",
+    flight_update: "flight update",
+    insurance: "insurance",
+    admin_notice: "admin notice",
+    appointment: "appointment",
+    subscription: "subscription",
+    personal_message: "personal message",
+    marketing: "marketing",
+    unknown: "uncertain signal"
+  };
+
+  return labels[kind] ?? "uncertain signal";
+}
+
+/** Human phrase for EmailUnderstanding's suggestedUserAction enum, matching the "Suggested action:"
+ * line of the review-detail response (Part 2's exact template: approve / ignore / turn into action
+ * / ask clarification, plus "monitor" for an informational item with nothing to decide yet). */
+export function humanSuggestedActionLabel(action: EmailUnderstanding["suggestedUserAction"]): string {
+  const labels: Record<EmailUnderstanding["suggestedUserAction"], string> = {
+    approve: "approve",
+    ignore: "ignore",
+    turn_into_action: "turn into an action",
+    ask_clarification: "ask you for a bit more detail before deciding",
+    monitor: "keep monitoring — nothing to decide right now"
+  };
+
+  return labels[action];
+}
+
+export interface GmailReviewDetailResponseInput {
+  number: number;
+  title: string;
+  currentClassification: string;
+  linkedGoalTitle?: string;
+  whyItMatters: string;
+  importantText: string;
+  suggestedAction: string;
+}
+
+/**
+ * The exact user-facing shape Part 2 specifies: a short title, the current classification, the
+ * linked goal (only when one resolves), a grounded one-line explanation, the cleaned/redacted
+ * important text, and the suggested next step - read-only, never itself a mutation.
+ */
+export function formatGmailReviewDetailResponse(input: GmailReviewDetailResponseInput): string {
+  const lines = [`Review ${input.number} — ${input.title}`, `Current classification: ${input.currentClassification}`];
+
+  if (input.linkedGoalTitle) {
+    lines.push(`Linked goal: ${input.linkedGoalTitle}`);
+  }
+
+  lines.push(`Why it matters: ${input.whyItMatters}`, "Important text:", input.importantText, "Suggested action:", input.suggestedAction);
+
+  return lines.join("\n");
+}
 
 export function emailReviewGroupLabel(kind: EmailReviewKind): string {
   if (kind === "job_search") {

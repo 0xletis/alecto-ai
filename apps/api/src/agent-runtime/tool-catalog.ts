@@ -625,6 +625,19 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "gmail.review.detail",
+    description:
+      "Show the full detail of ONE pending Gmail email review from the most recently shown list — refetches the real readonly Gmail message content (not just the stored snippet), cleans/redacts it, and explains what it is and why it was classified that way, grounded in the actual email content. Use for 'show review 3', 'details for 3', 'what is email 3?', 'explain review 3', 'why did you classify 3 like that?', 'show me more about 3', 'show full text for 3', 'show important text for 3' (English); 'qué es el email 3', 'enséñame detalles del 3', 'por qué clasificaste el 3 así' (Spanish); \"mostra'm els detalls del 3\", \"explica'm el correu 3\" (Catalan). Set fullText true only for an EXPLICIT request for the longer/full cleaned text ('show full text for 2', 'show me everything', 'texto completo') — the default view is already enough to decide. This is general across ANY email domain (job applications, travel/flight bookings, invoices, insurance, admin notices, subscriptions, personal mail), never job-search-only. Read-only: never approves, rejects, logs, or mutates the review, and never touches the real mailbox. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name), or a bare pronoun like 'this'/'it' referring to the last detailed review, when referenced by words instead of a number."),
+      fullText: z.boolean().optional().describe("True only when the user explicitly asked for the longer/full cleaned text, not the default detail view.")
+    })
+  },
+  {
     name: "gmail.review.to_action",
     description:
       "Convert a pending Gmail email review item into an action item, grounded in that email's real subject/content — never invents a task. Use for 'turn the recruiter one into a task', 'make the recruiter email an action', 'create an action from the email about X', 'convert 2 into a task for tomorrow' (English); 'convierte el 2 en tarea para mañana', 'haz una tarea del correo de Endesa' (Spanish); \"fes-ne una tasca per demà al matí\", 'fes una tasca del 2 per demà al matí' (Catalan). If the user asks for a due time, pass their exact timing phrase as dueText (e.g. '5 minutes from now', 'tomorrow morning', 'para mañana', 'per demà al matí'); if they say 'at the time it says in the email', omit dueText and the executor will parse the stored email snippet/evidence. If they ask for a reminder before it, set reminderLeadMinutes. If they ask to be reminded 'at that time' or 'at the same time' as the due time, set reminderLeadMinutes: 0. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
