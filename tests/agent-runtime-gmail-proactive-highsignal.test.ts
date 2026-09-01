@@ -290,9 +290,19 @@ test("10A. manual sync finds a recruiter reply: shows in progress, morning brief
       const morning = await preview(server, userId, MORNING_UTC);
       assert.equal(morning.decision, "proposed_message");
       if (morning.decision === "proposed_message") {
-        assert.match(morning.message, /New Gmail signal: recruiter reply/i);
-        assert.match(morning.message, /Review\/follow up today/i);
+        assert.match(morning.message, /Gmail \(already logged, not in your review queue\): recruiter reply/i);
+        assert.match(morning.message, /Worth following up today/i);
       }
+
+      // fix/private-alpha-gmail-review-quality-and-dedupe (Task 8): a real live-testing report —
+      // the proactive summary named an item ("Jordi (Recruiter)" here) that was NOT in the visible
+      // "show me" review list, because it auto-logged directly rather than sitting pending. The
+      // summary copy above now says so explicitly ("already logged, not in your review queue"), so
+      // this is no longer a silent scope mismatch — confirmed here by checking "show me" really has
+      // nothing pending for this already-logged item.
+      const reviews = await sendAgentMessage(server, userId, "show me email reviews");
+      assert.doesNotMatch(reviews.reply, /Jordi/i);
+      assert.equal(await prisma.emailReviewItem.count({ where: { userId, status: "pending" } }), 0);
     } finally {
       restore();
       clearAgentRuntimeMocks();
@@ -418,7 +428,7 @@ test("10E. a built-in rule with no stored goalId still surfaces in the morning b
       const morning = await preview(server, userId, MORNING_UTC);
       assert.equal(morning.decision, "proposed_message");
       if (morning.decision === "proposed_message") {
-        assert.match(morning.message, /New Gmail signal: recruiter reply/i, "the live fallback must resolve the unlinked rule to the one active job-search goal");
+        assert.match(morning.message, /Gmail \(already logged, not in your review queue\): recruiter reply/i, "the live fallback must resolve the unlinked rule to the one active job-search goal");
       }
     } finally {
       restore();
@@ -461,7 +471,7 @@ test("10F. no active job-search goal: a pending Gmail review is still surfaced v
     // No active goal at all -> the goal-anchor nudge, never a fabricated goal-linked Gmail line.
     assert.equal(morning.decision, "proposed_message");
     if (morning.decision === "proposed_message") {
-      assert.doesNotMatch(morning.message, /Gmail item needs review|New Gmail signal|High-priority Gmail signal/i);
+      assert.doesNotMatch(morning.message, /Gmail item needs review|Gmail \(already logged|High-priority Gmail signal/i);
     }
 
     const midday = await preview(server, userId, "2026-08-20T11:00:00.000Z");
@@ -611,7 +621,7 @@ test("3A/3B. evening check-in mentions Gmail events logged today and pending rev
       const evening = await preview(server, userId, now.toISOString());
       assert.equal(evening.decision, "proposed_message");
       if (evening.decision === "proposed_message") {
-        assert.match(evening.message, /New Gmail signal: recruiter reply/i);
+        assert.match(evening.message, /Gmail \(already logged, not in your review queue\): recruiter reply/i);
         assert.match(evening.message, /1 Gmail item needs review before I log it\./i);
       }
     } finally {

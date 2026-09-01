@@ -65,7 +65,10 @@ export function classifyJobSearchEmail(input: ClassifyJobSearchEmailInput): Emai
   const candidate = result.eventCandidates[0];
   const actionRequired = result.classification === "application_action_required";
   const decision =
-    result.classification === "filtered_marketing" || result.classification === "unknown"
+    result.classification === "filtered_marketing" ||
+    result.classification === "unknown" ||
+    result.classification === "security_auth" ||
+    result.classification === "onboarding_noise"
       ? "ignore"
       : actionRequired
         ? "needs_review"

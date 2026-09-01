@@ -184,6 +184,29 @@ export interface EmailReviewCandidateDebug {
   semanticKey: string;
 }
 
+/**
+ * fix/private-alpha-email-review-detail-and-general-mail-understanding: the real, on-demand
+ * readonly refetch of one Gmail message's content, keyed off an EmailReviewItem's own stored
+ * providerMessageId/connectionId — never anything stored at review-creation time, which only ever
+ * kept a short snippet. Lives in server-types.ts (not agent-runtime) since it crosses the
+ * server.ts <-> agent-runtime dependency-injection seam (services.ts) the same way syncGmailForUser
+ * already does: the real Gmail OAuth/token/fetch code stays in server.ts, executor.ts only ever
+ * calls through the injected service.
+ */
+export interface RefetchedGmailReviewContent {
+  subject: string;
+  from: string;
+  date: string;
+  /** Raw decoded body text - NOT yet cleaned/redacted. The caller (executor.ts) runs this through
+   * packages/core's cleanEmailBodyForDisplay before showing it to a user or an LLM. */
+  rawBodyText: string;
+  isHtml: boolean;
+}
+
+export type RefetchGmailReviewContentResult =
+  | { status: "ok"; content: RefetchedGmailReviewContent }
+  | { status: "error"; message: string };
+
 export interface EmailRuleDiagnostics {
   totalEmailRules: number;
   rulesForConnection: number;

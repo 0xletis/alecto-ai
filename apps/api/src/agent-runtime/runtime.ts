@@ -23,6 +23,7 @@ import {
   parseGmailReviewInstructionWithLLM,
   validateGmailReviewInstructionOperations
 } from "./gmail-review-instruction-parser.js";
+import { gmailReviewPresentationCategory } from "../email-reviews/email-review-service.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import {
@@ -1158,6 +1159,17 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return gmailReviewBulkTriageResponse;
   }
 
+  // fix/private-alpha-gmail-review-quality-and-dedupe (Task 7): checked right after the plain
+  // "remove all reviews" bulk shortcut above — a category-scoped bulk command ("ignore the noise",
+  // "log the application confirmations") only ever touches the ONE category the user named, never
+  // every visible review, so it needs its own narrower match on top of formatGmailReviewListForChat's
+  // own confirmation/needs_review/noise grouping (email-review-service.ts's
+  // gmailReviewPresentationCategory) rather than the blanket bulk-reject path above.
+  const gmailReviewCategoryBulkResponse = !pending ? await gmailReviewCategoryBulkShortcut(message, context) : undefined;
+  if (gmailReviewCategoryBulkResponse) {
+    return gmailReviewCategoryBulkResponse;
+  }
+
   // fix/private-alpha-gmail-review-llm-instruction-routing: checked BEFORE gmail.sync — a real
   // reported bug had "I wanna disconnect my mail and connect a new one" (unambiguous
   // disconnect/switch intent) matched by gmailSyncShortcutOperation's own bare "mail...new"
@@ -1330,6 +1342,35 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     // acting on half a message.
     const gmailReviewVisibleEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
     const gmailReviewNeedsLLMInstruction = gmailReviewInstructionNeedsLLMParsing(message, gmailReviewVisibleEntities);
+
+    // fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 2/8): checked
+    // ahead of every triage shortcut below — "details for 3"/"why is 3 noise" is never a reject/
+    // keep/approve instruction, and a bare "ignore this"/"approve this" right after a detail view
+    // must resolve to the review just detailed, not fall through to the generic numbered-ref
+    // extractors below (which have no number/named-subject to match against a bare pronoun anyway).
+    // A detail-shaped message with NO review list currently visible asks the user to list reviews
+    // first, rather than falling through to the real planner with nothing grounded to act on.
+    if (gmailReviewVisibleEntities.length === 0 && GMAIL_REVIEW_DETAIL_TRIGGER_RE.test(normalizeIntentText(message))) {
+      return finalize(context, {
+        reply: 'I don\'t have any Gmail reviews in view right now. Say "show me my email reviews" first, then I can show details for one.',
+        operationsPlanned: [],
+        executedOps: [],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: "gmail_reviews"
+      });
+    }
+
+    const gmailReviewDetailShortcuts = gmailReviewDetailShortcutOperation(message, context);
+    if (gmailReviewDetailShortcuts.length > 0) {
+      return finalizeDeterministicOperations(context, message, gmailReviewDetailShortcuts, "gmail_reviews");
+    }
+
+    const gmailReviewThisFollowupShortcuts = gmailReviewThisFollowupShortcutOperation(message, context);
+    if (gmailReviewThisFollowupShortcuts.length > 0) {
+      return finalizeDeterministicOperations(context, message, gmailReviewThisFollowupShortcuts, "gmail_reviews");
+    }
 
     if (!gmailReviewNeedsLLMInstruction) {
       const gmailReviewTriageShortcuts = gmailReviewExplicitTriageShortcutOperations(message, context);
@@ -1977,6 +2018,117 @@ function gmailReviewToActionShortcutOperations(message: string, context: Context
   }));
 }
 
+// fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 2): a deterministic
+// pre-planner shortcut for "show me the real content and explain this review" — checked so this
+// class of message never depends on the real LLM planner correctly picking gmail.review.detail
+// over gmail.review.inspect/approve/reject, since those look similar to a planner ("does the second
+// one mention X" vs "show review 2" vs "why is 2 noise"). English + Spanish + Catalan, matching the
+// task's own exact phrasing list.
+const GMAIL_REVIEW_DETAIL_TRIGGER_RE = new RegExp(
+  [
+    "\\bdetails?\\b[\\s\\S]{0,15}\\b(for|of|about)\\b",
+    "\\bshow( me)?\\b[\\s\\S]{0,20}\\b(more about|full text for|important text for|review)\\b",
+    "\\bwhat is email\\b",
+    "\\bexplain review\\b",
+    "\\bwhy did you classify\\b",
+    "\\bwhy is\\b[\\s\\S]{0,15}\\bnoise\\b",
+    "\\bqu[eé] es el email\\b",
+    "\\bense[nñ]ame\\b[\\s\\S]{0,15}\\bdetalles\\b",
+    "\\bdetalles del\\b",
+    "\\bpor qu[eé]\\b[\\s\\S]{0,25}\\bclasificaste\\b",
+    "\\bexplica'?m\\b[\\s\\S]{0,15}\\bcorreu\\b",
+    "\\bmostra'?m\\b[\\s\\S]{0,15}\\bdetalls\\b",
+    "\\bdetalls del\\b",
+    "\\bper qu[eè]\\b[\\s\\S]{0,25}\\bclassificat\\b"
+  ].join("|"),
+  "i"
+);
+const GMAIL_REVIEW_DETAIL_FULL_TEXT_RE = /\b(full text|show me everything|texto completo|tot el text|el text complet)\b/i;
+
+function gmailReviewDetailShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
+  const visibleReviews = context.session.visibleEntities.filter(
+    (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+  );
+  if (visibleReviews.length === 0) {
+    return [];
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_REVIEW_DETAIL_TRIGGER_RE.test(text)) {
+    return [];
+  }
+
+  const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index));
+  const indexes = extractIndexesFromText(text, visibleIndexSet);
+  const fullText = GMAIL_REVIEW_DETAIL_FULL_TEXT_RE.test(text);
+
+  if (indexes.length > 0) {
+    return [{ tool: "gmail.review.detail", args: { index: indexes[0], ...(fullText ? { fullText: true } : {}) }, rationale: "user asked for the real content/explanation of one visible Gmail review" }];
+  }
+
+  // A number WAS mentioned but didn't match any currently-visible index (e.g. "show review 99")
+  // — that is a genuinely wrong reference, never silently reinterpreted as "the only one visible."
+  // Falling through here lets it reach the normal index-based resolution below/in the validator,
+  // which asks a real "I don't see a #99" clarification instead of guessing.
+  const mentionedAnyNumber = /\d/.test(text);
+
+  const selected = selectVisibleEntityMention(text, visibleReviews);
+  if (selected) {
+    return [{ tool: "gmail.review.detail", args: { ...visibleEntityToGmailReviewRef(selected), ...(fullText ? { fullText: true } : {}) }, rationale: "user asked for the real content/explanation of one visible Gmail review" }];
+  }
+
+  if (!mentionedAnyNumber && visibleReviews.length === 1) {
+    return [{ tool: "gmail.review.detail", args: { index: visibleReviews[0]!.index, ...(fullText ? { fullText: true } : {}) }, rationale: "user asked for the real content/explanation of the only visible Gmail review" }];
+  }
+
+  if (mentionedAnyNumber) {
+    const [rawNumber] = text.match(/\d+/) ?? [];
+    return [{ tool: "gmail.review.detail", args: { index: rawNumber ? Number(rawNumber) : undefined }, rationale: "user referenced a Gmail review number for details that is not in the currently visible list" }];
+  }
+
+  return [];
+}
+
+// fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 8): after "details for
+// N", a bare pronoun follow-up ("approve this", "ignore this", "not relevant", "already counted",
+// "count this", "turn this into an action", "remind me about this tomorrow") always means the review
+// just detailed — resolved deterministically via resolveGmailReviewRef's new pronoun branch
+// (validator.ts), never left to the real planner to guess a tool AND a target in one shot.
+const GMAIL_REVIEW_THIS_IGNORE_RE = /\b(ignore|reject|dismiss|not relevant|no relevante|not related|already counted|ya lo cont[eé]|ja ho he comptat)\b[\s\S]{0,10}\b(this|it)\b|^\s*(not relevant|no relevante|already counted)\s*$/i;
+const GMAIL_REVIEW_THIS_APPROVE_RE = /\b(approve|count|log)\b[\s\S]{0,10}\b(this|it)\b/i;
+const GMAIL_REVIEW_THIS_ACTION_RE = /\b(turn|convert|make)\b[\s\S]{0,15}\b(this|it)\b[\s\S]{0,15}\b(action|task)\b|\bremind me about this\b|\bremind me\b[\s\S]{0,10}\bthis\b/i;
+
+function gmailReviewThisFollowupShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
+  const focused = context.session.focusedEntities?.gmail_review;
+  if (!focused) {
+    return [];
+  }
+  const stillVisible = context.session.visibleEntities.some((entity) => entity.type === "gmail_review" && entity.id === focused.id);
+  if (!stillVisible) {
+    return [];
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return [];
+  }
+
+  if (GMAIL_REVIEW_THIS_ACTION_RE.test(text)) {
+    const dueText = extractNaturalDueTextFromMessage(text);
+    return [{ tool: "gmail.review.to_action", args: { ref: "this", ...(dueText ? { dueText } : {}) }, rationale: "user asked to turn the last-detailed Gmail review into an action" }];
+  }
+
+  if (GMAIL_REVIEW_THIS_IGNORE_RE.test(text)) {
+    return [{ tool: "gmail.review.reject", args: { ref: "this" }, rationale: "user asked to ignore/dismiss the last-detailed Gmail review" }];
+  }
+
+  if (GMAIL_REVIEW_THIS_APPROVE_RE.test(text)) {
+    return [{ tool: "gmail.review.approve", args: { ref: "this" }, rationale: "user asked to approve/count/log the last-detailed Gmail review" }];
+  }
+
+  return [];
+}
+
 const VAGUE_GMAIL_REVIEW_MUTATION_PATTERNS = [
   /\bhandle\s+(it|them|these|those|this)\b/,
   /\btake care of\s+(it|them|these|those|this)\b/,
@@ -1992,8 +2144,14 @@ const VAGUE_GMAIL_REVIEW_MUTATION_PATTERNS = [
 // regardless of which surface was last shown — "remove/reject/clear/delete all mail/gmail/email
 // reviews" unambiguously means the review QUEUE, never the Gmail ACCOUNT (that requires actual
 // account/connect/disconnect/switch/authorize wording — see gmailDisconnectShortcutOperation).
+// fix/private-alpha-gmail-review-quality-and-dedupe (Task 9): Spanish/Catalan "already counted"
+// dismissals ("ya los conté, ignora todas las reviews" / "ja ho he comptat, ignora totes les
+// revisions") use "ignora" (not the pre-existing borra/elimina/rechaza/quita/esborra/rebutja verb
+// list) and never pair "reviews" with a redundant correos/mail/email qualifier — "reviews"/
+// "revisiones"/"revisions" is already an unambiguous review-specific noun on its own, so that
+// trailing qualifier is now optional rather than required.
 const GMAIL_REVIEW_BULK_EXPLICIT_RE =
-  /\b(remove|reject|clear|delete|ignore)\b[\s\S]{0,15}\ball\b[\s\S]{0,25}\b(gmail|mail|email)\b[\s\S]{0,10}\breviews?\b|\b(borra|elimina|rechaza|quita)[a-z]*\b[\s\S]{0,15}\b(todas?|totes?)\b[\s\S]{0,20}\b(revisiones|revisions|reviews?)\b[\s\S]{0,20}\b(correos?|correus?|mail|email)\b|\b(esborra|rebutja)[a-z]*\b[\s\S]{0,15}\btotes?\b[\s\S]{0,20}\b(revisions|reviews?)\b[\s\S]{0,20}\b(correus?|mail|email)\b/i;
+  /\b(remove|reject|clear|delete|ignore)\b[\s\S]{0,15}\ball\b[\s\S]{0,25}\b(gmail|mail|email)\b[\s\S]{0,10}\breviews?\b|\b(borra|elimina|rechaza|quita|ignora)[a-z]*\b[\s\S]{0,15}\b(todas?|totes?)\b[\s\S]{0,20}\b(revisiones|revisions|reviews?)\b(?:[\s\S]{0,20}\b(correos?|correus?|mail|email)\b)?|\b(esborra|rebutja|ignora)[a-z]*\b[\s\S]{0,15}\btotes?\b[\s\S]{0,20}\b(revisions|reviews?)\b(?:[\s\S]{0,20}\b(correus?|mail|email)\b)?/i;
 // A bare "remove all"/"reject all"/"clear all" with no explicit domain word — only means Gmail
 // reviews when that's genuinely the surface the user was just looking at (see
 // mostRecentVisibleSurfaceType's own call site below), and explicitly excludes "all
@@ -2032,8 +2190,12 @@ function gmailReviewBulkTriageShortcutOperation(message: string, context: Contex
  * counted them when I sent the update") — surfaced back in the reply so the response is specific
  * to what they actually said, not a generic receipt. */
 function extractBulkReviewDismissalReason(message: string): string | undefined {
-  const text = message.toLowerCase();
-  if (/\balready (counted|logged|reported|sent|included|tracked)\b/.test(text)) {
+  const text = normalizeIntentText(message);
+  if (
+    /\balready (counted|logged|reported|sent|included|tracked)\b/.test(text) ||
+    /\bya\b[\s\S]{0,15}\b(conte|contado|contados|contada|contadas)\b/.test(text) ||
+    /\bja\b[\s\S]{0,15}\b(comptat|comptats|comptada|comptades)\b/.test(text)
+  ) {
     return "Since you already counted/logged that separately, I won't count these again.";
   }
   return undefined;
@@ -2054,6 +2216,75 @@ async function gmailReviewBulkTriageShortcut(message: string, context: ContextBu
 
   const reasonNote = extractBulkReviewDismissalReason(message);
   const reply = `Got it — ignored the ${count} visible Gmail review${count === 1 ? "" : "s"}.${reasonNote ? ` ${reasonNote}` : ""} I did not delete any emails.`;
+  return { ...response, reply };
+}
+
+const GMAIL_REVIEW_NOISE_BULK_RE = /\b(ignore|reject|clear|remove|dismiss)\b[\s\S]{0,15}\b(the\s+)?noise\b/;
+const GMAIL_REVIEW_CONFIRMATION_BULK_RE =
+  /\b(log|approve|confirm)\b[\s\S]{0,20}\b(the\s+)?(application\s+)?confirmations?\b/;
+
+/**
+ * fix/private-alpha-gmail-review-quality-and-dedupe (Task 7): a real reported UX gap — the review
+ * list is now grouped into "Likely application confirmations" / "Needs review" / "Likely noise"
+ * (formatGmailReviewListForChat), but there was no way to act on a WHOLE group at once other than
+ * naming every number by hand. "ignore the noise" rejects only the noise-category items; "log the
+ * application confirmations" approves only the confirmation-category items — both computed fresh
+ * from each visible review's OWN classification (gmailReviewPresentationCategory), never a guess.
+ */
+async function gmailReviewCategoryBulkShortcut(message: string, context: ContextBundle): Promise<AgentMessageResponse | undefined> {
+  const visibleReviews = context.session.visibleEntities.filter(
+    (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+  );
+  if (visibleReviews.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text) {
+    return undefined;
+  }
+
+  const wantsNoise = GMAIL_REVIEW_NOISE_BULK_RE.test(text);
+  const wantsConfirmations = !wantsNoise && GMAIL_REVIEW_CONFIRMATION_BULK_RE.test(text);
+  if (!wantsNoise && !wantsConfirmations) {
+    return undefined;
+  }
+
+  const reviewsById = new Map(context.gmailReviews.map((review) => [review.id, review] as const));
+  const targetCategory = wantsNoise ? "noise" : "confirmation";
+  const matchingEntities = visibleReviews.filter((entity) => {
+    const review = reviewsById.get(entity.id);
+    return review ? gmailReviewPresentationCategory(review) === targetCategory : false;
+  });
+
+  if (matchingEntities.length === 0) {
+    return finalize(context, {
+      reply: wantsNoise ? "Nothing in the visible reviews looks like noise right now." : "Nothing in the visible reviews looks like an application confirmation right now.",
+      operationsPlanned: [],
+      executedOps: [],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: "gmail_reviews"
+    });
+  }
+
+  const operations: PlannedOperation[] = matchingEntities.map((entity) => ({
+    tool: wantsNoise ? "gmail.review.reject" : "gmail.review.approve",
+    args: { index: entity.index },
+    rationale: wantsNoise ? "user asked to ignore the noise-category Gmail reviews" : "user asked to log the application-confirmation-category Gmail reviews"
+  }));
+
+  const response = await finalizeDeterministicOperations(context, message, operations, "gmail_reviews");
+  const allSucceeded = response.operationsExecuted.length > 0 && response.operationsExecuted.every((op) => op.status === "executed");
+  if (!allSucceeded) {
+    return response;
+  }
+
+  const count = matchingEntities.length;
+  const reply = wantsNoise
+    ? `Ignored ${count} noise item${count === 1 ? "" : "s"} — nothing was changed in your actual mailbox, only Alecto's own review queue.`
+    : `Logged ${count} application confirmation${count === 1 ? "" : "s"}.`;
   return { ...response, reply };
 }
 

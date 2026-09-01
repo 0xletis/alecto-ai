@@ -309,18 +309,30 @@ function describeGmailSignalsForBrief(goalLinkedReviews: EmailReviewItem[], goal
     }
   }
 
+  // fix/private-alpha-gmail-review-quality-and-dedupe (Task 8): a real live-testing report — the
+  // evening check-in named fabletics@myworkday.com as an application confirmation, but that exact
+  // item was NOT in the visible "show me" pending-review list, because it was never a pending
+  // review at all: it auto-logged directly (confident enough to skip review), so it lives in
+  // recentEvents, not EmailReviewItem. The old wording ("New Gmail signal... Review/follow up
+  // today.") was indistinguishable from a genuinely pending item, so the user reasonably expected
+  // to find it in "show me my reviews." Both lines now say plainly that this already happened
+  // automatically and isn't waiting in the review queue, so "show me" never contradicts the summary.
   const recruiterEvent = latestEventByType.get("career.recruiter_reply_received");
   if (recruiterEvent) {
     const sender = gmailEventFromLabel(recruiterEvent);
     const subject = gmailEventSubjectLabel(recruiterEvent);
-    lines.push(`New Gmail signal: recruiter reply${sender ? ` from ${sender}` : ""}${subject ? ` about "${subject}"` : ""}. Review/follow up today.`);
+    lines.push(
+      `Gmail (already logged, not in your review queue): recruiter reply${sender ? ` from ${sender}` : ""}${subject ? ` about "${subject}"` : ""}. Worth following up today.`
+    );
   }
 
   const confirmationEvent = latestEventByType.get("career.application_confirmation_received");
   if (confirmationEvent) {
     const sender = gmailEventFromLabel(confirmationEvent);
     const subject = gmailEventSubjectLabel(confirmationEvent);
-    lines.push(`Gmail: application confirmation${sender ? ` from ${sender}` : ""}${subject ? ` for "${subject}"` : ""}.`);
+    lines.push(
+      `Gmail (already logged, not in your review queue): application confirmation${sender ? ` from ${sender}` : ""}${subject ? ` for "${subject}"` : ""}.`
+    );
   }
 
   const rejectionEvent = latestEventByType.get("career.rejection_received");

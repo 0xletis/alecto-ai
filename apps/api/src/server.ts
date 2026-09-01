@@ -56,6 +56,9 @@ import {
   writeGmailBackgroundSyncAttempt,
   UpdateIntegrationConnectionInputSchema,
   UpdateUserOperatingProfileInputSchema,
+  isSecurityOrAuthEmail,
+  cleanEmailBodyForDisplay,
+  CLASSIFIER_BODY_LENGTH,
   type GithubPublicConnectionInput,
   type GoalSummary,
   type Goal,
@@ -108,6 +111,8 @@ import {
   findExternalEvent,
   findGmailSemanticDuplicateEvent,
   findGmailSemanticDuplicateReviewItem,
+  findCompanyRoleDayDuplicateReviewItem,
+  findCompanyRoleDayDuplicateEvent,
   hasRecentNotificationLog,
   createExternalEventIfNotExists,
   createGithubPublicConnection,
@@ -142,6 +147,7 @@ import {
   upsertEmailReviewItem,
   type IntegrationConnection,
   type EmailSignalRule,
+  type EmailReviewItem,
   type ActionItem,
   type ActionItemReminderType,
   updateIntegrationConnection,
@@ -264,6 +270,7 @@ import type {
   EmailReviewCandidateDebug,
   EmailRuleDiagnostics,
   EmailRuleSyncSummary,
+  RefetchGmailReviewContentResult,
   GmailLastSyncDiagnostics,
   GithubCommit,
   GmailErrorStage,
@@ -289,7 +296,8 @@ export function buildServer() {
 
   configureAgentRuntimeServices({
     syncGmailForUser: syncGmailForConversation,
-    gmailSyncDebugForUser: gmailSyncDebugForConversation
+    gmailSyncDebugForUser: gmailSyncDebugForConversation,
+    refetchGmailReviewContentForUser: refetchGmailReviewContentForConversation
   });
 
   server.get("/health", async () => ({
@@ -2432,6 +2440,42 @@ async function gmailSyncDebugForConversation(userId: string): Promise<string> {
   return formatGmailLastSyncDiagnostics(diagnostics);
 }
 
+/**
+ * fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 1 audit finding): the
+ * ONLY place a pending EmailReviewItem's real Gmail content is ever refetched — everything stored
+ * on the row itself at creation time is a short snippet plus a mostly-header evidence prefix, never
+ * enough for a real "explain this email" answer. Reuses the exact same readonly token/fetch
+ * machinery syncEmailSignalRule already relies on (getValidGmailAccessToken, getGmailMessage with
+ * format=full) — never a new scope, never a write call. Registered as the
+ * refetchGmailReviewContentForUser agent-runtime service (see services.ts) so executor.ts, which
+ * cannot import server.ts's private Gmail/OAuth functions directly, can still reach this.
+ */
+async function refetchGmailReviewContentForConversation(userId: string, review: EmailReviewItem): Promise<RefetchGmailReviewContentResult> {
+  try {
+    const connection = await getIntegrationConnection(userId, review.connectionId);
+    if (!connection) {
+      return { status: "error", message: "I can't refetch that email — the Gmail connection it came from no longer exists." };
+    }
+
+    const accessToken = await getValidGmailAccessToken(connection);
+    const message = await getGmailMessage(accessToken, review.providerMessageId);
+    const decoded = decodeGmailBodyDetailed(message.payload);
+
+    return {
+      status: "ok",
+      content: {
+        subject: getGmailHeader(message, "subject") || review.subject || "",
+        from: getGmailHeader(message, "from") || review.from || "",
+        date: getGmailHeader(message, "date") || "",
+        rawBodyText: decoded.text || message.snippet || review.snippet || review.evidence || "",
+        isHtml: decoded.isHtml
+      }
+    };
+  } catch (error) {
+    return { status: "error", message: safeGmailErrorMessage(error) };
+  }
+}
+
 async function syncIntegrationsForConversation(userId: string): Promise<string> {
   const connections = (await getIntegrationConnections(userId)).filter(
     (connection) =>
@@ -4514,6 +4558,29 @@ async function syncEmailSignalRule(input: {
       continue;
     }
 
+    // fix/private-alpha-gmail-review-quality-and-dedupe (Task 6): the exact-key semantic dedup
+    // above only catches a byte-for-byte-normalized subject+sender repeat, but a real duplicate
+    // application confirmation for the same job (an ATS auto-reply vs. a recruiter's own
+    // confirmation) routinely differs in both — and at high classifier confidence, never enters the
+    // review queue's own loose dedup at all. Scoped narrowly to application confirmations only, so
+    // a genuinely distinct recruiter reply/interview/offer/rejection is never silently dropped.
+    if (eventType === "career.application_confirmation_received") {
+      const companyDayDuplicateEvent = await withGmailStage("event_creation", () =>
+        findCompanyRoleDayDuplicateEvent({
+          userId: input.userId,
+          eventType,
+          company: typeof classification.extracted.company === "string" ? classification.extracted.company : undefined,
+          role: typeof classification.extracted.role === "string" ? classification.extracted.role : undefined,
+          referenceDate: new Date()
+        })
+      );
+
+      if (companyDayDuplicateEvent) {
+        summary.semanticDeduped += 1;
+        continue;
+      }
+    }
+
     const created = await withGmailStage("event_creation", () => createExternalEventIfNotExists(
       input.userId,
       {
@@ -4717,13 +4784,23 @@ async function classifyEmailForRule(
   }
 
   try {
+    // fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 5 audit finding):
+    // this previously passed `message.snippet` as bodyText too — classifyEmailWithLLM's own input
+    // schema already has a real bodyText field, but the caller never filled it with anything beyond
+    // the ~100-char Gmail snippet, so the LLM fallback classifier (the path an ambiguous email
+    // actually reaches) was silently snippet-limited even though the deterministic rules classifier
+    // right above it already sees the full decoded, cleaned body via gmailMessageToText.
+    const decodedBody = decodeGmailBodyDetailed(message.payload);
+    const bodyText = decodedBody.text
+      ? cleanEmailBodyForDisplay(decodedBody.text, { isHtml: decodedBody.isHtml, maxLength: CLASSIFIER_BODY_LENGTH })
+      : (message.snippet ?? "");
     const llmClassification = await classifyEmailWithLLM({
       adapterId: rule.adapterId === "work_action_email" ? "work_action_email" : "job_search_email",
       source: "gmail",
       subject: getGmailHeader(message, "subject"),
       from: getGmailHeader(message, "from"),
       snippet: message.snippet,
-      bodyText: message.snippet ?? "",
+      bodyText,
       allowedEventTypes: rule.adapterId === "work_action_email" ? WorkActionEmailAllowedEventTypes : JobSearchEmailAllowedEventTypes,
       classifierMode: rule.classifierMode === "llm" ? "llm" : "hybrid",
       minAutoLogConfidence: rule.minAutoLogConfidence,
@@ -4871,28 +4948,13 @@ function classifySecurityAuthEmailNoise(
   };
 }
 
+// fix/private-alpha-gmail-review-quality-and-dedupe (Task 2): delegates to
+// @operator-agent/core's isSecurityOrAuthEmail (packages/core/src/ingestion.ts) instead of
+// maintaining a second, independently-drifting phrase list — that shared list is also what the
+// deterministic job_search_email/work_action_email classifier itself checks first, so a
+// verification/auth-code email is hard-excluded identically everywhere it could be classified.
 function isSecurityAuthAccountEmail(text: string): boolean {
-  const normalized = normalizeForComparison(text);
-
-  return [
-    /\bsecurity code\b/,
-    /\bverification code\b/,
-    /\botp\b/,
-    /\blogin code\b/,
-    /\bsign in alert\b/,
-    /\bsignin alert\b/,
-    /\bsign in\b.*\balert\b/,
-    /\bpassword reset\b/,
-    /\breset your password\b/,
-    /\baccount security\b/,
-    /\btwo factor\b/,
-    /\b2fa\b/,
-    /\bauthentication\b/,
-    /\bsuspicious login\b/,
-    /\bdevice login\b/,
-    /\bnew device\b.*\blogin\b/,
-    /\baccount recovery\b/
-  ].some((pattern) => pattern.test(normalized));
+  return isSecurityOrAuthEmail(text);
 }
 
 const REVIEW_PRIORITY_VALUES = new Set(["low", "normal", "high"]);
@@ -5080,6 +5142,63 @@ async function createEmailReviewItemForClassification(input: {
         matchedReviewStatus: semanticReview.status
       }
     };
+  }
+
+  // fix/private-alpha-gmail-review-quality-and-dedupe (Task 6): the exact-key semantic dedup above
+  // only catches a byte-for-byte-normalized subject+sender repeat. Same-day same-company (and, when
+  // both extracted, same-role) application confirmations are still real duplicates even when their
+  // subject/sender differ — this loose fallback only ever applies to application-confirmation
+  // reviews, never to recruiter replies/interviews/offers/rejections, so a genuinely distinct
+  // high-signal email is never silently swallowed.
+  if (proposedEventType === "career.application_confirmation_received" && company) {
+    const companyDayDuplicate = await findCompanyRoleDayDuplicateReviewItem({
+      userId: input.userId,
+      proposedEventType,
+      company,
+      role,
+      referenceDate: input.message.internalDate ? new Date(Number(input.message.internalDate)) : new Date()
+    });
+
+    if (companyDayDuplicate) {
+      if (companyDayDuplicate.status === "pending") {
+        return {
+          status: "semantic_pending" as const,
+          item: companyDayDuplicate,
+          debug: {
+            ...baseDebug,
+            decision: "existing_pending_company_day",
+            matchedReviewId: companyDayDuplicate.id,
+            matchedReviewStatus: companyDayDuplicate.status
+          }
+        };
+      }
+
+      if (companyDayDuplicate.status === "rejected") {
+        return {
+          status: "semantic_rejected" as const,
+          item: companyDayDuplicate,
+          debug: {
+            ...baseDebug,
+            decision: "existing_rejected_company_day",
+            matchedReviewId: companyDayDuplicate.id,
+            matchedReviewStatus: companyDayDuplicate.status
+          }
+        };
+      }
+
+      if (companyDayDuplicate.status === "approved") {
+        return {
+          status: "semantic_approved" as const,
+          item: companyDayDuplicate,
+          debug: {
+            ...baseDebug,
+            decision: "existing_approved_company_day",
+            matchedReviewId: companyDayDuplicate.id,
+            matchedReviewStatus: companyDayDuplicate.status
+          }
+        };
+      }
+    }
   }
 
   const created = await upsertEmailReviewItem({
@@ -5908,14 +6027,61 @@ function gmailMessageToText(message: GmailMessage): string {
   // sometimes inject invisible/zero-width characters specifically to dodge naive keyword content
   // filters (e.g. "n​ewsletter" with a zero-width space mid-word breaks a plain .includes("newsletter")
   // match), so leaving them in the text the classifier itself reads would undermine the same
-  // precision fix this task is otherwise making. A large cap (not a real one) — this is
-  // classification input, not something ever shown to a user, so length itself isn't the risk here.
+  // precision fix this task is otherwise making.
   const subject = sanitizeEmailText(getGmailHeader(message, "subject"), 500);
   const from = sanitizeEmailText(getGmailHeader(message, "from"), 500);
   const snippet = sanitizeEmailText(message.snippet ?? "", 2000);
-  const body = sanitizeEmailText(decodeGmailBody(message.payload) || message.snippet || "", 6000);
+  // fix/private-alpha-email-review-detail-and-general-mail-understanding (Task 5): runs through the
+  // same general cleaner the review-detail command and the LLM understanding layer use (prefers
+  // text/plain, falls back to HTML converted to readable text, strips script/style/tracking noise,
+  // redacts secrets) — the deterministic classifier gets real body content, not just a raw decode.
+  const decodedBody = decodeGmailBodyDetailed(message.payload);
+  const body = decodedBody.text
+    ? cleanEmailBodyForDisplay(decodedBody.text, { isHtml: decodedBody.isHtml, maxLength: CLASSIFIER_BODY_LENGTH })
+    : sanitizeEmailText(message.snippet ?? "", CLASSIFIER_BODY_LENGTH);
 
   return [`Subject: ${subject}`, `From: ${from}`, `Snippet: ${snippet}`, `Body: ${body}`].filter(Boolean).join("\n");
+}
+
+/**
+ * fix/private-alpha-email-review-detail-and-general-mail-understanding (Part 1 audit finding):
+ * the old decodeGmailBody grabbed whichever text/* MIME part appeared first in document order,
+ * with no way for the caller to know whether it got plain text or raw HTML. Prefers text/plain
+ * explicitly (searched first, anywhere in the tree); only falls back to text/html when no
+ * text/plain part exists at all — and tells the caller which one it got, so cleanEmailBodyForDisplay
+ * knows whether to run HTML-to-text conversion.
+ */
+function decodeGmailBodyDetailed(part?: GmailMessagePart): { text: string; isHtml: boolean } {
+  const plain = findGmailBodyPart(part, "text/plain");
+  if (plain) {
+    return { text: decodeBase64Url(plain), isHtml: false };
+  }
+
+  const html = findGmailBodyPart(part, "text/html");
+  if (html) {
+    return { text: decodeBase64Url(html), isHtml: true };
+  }
+
+  return { text: "", isHtml: false };
+}
+
+function findGmailBodyPart(part: GmailMessagePart | undefined, mimeType: "text/plain" | "text/html"): string | undefined {
+  if (!part) {
+    return undefined;
+  }
+
+  if (part.mimeType === mimeType && part.body?.data) {
+    return part.body.data;
+  }
+
+  for (const child of part.parts ?? []) {
+    const found = findGmailBodyPart(child, mimeType);
+    if (found) {
+      return found;
+    }
+  }
+
+  return undefined;
 }
 
 function getGmailHeader(message: GmailMessage, name: string): string {
@@ -5965,18 +6131,6 @@ async function buildRejectedSenderSuppressionMap(
   }
 
   return map;
-}
-
-function decodeGmailBody(part?: GmailMessagePart): string {
-  if (!part) {
-    return "";
-  }
-
-  if (part.body?.data && (!part.mimeType || part.mimeType.startsWith("text/"))) {
-    return decodeBase64Url(part.body.data);
-  }
-
-  return (part.parts ?? []).map(decodeGmailBody).filter(Boolean).join("\n").slice(0, 5000);
 }
 
 function decodeBase64Url(value: string): string {

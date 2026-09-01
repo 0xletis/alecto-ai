@@ -7,3 +7,4 @@ export * from "./polish-insight.js";
 export * from "./proactive-brief.js";
 export * from "./semantic-router.js";
 export * from "./types.js";
+export * from "./understand-email.js";

@@ -6262,7 +6262,7 @@ test("archived Gmail event does not block review creation, active event does", a
   assert.equal(activeEventMatch?.status, "active");
 });
 
-test("Topper account email is ignored and application security code goes to review", () => {
+test("Topper account email is ignored and application security code is hard-filtered, never review", () => {
   const topper = classifyJobSearchEmail({
     text: [
       "Subject: Update regarding your Topper account",
@@ -6273,6 +6273,11 @@ test("Topper account email is ignored and application security code goes to revi
   });
   assert.equal(topper.decision, "ignore");
 
+  // fix/private-alpha-gmail-review-quality-and-dedupe (Task 2): a real live-testing report — a
+  // security/verification code email was reaching the review queue (and, worse, sometimes the LLM
+  // classifier mislabeled it as a recruiter reply) instead of being hard-excluded outright, even
+  // for an application-flow code like this one. There is deliberately no carve-out for
+  // application-flow codes — every security/verification/OTP code is noise, regardless of context.
   const securityCode = classifyJobSearchEmail({
     text: [
       "Subject: Security code for your application to Blockchain.com",
@@ -6281,8 +6286,8 @@ test("Topper account email is ignored and application security code goes to revi
     ].join("\n"),
     classifierMode: "rules"
   });
-  assert.equal(securityCode.decision, "needs_review");
-  assert.equal(securityCode.reason, "application_action_required");
+  assert.equal(securityCode.decision, "ignore");
+  assert.equal(securityCode.reason, "security_auth");
 });
 
 test("work action email is review-worthy, newsletter and security code are ignored", () => {
