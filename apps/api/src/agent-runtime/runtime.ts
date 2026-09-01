@@ -113,6 +113,50 @@ const CANCEL_WHITELIST = new Set([
   "cancel·la"
 ]);
 
+// fix/private-alpha-goal-guardrail-followup-keep-active: a real Telegram transcript found "im
+// kiding keep it" — a false-alarm follow-up right after the goal-avoidance guardrail intervened
+// on "quiero dejar este objetivo" — planned as a fresh goal.archive_propose(operation: "pause")
+// by the real LLM planner. Neither CONFIRM_WHITELIST/CANCEL_WHITELIST above nor
+// EXTENDED_CONFIRM_PHRASE_RE recognize "keep it" at all (it's neither a yes nor a no), and no
+// pending operation existed for the planner's own pending-operation firewall to protect against
+// in the first place — the guardrail's early-return never opens one. The planner was simply
+// asked to interpret an ambiguous "keep it" against recent conversation history that happened to
+// contain the word "paused" (the guardrail's own coaching reply, "I'd rather you paused here —
+// what's driving this right now?", meant "let's pause and reflect," never "pause the goal") and
+// picked the wrong reading. Recognized deterministically instead, in both of the two real shapes
+// this can take: (1) right after a guardrail intervention (session.topic === "guardrail" on the
+// immediately preceding turn, checked in processAgentMessageInner, no pending operation involved
+// at all), and (2) as new cancel vocabulary for an ALREADY-open real pending pause/archive
+// confirmation (pending.topic === "goal_lifecycle"). Neither path ever calls the planner for a
+// message that matches, so this class of misreading can't recur no matter how the model's own
+// judgment on an ambiguous continuation happens to land.
+const KEEP_GOAL_ACTIVE_EN_RE = /\bkeep (it|the goal|this goal)\b|\bdon'?t (pause|archive) it\b/;
+const KEEP_GOAL_ACTIVE_ES_RE = /\bseguir con el objetivo\b|\bmantenerlo\b|\bmantenlo\b/;
+const KEEP_GOAL_ACTIVE_CA_RE = /\bconserva l['’]?objectiu\b|\bmanten-lo\b/;
+// The exact same multilingual affirmative-opener vocabulary EXTENDED_CONFIRM_PHRASE_RE already
+// uses, reused here only to detect the one genuinely CONTRADICTORY shape ("yes keep it") — an
+// opener that would otherwise read as a real confirmation, paired with keep-language that means
+// the opposite. Never treated as a plain confirm OR a plain cancel; always asks instead.
+const GOAL_LIFECYCLE_AFFIRMATIVE_OPENER_RE = /^(yes|yep|yeah|y|si|vale|confirm[a]?|d['’]?acord|ok|okay)\b/;
+
+type KeepGoalActiveLanguage = "en" | "es" | "ca";
+
+function detectKeepGoalActiveLanguage(normalizedText: string): KeepGoalActiveLanguage | undefined {
+  if (KEEP_GOAL_ACTIVE_CA_RE.test(normalizedText)) return "ca";
+  if (KEEP_GOAL_ACTIVE_ES_RE.test(normalizedText)) return "es";
+  if (KEEP_GOAL_ACTIVE_EN_RE.test(normalizedText)) return "en";
+  return undefined;
+}
+
+const KEEP_GOAL_ACTIVE_REPLY: Record<KeepGoalActiveLanguage, string> = {
+  en: "Got it — keeping the goal active. No changes made.",
+  es: "De acuerdo — mantengo el objetivo activo. No he cambiado nada.",
+  ca: "D'acord — mantinc l'objectiu actiu. No he canviat res."
+};
+
+const GOAL_LIFECYCLE_CONTRADICTION_CLARIFICATION =
+  "That sounds contradictory — do you want me to actually pause/archive it, or keep the goal active? Reply \"yes\" for the first, \"keep it\" for the second.";
+
 // fix/private-alpha-conversation-kernel-context-routing (Part 4): "cancel, I mean X"/"no, actually
 // X"/"cancel, X" — a leading cancel word followed by a real correction, as opposed to CANCEL_
 // WHITELIST above (which only ever matches the cancel word ALONE, nothing else in the message).
@@ -944,6 +988,65 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     // Unresolved — never guesses, never clears the clarification. The user already saw the full
     // numbered list once; a short reminder of the allowed replies is enough, not a full re-list.
     return finalizeGoalRestoreDisambiguationClarification(context, pending);
+  }
+
+  // fix/private-alpha-goal-guardrail-followup-keep-active: a real, open goal.archive_propose
+  // confirmation (pause or archive) gets its own "keep it" cancel vocabulary — see
+  // KEEP_GOAL_ACTIVE_EN_RE's own doc comment above for the real reported bug this closes.
+  // "yes keep it" is a genuine contradiction (an affirmative opener paired with keep-language
+  // that means the opposite) and must never be silently read as either — it always asks instead,
+  // checked before the plain keep-language case so the contradiction can't accidentally match
+  // that broader pattern first.
+  if (pending?.topic === "goal_lifecycle") {
+    const normalizedForGoalLifecycle = normalizeIntentText(message);
+    const keepLanguage = detectKeepGoalActiveLanguage(normalizedForGoalLifecycle);
+    if (keepLanguage && GOAL_LIFECYCLE_AFFIRMATIVE_OPENER_RE.test(normalizedForGoalLifecycle)) {
+      return finalize(context, {
+        reply: GOAL_LIFECYCLE_CONTRADICTION_CLARIFICATION,
+        operationsPlanned: [],
+        executedOps: [],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: "goal_lifecycle"
+      });
+    }
+    if (keepLanguage) {
+      setPendingOperation(context.session, null);
+      const reply = KEEP_GOAL_ACTIVE_REPLY[keepLanguage];
+      return finalize(context, {
+        reply,
+        operationsPlanned: [],
+        executedOps: [{ tool: "confirmation.cancel", status: "executed", summary: reply }],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: "goal_lifecycle"
+      });
+    }
+  }
+
+  // fix/private-alpha-goal-guardrail-followup-keep-active: the OTHER real shape of the same bug —
+  // no pending operation exists at all (the guardrail's own early-return never opens one), but the
+  // guardrail intervened on the IMMEDIATELY PRECEDING turn (session.topic, overwritten by
+  // finalize()'s setTopic on every turn, so this can only ever mean the turn right before this
+  // one — same "immediately preceding" guarantee mostRecentTurnWasAMutation already relies on).
+  // A false-alarm reply here must never reach the real planner at all — that's exactly how "im
+  // kidding keep it" got misread as continuing a pause in the first place.
+  if (!pending && context.session.topic === "guardrail") {
+    const keepLanguage = detectKeepGoalActiveLanguage(normalizeIntentText(message));
+    if (keepLanguage) {
+      const reply = KEEP_GOAL_ACTIVE_REPLY[keepLanguage];
+      return finalize(context, {
+        reply,
+        operationsPlanned: [],
+        executedOps: [],
+        plannerUsed: "none",
+        llmPlannerAttempted: false,
+        toolValidationPassed: true,
+        topic: "goal_lifecycle"
+      });
+    }
   }
 
   // Exact confirm/cancel is checked FIRST and ALWAYS — regardless of whether a pending
