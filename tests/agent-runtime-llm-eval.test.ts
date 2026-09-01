@@ -16967,3 +16967,512 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-email-review-resolution-and-stale-classification: live-bug-report coverage
+// for review resolution (progress logged from a review must resolve it, never double-count), stale
+// stored classification reconciliation on detail, gmail.review.inspect's full-body alias, and the
+// "show full text for it" follow-up. Real planner + real understanding call throughout — no mocks —
+// against a mocked Gmail mailbox and a real encrypted token, same pattern as the generic-sweep
+// scenarios above.
+
+async function seedResolutionEvalReviewRule(userId: string, connectionId: string) {
+  return prisma.emailSignalRule.create({
+    data: {
+      userId,
+      connectionId,
+      adapterId: "job_search_email",
+      name: "Job search emails",
+      status: "active",
+      fetchStrategy: "query",
+      classifierMode: "rules",
+      lookbackDays: 30,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 10,
+      minAutoLogConfidence: 0.9,
+      minReviewConfidence: 0.65,
+      createdBy: "user"
+    }
+  });
+}
+
+async function seedResolutionEvalReview(
+  userId: string,
+  connectionId: string,
+  ruleId: string,
+  input: { providerMessageId: string; subject: string; from: string; reason: string; proposedEventType?: string; updatedAt?: Date }
+) {
+  return prisma.emailReviewItem.create({
+    data: {
+      userId,
+      connectionId,
+      ruleId,
+      adapterId: "job_search_email",
+      provider: "gmail",
+      providerMessageId: input.providerMessageId,
+      externalId: `gmail-review:${ruleId}:${input.providerMessageId}`,
+      status: "pending",
+      subject: input.subject,
+      from: input.from,
+      snippet: input.subject,
+      evidence: input.subject,
+      confidence: 0.75,
+      reason: input.reason,
+      proposedEventType: input.proposedEventType,
+      extracted: {},
+      updatedAt: input.updatedAt
+    }
+  });
+}
+
+test(
+  "458. a stale 'recruiter reply' review is corrected to 'application confirmation' by a real detail call (email-review-stale-classification A)",
+  { ...llmEvalOptions(["email-review-stale-classification"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-458-${randomUUID()}`;
+    const trace = new EvalTrace("458-stale-recruiter-reply-corrected", ["email-review-stale-classification"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-458-innovation-labs",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        body: "Thank you for applying to Innovation Labs. We have received your application for the Front-End Engineer role and will review it shortly."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-458-innovation-labs",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        reason: "recruiter_reply",
+        proposedEventType: "career.recruiter_reply_received"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const mentionsConfirmation = /application confirmation/i.test(t2.reply);
+        trace.checkpoint("detail reply calls it an application confirmation, not a recruiter reply", mentionsConfirmation, t2.reply);
+        assert.ok(mentionsConfirmation, `expected the corrected classification in the reply — got: ${t2.reply}`);
+
+        const refreshed = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        const stored = refreshed?.reason === "application_confirmation";
+        trace.checkpoint("the stored review reason was refreshed to application_confirmation", stored, refreshed?.reason);
+        assert.ok(stored, `expected the review's stored reason to be refreshed — got: ${refreshed?.reason}`);
+        assert.equal(refreshed?.status, "pending", "a classification refresh must never change status");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "459. 'mark it as a CV sent' after details logs progress AND resolves the review (email-review-resolution A / email-progress-from-review A)",
+  { ...llmEvalOptions(["email-review-resolution", "email-progress-from-review"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-459-${randomUUID()}`;
+    const trace = new EvalTrace("459-mark-as-cv-sent-resolves-review", ["email-review-resolution", "email-progress-from-review"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-459-innovation-labs",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        body: "Thank you for applying to Innovation Labs. We have received your application for the Front-End Engineer role."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-459-innovation-labs",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        reason: "recruiter_reply",
+        proposedEventType: "career.recruiter_reply_received"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark it as a CV sent", await sendAgentMessage(server, userId, "mark it as a CV sent"));
+        assertNoGenericAgentError(t3);
+
+        const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        const resolved = after?.status !== "pending";
+        trace.checkpoint("the review is resolved, not left pending", resolved, after?.status);
+        assert.ok(resolved, `expected the review to be resolved after logging progress from it — got status: ${after?.status}`);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("exactly one CV-sent event was logged", events === 1, `count=${events}`);
+        assert.equal(events, 1, `expected exactly one career.application_sent event — got ${events}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "460. saying 'mark it as a CV sent' twice never double-counts (email-review-resolution B)",
+  { ...llmEvalOptions(["email-review-resolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-460-${randomUUID()}`;
+    const trace = new EvalTrace("460-no-double-count", ["email-review-resolution"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-460-innovation-labs",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        body: "Thank you for applying to Innovation Labs. We have received your application for the Front-End Engineer role."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-460-innovation-labs",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        reason: "recruiter_reply",
+        proposedEventType: "career.recruiter_reply_received"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("mark it as a CV sent (1st)", await sendAgentMessage(server, userId, "mark it as a CV sent"));
+        const t4 = trace.record("mark it as a CV sent (2nd)", await sendAgentMessage(server, userId, "mark it as a CV sent"));
+        assertNoGenericAgentError(t4);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("still exactly one CV-sent event after a repeated request", events === 1, `count=${events}`);
+        assert.equal(events, 1, `expected the second attempt to never double-count — got ${events} events`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "461. 'why is 3 uncertain signal?' uses the full-body detail flow, never the old snippet-only limitation (email-review-inspect-alias A)",
+  { ...llmEvalOptions(["email-review-inspect-alias"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-461-${randomUUID()}`;
+    const trace = new EvalTrace("461-inspect-alias-full-body", ["email-review-inspect-alias"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      { id: "eval-461-m1", subject: "Innovation Labs", from: "no-reply@innovationlabs.example", body: "We received your application for the Front-End Engineer role." },
+      { id: "eval-461-m2", subject: "AIT confirmation", from: "no-reply@ait.example", body: "We received your application and will follow up soon." },
+      { id: "eval-461-m3", subject: "Kraken talent newsletter", from: "jobs@kraken.example", body: "This week's top engineering roles across our partner network include several remote-friendly positions at growing startups." }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-461-m1", subject: "Innovation Labs", from: "no-reply@innovationlabs.example", reason: "application_confirmation", updatedAt: new Date("2026-08-20T09:02:00.000Z") });
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-461-m2", subject: "AIT confirmation", from: "no-reply@ait.example", reason: "application_confirmation", updatedAt: new Date("2026-08-20T09:01:00.000Z") });
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-461-m3", subject: "Kraken talent newsletter", from: "jobs@kraken.example", reason: "uncertain signal", updatedAt: new Date("2026-08-20T09:00:00.000Z") });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("why is 3 uncertain signal?", await sendAgentMessage(server, userId, "why is 3 uncertain signal?"));
+        assertNoGenericAgentError(t2);
+
+        const leaked = /I only have the stored subject, snippet, and evidence/i.test(t2.reply);
+        trace.checkpoint("never leaks the old snippet-only limitation when a real refetch was possible", !leaked, t2.reply);
+        assert.ok(!leaked, `the old stored-preview-only limitation must never appear — got: ${t2.reply}`);
+
+        const mentionsReview3 = /review 3/i.test(t2.reply);
+        trace.checkpoint("reply is grounded in review 3", mentionsReview3, t2.reply);
+        assert.ok(mentionsReview3, `expected the reply to be about review 3 — got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "462. 'show full text for it' after a detail view resolves and never crashes (email-review-full-text-followup A)",
+  { ...llmEvalOptions(["email-review-full-text-followup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-462-${randomUUID()}`;
+    const trace = new EvalTrace("462-full-text-followup", ["email-review-full-text-followup"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const longBody =
+      "We received your application for the Front-End Engineer role. Our team reviews every application carefully " +
+      "and typically responds within two weeks. In the meantime, feel free to explore our engineering blog for more " +
+      "about our culture and stack.";
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-462-innovation-labs", subject: "Innovation Labs", from: "no-reply@innovationlabs.example", body: longBody }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-462-innovation-labs", subject: "Innovation Labs", from: "no-reply@innovationlabs.example", reason: "application_confirmation" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("show full text for it", await sendAgentMessage(server, userId, "show full text for it"));
+        assertNoGenericAgentError(t3);
+
+        const mentionsReview1 = /review 1/i.test(t3.reply);
+        trace.checkpoint("'it' resolved to review 1", mentionsReview1, t3.reply);
+        assert.ok(mentionsReview1, `expected 'it' to resolve to review 1 — got: ${t3.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "463. a stale 'rejection' review is corrected to 'application confirmation' (Elastic-shaped case) (email-review-stale-classification B)",
+  { ...llmEvalOptions(["email-review-stale-classification"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-463-${randomUUID()}`;
+    const trace = new EvalTrace("463-stale-rejection-corrected", ["email-review-stale-classification"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-463-elastic",
+        subject: "Your application to Elastic",
+        from: "no-reply@elastic.example",
+        body: "Thank you, we have received your resume for the Platform Engineer role and our team will be in touch soon."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-463-elastic",
+        subject: "Your application to Elastic",
+        from: "no-reply@elastic.example",
+        reason: "rejection",
+        proposedEventType: "career.rejection_received"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        // The reply may still legitimately mention "rejection" once, in the transparent "Updated
+        // classification: rejection -> application confirmation." correction note — only the
+        // CURRENT classification line must no longer call it a rejection.
+        const noLongerRejection = !/Current classification: rejection\b/i.test(t2.reply);
+        trace.checkpoint("current classification is no longer 'rejection'", noLongerRejection, t2.reply);
+        assert.ok(noLongerRejection, `expected the stale 'rejection' label to be corrected — got: ${t2.reply}`);
+
+        const refreshed = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        const corrected = refreshed?.reason !== "rejection";
+        trace.checkpoint("the stored review reason is no longer 'rejection'", corrected, refreshed?.reason);
+        assert.ok(corrected, `expected the stored reason to be corrected away from rejection — got: ${refreshed?.reason}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "464. a stale 'job offer' review is corrected to 'application confirmation' (Innovation Labs-shaped case) (email-review-stale-classification C)",
+  { ...llmEvalOptions(["email-review-stale-classification"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-464-${randomUUID()}`;
+    const trace = new EvalTrace("464-stale-job-offer-corrected", ["email-review-stale-classification"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-464-innovation-labs-backend",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        body: "Thank you for applying to Innovation Labs. We have received your application for the Backend Engineer role and will review it shortly."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-464-innovation-labs-backend",
+        subject: "Thank you for applying to Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        reason: "job_offer"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        // Same reasoning as the rejection scenario above: the transparent correction note may
+        // still mention "job offer" once as the OLD label, so only the CURRENT classification
+        // line is checked.
+        const noLongerOffer = !/Current classification: job offer\b/i.test(t2.reply);
+        trace.checkpoint("current classification is no longer 'job offer'", noLongerOffer, t2.reply);
+        assert.ok(noLongerOffer, `expected the stale 'job offer' label to be corrected — got: ${t2.reply}`);
+
+        const refreshed = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        const corrected = refreshed?.reason !== "offer";
+        trace.checkpoint("the stored review reason is no longer 'offer'", corrected, refreshed?.reason);
+        assert.ok(corrected, `expected the stored reason to be corrected away from offer — got: ${refreshed?.reason}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "465. Spanish: 'márcalo como CV enviado' after details resolves the review (email-progress-from-review B)",
+  { ...llmEvalOptions(["email-progress-from-review"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-465-${randomUUID()}`;
+    const trace = new EvalTrace("465-spanish-mark-as-cv-sent", ["email-progress-from-review"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-465-innovation-labs",
+        subject: "Gracias por aplicar a Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        body: "Gracias por aplicar a Innovation Labs. Hemos recibido tu solicitud para el puesto de Front-End Engineer."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-465-innovation-labs",
+        subject: "Gracias por aplicar a Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        reason: "recruiter_reply",
+        proposedEventType: "career.recruiter_reply_received"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("márcalo como CV enviado", await sendAgentMessage(server, userId, "márcalo como CV enviado"));
+        assertNoGenericAgentError(t3);
+
+        const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        const resolved = after?.status !== "pending";
+        trace.checkpoint("the review is resolved after the Spanish confirmation", resolved, after?.status);
+        assert.ok(resolved, `expected the review to be resolved — got status: ${after?.status}`);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("exactly one CV-sent event was logged", events === 1, `count=${events}`);
+        assert.equal(events, 1, `expected exactly one career.application_sent event — got ${events}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "466. Catalan: 'marca-ho com a CV enviat' after details resolves the review (email-progress-from-review C)",
+  { ...llmEvalOptions(["email-progress-from-review"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-466-${randomUUID()}`;
+    const trace = new EvalTrace("466-catalan-mark-as-cv-sent", ["email-progress-from-review"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([
+      {
+        id: "eval-466-innovation-labs",
+        subject: "Gràcies per sol·licitar a Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        body: "Gràcies per sol·licitar a Innovation Labs. Hem rebut la teva sol·licitud per al lloc de Front-End Engineer."
+      }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-466-innovation-labs",
+        subject: "Gràcies per sol·licitar a Innovation Labs",
+        from: "no-reply@innovationlabs.example",
+        reason: "recruiter_reply",
+        proposedEventType: "career.recruiter_reply_received"
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("marca-ho com a CV enviat", await sendAgentMessage(server, userId, "marca-ho com a CV enviat"));
+        assertNoGenericAgentError(t3);
+
+        const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        const resolved = after?.status !== "pending";
+        trace.checkpoint("the review is resolved after the Catalan confirmation", resolved, after?.status);
+        assert.ok(resolved, `expected the review to be resolved — got status: ${after?.status}`);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("exactly one CV-sent event was logged", events === 1, `count=${events}`);
+        assert.equal(events, 1, `expected exactly one career.application_sent event — got ${events}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

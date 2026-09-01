@@ -30,7 +30,8 @@ const GMAIL_REVIEW_REFERENCE_TOOLS = new Set([
   "gmail.review.detail",
   "gmail.review.to_action",
   "gmail.review.keep",
-  "gmail.review.approve"
+  "gmail.review.approve",
+  "gmail.review.log_progress"
 ]);
 
 /**

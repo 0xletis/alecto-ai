@@ -1367,6 +1367,27 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       return finalizeDeterministicOperations(context, message, gmailReviewDetailShortcuts, "gmail_reviews");
     }
 
+    // fix/private-alpha-email-review-resolution-and-stale-classification (Task 2): checked ahead of
+    // gmailReviewThisFollowupShortcutOperation below — "count this as a CV sent"/"mark 2 as a CV
+    // sent" would otherwise either match that function's much looser approve/count/log regex (and
+    // silently log whatever the review's OWN stale classification says instead of what the user just
+    // explicitly stated) or, for "mark ...", not match anything there at all and fall through to the
+    // real planner with no review-linking tool available (the exact live-reported bug: progress got
+    // logged via event.log_job_applications while the review it came from stayed pending forever).
+    const gmailReviewMarkProgressShortcuts = gmailReviewMarkProgressShortcutOperation(message, context);
+    if (gmailReviewMarkProgressShortcuts.length > 0) {
+      return finalizeDeterministicOperations(context, message, gmailReviewMarkProgressShortcuts, "gmail_reviews");
+    }
+
+    if (GMAIL_REVIEW_REFRESH_RE.test(normalizeIntentText(message))) {
+      return finalizeDeterministicOperations(
+        context,
+        message,
+        [{ tool: "gmail.review.refresh", args: {}, rationale: "user asked to refresh/recheck stale email review classifications" }],
+        "gmail_reviews"
+      );
+    }
+
     const gmailReviewThisFollowupShortcuts = gmailReviewThisFollowupShortcutOperation(message, context);
     if (gmailReviewThisFollowupShortcuts.length > 0) {
       return finalizeDeterministicOperations(context, message, gmailReviewThisFollowupShortcuts, "gmail_reviews");
@@ -2024,26 +2045,42 @@ function gmailReviewToActionShortcutOperations(message: string, context: Context
 // over gmail.review.inspect/approve/reject, since those look similar to a planner ("does the second
 // one mention X" vs "show review 2" vs "why is 2 noise"). English + Spanish + Catalan, matching the
 // task's own exact phrasing list.
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 4): a live reported bug
+// — "why is 3 uncertain signal?" fell through to the real planner (which still had gmail.review.
+// inspect as an option for "a question about one review") because the trigger only recognized "why
+// is X noise", not the other stored-classification labels a review can carry. Broadened to the full
+// label vocabulary (uncertain/signal, recruiter/reply, offer, rejection, confirmation, classified)
+// plus a bare "what is N"/"show me more about N" shape, so every phrasing from the bug report routes
+// deterministically to gmail.review.detail (gmail.review.inspect now just aliases it internally too
+// — see executor.ts — so this is belt-and-braces, not the only safety net).
 const GMAIL_REVIEW_DETAIL_TRIGGER_RE = new RegExp(
   [
     "\\bdetails?\\b[\\s\\S]{0,15}\\b(for|of|about)\\b",
     "\\bshow( me)?\\b[\\s\\S]{0,20}\\b(more about|full text for|important text for|review)\\b",
     "\\bwhat is email\\b",
+    "\\bwhat is\\b[\\s\\S]{0,10}\\d",
     "\\bexplain review\\b",
     "\\bwhy did you classify\\b",
-    "\\bwhy is\\b[\\s\\S]{0,15}\\bnoise\\b",
+    "\\bwhy is\\b[\\s\\S]{0,20}\\b(noise|uncertain|signal|recruiter|reply|offer|rejection|confirmation|classified)\\b",
     "\\bqu[eé] es el email\\b",
     "\\bense[nñ]ame\\b[\\s\\S]{0,15}\\bdetalles\\b",
     "\\bdetalles del\\b",
     "\\bpor qu[eé]\\b[\\s\\S]{0,25}\\bclasificaste\\b",
+    "\\bpor qu[eé]\\b[\\s\\S]{0,20}\\b(incierto|ruido|reclutador|rechazo|confirmaci[oó]n)\\b",
     "\\bexplica'?m\\b[\\s\\S]{0,15}\\bcorreu\\b",
     "\\bmostra'?m\\b[\\s\\S]{0,15}\\bdetalls\\b",
     "\\bdetalls del\\b",
-    "\\bper qu[eè]\\b[\\s\\S]{0,25}\\bclassificat\\b"
+    "\\bper qu[eè]\\b[\\s\\S]{0,25}\\bclassificat\\b",
+    "\\bper qu[eè]\\b[\\s\\S]{0,20}\\b(incert|soroll|recluta|rebuig|confirmaci[oó])\\b"
   ].join("|"),
   "i"
 );
 const GMAIL_REVIEW_DETAIL_FULL_TEXT_RE = /\b(full text|show me everything|texto completo|tot el text|el text complet)\b/i;
+
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 6): explicit "refresh
+// email reviews" — the bounded, capped alternative to auto-refreshing on every gmail.review.list.
+const GMAIL_REVIEW_REFRESH_RE =
+  /\b(refresh|recheck|re-check|update)\b[\s\S]{0,20}\b(email|mail|gmail)\s*reviews?\b|\bactualiza(r)?\b[\s\S]{0,20}\brevisiones\b|\bactualitza(r)?\b[\s\S]{0,20}\brevisions\b/i;
 
 function gmailReviewDetailShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
   const visibleReviews = context.session.visibleEntities.filter(
@@ -2079,6 +2116,22 @@ function gmailReviewDetailShortcutOperation(message: string, context: ContextBun
 
   if (!mentionedAnyNumber && visibleReviews.length === 1) {
     return [{ tool: "gmail.review.detail", args: { index: visibleReviews[0]!.index, ...(fullText ? { fullText: true } : {}) }, rationale: "user asked for the real content/explanation of the only visible Gmail review" }];
+  }
+
+  // fix/private-alpha-email-review-resolution-and-stale-classification (Task 5): a real reported
+  // bug — "why is 3 uncertain signal?" then "show full text for it" produced a hard error instead of
+  // resolving "it" to review 3, because with MORE THAN ONE review visible (the realistic case — a
+  // pending queue of 10) neither branch above fires: no number was mentioned and selectVisibleEntityMention
+  // found no named match for a bare pronoun. The last-focused Gmail review (set by the previous
+  // detail/inspect call, which now always returns entities — see executor.ts) is exactly what "it"
+  // means here, same resolution gmailReviewThisFollowupShortcutOperation already relies on for
+  // approve/ignore/action follow-ups.
+  if (!mentionedAnyNumber) {
+    const focused = context.session.focusedEntities?.gmail_review;
+    const stillVisible = focused && context.session.visibleEntities.some((entity) => entity.type === "gmail_review" && entity.id === focused.id);
+    if (stillVisible) {
+      return [{ tool: "gmail.review.detail", args: { ref: "this", ...(fullText ? { fullText: true } : {}) }, rationale: "user asked for the real content/explanation of the last-focused Gmail review" }];
+    }
   }
 
   if (mentionedAnyNumber) {
@@ -2124,6 +2177,54 @@ function gmailReviewThisFollowupShortcutOperation(message: string, context: Cont
 
   if (GMAIL_REVIEW_THIS_APPROVE_RE.test(text)) {
     return [{ tool: "gmail.review.approve", args: { ref: "this" }, rationale: "user asked to approve/count/log the last-detailed Gmail review" }];
+  }
+
+  return [];
+}
+
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 2): the user's own
+// explicitly stated outcome ("mark it/this/2 as a CV sent", "count this as an application sent")
+// always routes to gmail.review.log_progress — never gmail.review.approve, which would instead log
+// whatever the review's OWN (possibly unrelated) classification says. English + Spanish + Catalan.
+const GMAIL_REVIEW_MARK_PROGRESS_RE = new RegExp(
+  [
+    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b",
+    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\bsent\\b",
+    "\\bm[aá]rca(lo|la|ho)?\\b[\\s\\S]{0,20}\\bcv enviado\\b",
+    "\\bmarca'?(ho|l|la)?\\b[\\s\\S]{0,20}\\bcv enviat\\b"
+  ].join("|"),
+  "i"
+);
+
+function gmailReviewMarkProgressShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_REVIEW_MARK_PROGRESS_RE.test(text)) {
+    return [];
+  }
+
+  const visibleReviews = context.session.visibleEntities.filter(
+    (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+  );
+
+  if (visibleReviews.length > 0) {
+    const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index));
+    const indexes = extractIndexesFromText(text, visibleIndexSet);
+    if (indexes.length > 0) {
+      return [{ tool: "gmail.review.log_progress", args: { index: indexes[0] }, rationale: "user explicitly said this visible Gmail review is a CV/application sent" }];
+    }
+
+    const selected = selectVisibleEntityMention(text, visibleReviews);
+    if (selected) {
+      return [{ tool: "gmail.review.log_progress", args: visibleEntityToGmailReviewRef(selected), rationale: "user explicitly said this visible Gmail review is a CV/application sent" }];
+    }
+  }
+
+  const focused = context.session.focusedEntities?.gmail_review;
+  if (focused) {
+    const stillVisible = context.session.visibleEntities.some((entity) => entity.type === "gmail_review" && entity.id === focused.id);
+    if (stillVisible) {
+      return [{ tool: "gmail.review.log_progress", args: { ref: "this" }, rationale: "user explicitly said the last-detailed Gmail review is a CV/application sent" }];
+    }
   }
 
   return [];
@@ -3632,6 +3733,14 @@ function gmailSyncShortcutOperation(message: string): PlannedOperation | undefin
   // scheduled-sync preference or status query they're actually asking for. Both defer to
   // gmailAutonomyStatusShortcutOperation/gmailAutonomyCompoundShortcutOperations instead.
   if (looksLikeGmailAutonomyStatusQuery(text)) {
+    return undefined;
+  }
+
+  // fix/private-alpha-email-review-resolution-and-stale-classification (Task 6): "refresh email
+  // reviews"/"recheck my reviews" is unambiguously about the review QUEUE (gmail.review.refresh,
+  // reclassifying stale rows), never a request to re-sync the mailbox — defers to
+  // GMAIL_REVIEW_REFRESH_RE below rather than matching the much broader sync-word regex further down.
+  if (/\breviews?\b/.test(text)) {
     return undefined;
   }
   const autonomyPreference = parseGmailAutonomyPreferenceForAgentRuntime(message);
