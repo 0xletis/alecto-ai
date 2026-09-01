@@ -849,6 +849,35 @@ export function humanEmailKindLabel(kind: EmailKind): string {
   return labels[kind] ?? "uncertain signal";
 }
 
+/** fix/private-alpha-email-review-resolution-and-stale-classification: the general emailKind the
+ * LLM understanding layer produces maps to a `reason` string always, and to a registered
+ * EventTypeSchema `proposedEventType` only for the career.* kinds that already have one (the same
+ * mapping ingestion.ts's own eventTypeForJobClassification uses) - every other domain (invoice,
+ * travel, insurance, admin, ...) sets reason only, leaving proposedEventType undefined exactly like
+ * a freshly-classified review of that kind already would, since there is no registered event type
+ * for those domains yet. Used only to REFRESH stale metadata on an existing pending review (Task 3)
+ * - never to decide what gmail.review.approve should log, which still always reads directly from
+ * whatever the review's own (now-refreshed) proposedEventType/reason says at approval time. */
+export function emailReviewClassificationFromUnderstanding(kind: EmailKind): { reason: string; proposedEventType?: string } {
+  const eventTypesByKind: Partial<Record<EmailKind, string>> = {
+    application_confirmation: "career.application_confirmation_received",
+    recruiter_reply: "career.recruiter_reply_received",
+    interview: "career.interview_scheduled",
+    offer: "career.offer_received",
+    rejection: "career.rejection_received"
+  };
+  const reasonsByKind: Partial<Record<EmailKind, string>> = {
+    job_alert: "filtered_marketing",
+    security_auth: "security_auth",
+    onboarding: "onboarding_noise"
+  };
+
+  return {
+    reason: reasonsByKind[kind] ?? kind,
+    proposedEventType: eventTypesByKind[kind]
+  };
+}
+
 /** Human phrase for EmailUnderstanding's suggestedUserAction enum, matching the "Suggested action:"
  * line of the review-detail response (Part 2's exact template: approve / ignore / turn into action
  * / ask clarification, plus "monitor" for an informational item with nothing to decide yet). */

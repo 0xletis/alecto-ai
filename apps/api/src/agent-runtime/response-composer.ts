@@ -148,6 +148,8 @@ const GROUND_TRUTH_ONLY_TOOLS = new Set([
   // is exactly the case groundTruthOnly exists for: the real outcome (whether evidence was logged,
   // what was extracted, which goal it counts toward) is only known AFTER execution, never before.
   "gmail.review.approve",
+  "gmail.review.log_progress",
+  "gmail.review.refresh",
   "daily_loop.settings_apply_update",
   "gmail.review.reject",
   "gmail.review.to_action",

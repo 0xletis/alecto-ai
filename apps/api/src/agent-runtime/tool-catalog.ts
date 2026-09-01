@@ -614,7 +614,7 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.inspect",
     description:
-      "Answer a question about one pending Gmail review item from the most recently shown list, using only the stored subject/sender/snippet/evidence. Use for questions like 'does the jobs newsletter one mention frontend developer jobs?', 'what does the second email say?' (English); '¿de qué trata el correo 2?', '¿qué dice el de Endesa?' (Spanish); 'de què va el correu 2?' (Catalan). If only snippet/evidence is stored, say that limitation instead of inventing details.",
+      "Deprecated alias for gmail.review.detail — kept only for backward compatibility, behaves identically (real readonly Gmail refetch, cleaned/redacted full body, grounded explanation). Prefer gmail.review.detail directly for any new plan; this name exists only so an older-worded question about one review ('does the jobs newsletter one mention frontend developer jobs?', '¿de qué trata el correo 2?', 'de què va el correu 2?') still resolves correctly.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
@@ -673,6 +673,27 @@ export const toolCatalog: ToolDefinition[] = [
       reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
       index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
       ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number.")
+    })
+  },
+  {
+    name: "gmail.review.refresh",
+    description:
+      "Re-check a bounded number of pending Gmail email reviews (a real readonly Gmail refetch + full-body understanding, capped so it never hammers Gmail on every list) and refresh any that were classified with an old/stale label before a fix, then show the updated list. Use for 'refresh email reviews', 'refresh my reviews', 'recheck email reviews', 'update the review classifications'. Never approves, rejects, or logs anything — only ever updates a pending review's own classification metadata, never its status, and never touches the real mailbox.",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({})
+  },
+  {
+    name: "gmail.review.log_progress",
+    description:
+      "Log that the user sent a CV/job application, using a pending Gmail email review as the evidence, and resolve that review at the same time (removes it from the pending list, links the new event to it) — unlike gmail.review.approve, this logs the user's OWN explicitly stated outcome ('mark it as a CV sent', 'mark 2 as CV sent', 'count this as an application sent') rather than whatever the review's own classification happens to say, so it is correct even when the review is really a confirmation/reply email being used as proof a CV was sent. Only use when the user explicitly says the email represents a CV/application being SENT — for 'approve/count/log this' with no stated outcome, or logging the review the way its own classification already recommends (a recruiter reply, an interview, a rejection), use gmail.review.approve instead. Reference the item by `index` (its number in the list) when the user gave a number, or `ref` (its own visible subject/sender/rule wording) when they described it in words — never invent a reviewId yourself.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      reviewId: z.string().min(1).optional().describe("Direct review id, only if already known from context. Prefer index/ref."),
+      index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
+      ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number."),
+      count: z.number().int().positive().max(20).optional().describe("How many CVs/applications this one email represents evidence for. Defaults to 1 — only set higher if the user explicitly said a number.")
     })
   },
   {

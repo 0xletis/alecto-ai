@@ -456,12 +456,16 @@ test("Gmail review meeting transcript supports list, QA, multi-task conversion, 
     assert.match(list.reply, /^2\. Brainstorm meeting/im);
     assert.match(list.reply, /^3\. Branding direction meeting/im);
 
+    // fix/private-alpha-email-review-resolution-and-stale-classification (Task 4): gmail.review.
+    // inspect is now a thin alias for the full-body detail/explanation flow (buildGmailReviewDetailResult)
+    // — it no longer answers with a bare stored-snippet-substring "yes"/"no", and it must never say
+    // it only has the stored subject/snippet/evidence when a real (or, absent a usable LLM key in
+    // this test env, a gracefully-degraded) understanding attempt was made instead.
     const qa = await sendAgentMessage(server, userId, "the jobs newsletter one does it have any info on frontend developer jobs?");
     assert.deepEqual(qa.operationsPlanned.map((operation) => operation.tool), ["gmail.review.inspect"]);
     assert.match(qa.reply, /Jobs Newsletter #461/i);
-    assert.match(qa.reply, /yes/i);
     assert.match(qa.reply, /Frontend Developer/i);
-    assert.match(qa.reply, /only have the stored subject, snippet, and evidence/i);
+    assert.doesNotMatch(qa.reply, /I only have the stored subject, snippet, and evidence/i);
     assert.doesNotMatch(qa.reply, /Pending Gmail reviews:/i);
 
     const created = await sendAgentMessage(server, userId, "turn 2 and 3 into tasks at the time they say in each mail and remind me 30 minutes before each");

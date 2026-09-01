@@ -28,6 +28,7 @@ import {
   getProactiveBriefPreferences,
   hasNotificationLog,
   pauseActiveEmailSignalRulesForConnection,
+  refreshEmailReviewClassification,
   rescheduleActionItem,
   selfHealDailyLoopEnabled,
   setGoalStatus,
@@ -118,7 +119,7 @@ import { archiveStaleJobSearchEmailRules, getVisibleGmailEmailRules } from "../g
 import {
   approveEmailReviewForUser,
   createActionItemFromEmailReview,
-  formatEmailReviewDetailsForContext,
+  emailReviewClassificationFromUnderstanding,
   formatGmailReviewDetailResponse,
   formatGmailReviewListForChat,
   gmailReviewChatLabel,
@@ -2376,6 +2377,25 @@ export async function executeOperation(
         };
       }
 
+      case "gmail.review.refresh": {
+        const { refreshedCount, checkedCount } = await refreshStaleGmailReviewClassifications(userId, context);
+        const items = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const timezone = await getUserTimezone(userId);
+        const refreshNote =
+          checkedCount === 0
+            ? "You don't have any pending email reviews to refresh."
+            : refreshedCount > 0
+              ? `Refreshed ${refreshedCount} of ${checkedCount} pending review${checkedCount === 1 ? "" : "s"} with the latest classification.`
+              : `Checked ${checkedCount} pending review${checkedCount === 1 ? "" : "s"} — classifications were already up to date.`;
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `${refreshNote}\n\n${formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone)}`,
+          result: { refreshedCount, checkedCount, items },
+          entities: items.map((review, index) => reviewToEntity(review, index + 1, context.gmailRules))
+        };
+      }
+
       case "gmail.review.reject": {
         const result = await rejectEmailReviewForUser(userId, args.reviewId as string);
         if (result.status === "not_found") {
@@ -2416,23 +2436,17 @@ export async function executeOperation(
         };
       }
 
-      case "gmail.review.inspect": {
-        const reviewId = args.reviewId as string;
-        const review = await getEmailReviewItems(userId, { status: "pending", limit: 50 }).then((items) =>
-          items.find((item) => item.id === reviewId)
-        );
-        if (!review) {
-          return failed(operation.tool, "That email review no longer exists or was already decided.");
-        }
-
-        return {
-          tool: operation.tool,
-          status: "executed",
-          summary: formatGmailReviewQuestionAnswer(review, args.question as string | undefined),
-          result: { details: await formatEmailReviewDetailsForContext(userId, review.id) }
-        };
-      }
-
+      // fix/private-alpha-email-review-resolution-and-stale-classification (Task 4): gmail.review.
+      // inspect is now a thin alias for the exact same full-body detail/explanation flow —
+      // buildGmailReviewDetailResult below — never the old stored-snippet-only path (a real
+      // reported bug: "why is 3 uncertain signal?" answered "I only have the stored subject,
+      // snippet, and evidence here, not the full Gmail body" even though a real readonly refetch
+      // was fully possible). providerMessageId/connectionId are required, non-null columns on
+      // every EmailReviewItem row, so "fall back only when refetch is impossible" in practice means
+      // "fall back only when the live refetch itself fails" (token expired, connection removed,
+      // Gmail API error) — buildGmailReviewDetailResult already degrades to the review's own stored
+      // snippet/evidence in exactly that case, so no separate fallback branch is needed here.
+      case "gmail.review.inspect":
       case "gmail.review.detail": {
         const reviewId = args.reviewId as string;
         const review = await getEmailReviewItems(userId, { status: "pending", limit: 50 }).then((items) =>
@@ -2442,89 +2456,13 @@ export async function executeOperation(
           return failed(operation.tool, "That email review no longer exists or was already decided.");
         }
 
-        const visibleReviewEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
-        const existingEntity = visibleReviewEntities.find((entity) => entity.id === review.id);
-        const number = existingEntity?.index ?? visibleReviewEntities.length + 1;
-        const fullText = args.fullText === true;
-
-        const rule = context.gmailRules.find((item) => item.id === review.ruleId);
-        const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
-        const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
-
-        const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
-        const maxLength = fullText ? FULL_EMAIL_DETAIL_LENGTH : DEFAULT_EMAIL_DETAIL_LENGTH;
-        const usedLiveContent = refetch.status === "ok" && Boolean(refetch.content.rawBodyText);
-        const rawSubject = usedLiveContent ? refetch.content.subject : review.subject ?? "";
-        const rawBody = usedLiveContent
-          ? refetch.content.rawBodyText
-          : [review.snippet, review.evidence].filter(Boolean).join("\n");
-        const cleanedSubject = cleanEmailBodyForDisplay(rawSubject, { maxLength: 300 });
-        const cleanedBody = cleanEmailBodyForDisplay(rawBody, { isHtml: usedLiveContent && refetch.status === "ok" ? refetch.content.isHtml : false, maxLength });
-        const senderDomain = (usedLiveContent ? refetch.content.from : review.from ?? "").split("@").pop()?.replace(/[>\s]+$/g, "") ?? "";
-
-        let understandingResult: ReturnType<typeof validateEmailUnderstanding> | undefined;
-        try {
-          const raw = await understandEmail({
-            subject: cleanedSubject,
-            bodyExcerpt: cleanedBody,
-            senderDomain,
-            date: usedLiveContent && refetch.status === "ok" ? refetch.content.date : undefined,
-            linkedGoal: linkedGoal ? { title: linkedGoal.title, category: linkedGoal.category ?? undefined } : undefined,
-            activeWatcherDescription: rule?.description || rule?.name,
-            currentCandidateClassification: review.reason
-          });
-          understandingResult = validateEmailUnderstanding(raw, `${cleanedSubject} ${cleanedBody}`);
-        } catch {
-          understandingResult = undefined;
-        }
-
-        const title = truncateForChat(cleanedSubject || gmailReviewChatLabel(review, context.gmailRules), 100);
-        const importantText = cleanedBody || "I don't have enough content to show for this email.";
-
-        if (!understandingResult || !understandingResult.understanding) {
-          const summary = formatGmailReviewDetailResponse({
-            number,
-            title,
-            currentClassification: gmailReviewSignalTypeLabel(review),
-            linkedGoalTitle: linkedGoal?.title,
-            whyItMatters: "I couldn't confidently work out why this matters — here's the important text so you can decide.",
-            importantText,
-            suggestedAction: humanSuggestedActionLabel("ask_clarification")
-          });
-          return {
-            tool: operation.tool,
-            status: "executed",
-            summary,
-            result: { review, refetchStatus: refetch.status },
-            entities: [...visibleReviewEntities.filter((entity) => entity.id !== review.id), reviewToEntity(review, number, context.gmailRules)]
-          };
-        }
-
-        const understanding = understandingResult.understanding;
-        const whyItMatters = understanding.why.length > 0 ? understanding.why.join("; ") : understanding.summary;
-        const currentClassification =
-          understanding.emailKind !== "unknown" ? humanEmailKindLabel(understanding.emailKind) : gmailReviewSignalTypeLabel(review);
-        const suggestedAction = humanSuggestedActionLabel(
-          understandingResult.status === "needs_clarification" ? "ask_clarification" : understanding.suggestedUserAction
-        );
-
-        const summary = formatGmailReviewDetailResponse({
-          number,
-          title,
-          currentClassification,
-          linkedGoalTitle: linkedGoal?.title,
-          whyItMatters,
-          importantText,
-          suggestedAction
-        });
-
-        return {
+        return buildGmailReviewDetailResult({
           tool: operation.tool,
-          status: "executed",
-          summary,
-          result: { review, understanding, refetchStatus: refetch.status },
-          entities: [...visibleReviewEntities.filter((entity) => entity.id !== review.id), reviewToEntity(review, number, context.gmailRules)]
-        };
+          userId,
+          review,
+          fullText: args.fullText === true,
+          context
+        });
       }
 
       case "gmail.review.to_action": {
@@ -2611,6 +2549,57 @@ export async function executeOperation(
           result: { emailReview: result.emailReview, event: result.event, actionItem: result.actionItem },
           entities,
           ...(evolutionOffer?.pendingOperationUpdate ? { pendingOperationUpdate: evolutionOffer.pendingOperationUpdate } : {})
+        };
+      }
+
+      // fix/private-alpha-email-review-resolution-and-stale-classification (Task 2): a real
+      // reported bug — "details for 1" → "mark it as a CV sent" replied "I've logged your CV
+      // sent..." (via event.log_job_applications, which has no review-linking argument at all) and
+      // then a very next "show email reviews" still showed review 1 pending, creating real
+      // double-count risk. Unlike gmail.review.approve (which trusts the review's OWN stored
+      // classification), this logs exactly what the user explicitly said happened, then links +
+      // resolves the review directly via approveEmailReviewItem — never re-derives anything from
+      // the review's own reason/proposedEventType, so it stays correct even when a confirmation/
+      // reply email is being used as evidence for a CV the user says they sent.
+      case "gmail.review.log_progress": {
+        const reviewId = args.reviewId as string;
+        const review = await getEmailReviewItems(userId, { status: "pending", limit: 50 }).then((items) =>
+          items.find((item) => item.id === reviewId)
+        );
+        if (!review) {
+          return failed(operation.tool, "That email review no longer exists or was already decided.");
+        }
+
+        const count = (args.count as number | undefined) ?? 1;
+        const created = await createEvents(
+          userId,
+          Array.from({ length: count }, () => ({
+            type: "career.application_sent" as const,
+            source: "manual" as const,
+            confidence: 1,
+            evidence: [gmailReviewChatLabel(review, context.gmailRules), message].filter(Boolean) as string[]
+          }))
+        );
+        await approveEmailReviewItem(userId, review.id, created[0]?.id);
+
+        const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
+        const reconciliation = reconcileApplicationsSentWithOpenAction(count, context.openActions);
+        let completedAction: ActionItem | undefined;
+        if (reconciliation.kind === "complete") {
+          completedAction = await completeActionItem(userId, reconciliation.action.id);
+        }
+
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Logged ${count} CV${count === 1 ? "" : "s"} sent from that email and resolved the review.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}`,
+          result: { emailReview: review, events: created, actionItem: completedAction },
+          entities: [
+            ...(completedAction ? [actionToEntity(completedAction)] : []),
+            ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+          ]
         };
       }
 
@@ -3703,58 +3692,207 @@ export async function executeOperation(
   }
 }
 
-function formatGmailReviewQuestionAnswer(review: EmailReviewItem, question?: string): string {
-  const subject = review.subject ?? "Gmail review";
-  const sourceText = [review.subject, review.snippet, review.evidence]
-    .filter(Boolean)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-  const preview = sourceText ? truncateForChat(sourceText, 320) : "";
-  const limitation = "I only have the stored subject, snippet, and evidence here, not the full Gmail body.";
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 3/4): the shared
+// full-body detail/explanation flow behind both gmail.review.detail and gmail.review.inspect
+// (which is now a thin alias — see the switch case above). Readonly Gmail refetch → clean/redact
+// → understand → (Task 3) write back a corrected classification when the review's stored label is
+// stale — never touches `status`, never approves/rejects/logs anything on its own.
+async function buildGmailReviewDetailResult(input: {
+  tool: string;
+  userId: string;
+  review: EmailReviewItem;
+  fullText: boolean;
+  context: ContextBundle;
+}): Promise<ExecutedOperation> {
+  const { tool, userId, review, fullText, context } = input;
 
-  if (!sourceText) {
-    return `${subject}: I do not have enough stored preview text to answer that safely. ${limitation}`;
+  const visibleReviewEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+  const existingEntity = visibleReviewEntities.find((entity) => entity.id === review.id);
+  const number = existingEntity?.index ?? visibleReviewEntities.length + 1;
+
+  const rule = context.gmailRules.find((item) => item.id === review.ruleId);
+  const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
+  const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+
+  const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
+  const maxLength = fullText ? FULL_EMAIL_DETAIL_LENGTH : DEFAULT_EMAIL_DETAIL_LENGTH;
+  const usedLiveContent = refetch.status === "ok" && Boolean(refetch.content.rawBodyText);
+  const rawSubject = usedLiveContent ? refetch.content.subject : review.subject ?? "";
+  const rawBody = usedLiveContent
+    ? refetch.content.rawBodyText
+    : [review.snippet, review.evidence].filter(Boolean).join("\n");
+  const cleanedSubject = cleanEmailBodyForDisplay(rawSubject, { maxLength: 300 });
+  const cleanedBody = cleanEmailBodyForDisplay(rawBody, { isHtml: usedLiveContent && refetch.status === "ok" ? refetch.content.isHtml : false, maxLength });
+  const senderDomain = (usedLiveContent ? refetch.content.from : review.from ?? "").split("@").pop()?.replace(/[>\s]+$/g, "") ?? "";
+
+  let understandingResult: ReturnType<typeof validateEmailUnderstanding> | undefined;
+  try {
+    const raw = await understandEmail({
+      subject: cleanedSubject,
+      bodyExcerpt: cleanedBody,
+      senderDomain,
+      date: usedLiveContent && refetch.status === "ok" ? refetch.content.date : undefined,
+      linkedGoal: linkedGoal ? { title: linkedGoal.title, category: linkedGoal.category ?? undefined } : undefined,
+      activeWatcherDescription: rule?.description || rule?.name,
+      currentCandidateClassification: review.reason
+    });
+    understandingResult = validateEmailUnderstanding(raw, `${cleanedSubject} ${cleanedBody}`);
+  } catch {
+    understandingResult = undefined;
   }
 
-  const asked = normalizeSearchText(question ?? "");
-  const source = normalizeSearchText(sourceText);
-  const contentTerms = meaningfulQuestionTerms(asked);
-  const matchedTerms = contentTerms.filter((term) => source.includes(term));
+  const title = truncateForChat(cleanedSubject || gmailReviewChatLabel(review, context.gmailRules), 100);
+  const importantText = cleanedBody || "I don't have enough content to show for this email.";
 
-  if (contentTerms.length > 0) {
-    if (matchedTerms.length > 0) {
-      return `${subject}: yes, the stored preview mentions ${matchedTerms.slice(0, 4).join(", ")}.\nPreview: ${preview}\n${limitation}`;
+  if (!understandingResult || !understandingResult.understanding) {
+    const summary = formatGmailReviewDetailResponse({
+      number,
+      title,
+      currentClassification: gmailReviewSignalTypeLabel(review),
+      linkedGoalTitle: linkedGoal?.title,
+      whyItMatters: "I couldn't confidently work out why this matters — here's the important text so you can decide.",
+      importantText,
+      suggestedAction: humanSuggestedActionLabel("ask_clarification")
+    });
+    return {
+      tool,
+      status: "executed",
+      summary,
+      result: { review, refetchStatus: refetch.status },
+      entities: [...visibleReviewEntities.filter((entity) => entity.id !== review.id), reviewToEntity(review, number, context.gmailRules)]
+    };
+  }
+
+  const understanding = understandingResult.understanding;
+  const whyItMatters = understanding.why.length > 0 ? understanding.why.join("; ") : understanding.summary;
+  const currentClassification =
+    understanding.emailKind !== "unknown" ? humanEmailKindLabel(understanding.emailKind) : gmailReviewSignalTypeLabel(review);
+  const suggestedAction = humanSuggestedActionLabel(
+    understandingResult.status === "needs_clarification" ? "ask_clarification" : understanding.suggestedUserAction
+  );
+
+  // fix/private-alpha-email-review-resolution-and-stale-classification (Task 3): a real
+  // reported bug — a review created before a classifier fix kept its OLD, stale reason/
+  // proposedEventType ("recruiter reply") in the list even after this exact detail call
+  // correctly explained it as an application confirmation, since nothing ever wrote the
+  // fresh understanding back. Only ever runs on a confidently-understood ("ok", never
+  // "needs_clarification" — that already means low confidence or an unresolved "unknown"
+  // kind) result that actually DIFFERS from what's stored, and only ever touches
+  // classification/evidence metadata — never `status`, never approves/rejects/logs anything.
+  let updatedReview = review;
+  let classificationCorrectionNote: string | undefined;
+  if (understandingResult.status === "ok") {
+    const refreshedClassification = emailReviewClassificationFromUnderstanding(understanding.emailKind);
+    const staleReason = review.reason;
+    const staleLabel = gmailReviewSignalTypeLabel(review);
+    if (refreshedClassification.reason !== staleReason) {
+      const refreshed = await refreshEmailReviewClassification(userId, review.id, {
+        reason: refreshedClassification.reason,
+        proposedEventType: refreshedClassification.proposedEventType,
+        confidence: understanding.confidence,
+        evidence: importantText.slice(0, 300)
+      });
+      if (refreshed) {
+        updatedReview = refreshed;
+        classificationCorrectionNote = `Updated classification: ${staleLabel} → ${currentClassification}.`;
+      }
     }
-    return `${subject}: I do not see that in the stored preview.\nPreview: ${preview}\n${limitation}`;
   }
 
-  return `${subject}:\nPreview: ${preview}\n${limitation}`;
+  const summary = [
+    formatGmailReviewDetailResponse({
+      number,
+      title,
+      currentClassification,
+      linkedGoalTitle: linkedGoal?.title,
+      whyItMatters,
+      importantText,
+      suggestedAction
+    }),
+    classificationCorrectionNote
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  return {
+    tool,
+    status: "executed",
+    summary,
+    result: { review: updatedReview, understanding, refetchStatus: refetch.status },
+    entities: [...visibleReviewEntities.filter((entity) => entity.id !== review.id), reviewToEntity(updatedReview, number, context.gmailRules)]
+  };
 }
 
-function meaningfulQuestionTerms(text: string): string[] {
-  const stopWords = new Set([
-    "the",
-    "one",
-    "does",
-    "have",
-    "any",
-    "info",
-    "about",
-    "with",
-    "from",
-    "that",
-    "this",
-    "email",
-    "review",
-    "mail",
-    "mails",
-    "emails",
-    "job",
-    "jobs",
-    "newsletter"
-  ]);
-  return [...new Set(text.split(/\s+/).filter((term) => term.length >= 4 && !stopWords.has(term)))];
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 6): after a classifier
+// fix ships, old pending reviews can keep a stale stored label forever unless the user happens to
+// open each one's detail individually. This is the explicit "refresh email reviews" path — the
+// preferred bounded/capped option (never runs unprompted on every gmail.review.list, which would
+// mean a readonly Gmail refetch + LLM call per pending row on every single list view). Reuses the
+// exact same refetch → clean → understand → refresh logic as buildGmailReviewDetailResult, minus
+// the human-readable detail response nobody asked for here — only ever touches classification
+// metadata on reviews that are still pending, never status, never approves/rejects/logs anything,
+// and a single failed refetch/understanding for one review is skipped rather than aborting the rest.
+const GMAIL_REVIEW_REFRESH_MAX_ITEMS = 8;
+
+async function refreshStaleGmailReviewClassifications(
+  userId: string,
+  context: ContextBundle
+): Promise<{ refreshedCount: number; checkedCount: number }> {
+  const pending = await getEmailReviewItems(userId, { status: "pending", limit: GMAIL_REVIEW_REFRESH_MAX_ITEMS });
+  let refreshedCount = 0;
+
+  for (const review of pending) {
+    const rule = context.gmailRules.find((item) => item.id === review.ruleId);
+    const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
+    const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+
+    try {
+      const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
+      const usedLiveContent = refetch.status === "ok" && Boolean(refetch.content.rawBodyText);
+      if (!usedLiveContent) {
+        continue;
+      }
+      const cleanedSubject = cleanEmailBodyForDisplay(refetch.content.subject, { maxLength: 300 });
+      const cleanedBody = cleanEmailBodyForDisplay(refetch.content.rawBodyText, {
+        isHtml: refetch.content.isHtml,
+        maxLength: DEFAULT_EMAIL_DETAIL_LENGTH
+      });
+      const senderDomain = refetch.content.from.split("@").pop()?.replace(/[>\s]+$/g, "") ?? "";
+
+      const raw = await understandEmail({
+        subject: cleanedSubject,
+        bodyExcerpt: cleanedBody,
+        senderDomain,
+        date: refetch.content.date,
+        linkedGoal: linkedGoal ? { title: linkedGoal.title, category: linkedGoal.category ?? undefined } : undefined,
+        activeWatcherDescription: rule?.description || rule?.name,
+        currentCandidateClassification: review.reason
+      });
+      const understandingResult = validateEmailUnderstanding(raw, `${cleanedSubject} ${cleanedBody}`);
+      if (understandingResult.status !== "ok" || !understandingResult.understanding) {
+        continue;
+      }
+
+      const refreshedClassification = emailReviewClassificationFromUnderstanding(understandingResult.understanding.emailKind);
+      if (refreshedClassification.reason === review.reason) {
+        continue;
+      }
+
+      const refreshed = await refreshEmailReviewClassification(userId, review.id, {
+        reason: refreshedClassification.reason,
+        proposedEventType: refreshedClassification.proposedEventType,
+        confidence: understandingResult.understanding.confidence,
+        evidence: cleanedBody.slice(0, 300)
+      });
+      if (refreshed) {
+        refreshedCount += 1;
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return { refreshedCount, checkedCount: pending.length };
 }
 
 // Task 3/4 (launch-readiness): returns the specific clarification (e.g. a weekday/day-of-month

@@ -2182,6 +2182,55 @@ export async function approveEmailReviewItem(
   return toEmailReviewItem(item);
 }
 
+export interface EmailReviewClassificationRefresh {
+  reason?: string;
+  proposedEventType?: string;
+  confidence?: number;
+  evidence?: string;
+  extracted?: Record<string, unknown>;
+}
+
+/**
+ * fix/private-alpha-email-review-resolution-and-stale-classification: a real reported bug — a
+ * pending review created before a classifier fix kept showing its OLD, stale label ("recruiter
+ * reply") in the review list even after "details for N" refetched the real email and correctly
+ * explained it as an application confirmation, because the detail command only ever computed a
+ * FRESH understanding without ever writing it back. This is the safe, narrow write-back: ONLY
+ * classification/evidence/confidence metadata, NEVER `status` (a metadata refresh can never itself
+ * approve/reject/log anything — that still requires a distinct, explicit user instruction), and
+ * ONLY while the review is still pending (once decided, its classification is historical and no
+ * longer drives anything, so refreshing it would be pointless busywork, not a safety concern, but
+ * still deliberately skipped to keep this function's effect boundary as narrow as possible).
+ */
+export async function refreshEmailReviewClassification(
+  userId: string,
+  reviewId: string,
+  refresh: EmailReviewClassificationRefresh
+): Promise<EmailReviewItem | undefined> {
+  await ensureUser(userId);
+
+  const existing = await prisma.emailReviewItem.findFirst({
+    where: { id: reviewId, userId }
+  });
+
+  if (!existing || existing.status !== "pending") {
+    return existing ? toEmailReviewItem(existing) : undefined;
+  }
+
+  const item = await prisma.emailReviewItem.update({
+    where: { id: reviewId },
+    data: {
+      ...(refresh.reason !== undefined ? { reason: refresh.reason } : {}),
+      ...(refresh.proposedEventType !== undefined ? { proposedEventType: refresh.proposedEventType } : {}),
+      ...(refresh.confidence !== undefined ? { confidence: refresh.confidence } : {}),
+      ...(refresh.evidence !== undefined ? { evidence: refresh.evidence } : {}),
+      ...(refresh.extracted !== undefined ? { extracted: toJsonObject(refresh.extracted) } : {})
+    }
+  });
+
+  return toEmailReviewItem(item);
+}
+
 export async function rejectEmailReviewItem(userId: string, reviewId: string): Promise<EmailReviewItem | undefined> {
   await ensureUser(userId);
 
