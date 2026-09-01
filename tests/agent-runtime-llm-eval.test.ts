@@ -15311,3 +15311,221 @@ test(
     }
   }
 );
+
+// fix/private-alpha-goal-guardrail-followup-keep-active (Task 5): a real Telegram transcript
+// found "im kiding keep it" — a false-alarm follow-up right after the goal-avoidance guardrail
+// correctly intervened — planned as a fresh goal.archive_propose(operation: "pause") by the real
+// LLM planner, misreading the guardrail's own coaching reply ("I'd rather you paused here") as
+// license to continue a pause conversation that was never actually opened. Fixed deterministically
+// in runtime.ts (isExplicitActionMutationGuardrailBypass's sibling checks around session.topic ===
+// "guardrail" and pending.topic === "goal_lifecycle") — these real-LLM scenarios prove the whole
+// pipeline end to end: the real guardrail classifier still correctly fires on genuine abandonment
+// language, and the deterministic follow-up fix keeps the goal active without ever asking the
+// planner to interpret the ambiguous "keep it" reply itself.
+
+test(
+  "422. Spanish: 'quiero dejar este objetivo' guardrail fires, then 'im kidding keep it' keeps the goal active (goal-guardrail-followup A)",
+  { ...llmEvalOptions(["goal-guardrail-followup", "goal-keep-active-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-422-${randomUUID()}`;
+    const trace = new EvalTrace("422-quiero-dejar-then-keep-it", ["goal-guardrail-followup", "goal-keep-active-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const goal = goalResult.duplicate ? goalResult.existingGoal : goalResult.goal;
+
+      await trace.guard(async () => {
+        const t1 = trace.record("quiero dejar este objetivo", await sendAgentMessage(server, userId, "quiero dejar este objetivo"));
+        assertNoGenericAgentError(t1, "Spanish genuine goal abandonment");
+        trace.checkpoint("guardrail intervened", t1.debug.conversationTopic === "guardrail", t1.debug.conversationTopic ?? "null");
+
+        const t2 = trace.record("im kidding keep it", await sendAgentMessage(server, userId, "im kidding keep it"));
+        assertNoGenericAgentError(t2, "false-alarm follow-up");
+        trace.checkpoint("no mutation on the follow-up", t2.debug.mutationExecuted === false, String(t2.debug.mutationExecuted));
+        assert.equal(t2.debug.mutationExecuted, false);
+        trace.checkpoint("no pause/archive proposal left pending", t2.debug.pendingOperation === false, String(t2.debug.pendingOperation));
+        assert.equal(t2.debug.pendingOperation, false);
+        trace.checkpoint("reply never proposes pausing/archiving", !/pause|archive/i.test(t2.reply), t2.reply);
+        assert.doesNotMatch(t2.reply, /pause|archive/i);
+
+        const stillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
+        trace.checkpoint("goal remains active", stillActive?.status === "active", stillActive?.status ?? "missing");
+        assert.equal(stillActive?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "423. English: 'I want to quit this goal' guardrail fires, then 'joking keep it' keeps the goal active (goal-guardrail-followup B)",
+  { ...llmEvalOptions(["goal-guardrail-followup", "goal-keep-active-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-423-${randomUUID()}`;
+    const trace = new EvalTrace("423-quit-goal-then-keep-it", ["goal-guardrail-followup", "goal-keep-active-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const goal = goalResult.duplicate ? goalResult.existingGoal : goalResult.goal;
+
+      await trace.guard(async () => {
+        const t1 = trace.record("I want to quit this goal", await sendAgentMessage(server, userId, "I want to quit this goal"));
+        assertNoGenericAgentError(t1, "English genuine goal abandonment");
+        trace.checkpoint("guardrail intervened", t1.debug.conversationTopic === "guardrail", t1.debug.conversationTopic ?? "null");
+
+        const t2 = trace.record("joking keep it", await sendAgentMessage(server, userId, "joking keep it"));
+        assertNoGenericAgentError(t2, "false-alarm follow-up");
+        assert.equal(t2.debug.mutationExecuted, false);
+        assert.equal(t2.debug.pendingOperation, false, "no pause/archive proposal must be left pending");
+        assert.doesNotMatch(t2.reply, /pause|archive/i);
+
+        const stillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
+        trace.checkpoint("goal remains active", stillActive?.status === "active", stillActive?.status ?? "missing");
+        assert.equal(stillActive?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "424. Spanish: 'era broma, mantenlo' keeps the goal active with a localized reply (goal-guardrail-followup C)",
+  { ...llmEvalOptions(["goal-guardrail-followup", "goal-keep-active-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-424-${randomUUID()}`;
+    const trace = new EvalTrace("424-era-broma-mantenlo", ["goal-guardrail-followup", "goal-keep-active-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar trabajo de desarrollador remoto", category: "career" });
+      const goal = goalResult.duplicate ? goalResult.existingGoal : goalResult.goal;
+
+      await trace.guard(async () => {
+        trace.record("quiero dejar este objetivo", await sendAgentMessage(server, userId, "quiero dejar este objetivo"));
+        const t2 = trace.record("era broma, mantenlo", await sendAgentMessage(server, userId, "era broma, mantenlo"));
+        assertNoGenericAgentError(t2, "Spanish false-alarm follow-up");
+        assert.equal(t2.debug.mutationExecuted, false);
+        assert.equal(t2.debug.pendingOperation, false);
+        trace.checkpoint("localized Spanish reply", /mantengo el objetivo activo/i.test(t2.reply), t2.reply);
+        assert.match(t2.reply, /mantengo el objetivo activo/i);
+
+        const stillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
+        assert.equal(stillActive?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "425. Catalan: 'era broma, mantén-lo' keeps the goal active with a localized reply (goal-guardrail-followup D)",
+  { ...llmEvalOptions(["goal-guardrail-followup", "goal-keep-active-routing"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-425-${randomUUID()}`;
+    const trace = new EvalTrace("425-era-broma-mantenlo-ca", ["goal-guardrail-followup", "goal-keep-active-routing"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Buscar feina de desenvolupador remot", category: "career" });
+      const goal = goalResult.duplicate ? goalResult.existingGoal : goalResult.goal;
+
+      await trace.guard(async () => {
+        trace.record("vull deixar aquest objectiu", await sendAgentMessage(server, userId, "vull deixar aquest objectiu"));
+        const t2 = trace.record("era broma, mantén-lo", await sendAgentMessage(server, userId, "era broma, mantén-lo"));
+        assertNoGenericAgentError(t2, "Catalan false-alarm follow-up");
+        assert.equal(t2.debug.mutationExecuted, false);
+        assert.equal(t2.debug.pendingOperation, false);
+        trace.checkpoint("localized Catalan reply", /mantinc l'objectiu actiu/i.test(t2.reply), t2.reply);
+        assert.match(t2.reply, /mantinc l'objectiu actiu/i);
+
+        const stillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
+        assert.equal(stillActive?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "426. 'pause this goal' still opens a real confirmation (goal-guardrail-followup E)",
+  { ...llmEvalOptions(["goal-guardrail-followup", "pending-goal-confirmation-cancel"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-426-${randomUUID()}`;
+    const trace = new EvalTrace("426-pause-this-goal-still-confirms", ["goal-guardrail-followup", "pending-goal-confirmation-cancel"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const goal = goalResult.duplicate ? goalResult.existingGoal : goalResult.goal;
+
+      await trace.guard(async () => {
+        // Named explicitly rather than a bare "this goal" — a bare pronoun only resolves via
+        // session focus (set by a prior goal.status/goal.list-shaped turn), which this scenario
+        // deliberately doesn't establish first, so it isn't what's under test here.
+        const message = `pause my ${goal.title} goal`;
+        const reply = trace.record(message, await sendAgentMessage(server, userId, message));
+        assertNoGenericAgentError(reply, "explicit pause command");
+        trace.checkpoint("opens a real pending confirmation", reply.debug.pendingOperation === true, String(reply.debug.pendingOperation));
+        assert.equal(reply.debug.pendingOperation, true);
+        assert.equal(reply.debug.mutationExecuted, false, "must never pause without an explicit confirmation");
+
+        const stillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
+        assert.equal(stillActive?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "427. pending pause + 'keep it' cancels, goal remains active (goal-guardrail-followup F)",
+  { ...llmEvalOptions(["goal-guardrail-followup", "pending-goal-confirmation-cancel"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-427-${randomUUID()}`;
+    const trace = new EvalTrace("427-pending-pause-keep-it-cancels", ["goal-guardrail-followup", "pending-goal-confirmation-cancel"], userId);
+
+    try {
+      await seedUser(userId);
+      const goalResult = await createGoal(userId, { title: "Find a fully remote developer job", category: "career" });
+      const goal = goalResult.duplicate ? goalResult.existingGoal : goalResult.goal;
+
+      await trace.guard(async () => {
+        const message = `pause my ${goal.title} goal`;
+        const t1 = trace.record(message, await sendAgentMessage(server, userId, message));
+        assertNoGenericAgentError(t1, "explicit pause command");
+        assert.equal(t1.debug.pendingOperation, true);
+
+        const t2 = trace.record("keep it", await sendAgentMessage(server, userId, "keep it"));
+        assertNoGenericAgentError(t2, "keep-it cancellation");
+        trace.checkpoint("pending confirmation cancelled", t2.debug.pendingOperation === false, String(t2.debug.pendingOperation));
+        assert.equal(t2.debug.pendingOperation, false);
+        assert.equal(t2.debug.mutationExecuted, false);
+
+        const stillActive = await prisma.goal.findUnique({ where: { id: goal.id } });
+        trace.checkpoint("goal remains active", stillActive?.status === "active", stillActive?.status ?? "missing");
+        assert.equal(stillActive?.status, "active");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
