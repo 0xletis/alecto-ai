@@ -216,3 +216,45 @@ export function goalHasOnlyCompletionSignals<T extends Pick<Goal, "targetMetrics
   const metrics = goal.targetMetrics ?? [];
   return metrics.length > 0 && metrics.every((metric) => isCompletionShapedSignalText(metric.label));
 }
+
+/**
+ * fix/private-alpha-production-email-progress-truth: the confirmed root cause of a live "Logged 1
+ * CV sent" / goal.status-never-moves contradiction. A goal created via the FIXED template picker
+ * (goal-templates.ts) declares an eventType-based metric (e.g. `eventType: "career.application_sent"`)
+ * — but a goal created via the ADAPTIVE, natural-language flow (goal.create_apply) ALWAYS declares
+ * signalKey-based metrics instead (see executor.ts's targetMetrics construction there), even for an
+ * activity — "applications sent" — that also has a real registered EventTypeSchema member. A tool
+ * that unconditionally writes a `career.application_sent`-typed event (the canonical, cross-goal
+ * shape every logging path should keep using) then has NOTHING that goal's own
+ * countEvidenceForMetric call would ever match, because that call only recognizes EITHER an exact
+ * eventType metric OR a signalKey metric paired with a `custom.goal_progress_logged` event carrying
+ * that same signalKey — never a registry event against a signalKey-shaped metric.
+ *
+ * This is the bridge: for ONE already-resolved goal, find whichever of its OWN declared metrics
+ * represents the given canonical activity — an exact eventType match first, or (only when no exact
+ * match exists) a signalKey-based metric whose own LABEL is both progress-shaped (an ongoing,
+ * repeatable unit, not a one-time "goal finished" marker) and matches the caller-supplied keyword
+ * pattern for this specific activity. The keyword pattern itself is not defined here — the generic
+ * bridging MECHANISM is domain-agnostic; only the caller (e.g. "applications sent" for
+ * career.application_sent) supplies domain knowledge, so this stays reusable for any future
+ * eventType/signalKey mismatch, not just this one.
+ */
+export interface CanonicalEventMetricBridge {
+  eventType: string;
+  /** Matched against a candidate signalKey metric's own LABEL (never its key) when no exact
+   * eventType match exists on the goal. */
+  labelKeywords: RegExp;
+}
+
+export function resolveGoalMetricForCanonicalEvent<T extends Pick<Goal, "targetMetrics">>(
+  goal: T,
+  bridge: CanonicalEventMetricBridge
+): GoalMetric | undefined {
+  const metrics = goal.targetMetrics ?? [];
+  const exact = metrics.find((metric) => metric.eventType === bridge.eventType);
+  if (exact) {
+    return exact;
+  }
+
+  return metrics.find((metric) => metric.signalKey && isProgressShapedSignalText(metric.label) && bridge.labelKeywords.test(metric.label));
+}

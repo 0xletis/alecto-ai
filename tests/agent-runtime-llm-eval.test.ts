@@ -18351,3 +18351,470 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-production-email-progress-truth (Task 10): the live production
+// contradiction — "Logged 1 CV sent" claimed while goal.status stayed unchanged — reproduced
+// after the FIRST read-after-write invariant landed, because that invariant verified a hardcoded
+// GLOBAL career.application_sent count, not the SAME metric the goal's own goal.status display
+// actually reads. A goal created through the adaptive, natural-language flow (goal.create_apply)
+// always declares a signalKey-based metric for "applications sent," never the eventType-based one
+// the fixed career.job_search TEMPLATE uses — so scenarios A/E/I/J below deliberately seed a goal
+// shaped that way (never templateId) to exercise the real regression surface, not the shape that
+// happened to already work.
+
+/** Shapes a goal's targetMetrics EXACTLY like goal.create_apply (adaptive goal creation) does —
+ * signalKey-based, never eventType-based, even for "applications sent." */
+async function seedAdaptiveJobSearchGoalForEval(userId: string, title: string) {
+  const result = await createGoal(userId, {
+    title,
+    category: "career",
+    targetMetrics: [{ key: "applications_sent", label: "Applications sent", labelSingular: "Application sent", signalKey: "applications_sent", aggregation: "count", window: "weekly" }]
+  });
+  if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+  return result.goal;
+}
+
+async function seedResolutionEvalReviewRuleForGoal(userId: string, connectionId: string, goalId: string) {
+  return prisma.emailSignalRule.create({
+    data: {
+      userId,
+      connectionId,
+      goalId,
+      adapterId: "job_search_email",
+      name: "Job search emails",
+      status: "active",
+      fetchStrategy: "query",
+      classifierMode: "rules",
+      lookbackDays: 30,
+      maxMessagesPerSync: 25,
+      maxEventsPerSync: 10,
+      minAutoLogConfidence: 0.9,
+      minReviewConfidence: 0.65,
+      createdBy: "user"
+    }
+  });
+}
+
+test(
+  "487. Darwin Recruitment, applied today, adaptive (signalKey) goal — mark as CV sent verifiably moves Today AND This week (email-progress-production-invariant A / email-progress-read-after-write E)",
+  { ...llmEvalOptions(["email-progress-production-invariant", "email-progress-read-after-write", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-487-${randomUUID()}`;
+    const trace = new EvalTrace("487-adaptive-goal-verified-today-and-week", ["email-progress-production-invariant", "email-progress-read-after-write", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-487-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "Se ha enviado tu solicitud a Darwin Recruitment. Full Stack - React & NestJS." }]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedAdaptiveJobSearchGoalForEval(userId, "Find a fully remote developer job, ideally in Web3");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      for (let i = 0; i < 16; i += 1) {
+        await createEvent(userId, { type: "custom.goal_progress_logged", source: "manual", confidence: 1, timestamp: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000), data: { signalKey: "applications_sent" } });
+      }
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-487-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        const t0 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+        trace.checkpoint("baseline shows Today: 0, This week: 16", /today[^\n]*\b0\b/i.test(t0.reply) && /week[^\n]*\b16\b/i.test(t0.reply), t0.reply);
+
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+        assertNoGenericAgentError(t3);
+        const claimedLogged = /^logged 1/i.test(t3.reply.trim());
+        trace.checkpoint("only claims 'logged' when the goal's OWN metric aggregation actually verified", claimedLogged, t3.reply);
+        assert.ok(claimedLogged, `expected a genuine successful log to say so — got: ${t3.reply}`);
+
+        const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        trace.checkpoint("the review resolved only after verification passed", after?.status === "approved", after?.status);
+        assert.equal(after?.status, "approved");
+
+        const t4 = trace.record("show today goal progress (again)", await sendAgentMessage(server, userId, "show today goal progress"));
+        const showsToday1AndWeek17 = /today[^\n]*\b1\b/i.test(t4.reply) && /week[^\n]*\b17\b/i.test(t4.reply);
+        trace.checkpoint("the exact next goal.status response shows Today: 1, This week: 17 — never Today: 0", showsToday1AndWeek17, t4.reply);
+        assert.ok(showsToday1AndWeek17, `the live production contradiction this task fixes: goal.status must move after a genuine 'Logged' claim — got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "488. invariant failure simulated on an adaptive goal — no false 'logged' claim, review stays pending (email-progress-production-invariant B / email-review-resolution C)",
+  { ...llmEvalOptions(["email-progress-production-invariant", "email-review-resolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-488-${randomUUID()}`;
+    const trace = new EvalTrace("488-adaptive-goal-verification-failure", ["email-progress-production-invariant", "email-review-resolution"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-488-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "Se ha enviado tu solicitud a Darwin Recruitment." }]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedAdaptiveJobSearchGoalForEval(userId, "Find a fully remote developer job");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-488-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL = "true";
+      try {
+        await trace.guard(async () => {
+          trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+          trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+          const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+          assertNoGenericAgentError(t3);
+
+          const claimedLogged = /^logged/i.test(t3.reply.trim());
+          trace.checkpoint("never claims 'logged' when the goal-metric verification failed", !claimedLogged, t3.reply);
+          assert.ok(!claimedLogged, `a failed verification must never claim success — got: ${t3.reply}`);
+
+          const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+          trace.checkpoint("the review stays pending, never silently resolved with an invisible count", after?.status === "pending", after?.status);
+          assert.equal(after?.status, "pending");
+        });
+      } finally {
+        delete process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL;
+      }
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "489. a wrong-metric-key verification failure never claims 'logged' (email-progress-production-invariant C / email-progress-count-consistency F)",
+  { ...llmEvalOptions(["email-progress-production-invariant", "email-progress-count-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-489-${randomUUID()}`;
+    const trace = new EvalTrace("489-wrong-metric-key-simulated", ["email-progress-production-invariant", "email-progress-count-consistency"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-489-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "Se ha enviado tu solicitud a Darwin Recruitment." }]);
+
+    try {
+      await seedUser(userId);
+      // A goal whose own declared metric key can NEVER match what gets written (a completely
+      // unrelated signalKey) — the exact "verifying a different metric than what's displayed" shape
+      // this task's root cause was. The escape hatch below forces the same observable failure
+      // deterministically (a real gpt-4o-mini call cannot be made to reliably emit a metric-key
+      // mismatch on demand), but the seeded goal shape documents precisely which mismatch this
+      // stands in for.
+      const goal = await seedAdaptiveJobSearchGoalForEval(userId, "Find a fully remote developer job");
+      await prisma.goal.update({ where: { id: goal.id }, data: { targetMetrics: [{ key: "unrelated_signal", label: "Unrelated signal", signalKey: "unrelated_signal", aggregation: "count", window: "weekly" }] } });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-489-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL = "true";
+      try {
+        await trace.guard(async () => {
+          trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+          trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+          const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+          assertNoGenericAgentError(t3);
+
+          const claimedLogged = /^logged/i.test(t3.reply.trim());
+          trace.checkpoint("never claims 'logged' when the write can't be verified against the goal's real metric", !claimedLogged, t3.reply);
+          assert.ok(!claimedLogged, `got: ${t3.reply}`);
+
+          const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+          trace.checkpoint("the review stays pending", after?.status === "pending", after?.status);
+          assert.equal(after?.status, "pending");
+        });
+      } finally {
+        delete process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL;
+      }
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "490. a wrong-goalId verification failure never claims 'logged' (email-progress-production-invariant D / email-review-resolution D)",
+  { ...llmEvalOptions(["email-progress-production-invariant", "email-review-resolution"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-490-${randomUUID()}`;
+    const trace = new EvalTrace("490-wrong-goal-id-simulated", ["email-progress-production-invariant", "email-review-resolution"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-490-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "Se ha enviado tu solicitud a Darwin Recruitment." }]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedAdaptiveJobSearchGoalForEval(userId, "Find a fully remote developer job");
+      const otherGoal = await seedAdaptiveJobSearchGoalForEval(userId, "Read more books");
+      await prisma.goal.update({ where: { id: otherGoal.id }, data: { targetMetrics: [{ key: "reading_minutes", label: "reading minutes", signalKey: "reading_minutes", aggregation: "sum", window: "daily" }] } });
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      // The review's rule is deliberately linked to a DIFFERENT goal than the one that would
+      // actually be verified against — the exact "wrong goalId" shape this checks for.
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, otherGoal.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-490-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL = "true";
+      try {
+        await trace.guard(async () => {
+          trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+          trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+          const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+          assertNoGenericAgentError(t3);
+
+          const claimedLogged = /^logged/i.test(t3.reply.trim());
+          trace.checkpoint("never claims 'logged' when the linked goal doesn't verify", !claimedLogged, t3.reply);
+          assert.ok(!claimedLogged, `got: ${t3.reply}`);
+
+          const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+          trace.checkpoint("the review stays pending", after?.status === "pending", after?.status);
+          assert.equal(after?.status, "pending");
+        });
+      } finally {
+        delete process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL;
+      }
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "491. manual 'I sent 1 CV today' and email-derived 'mark it as CV sent' aggregate identically on an adaptive goal (email-progress-count-consistency G / email-progress-production-invariant E)",
+  { ...llmEvalOptions(["email-progress-count-consistency", "email-progress-production-invariant"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userIdManual = `llm-eval-491-manual-${randomUUID()}`;
+    const userIdEmail = `llm-eval-491-email-${randomUUID()}`;
+    const trace = new EvalTrace("491-manual-vs-email-parity", ["email-progress-count-consistency", "email-progress-production-invariant"], userIdEmail);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-491-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "Se ha enviado tu solicitud a Darwin Recruitment." }]);
+
+    try {
+      await trace.guard(async () => {
+        await seedUser(userIdManual);
+        await seedAdaptiveJobSearchGoalForEval(userIdManual, "Find a fully remote developer job");
+        trace.record("I sent 1 CV today", await sendAgentMessage(server, userIdManual, "I sent 1 CV today"));
+        const manualStatus = trace.record("show today goal progress (manual)", await sendAgentMessage(server, userIdManual, "show today goal progress"));
+
+        await seedUser(userIdEmail);
+        const goal = await seedAdaptiveJobSearchGoalForEval(userIdEmail, "Find a fully remote developer job");
+        const connection = await seedEvalGmailConnectionWithToken(userIdEmail);
+        const rule = await seedResolutionEvalReviewRuleForGoal(userIdEmail, connection.id, goal.id);
+        await seedResolutionEvalReview(userIdEmail, connection.id, rule.id, { providerMessageId: "eval-491-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+        trace.record("show email reviews", await sendAgentMessage(server, userIdEmail, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userIdEmail, "details for 1"));
+        trace.record("mark it as cv sent", await sendAgentMessage(server, userIdEmail, "mark it as cv sent"));
+        const emailStatus = trace.record("show today goal progress (email)", await sendAgentMessage(server, userIdEmail, "show today goal progress"));
+
+        const manualShowsToday1 = /today[^\n]*\b1\b/i.test(manualStatus.reply);
+        const emailShowsToday1 = /today[^\n]*\b1\b/i.test(emailStatus.reply);
+        trace.checkpoint("both the manual and email-derived path show Today: 1 for their own goal", manualShowsToday1 && emailShowsToday1, `manual="${manualStatus.reply}" email="${emailStatus.reply}"`);
+        assert.ok(manualShowsToday1, `manual path: ${manualStatus.reply}`);
+        assert.ok(emailShowsToday1, `email-derived path: ${emailStatus.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userIdManual } });
+      await prisma.user.deleteMany({ where: { id: userIdEmail } });
+    }
+  }
+);
+
+test(
+  "492. a LinkedIn 'no longer showing recruiters you're open to work' notification is ignored, not treated as job-search progress (email-review-classifier-precision A)",
+  { ...llmEvalOptions(["email-review-classifier-precision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-492-${randomUUID()}`;
+    const trace = new EvalTrace("492-linkedin-profile-status-noise", ["email-review-classifier-precision"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-492-li-status", subject: "Tu estado de búsqueda de empleo", from: "jobs-noreply@linkedin.com", body: "Ya no estás mostrando a los técnicos de selección que estás buscando empleo. Puedes activar 'Open to Work' de nuevo cuando quieras desde tu perfil." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-492-li-status", subject: "Tu estado de búsqueda de empleo", from: "jobs-noreply@linkedin.com", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const mislabelledAsProgress = /application confirmation|recruiter reply|job offer/i.test(t2.reply);
+        trace.checkpoint("a profile/account visibility notification is never treated as job-search progress", !mislabelledAsProgress, t2.reply);
+        assert.ok(!mislabelledAsProgress, `got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "493. a generic recruiter opportunity email is never labelled a job offer (email-review-classifier-precision B)",
+  { ...llmEvalOptions(["email-review-classifier-precision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-493-${randomUUID()}`;
+    const trace = new EvalTrace("493-recruiter-opportunity-not-offer", ["email-review-classifier-precision"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-493-oz", subject: "Opportunity at OpenZeppelin", from: "recruiter@openzeppelin.example", body: "Hi, I came across your profile and wanted to reach out about a Senior Engineer opportunity at OpenZeppelin that could be a great match. Would you be open to a quick chat sometime this week?" }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-493-oz", subject: "Opportunity at OpenZeppelin", from: "recruiter@openzeppelin.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const mislabelledAsOffer = /job offer/i.test(t2.reply);
+        trace.checkpoint("cold recruiter outreach with no concrete offer is never labelled a job offer", !mislabelledAsOffer, t2.reply);
+        assert.ok(!mislabelledAsOffer, `got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "494. a sparse application-confirmation email's detail view has no null fields and no recommendation garbage (email-detail-cleanup B)",
+  { ...llmEvalOptions(["email-detail-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-494-${randomUUID()}`;
+    const trace = new EvalTrace("494-sparse-detail-no-nulls", ["email-detail-cleanup"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const noisyBody = [
+      "Se ha enviado tu solicitud a Darwin Recruitment.",
+      "----------",
+      "Ahora sigue estos pasos para completar tu perfil.",
+      "Descubre otras vacantes similares."
+    ].join("\n");
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-494-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: noisyBody }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-494-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const hasNullField = /:\s*null\b/i.test(t2.reply);
+        trace.checkpoint("no key detail line ever renders a literal null value", !hasNullField, t2.reply);
+        assert.ok(!hasNullField, `got: ${t2.reply}`);
+
+        const hasMarketingTeaser = /ahora sigue estos pasos|descubre otras/i.test(t2.reply);
+        trace.checkpoint("no LinkedIn marketing teaser leaks into the default detail view", !hasMarketingTeaser, t2.reply);
+        assert.ok(!hasMarketingTeaser, `got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "495. Spanish: 'márcalo como CV enviado' on an adaptive goal verifiably updates Today's count (email-progress-read-after-write F)",
+  { ...llmEvalOptions(["email-progress-read-after-write", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-495-${randomUUID()}`;
+    const trace = new EvalTrace("495-spanish-adaptive-verified-update", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-495-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "Se ha enviado tu solicitud a Darwin Recruitment." }]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedAdaptiveJobSearchGoalForEval(userId, "Find a fully remote developer job");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-495-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("márcalo como CV enviado", await sendAgentMessage(server, userId, "márcalo como CV enviado"));
+        const t4 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+
+        const showsToday1 = /today[^\n]*\b1\b/i.test(t4.reply);
+        trace.checkpoint("the verified count is visible in the follow-up daily status", showsToday1, t4.reply);
+        assert.ok(showsToday1, `got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "496. Catalan: 'marca-ho com a CV enviat' on an adaptive goal verifiably updates Today's count (email-progress-read-after-write G)",
+  { ...llmEvalOptions(["email-progress-read-after-write", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-496-${randomUUID()}`;
+    const trace = new EvalTrace("496-catalan-adaptive-verified-update", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-496-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", body: "S'ha enviat la teva sol·licitud a Darwin Recruitment." }]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedAdaptiveJobSearchGoalForEval(userId, "Find a fully remote developer job");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-496-darwin", subject: "Darwin Recruitment", from: "no-reply@darwin.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("marca-ho com a CV enviat", await sendAgentMessage(server, userId, "marca-ho com a CV enviat"));
+        const t4 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+
+        const showsToday1 = /today[^\n]*\b1\b/i.test(t4.reply);
+        trace.checkpoint("the verified count is visible in the follow-up daily status", showsToday1, t4.reply);
+        assert.ok(showsToday1, `got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

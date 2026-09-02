@@ -910,6 +910,12 @@ export function emailReviewClassificationFromUnderstanding(kind: EmailKind): { r
   };
   const reasonsByKind: Partial<Record<EmailKind, string>> = {
     job_alert: "filtered_marketing",
+    // fix/private-alpha-production-email-progress-truth (Task 8): a LinkedIn/job-platform account-
+    // status notification ("you're no longer showing recruiters you're open to work") is classified
+    // as "marketing" by understand-email.ts's own prompt guidance — grouped as noise here the same
+    // way a job_alert already is, rather than falling through to "needs review" for lack of a
+    // recognized noise reason.
+    marketing: "filtered_marketing",
     security_auth: "security_auth",
     onboarding: "onboarding_noise"
   };
@@ -1016,20 +1022,33 @@ export function formatGmailReviewDetailResponse(input: GmailReviewDetailResponse
  * missing one), "Applied: <date>" formatted from the raw stated date text via
  * parseStatedDateText/formatKeyDetailDate so it reads like a real date rather than the model's raw
  * phrasing. Falls back to keyFacts verbatim for every non-job-application domain. */
+// fix/private-alpha-production-email-progress-truth (Task 7): a real reported bug — the default
+// detail view showed literal "Status: null" / "Next step: null" lines. The field really was absent
+// (the model had nothing real to report), but a smaller model doesn't always reliably emit the JSON
+// `null` type for an unset nullable field — it sometimes writes the four-character STRING "null"
+// instead, which a plain truthiness check treats as present. Filters that (and other placeholder-ish
+// non-answers a model can emit the same way — "n/a", "none", "unknown", or empty/whitespace) before
+// treating a field as real content.
+const EMPTY_DETAIL_VALUE_RE = /^\s*(null|n\/a|none|unknown|-)?\s*$/i;
+
+function hasMeaningfulDetailValue(value: string | null | undefined): value is string {
+  return typeof value === "string" && !EMPTY_DETAIL_VALUE_RE.test(value);
+}
+
 export function keyDetailLinesFromUnderstanding(understanding: Pick<EmailUnderstanding, "keyDetails" | "keyFacts">): string[] {
   const details = understanding.keyDetails;
   if (details) {
     const lines: string[] = [];
-    if (details.company) lines.push(`Company: ${details.company}`);
-    if (details.role) lines.push(`Role: ${details.role}`);
-    if (details.location) lines.push(`Location: ${details.location}`);
-    if (details.appliedDate) lines.push(`Applied: ${details.appliedDate}`);
-    if (details.status) lines.push(`Status: ${details.status}`);
-    if (details.nextStep) lines.push(`Next step: ${details.nextStep}`);
+    if (hasMeaningfulDetailValue(details.company)) lines.push(`Company: ${details.company}`);
+    if (hasMeaningfulDetailValue(details.role)) lines.push(`Role: ${details.role}`);
+    if (hasMeaningfulDetailValue(details.location)) lines.push(`Location: ${details.location}`);
+    if (hasMeaningfulDetailValue(details.appliedDate)) lines.push(`Applied: ${details.appliedDate}`);
+    if (hasMeaningfulDetailValue(details.status)) lines.push(`Status: ${details.status}`);
+    if (hasMeaningfulDetailValue(details.nextStep)) lines.push(`Next step: ${details.nextStep}`);
     return lines;
   }
 
-  return understanding.keyFacts ?? [];
+  return (understanding.keyFacts ?? []).filter((fact) => hasMeaningfulDetailValue(fact));
 }
 
 export function emailReviewGroupLabel(kind: EmailReviewKind): string {
