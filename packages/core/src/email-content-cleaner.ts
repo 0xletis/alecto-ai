@@ -172,7 +172,15 @@ const RECOMMENDATION_MARKERS: RegExp[] = [
   /\bmira a qui[eé]n ha contratado\b/i,
   /\bsolicitar con perfil y cv\b/i,
   /\b(empleos|ofertas|vacantes)\s+(recomendad[oa]s|similares|que\s+te\s+pueden\s+interesar)\b/i,
-  /\bpersonas\s+tambi[eé]n\s+vieron\b/i
+  /\bpersonas\s+tambi[eé]n\s+vieron\b/i,
+  // fix/private-alpha-production-email-progress-truth (Task 7): a real reported bug — "Ahora sigue
+  // estos pasos..." (LinkedIn's own "next steps" upsell/marketing block, distinct from the email's
+  // genuine content) and "Descubre otros..." (a generic "discover more" teaser) still leaked into
+  // the default detail view.
+  /\bahora sigue estos pasos\b/i,
+  /\bdescubre otr[oa]s?\b/i,
+  /\bnow follow these steps\b/i,
+  /\bdiscover other\b/i
 ];
 
 function stripRecommendationNoise(text: string): string {
@@ -218,7 +226,13 @@ function stripSeparatorLines(text: string): string {
   return text
     .split("\n")
     .filter((line) => !/^[\s\-=_*~.·•]{3,}$/.test(line))
-    .join("\n");
+    .join("\n")
+    // fix/private-alpha-production-email-progress-truth (Task 7): a real reported bug — separator
+    // garbage trailing directly after a real line of content ("Aplicado el 2 de septiembre de
+    // 2026. ----------"), which the whole-line-only check above never touches since the line isn't
+    // ENTIRELY separator characters. A run of 3+ repeated separator characters is never legitimate
+    // prose wherever it appears, not just alone on its own line.
+    .replace(/[\-=_*~.·•]{3,}/g, " ");
 }
 
 /**

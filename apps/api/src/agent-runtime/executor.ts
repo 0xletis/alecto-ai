@@ -48,6 +48,8 @@ import {
   buildOpenActionCommandFooter,
   cleanEmailBodyForDisplay,
   countEvidenceForMetric,
+  resolveGoalMetricForCanonicalEvent,
+  type CanonicalEventMetricBridge,
   CUSTOM_SIGNAL_EVENT_TYPE,
   DEFAULT_EMAIL_DETAIL_LENGTH,
   FULL_EMAIL_DETAIL_LENGTH,
@@ -1219,15 +1221,19 @@ export async function executeOperation(
 
       case "event.log_job_applications": {
         const count = args.count as number;
-        const created = await createEvents(
-          userId,
-          Array.from({ length: count }, () => ({
-            type: "career.application_sent" as const,
-            source: "manual" as const,
-            confidence: 1,
-            evidence: [args.notes as string | undefined, message].filter(Boolean) as string[]
-          }))
-        );
+        // fix/private-alpha-production-email-progress-truth (Task 5): the SAME shared write path
+        // gmail.review.log_progress now uses — never a parallel event-creation call that happens to
+        // look similar. Resolved against every active goal (not just ones that already declare the
+        // canonical eventType) so a goal created via the adaptive flow, whose own metric for this
+        // activity is signalKey-shaped, still gets a real, countable write — see
+        // logApplicationSentProgress's own reasoning for why that bridge exists at all.
+        const verificationMetrics = resolveApplicationSentVerificationMetrics(context.activeGoals);
+        const { events: created } = await logApplicationSentProgress(userId, verificationMetrics, {
+          count,
+          timestamp: resolveAgentRuntimeNow(),
+          evidence: [args.notes as string | undefined, message].filter(Boolean) as string[],
+          source: "manual"
+        });
         const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
 
         // fix/private-alpha-gmail-review-llm-instruction-routing addendum (Task 3) — a real
@@ -1253,7 +1259,7 @@ export async function executeOperation(
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged ${created.length} job application${created.length === 1 ? "" : "s"} sent.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}${coachingNote}`,
+          summary: `Logged ${count} job application${count === 1 ? "" : "s"} sent.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}${coachingNote}`,
           result: created,
           entities: completedAction ? [actionToEntity(completedAction)] : undefined
         };
@@ -2624,54 +2630,69 @@ export async function executeOperation(
         // always knows the email's OWN stated application date, if any. A failed/unavailable
         // refetch is never fatal here — it just falls through to the Gmail-received-date/now
         // fallback, same honest degradation gmail.review.detail already uses.
-        const { refetch, understandingResult } = await fetchAndUnderstandGmailReview(userId, review, context);
+        const { refetch, understandingResult, linkedGoal } = await fetchAndUnderstandGmailReview(userId, review, context);
         const appliedDateText = understandingResult?.understanding?.keyDetails?.appliedDate ?? undefined;
         const gmailReceivedDateText = refetch.status === "ok" ? refetch.content.date : undefined;
         const resolvedDate = resolveEmailProgressDate({ message, appliedDateText, gmailReceivedDateText, now: resolveAgentRuntimeNow(), timezone });
 
-        // fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 2): a real
-        // reported bug — "Logged 1 CV sent" every time, but the SAME aggregate goal.status reads
-        // stayed unchanged live. Root cause could never be conclusively reproduced against this
-        // exact committed code (a direct repro of the live transcript's Sep 2 scenario correctly
-        // showed Today: 1 / This week: 17), which points at a deploy/version-lag or a genuine race
-        // rather than a code defect that always fires — but "we couldn't reproduce it" is not the
-        // same as "it can't happen," so this now VERIFIES rather than assumes. Baseline counts are
-        // read with getEventsSince — the exact same function goal.status itself calls — captured
-        // BEFORE the write, then re-read fresh (a real new query, never the in-memory `created`
-        // array) AFTER it, and the reply only ever claims "Logged" once the real delta is confirmed.
+        // fix/private-alpha-production-email-progress-truth: the CONFIRMED root cause of the live
+        // "Logged 1 CV sent" / goal.status-stays-unchanged contradiction — the previous invariant
+        // verified a hardcoded, global "career.application_sent" type count, but this user's actual
+        // goal (created via the adaptive natural-language flow) declares a signalKey-based metric
+        // for "applications sent," which goal.status's OWN countEvidenceForMetric call NEVER matches
+        // against a career.application_sent-typed event — a genuine "verifying a different metric
+        // than what's displayed" bug, not a race or a deploy-lag. Verification now uses
+        // countApplicationSentProgress, which sums the EXACT SAME countEvidenceForMetric calls
+        // formatGoalStatusForChat itself makes, over the SAME (goal, metric) pairs
+        // logApplicationSentProgress just wrote to — never a parallel assumption about event shape.
+        const verificationMetrics = resolveApplicationSentVerificationMetrics(linkedGoal ? [linkedGoal] : []);
         const sevenDaysAgo = new Date(resolveAgentRuntimeNow().getTime() - 7 * 24 * 60 * 60 * 1000);
         const todayLocalDate = formatDateInTimezone(resolveAgentRuntimeNow(), timezone);
-        const countCanonicalEvents = (events: StoredEvent[]) => ({
-          week: events.filter((event) => event.type === "career.application_sent").length,
-          today: events.filter((event) => event.type === "career.application_sent" && formatDateInTimezone(event.timestamp, timezone) === todayLocalDate).length
+        const countBoth = (events: StoredEvent[]) => ({
+          week: countApplicationSentProgress(events, verificationMetrics),
+          today: countApplicationSentProgress(
+            events.filter((event) => formatDateInTimezone(event.timestamp, timezone) === todayLocalDate),
+            verificationMetrics
+          )
         });
-        const before = countCanonicalEvents(await getEventsSince(userId, sevenDaysAgo));
+        const before = countBoth(await getEventsSince(userId, sevenDaysAgo));
+        const openAction = reconcileApplicationsSentWithOpenAction(count, context.openActions);
+
+        // fix/private-alpha-production-email-progress-truth (Task 2): unconditional, structured
+        // "before" diagnostic — every attempt, not just failures, so a live incident has a full
+        // before/after trail to compare rather than only ever seeing the failure half.
+        console.log("[gmail.review.log_progress] attempt", {
+          userId,
+          goalId: linkedGoal?.id,
+          reviewId: review.id,
+          reviewReason: review.reason,
+          resolvedProgressDate: resolvedDate.date.toISOString(),
+          currentLocalDate: todayLocalDate,
+          metricKeys: verificationMetrics.map(({ metric }) => metric.eventType ?? metric.signalKey ?? metric.key),
+          baselineTodayCount: before.today,
+          baselineWeekCount: before.week,
+          openActionReconciliation: openAction.kind
+        });
 
         // Dedupe — the same underlying email can never be counted twice even across retries/races,
         // keyed off the underlying Gmail message (connectionId + providerMessageId), not the review
         // row's own externalId, since two DIFFERENT review rows (e.g. from two separate rules both
         // watching the same account) can point at the exact same email and must still dedupe across
         // each other, not just across repeats of the SAME review row.
-        const created: StoredEvent[] = [];
-        let newlyCreatedCount = 0;
-        for (let i = 0; i < count; i += 1) {
-          const result = await createExternalEventIfNotExists(userId, {
-            type: "career.application_sent",
-            source: "gmail",
-            confidence: 1,
-            timestamp: resolvedDate.date,
-            evidence: [gmailReviewChatLabel(review, context.gmailRules), message].filter(Boolean) as string[],
-            externalId: `gmail-message:${review.connectionId}:${review.providerMessageId}:cv-sent:${i}`
-          });
-          created.push(result.event);
-          if (result.created) newlyCreatedCount += 1;
-        }
+        const { events: created, newlyCreatedCount } = await logApplicationSentProgress(userId, verificationMetrics, {
+          count,
+          timestamp: resolvedDate.date,
+          evidence: [gmailReviewChatLabel(review, context.gmailRules), message].filter(Boolean) as string[],
+          source: "gmail",
+          externalIdBase: `gmail-message:${review.connectionId}:${review.providerMessageId}:cv-sent`
+        });
 
         if (newlyCreatedCount === 0) {
           // Nothing new was written — an honest duplicate, not a verification question. Still
           // resolves the review (it IS decided, just not double-counted) but never claims "logged."
           await approveEmailReviewItem(userId, review.id, created[0]?.id);
           const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+          console.log("[gmail.review.log_progress] result", { userId, reviewId: review.id, responsePath: "duplicate", verified: null, reviewResolved: true });
           return {
             tool: operation.tool,
             status: "executed",
@@ -2681,7 +2702,7 @@ export async function executeOperation(
           };
         }
 
-        const after = countCanonicalEvents(await getEventsSince(userId, sevenDaysAgo));
+        const after = countBoth(await getEventsSince(userId, sevenDaysAgo));
         // A resolved date older than the 7-day window (a real, if unusual, case — backlogging an
         // old application-confirmation email) genuinely never appears in "this week," so there is
         // nothing to verify against it; only require the week delta when the event actually landed
@@ -2694,22 +2715,30 @@ export async function executeOperation(
         const forceVerificationFailure = process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL === "true";
         const weekVerified = !forceVerificationFailure && (!dateWithinWeek || after.week === before.week + newlyCreatedCount);
         const todayVerified = !forceVerificationFailure && (!resolvedDate.isToday || after.today === before.today + newlyCreatedCount);
+        const verified = weekVerified && todayVerified;
 
-        if (!weekVerified || !todayVerified) {
+        console.log("[gmail.review.log_progress] result", {
+          userId,
+          goalId: linkedGoal?.id,
+          reviewId: review.id,
+          eventIds: created.map((event) => event.id),
+          eventType: created[0]?.type,
+          eventDate: created[0]?.timestamp?.toISOString(),
+          count: newlyCreatedCount,
+          postTodayCount: after.today,
+          postWeekCount: after.week,
+          expectedTodayDelta: resolvedDate.isToday ? newlyCreatedCount : 0,
+          expectedWeekDelta: dateWithinWeek ? newlyCreatedCount : 0,
+          metricAggregationScope: verificationMetrics.length > 0 ? "goal-metric" : "global-canonical-type",
+          verified,
+          responsePath: verified ? "logged" : "verification_failed"
+        });
+
+        if (!verified) {
           // Never resolves the review, never claims "logged" — the write happened (the events are
           // real rows), but goal.status's OWN read of them didn't show the expected delta, so the
           // one thing this tool must never do (claim success the aggregate doesn't back up) is
-          // skipped in favor of an honest, actionable admission. Always logged server-side
-          // (unconditional — this is a real data-integrity signal, not routine diagnostics).
-          console.error("[gmail.review.log_progress] read-after-write verification failed", {
-            userId,
-            reviewId: review.id,
-            eventIds: created.map((event) => event.id),
-            newlyCreatedCount,
-            before,
-            after,
-            resolvedDate: { iso: resolvedDate.date.toISOString(), isToday: resolvedDate.isToday, label: resolvedDate.label }
-          });
+          // skipped in favor of an honest, actionable admission.
           return {
             tool: operation.tool,
             status: "executed",
@@ -2722,7 +2751,7 @@ export async function executeOperation(
         const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
 
         const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
-        const reconciliation = reconcileApplicationsSentWithOpenAction(count, context.openActions);
+        const reconciliation = openAction;
         let completedAction: ActionItem | undefined;
         if (reconciliation.kind === "complete") {
           completedAction = await completeActionItem(userId, reconciliation.action.id);
@@ -3931,6 +3960,112 @@ function formatShortDateLabel(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-GB", { timeZone: timezone, day: "numeric", month: "short" }).format(date);
 }
 
+// fix/private-alpha-production-email-progress-truth: the confirmed root cause of the live "Logged 1
+// CV sent" / goal.status-never-moves contradiction — a goal created via the adaptive natural-
+// language flow (goal.create_apply) ALWAYS declares signalKey-based metrics, even for an activity
+// ("applications sent") that also has a real registered eventType. A tool that only ever wrote the
+// canonical career.application_sent-typed event had nothing THAT goal's own countEvidenceForMetric
+// call would ever recognize. Shared by both gmail.review.log_progress and
+// event.log_job_applications so "I sent 1 CV" and "mark it as a CV sent" are provably the same
+// underlying write, not two paths that happen to look similar.
+const APPLICATION_SENT_METRIC_BRIDGE: CanonicalEventMetricBridge = {
+  eventType: "career.application_sent",
+  labelKeywords: /\b(applications?|cvs?)\b/i
+};
+
+// Resolved ONCE, up front, from whichever goals are actually relevant to this log attempt — the
+// SAME resolved (goal, metric) pairs are then used both to count the BEFORE baseline, to decide
+// which bridge events to write, and to count the AFTER result, so verification can never drift from
+// what was actually written by re-deriving the metric list a second time differently.
+function resolveApplicationSentVerificationMetrics(targetGoals: Goal[]): Array<{ goal: Goal; metric: GoalMetric }> {
+  return targetGoals
+    .map((goal) => {
+      const metric = resolveGoalMetricForCanonicalEvent(goal, APPLICATION_SENT_METRIC_BRIDGE);
+      return metric ? { goal, metric } : undefined;
+    })
+    .filter((entry): entry is { goal: Goal; metric: GoalMetric } => Boolean(entry));
+}
+
+// Sums countEvidenceForMetric — the EXACT function formatGoalStatusForChat itself calls — across
+// every resolved (goal, metric) pair. When no linked goal has a compatible metric at all (the review
+// isn't linked to any goal, or none track this activity), falls back to a plain canonical-type
+// count — there's no specific goal display to disagree with in that case, so this is the same
+// honest, best-effort global signal the tool always had.
+function countApplicationSentProgress(events: StoredEvent[], verificationMetrics: Array<{ goal: Goal; metric: GoalMetric }>): number {
+  if (verificationMetrics.length === 0) {
+    return events.filter((event) => event.type === "career.application_sent").length;
+  }
+  return verificationMetrics.reduce((sum, { metric }) => sum + countEvidenceForMetric(metric, events), 0);
+}
+
+async function logApplicationSentProgress(
+  userId: string,
+  verificationMetrics: Array<{ goal: Goal; metric: GoalMetric }>,
+  input: { count: number; timestamp: Date; evidence: string[]; source: "manual" | "gmail"; externalIdBase?: string }
+): Promise<{ events: StoredEvent[]; newlyCreatedCount: number }> {
+  const events: StoredEvent[] = [];
+  let newlyCreatedCount = 0;
+
+  // Always the canonical, registry-backed event first — the one write every path must keep making
+  // identically, so cross-goal/global history stays consistent even for a goal with no compatible
+  // metric at all (and so a goal that DOES declare the real eventType metric is covered directly).
+  for (let i = 0; i < input.count; i += 1) {
+    if (input.externalIdBase) {
+      const result = await createExternalEventIfNotExists(userId, {
+        type: "career.application_sent",
+        source: input.source,
+        confidence: 1,
+        timestamp: input.timestamp,
+        evidence: input.evidence,
+        externalId: `${input.externalIdBase}:${i}`
+      });
+      events.push(result.event);
+      if (result.created) newlyCreatedCount += 1;
+    } else {
+      events.push(await createEvent(userId, { type: "career.application_sent", source: input.source, confidence: 1, timestamp: input.timestamp, evidence: input.evidence }));
+      newlyCreatedCount += 1;
+    }
+  }
+
+  // Bridge write: for every resolved goal whose OWN declared metric for this activity is
+  // signalKey-shaped (not the canonical eventType, already covered above), also write a matching
+  // custom.goal_progress_logged event — the exact shape goal.log_evidence already uses for a
+  // signalKey metric — so that goal's own countEvidenceForMetric call recognizes it too.
+  for (const { goal, metric } of verificationMetrics) {
+    if (metric.eventType === "career.application_sent" || !metric.signalKey) {
+      continue;
+    }
+
+    for (let i = 0; i < input.count; i += 1) {
+      if (input.externalIdBase) {
+        const result = await createExternalEventIfNotExists(userId, {
+          type: "custom.goal_progress_logged",
+          source: input.source,
+          confidence: 1,
+          timestamp: input.timestamp,
+          data: { signalKey: metric.signalKey },
+          evidence: input.evidence,
+          externalId: `${input.externalIdBase}:bridge:${goal.id}:${metric.signalKey}:${i}`
+        });
+        events.push(result.event);
+      } else {
+        events.push(
+          await createEvent(userId, {
+            type: "custom.goal_progress_logged",
+            source: input.source,
+            confidence: 1,
+            timestamp: input.timestamp,
+            data: { signalKey: metric.signalKey },
+            evidence: input.evidence
+          })
+        );
+      }
+    }
+  }
+
+  return { events, newlyCreatedCount };
+}
+
 // fix/private-alpha-email-review-resolution-and-stale-classification (Task 3/4): the shared
 // full-body detail/explanation flow behind both gmail.review.detail and gmail.review.inspect
 // (which is now a thin alias — see the switch case above). Readonly Gmail refetch → clean/redact
@@ -4049,7 +4184,13 @@ const GMAIL_REVIEW_LIST_AUTO_REFRESH_MAX_ITEMS = 3;
 // A row is a candidate for auto-refresh on LIST only when its stored classification is itself
 // uncertain/generic — never re-checks a row that already reads as a specific, confident
 // classification (application_confirmation, recruiter_reply, ...), which would just be wasted
-// latency for a row the list already displays correctly.
+// latency for a row the list already displays correctly. fix/private-alpha-production-email-
+// progress-truth (Task 9): a real reported bug had a generic recruiter opportunity mislabeled "job
+// offer" — deliberately NOT added to this auto-refresh set, though, since "offer" rows are rare but
+// would otherwise be re-verified (a live Gmail refetch + LLM call) on every single list view until
+// resolved. The classifier prompt fix prevents new misclassifications; an already-stale "offer" row
+// still gets corrected the moment the user opens "details for N" (which always refreshes) or runs
+// the explicit "refresh email reviews" command — both already existing, uncapped-frequency paths.
 const STALE_LOOKING_GMAIL_REVIEW_REASONS = new Set(["uncertain signal", "unknown", "rule_classification", "rules_match", "custom_rule_match"]);
 
 function looksLikeStaleGmailReviewClassification(review: Pick<EmailReviewItem, "reason">): boolean {
