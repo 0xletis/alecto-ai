@@ -182,7 +182,7 @@ test("5. 'show me the email reviews' routes to gmail.review.list, not avoidance"
     const reply = await sendAgentMessage(server, userId, "show me the email reviews");
 
     assert.doesNotMatch(reply.reply, /avoidance|conflicts with your goal|meditations/i);
-    assert.match(reply.reply, /pending gmail reviews:/i);
+    assert.match(reply.reply, /pending gmail reviews?:/i);
     assert.match(reply.reply, /recruiter reply/i);
     assert.equal(reply.debug.mutationExecuted, false);
   } finally {

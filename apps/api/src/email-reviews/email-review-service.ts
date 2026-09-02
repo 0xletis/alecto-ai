@@ -743,6 +743,60 @@ export function gmailReviewPresentationCategoryLabel(category: GmailReviewPresen
  * at once ("log the application confirmations", "ignore the noise") instead of reading 10 raw rows
  * — numbering stays global across groups so every existing numbered-reference command still works.
  */
+// fix/private-alpha-email-progress-count-and-review-ux (Task 6): a clean row — short label
+// (extracted company when the classifier already captured one at sync/classification time, else
+// the subject), role if extracted, classification, date, linked goal — never the raw stored
+// snippet/evidence text (which can carry tracking-link fragments, invisible characters, and
+// duplicated body text straight from the source email). No live refetch/LLM call here — list rows
+// stay cheap; a full readonly refetch + understanding only ever happens on "details for N".
+function gmailReviewRowLine(
+  review: EmailReviewItem,
+  rules: EmailSignalRule[],
+  activeGoals: Goal[],
+  timezone: string,
+  number: number
+): string {
+  const extracted = (review.extracted ?? {}) as Record<string, unknown>;
+  const company = typeof extracted.company === "string" && extracted.company.trim() ? extracted.company.trim() : undefined;
+  const role = typeof extracted.role === "string" && extracted.role.trim() ? extracted.role.trim() : undefined;
+  const label = company ?? gmailReviewChatLabel(review, rules);
+  const signalType = gmailReviewSignalTypeLabel(review);
+  const received = formatDateInTimezone(review.createdAt, timezone);
+  const rule = rules.find((item) => item.id === review.ruleId);
+  const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0] : undefined;
+  const linkedGoal = linkedGoalId ? activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+  const priorityPrefix = isHighPriorityGmailReview(review) ? "[High priority] " : "";
+
+  const parts = [label, role, signalType].filter((part): part is string => Boolean(part));
+
+  return `${number}. ${priorityPrefix}${parts.join(" — ")} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`;
+}
+
+// fix/private-alpha-email-progress-count-and-review-ux (Task 5): a real reported bug — the old
+// footer always said "details for 3" and offered "log the application confirmations"/"reject the
+// Endesa one" regardless of what was actually visible, including when only ONE review existed and
+// no confirmation/noise group or Endesa-named review was anywhere on screen. Contextual now: a
+// single review gets its own exact, grounded footer; a multi-review list only ever mentions a
+// category command when that category is actually present, and never names a specific company —
+// "with a number"/"one/all of them" instead of a fabricated example.
+function gmailReviewListFooter(reviewCount: number, groups: Array<{ category: GmailReviewPresentationCategory }>): string {
+  if (reviewCount === 1) {
+    return 'Reply "details for 1", "mark it as counted", or "ignore it if already counted."';
+  }
+
+  const base = groups.length > 1 ? "Open details with a number." : "Reply with a number for details, or say what to do with one/all of them.";
+
+  const suggestions: string[] = [];
+  if (groups.some((group) => group.category === "confirmation")) {
+    suggestions.push('"log the confirmations" if they are not already counted');
+  }
+  if (groups.some((group) => group.category === "noise")) {
+    suggestions.push('"ignore the noise"');
+  }
+
+  return suggestions.length > 0 ? `${base} You can also say ${suggestions.join(" or ")}.` : base;
+}
+
 export function formatGmailReviewListForChat(
   reviews: EmailReviewItem[],
   rules: EmailSignalRule[],
@@ -763,32 +817,20 @@ export function formatGmailReviewListForChat(
     }))
     .filter((group) => group.entries.length > 0);
 
-  const lines = ["Pending Gmail reviews:"];
+  const lines = [reviews.length === 1 ? "Pending Gmail review:" : "Pending Gmail reviews:"];
+  const showGroupHeadings = groups.length > 1;
 
   for (const group of groups) {
-    lines.push("", `${group.label}:`);
+    if (showGroupHeadings) {
+      lines.push("", `${group.label}:`);
+    }
 
     for (const { review, number } of group.entries) {
-      const label = gmailReviewChatLabel(review, rules);
-      const description = gmailReviewChatDescription(review);
-      const signalType = gmailReviewSignalTypeLabel(review);
-      const received = formatDateInTimezone(review.createdAt, timezone);
-      const rule = rules.find((item) => item.id === review.ruleId);
-      const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, activeGoals)][0] : undefined;
-      const linkedGoal = linkedGoalId ? activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
-      const priorityPrefix = isHighPriorityGmailReview(review) ? "[High priority] " : "";
-
-      lines.push(
-        `${number}. ${priorityPrefix}${label}${description ? ` — ${description}` : ""} — ${signalType} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`
-      );
+      lines.push(gmailReviewRowLine(review, rules, activeGoals, timezone, number));
     }
   }
 
-  lines.push(
-    "",
-    'Say "details for 3" to see the important email text and why I classified it.',
-    'Reply naturally: "log the application confirmations", "ignore the noise", "turn the recruiter one into a task", "reject the Endesa one", or reference by number.'
-  );
+  lines.push("", gmailReviewListFooter(reviews.length, groups));
 
   return lines.join("\n");
 }
@@ -893,12 +935,54 @@ export function humanSuggestedActionLabel(action: EmailUnderstanding["suggestedU
   return labels[action];
 }
 
+/** fix/private-alpha-email-progress-count-and-review-ux (Task 9): a real reported bug — an email
+ * clearly classified as "application confirmation" still showed "Suggested action: keep monitoring
+ * — nothing to decide right now," because the detail view trusted the LLM's own free-form
+ * `suggestedUserAction` enum value verbatim, and a confirmation-shaped email doesn't reliably make
+ * the model pick "approve" over "monitor." The concrete next step is DERIVED from the email's own
+ * classified kind here — a fact the classifier already committed to — rather than re-trusted from a
+ * second, looser LLM field. `ask_clarification` (a low-confidence/needs_clarification result) always
+ * wins regardless of kind, since the classifier itself said it isn't sure what this is. */
+export function suggestedActionCopyForEmailKind(kind: EmailKind, understandingStatus: "ok" | "needs_clarification"): string {
+  if (understandingStatus === "needs_clarification") {
+    return humanSuggestedActionLabel("ask_clarification");
+  }
+
+  const copyByKind: Partial<Record<EmailKind, string>> = {
+    application_confirmation: "Mark as CV sent if not already counted, or ignore if already counted.",
+    recruiter_reply: "Turn this into a follow-up action, or ignore if already handled.",
+    interview: "Turn this into a follow-up action, or ignore if already handled.",
+    offer: "Turn this into a follow-up action, or ignore if already handled.",
+    rejection: "Log this outcome, or ignore if already noted.",
+    job_alert: "Ignore — this is a listing/broadcast, not a personal reply.",
+    marketing: "Ignore — this is a listing/broadcast, not a personal reply.",
+    security_auth: "Ignore — this is a verification code, nothing to act on.",
+    onboarding: "Ignore, unless it needs a setup step — then turn it into an action.",
+    receipt: "Turn into an action if payment is due, or mark handled if already paid.",
+    invoice: "Turn into an action if payment is due, or mark handled if already paid.",
+    travel_booking: "Monitor, or turn into an action if it needs a response (rebooking, check-in).",
+    flight_update: "Monitor, or turn into an action if it needs a response (rebooking, check-in).",
+    insurance: "Turn into an action if it needs a response, otherwise monitor.",
+    admin_notice: "Turn into an action if there's a deadline or appointment to keep, otherwise monitor.",
+    appointment: "Turn into an action if there's a deadline or appointment to keep, otherwise monitor.",
+    subscription: "Turn into an action if you want to change or cancel it, otherwise ignore.",
+    personal_message: "Reply personally — nothing for me to track here."
+  };
+
+  return copyByKind[kind] ?? humanSuggestedActionLabel("ask_clarification");
+}
+
 export interface GmailReviewDetailResponseInput {
   number: number;
   title: string;
   currentClassification: string;
   linkedGoalTitle?: string;
   whyItMatters: string;
+  /** fix/private-alpha-email-progress-count-and-review-ux (Task 7): already-formatted "Label:
+   * value" lines (e.g. "Company: Iqana", "Applied: 1 Sep 2026") from EmailUnderstanding's
+   * keyDetails (job-application-shaped) or keyFacts (every other domain) — omitted entirely when
+   * neither produced anything real, never a placeholder "not available" line. */
+  keyDetailLines?: string[];
   importantText: string;
   suggestedAction: string;
 }
@@ -915,9 +999,37 @@ export function formatGmailReviewDetailResponse(input: GmailReviewDetailResponse
     lines.push(`Linked goal: ${input.linkedGoalTitle}`);
   }
 
-  lines.push(`Why it matters: ${input.whyItMatters}`, "Important text:", input.importantText, "Suggested action:", input.suggestedAction);
+  lines.push(`Why it matters: ${input.whyItMatters}`);
+
+  if (input.keyDetailLines && input.keyDetailLines.length > 0) {
+    lines.push("Key details:", ...input.keyDetailLines.map((line) => `- ${line}`));
+  }
+
+  lines.push("Important text:", input.importantText, "Suggested action:", input.suggestedAction);
 
   return lines.join("\n");
+}
+
+/** fix/private-alpha-email-progress-count-and-review-ux (Task 7): turns EmailUnderstanding's
+ * structured keyDetails/keyFacts into the "Key details:" bullet lines above — company/role/
+ * location/status/nextStep only when the model actually stated them (never a placeholder for a
+ * missing one), "Applied: <date>" formatted from the raw stated date text via
+ * parseStatedDateText/formatKeyDetailDate so it reads like a real date rather than the model's raw
+ * phrasing. Falls back to keyFacts verbatim for every non-job-application domain. */
+export function keyDetailLinesFromUnderstanding(understanding: Pick<EmailUnderstanding, "keyDetails" | "keyFacts">): string[] {
+  const details = understanding.keyDetails;
+  if (details) {
+    const lines: string[] = [];
+    if (details.company) lines.push(`Company: ${details.company}`);
+    if (details.role) lines.push(`Role: ${details.role}`);
+    if (details.location) lines.push(`Location: ${details.location}`);
+    if (details.appliedDate) lines.push(`Applied: ${details.appliedDate}`);
+    if (details.status) lines.push(`Status: ${details.status}`);
+    if (details.nextStep) lines.push(`Next step: ${details.nextStep}`);
+    return lines;
+  }
+
+  return understanding.keyFacts ?? [];
 }
 
 export function emailReviewGroupLabel(kind: EmailReviewKind): string {

@@ -1,3 +1,97 @@
+// fix/private-alpha-email-progress-count-and-review-ux (Task 3): a small, dedicated PAST-date
+// parser for "what date does this email state" (e.g. "1 de septiembre de 2026", "September 1,
+// 2026") — deliberately separate from action-intake.ts's parseActionDueDate, which is a FUTURE-
+// oriented scheduling parser (it rolls a past-sounding date forward to the next occurrence, which
+// is exactly wrong for recording when something already happened). English + Spanish month names.
+const MONTH_NAME_TO_NUMBER: Record<string, number> = {
+  january: 1,
+  jan: 1,
+  enero: 1,
+  ene: 1,
+  february: 2,
+  feb: 2,
+  febrero: 2,
+  march: 3,
+  mar: 3,
+  marzo: 3,
+  april: 4,
+  apr: 4,
+  abril: 4,
+  may: 5,
+  mayo: 5,
+  june: 6,
+  jun: 6,
+  junio: 6,
+  july: 7,
+  jul: 7,
+  julio: 7,
+  august: 8,
+  aug: 8,
+  agosto: 8,
+  ago: 8,
+  september: 9,
+  sep: 9,
+  sept: 9,
+  septiembre: 9,
+  october: 10,
+  oct: 10,
+  octubre: 10,
+  november: 11,
+  nov: 11,
+  noviembre: 11,
+  december: 12,
+  dec: 12,
+  diciembre: 12,
+  dic: 12
+};
+
+function isoDateFromParts(year: number, month: number, day: number): string | undefined {
+  if (month < 1 || month > 12 || day < 1 || day > 31) {
+    return undefined;
+  }
+  return `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function stripAccentsLower(text: string): string {
+  return text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+/** Parses a date STATED in free text (never relative — "today"/"tomorrow" are not this parser's
+ * job, callers decide that themselves) into an ISO "YYYY-MM-DD" string, or undefined if nothing
+ * recognizable is present. Tries, in order: ISO (2026-09-01), Spanish "D de MONTH de YYYY" / "D
+ * MONTH YYYY", English "MONTH D, YYYY" / "D MONTH YYYY". Never guesses a year that wasn't stated. */
+export function parseStatedDateText(text: string): string | undefined {
+  const normalized = stripAccentsLower(text);
+
+  const iso = normalized.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (iso) {
+    return isoDateFromParts(Number(iso[1]), Number(iso[2]), Number(iso[3]));
+  }
+
+  const spanishLong = normalized.match(/\b(\d{1,2})\s+de\s+([a-z]+)\s+de\s+(\d{4})\b/);
+  if (spanishLong) {
+    const month = MONTH_NAME_TO_NUMBER[spanishLong[2]!];
+    if (month) return isoDateFromParts(Number(spanishLong[3]), month, Number(spanishLong[1]));
+  }
+
+  const dayMonthYear = normalized.match(/\b(\d{1,2})\s+(?:de\s+)?([a-z]+)\s+(?:de\s+)?(\d{4})\b/);
+  if (dayMonthYear) {
+    const month = MONTH_NAME_TO_NUMBER[dayMonthYear[2]!];
+    if (month) return isoDateFromParts(Number(dayMonthYear[3]), month, Number(dayMonthYear[1]));
+  }
+
+  const monthDayYear = normalized.match(/\b([a-z]+)\s+(\d{1,2}),?\s+(\d{4})\b/);
+  if (monthDayYear) {
+    const month = MONTH_NAME_TO_NUMBER[monthDayYear[1]!];
+    if (month) return isoDateFromParts(Number(monthDayYear[3]), month, Number(monthDayYear[2]));
+  }
+
+  return undefined;
+}
+
 export interface LocalDayRange {
   date: string;
   start: Date;

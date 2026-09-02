@@ -17424,6 +17424,12 @@ test(
   }
 );
 
+// --- fix/private-alpha-email-progress-count-and-review-ux: live-bug-report coverage for progress
+// count consistency (a "logged" claim must always be visible in the real aggregate, and a
+// duplicate email must never say "logged" again), daily-scope progress answers, email detail
+// cleanup (tracking URLs/recommendation blocks removed), and contextual review-list UX (no fake
+// examples, no stale classification left showing). Real planner + real understanding throughout.
+
 test(
   "466. Catalan: 'marca-ho com a CV enviat' after details resolves the review (email-progress-from-review C)",
   { ...llmEvalOptions(["email-progress-from-review"]), timeout: EVAL_TIMEOUT_MS },
@@ -17467,6 +17473,449 @@ test(
         const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
         trace.checkpoint("exactly one CV-sent event was logged", events === 1, `count=${events}`);
         assert.equal(events, 1, `expected exactly one career.application_sent event — got ${events}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// installEvalGmailFetchMock above hardcodes its message "Date:" header to a fixed fixture date
+// (2026-08-20) that many pre-existing scenarios were written around — fine for those, but the new
+// date-policy work (email-review-service.ts's resolveEmailProgressDate) means a scenario that
+// checks "this week"/"today" progress needs a message dated close to whenever the suite actually
+// runs, not a fixed date that silently drifts more than 7 days stale over time. Same shape as
+// installEvalGmailFetchMock, just with "now" as the message's own Date header.
+function installEvalGmailFetchMockDatedNow(messages: EvalGmailMessage[]): () => void {
+  const previousFetch = globalThis.fetch;
+
+  globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const urlText = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const url = new URL(urlText);
+
+    if (url.hostname !== "gmail.googleapis.com") {
+      return previousFetch(input, init);
+    }
+
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (method !== "GET") {
+      return new Response("mutation not allowed in readonly Gmail sync test", { status: 500 });
+    }
+
+    if (url.pathname === "/gmail/v1/users/me/messages") {
+      return new Response(JSON.stringify({ messages: messages.map((message) => ({ id: message.id })) }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    const messageId = url.pathname.split("/").pop() ?? "";
+    const message = messages.find((candidate) => candidate.id === messageId);
+    if (!message) {
+      return new Response("not found", { status: 404 });
+    }
+
+    return new Response(
+      JSON.stringify({
+        id: message.id,
+        threadId: `thread-${message.id}`,
+        snippet: message.body.slice(0, 120),
+        payload: {
+          mimeType: "text/plain",
+          headers: [
+            { name: "Subject", value: message.subject },
+            { name: "From", value: message.from },
+            { name: "Date", value: new Date().toUTCString() }
+          ],
+          body: { data: Buffer.from(message.body, "utf8").toString("base64url") }
+        }
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }) as typeof fetch;
+
+  return () => {
+    globalThis.fetch = previousFetch;
+  };
+}
+
+test(
+  "467. 'mark it as a CV sent' visibly increments the real weekly progress total (email-progress-count-consistency A)",
+  { ...llmEvalOptions(["email-progress-count-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-467-${randomUUID()}`;
+    const trace = new EvalTrace("467-progress-visibly-increments", ["email-progress-count-consistency"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-467-iqana", subject: "Iqana", from: "no-reply@iqana.example", body: "Se ha enviado tu solicitud a Iqana. Software Engineer." }]);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-467-iqana", subject: "Iqana", from: "no-reply@iqana.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark it as a CV sent", await sendAgentMessage(server, userId, "mark it as a CV sent"));
+        assertNoGenericAgentError(t3);
+
+        const t4 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+        const showsProgress = /1\b.*(cv|application)/i.test(t4.reply) || /(cv|application).*\b1\b/i.test(t4.reply);
+        trace.checkpoint("the real progress aggregate visibly shows the CV that was just logged", showsProgress, t4.reply);
+        assert.ok(showsProgress, `expected the logged CV to be visible in the real progress aggregate — got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "468. a duplicate email never falsely claims 'logged' progress (email-progress-count-consistency B)",
+  { ...llmEvalOptions(["email-progress-count-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-468-${randomUUID()}`;
+    const trace = new EvalTrace("468-duplicate-never-claims-logged", ["email-progress-count-consistency"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-468-iqana", subject: "Iqana", from: "no-reply@iqana.example", body: "Se ha enviado tu solicitud a Iqana." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const rule2 = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-468-iqana", subject: "Iqana", from: "no-reply@iqana.example", reason: "uncertain signal", updatedAt: new Date(Date.now() - 1000) });
+      await prisma.emailReviewItem.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          ruleId: rule2.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          providerMessageId: "eval-468-iqana",
+          externalId: `gmail-review:${rule2.id}:eval-468-iqana`,
+          status: "pending",
+          subject: "Iqana",
+          from: "no-reply@iqana.example",
+          snippet: "Iqana",
+          confidence: 0.6,
+          reason: "uncertain signal",
+          extracted: {}
+        }
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("mark 1 as a CV sent", await sendAgentMessage(server, userId, "mark 1 as a CV sent"));
+        const t3 = trace.record("mark 1 as a CV sent (again, other review)", await sendAgentMessage(server, userId, "mark 1 as a CV sent"));
+        assertNoGenericAgentError(t3);
+
+        const falselyLogged = /^logged 1/i.test(t3.reply.trim());
+        trace.checkpoint("the duplicate never says 'Logged 1...' again", !falselyLogged, t3.reply);
+        assert.ok(!falselyLogged, `a duplicate email must never falsely claim to log new progress — got: ${t3.reply}`);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("exactly one CV-sent event exists across both review rows", events === 1, `count=${events}`);
+        assert.equal(events, 1, `expected the same underlying email to be counted only once — got ${events}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "469. 'show today goal progress' shows a Today line even when it is zero (goal-progress-daily-scope A)",
+  { ...llmEvalOptions(["goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-469-${randomUUID()}`;
+    const trace = new EvalTrace("469-today-line-at-zero", ["goal-progress-daily-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createEvent(userId, { type: "career.application_sent", source: "manual", confidence: 1, timestamp: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000) });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+        assertNoGenericAgentError(t1);
+
+        const showsZeroToday = /today[^\n]*\b0\b/i.test(t1.reply);
+        trace.checkpoint("the reply states today's count is 0, not just the weekly total", showsZeroToday, t1.reply);
+        assert.ok(showsZeroToday, `expected an explicit Today: 0 line — got: ${t1.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "470. 'how many CVs did I send today?' answers the daily count directly, never weekly-only (goal-progress-daily-scope B)",
+  { ...llmEvalOptions(["goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-470-${randomUUID()}`;
+    const trace = new EvalTrace("470-daily-count-direct-answer", ["goal-progress-daily-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      await createEvent(userId, { type: "career.application_sent", source: "manual", confidence: 1, timestamp: new Date() });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("how many CVs did I send today?", await sendAgentMessage(server, userId, "how many CVs did I send today?"));
+        assertNoGenericAgentError(t1);
+
+        const answersToday = /today[^\n]*\b1\b|\b1\b[^\n]*today/i.test(t1.reply);
+        trace.checkpoint("the reply directly states today's real count", answersToday, t1.reply);
+        assert.ok(answersToday, `expected a direct answer about today's count — got: ${t1.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "471. an Iqana-shaped application-confirmation email's detail view is cleaned of tracking URLs and recommendations (email-detail-cleanup A)",
+  { ...llmEvalOptions(["email-detail-cleanup"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-471-${randomUUID()}`;
+    const trace = new EvalTrace("471-detail-cleanup-tracking-urls", ["email-detail-cleanup"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const noisyBody = [
+      "Se ha enviado tu solicitud a Iqana.",
+      "Software Engineer.",
+      "View job: https://www.linkedin.com/comm/jobs/view/998877?trk=flagship3_search_srp_jobcard&refId=zz9988",
+      "Jobs you may be interested in:",
+      "Backend Engineer at OtherCo"
+    ].join("\n");
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-471-iqana", subject: "Iqana", from: "no-reply@iqana.example", body: noisyBody }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-471-iqana", subject: "Iqana", from: "no-reply@iqana.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const leakedUrl = /linkedin\.com\/comm\/jobs/i.test(t2.reply);
+        trace.checkpoint("no raw tracking URL leaked into the default detail view", !leakedUrl, t2.reply);
+        assert.ok(!leakedUrl, `a raw tracking URL must never appear in the default detail view — got: ${t2.reply}`);
+
+        const leakedRecommendation = /Backend Engineer at OtherCo/i.test(t2.reply);
+        trace.checkpoint("no recommended-jobs block leaked into the default detail view", !leakedRecommendation, t2.reply);
+        assert.ok(!leakedRecommendation, `a recommendations block must never appear in the default detail view — got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "472. a stale 'uncertain signal' row is refreshed to 'application confirmation' before the list is shown (email-review-list-refresh A)",
+  { ...llmEvalOptions(["email-review-list-refresh"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-472-${randomUUID()}`;
+    const trace = new EvalTrace("472-stale-row-refreshed-before-list", ["email-review-list-refresh"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMock([{ id: "eval-472-iqana", subject: "Iqana", from: "no-reply@iqana.example", body: "Se ha enviado tu solicitud a Iqana. Software Engineer." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-472-iqana", subject: "Iqana", from: "no-reply@iqana.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        assertNoGenericAgentError(t1);
+
+        const stillStale = /uncertain signal/i.test(t1.reply);
+        trace.checkpoint("the list no longer shows the stale 'uncertain signal' label", !stillStale, t1.reply);
+        assert.ok(!stillStale, `expected the stale label to be refreshed before the list was shown — got: ${t1.reply}`);
+
+        const refreshed = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        trace.checkpoint("the review status is unchanged by the auto-refresh", refreshed?.status === "pending", refreshed?.status);
+        assert.equal(refreshed?.status, "pending", "an auto-refresh must never change review status");
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "473. a single-review list's footer is contextual, no fake company names or nonexistent numbers (email-review-list-ux A)",
+  { ...llmEvalOptions(["email-review-list-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-473-${randomUUID()}`;
+    const trace = new EvalTrace("473-single-review-contextual-footer", ["email-review-list-ux"], userId);
+
+    try {
+      await seedUser(userId);
+      const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-473-iqana",
+        subject: "Iqana",
+        from: "no-reply@iqana.example",
+        reason: "application_confirmation",
+        proposedEventType: "career.application_confirmation_received"
+      });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        assertNoGenericAgentError(t1);
+
+        const fabricatedNumber = /details for 3/i.test(t1.reply);
+        trace.checkpoint("no fabricated 'details for 3' when only one review exists", !fabricatedNumber, t1.reply);
+        assert.ok(!fabricatedNumber, `must never reference a review number that doesn't exist — got: ${t1.reply}`);
+
+        const fakeCompany = /reject the Endesa one/i.test(t1.reply);
+        trace.checkpoint("no fake company name in the footer", !fakeCompany, t1.reply);
+        assert.ok(!fakeCompany, `must never mention a company that isn't actually visible — got: ${t1.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "474. a grouped review list only offers commands for groups that are actually present (email-review-list-ux B)",
+  { ...llmEvalOptions(["email-review-list-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-474-${randomUUID()}`;
+    const trace = new EvalTrace("474-grouped-list-relevant-commands-only", ["email-review-list-ux"], userId);
+
+    try {
+      await seedUser(userId);
+      const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      // Only recruiter/interview ("needs review") — no confirmation group, no noise group.
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-474-m1", subject: "Recruiter note", from: "recruiter@example.com", reason: "recruiter_reply", proposedEventType: "career.recruiter_reply_received" });
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-474-m2", subject: "Interview invite", from: "hr@example.com", reason: "interview", proposedEventType: "career.interview_scheduled" });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        assertNoGenericAgentError(t1);
+
+        const mentionsAbsentNoise = /ignore the noise/i.test(t1.reply);
+        const mentionsAbsentConfirmations = /log the confirmations|log the application confirmations/i.test(t1.reply);
+        trace.checkpoint("no command mentioned for an absent noise/confirmation group", !mentionsAbsentNoise && !mentionsAbsentConfirmations, t1.reply);
+        assert.ok(!mentionsAbsentNoise, `must never suggest 'ignore the noise' with no noise group visible — got: ${t1.reply}`);
+        assert.ok(!mentionsAbsentConfirmations, `must never suggest logging confirmations with no confirmation group visible — got: ${t1.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "475. Spanish: 'márcalo como CV enviado' then 'cuántos CVs he enviado hoy' — logs and answers correctly (email-progress-count-consistency C / goal-progress-daily-scope C)",
+  { ...llmEvalOptions(["email-progress-count-consistency", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-475-${randomUUID()}`;
+    const trace = new EvalTrace("475-spanish-progress-and-daily-query", ["email-progress-count-consistency", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-475-iqana", subject: "Iqana", from: "no-reply@iqana.example", body: "Se ha enviado tu solicitud a Iqana." }]);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-475-iqana", subject: "Iqana", from: "no-reply@iqana.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("márcalo como CV enviado", await sendAgentMessage(server, userId, "márcalo como CV enviado"));
+        const t4 = trace.record("cuántos CVs he enviado hoy", await sendAgentMessage(server, userId, "cuántos CVs he enviado hoy"));
+        assertNoGenericAgentError(t4);
+
+        const answersToday = /\b1\b/.test(t4.reply);
+        trace.checkpoint("the Spanish daily query answers with the real count", answersToday, t4.reply);
+        assert.ok(answersToday, `expected the Spanish daily query to answer with 1 — got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "476. Catalan: 'marca-ho com a CV enviat' then 'quants CVs he enviat avui' — logs and answers correctly (email-progress-count-consistency D / goal-progress-daily-scope D)",
+  { ...llmEvalOptions(["email-progress-count-consistency", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-476-${randomUUID()}`;
+    const trace = new EvalTrace("476-catalan-progress-and-daily-query", ["email-progress-count-consistency", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-476-iqana", subject: "Iqana", from: "no-reply@iqana.example", body: "S'ha enviat la teva sol·licitud a Iqana." }]);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-476-iqana", subject: "Iqana", from: "no-reply@iqana.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("marca-ho com a CV enviat", await sendAgentMessage(server, userId, "marca-ho com a CV enviat"));
+        const t4 = trace.record("quants CVs he enviat avui", await sendAgentMessage(server, userId, "quants CVs he enviat avui"));
+        assertNoGenericAgentError(t4);
+
+        const answersToday = /\b1\b/.test(t4.reply);
+        trace.checkpoint("the Catalan daily query answers with the real count", answersToday, t4.reply);
+        assert.ok(answersToday, `expected the Catalan daily query to answer with 1 — got: ${t4.reply}`);
       });
     } finally {
       restoreFetch();

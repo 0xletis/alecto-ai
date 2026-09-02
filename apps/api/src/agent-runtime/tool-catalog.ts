@@ -765,11 +765,12 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "goal.status",
     description:
-      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence counted toward EACH of its declared signals (fixed or custom), and real pending Gmail reviews linked to it. Never invents counts or progress. If goalRef could plausibly mean more than one active goal, this asks which one instead of silently picking or falling back to a generic same-category goal. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', 'how many CVs did I send today?', or the equivalent for any other active goal (e.g. 'how's training going?', 'how's the tea goal going?', 'how's my Nietzsche book going?').",
+      "Grounded progress summary for one active goal (or all active goals if none is clearly named) — real open actions linked to it, real recent evidence counted toward EACH of its declared signals (fixed or custom), and real pending Gmail reviews linked to it. Never invents counts or progress. If goalRef could plausibly mean more than one active goal, this asks which one instead of silently picking or falling back to a generic same-category goal. Use for 'how is my job search going?', 'job search status', 'what did I do this week for jobs?', or the equivalent for any other active goal (e.g. 'how's training going?', 'how's the tea goal going?', 'how's my Nietzsche book going?'). For a question specifically about TODAY ('how many CVs did I send today?', 'how many today?', 'today progress', 'show today goal progress', 'cuántos CVs he enviado hoy', 'quants CVs he enviat avui') set scope to 'today' — this is a READ-ONLY question, never plan a logging tool (goal.log_evidence, event.log_job_applications) for it, even though it mentions a count and 'today'; only a genuine STATEMENT that something already happened ('I sent 3 CVs today') is a logging instruction.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
-      goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it (e.g. 'job search', 'training', 'Endesa bills', 'tea') — matched against real active goal titles/categories, never an invented id. Omit if the user didn't name a specific goal.")
+      goalRef: z.string().min(1).optional().describe("The goal's own wording as the user referred to it (e.g. 'job search', 'training', 'Endesa bills', 'tea') — matched against real active goal titles/categories, never an invented id. Omit if the user didn't name a specific goal."),
+      scope: z.enum(["today"]).optional().describe("Set to 'today' only when the user explicitly asked about TODAY's progress specifically — always shows today's real count first (zero included), never omitted.")
     })
   },
   {

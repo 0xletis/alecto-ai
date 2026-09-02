@@ -10,6 +10,7 @@ import {
   createEmailSignalRule,
   createEvent,
   createEvents,
+  createExternalEventIfNotExists,
   createGoal,
   createMemory,
   getActionItem,
@@ -63,7 +64,9 @@ import {
   gmailScheduledSyncRuntimeFromEnv,
   goalHasOnlyCompletionSignals,
   isProgressShapedSignalText,
+  localDateTimeToUtc,
   parseActionDueDate,
+  parseStatedDateText,
   proactiveOperatorAllowlistActiveFromEnv,
   proactiveOperatorAllowlistFromEnv,
   proactiveOperatorDeliveryEnabledFromEnv,
@@ -127,6 +130,8 @@ import {
   humanEmailKindLabel,
   humanEmailReviewEventLabel,
   humanSuggestedActionLabel,
+  keyDetailLinesFromUnderstanding,
+  suggestedActionCopyForEmailKind,
   rejectEmailReviewForUser
 } from "../email-reviews/email-review-service.js";
 import { formatMinutesOfDay, parseTimeOfDayText } from "../operator/daily-loop-settings.js";
@@ -2366,8 +2371,27 @@ export async function executeOperation(
 
       case "gmail.review.list": {
         const status = (args.status as EmailReviewItem["status"] | "all" | undefined) ?? "pending";
-        const items = await getEmailReviewItems(userId, { status, limit: (args.limit as number | undefined) ?? 10 });
+        let items = await getEmailReviewItems(userId, { status, limit: (args.limit as number | undefined) ?? 10 });
         const timezone = await getUserTimezone(userId);
+
+        // fix/private-alpha-email-progress-count-and-review-ux (Task 8): a real reported bug — the
+        // list said "uncertain signal" and a very next "details for N" immediately corrected it to
+        // "application confirmation," which is honest once but bad UX every time it's shown again.
+        // Bounded, stale-rows-only auto-refresh (see looksLikeStaleGmailReviewClassification above)
+        // — never on "all"/decided-status views, only ever the live pending queue the user is about
+        // to read right now.
+        if (status === "pending") {
+          const staleCandidates = items.filter((item) => looksLikeStaleGmailReviewClassification(item)).slice(0, GMAIL_REVIEW_LIST_AUTO_REFRESH_MAX_ITEMS);
+          if (staleCandidates.length > 0) {
+            // Merged in place, by id, rather than re-querying — a fresh query would re-sort by
+            // updatedAt (which the refresh write just bumped) and silently renumber the whole
+            // list mid-turn, breaking every "details for N"/"reject N" reference that follows.
+            const { refreshedItems } = await refreshStaleGmailReviewClassifications(userId, context, { candidates: staleCandidates });
+            const refreshedById = new Map(refreshedItems.map((item) => [item.id, item]));
+            items = items.map((item) => refreshedById.get(item.id) ?? item);
+          }
+        }
+
         return {
           tool: operation.tool,
           status: "executed",
@@ -2378,8 +2402,12 @@ export async function executeOperation(
       }
 
       case "gmail.review.refresh": {
-        const { refreshedCount, checkedCount } = await refreshStaleGmailReviewClassifications(userId, context);
-        const items = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const pendingBeforeRefresh = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const { refreshedCount, checkedCount, refreshedItems } = await refreshStaleGmailReviewClassifications(userId, context);
+        const refreshedById = new Map(refreshedItems.map((item) => [item.id, item]));
+        // Merged in place (same reasoning as gmail.review.list's own auto-refresh above) — never
+        // re-queried, so a refresh never silently renumbers the list it's about to show.
+        const items = pendingBeforeRefresh.map((item) => refreshedById.get(item.id) ?? item);
         const timezone = await getUserTimezone(userId);
         const refreshNote =
           checkedCount === 0
@@ -2570,17 +2598,56 @@ export async function executeOperation(
           return failed(operation.tool, "That email review no longer exists or was already decided.");
         }
 
+        const timezone = await getUserTimezone(userId);
         const count = (args.count as number | undefined) ?? 1;
-        const created = await createEvents(
-          userId,
-          Array.from({ length: count }, () => ({
-            type: "career.application_sent" as const,
-            source: "manual" as const,
+
+        // fix/private-alpha-email-progress-count-and-review-ux (Task 3): date policy — a fresh
+        // readonly refetch + understanding (never a stale cached value) so "mark it as a CV sent"
+        // always knows the email's OWN stated application date, if any. A failed/unavailable
+        // refetch is never fatal here — it just falls through to the Gmail-received-date/now
+        // fallback, same honest degradation gmail.review.detail already uses.
+        const { refetch, understandingResult } = await fetchAndUnderstandGmailReview(userId, review, context);
+        const appliedDateText = understandingResult?.understanding?.keyDetails?.appliedDate ?? undefined;
+        const gmailReceivedDateText = refetch.status === "ok" ? refetch.content.date : undefined;
+        const resolvedDate = resolveEmailProgressDate({ message, appliedDateText, gmailReceivedDateText, now: resolveAgentRuntimeNow(), timezone });
+
+        // fix/private-alpha-email-progress-count-and-review-ux (Task 2): dedupe — the same
+        // underlying email can never be counted twice even across retries/races, keyed off the
+        // review's own externalId (already unique per Gmail message) rather than trusting the
+        // status:"pending" guard above alone. A fully-duplicate result (every index already
+        // existed) resolves the review as a duplicate and reports honestly — it never says
+        // "logged" for progress that was never actually added.
+        // Keyed off the underlying Gmail message (connectionId + providerMessageId), not the
+        // review row's own externalId — two DIFFERENT review rows (e.g. from two separate rules
+        // both watching the same account) can point at the exact same email, and this must still
+        // dedupe across them, not just across repeats of the SAME review.
+        const created: StoredEvent[] = [];
+        let anyNewlyCreated = false;
+        for (let i = 0; i < count; i += 1) {
+          const result = await createExternalEventIfNotExists(userId, {
+            type: "career.application_sent",
+            source: "gmail",
             confidence: 1,
-            evidence: [gmailReviewChatLabel(review, context.gmailRules), message].filter(Boolean) as string[]
-          }))
-        );
+            timestamp: resolvedDate.date,
+            evidence: [gmailReviewChatLabel(review, context.gmailRules), message].filter(Boolean) as string[],
+            externalId: `gmail-message:${review.connectionId}:${review.providerMessageId}:cv-sent:${i}`
+          });
+          created.push(result.event);
+          if (result.created) anyNewlyCreated = true;
+        }
+
         await approveEmailReviewItem(userId, review.id, created[0]?.id);
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+
+        if (!anyNewlyCreated) {
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "That email was already counted, so I resolved the review without adding another CV.",
+            result: { emailReview: review, events: created, duplicate: true },
+            entities: remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+          };
+        }
 
         const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
         const reconciliation = reconcileApplicationsSentWithOpenAction(count, context.openActions);
@@ -2589,12 +2656,12 @@ export async function executeOperation(
           completedAction = await completeActionItem(userId, reconciliation.action.id);
         }
 
-        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const dateNote = resolvedDate.isToday ? "" : ` for ${resolvedDate.label}`;
 
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `Logged ${count} CV${count === 1 ? "" : "s"} sent from that email and resolved the review.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}`,
+          summary: `Logged ${count} CV${count === 1 ? "" : "s"} sent${dateNote} from that email and resolved the review.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}`,
           result: { emailReview: review, events: created, actionItem: completedAction },
           entities: [
             ...(completedAction ? [actionToEntity(completedAction)] : []),
@@ -2643,7 +2710,10 @@ export async function executeOperation(
         const recentEvents = await getEventsSince(userId, sevenDaysAgo);
         const todayLocalDate = formatDateInTimezone(new Date(), timezone);
 
-        const summaries = targetGoals.map((goal) => formatGoalStatusForChat(goal, { openActions: context.openActions, gmailReviews: context.gmailReviews, gmailRules: context.gmailRules, recentEvents, timezone, todayLocalDate }));
+        const scope = args.scope === "today" ? ("today" as const) : undefined;
+        const summaries = targetGoals.map((goal) =>
+          formatGoalStatusForChat(goal, { openActions: context.openActions, gmailReviews: context.gmailReviews, gmailRules: context.gmailRules, recentEvents, timezone, todayLocalDate, scope })
+        );
 
         return {
           tool: operation.tool,
@@ -3692,30 +3762,31 @@ export async function executeOperation(
   }
 }
 
-// fix/private-alpha-email-review-resolution-and-stale-classification (Task 3/4): the shared
-// full-body detail/explanation flow behind both gmail.review.detail and gmail.review.inspect
-// (which is now a thin alias — see the switch case above). Readonly Gmail refetch → clean/redact
-// → understand → (Task 3) write back a corrected classification when the review's stored label is
-// stale — never touches `status`, never approves/rejects/logs anything on its own.
-async function buildGmailReviewDetailResult(input: {
-  tool: string;
-  userId: string;
-  review: EmailReviewItem;
-  fullText: boolean;
-  context: ContextBundle;
-}): Promise<ExecutedOperation> {
-  const { tool, userId, review, fullText, context } = input;
-
-  const visibleReviewEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
-  const existingEntity = visibleReviewEntities.find((entity) => entity.id === review.id);
-  const number = existingEntity?.index ?? visibleReviewEntities.length + 1;
-
+// fix/private-alpha-email-progress-count-and-review-ux: the shared readonly refetch -> clean/redact
+// -> LLM-understand step behind gmail.review.detail/inspect, the bounded stale-classification
+// refresh, and gmail.review.log_progress's date-policy lookup — extracted once (previously
+// duplicated across the first two) so a change to the refetch/clean/understand pipeline can never
+// drift between callers. Never mutates anything itself.
+async function fetchAndUnderstandGmailReview(
+  userId: string,
+  review: EmailReviewItem,
+  context: ContextBundle,
+  options: { fullText?: boolean } = {}
+): Promise<{
+  refetch: Awaited<ReturnType<typeof refetchGmailReviewContentForAgentRuntime>>;
+  cleanedSubject: string;
+  cleanedBody: string;
+  senderDomain: string;
+  rule: EmailSignalRule | undefined;
+  linkedGoal: Goal | undefined;
+  understandingResult: ReturnType<typeof validateEmailUnderstanding> | undefined;
+}> {
   const rule = context.gmailRules.find((item) => item.id === review.ruleId);
   const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
   const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
 
   const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
-  const maxLength = fullText ? FULL_EMAIL_DETAIL_LENGTH : DEFAULT_EMAIL_DETAIL_LENGTH;
+  const maxLength = options.fullText ? FULL_EMAIL_DETAIL_LENGTH : DEFAULT_EMAIL_DETAIL_LENGTH;
   const usedLiveContent = refetch.status === "ok" && Boolean(refetch.content.rawBodyText);
   const rawSubject = usedLiveContent ? refetch.content.subject : review.subject ?? "";
   const rawBody = usedLiveContent
@@ -3740,6 +3811,73 @@ async function buildGmailReviewDetailResult(input: {
   } catch {
     understandingResult = undefined;
   }
+
+  return { refetch, cleanedSubject, cleanedBody, senderDomain, rule, linkedGoal, understandingResult };
+}
+
+// fix/private-alpha-email-progress-count-and-review-ux (Task 3): date policy for an email-derived
+// progress event — priority order: (1) the user EXPLICITLY says "today"/"hoy"/"avui" in this exact
+// turn, which always wins even over a different date the email itself states; (2) the date the
+// email body itself states the application/submission happened on; (3) the date Gmail says the
+// message was received; (4) "now", if nothing else resolved. Never guesses a date the email/Gmail/
+// user didn't actually provide.
+function resolveEmailProgressDate(input: {
+  message: string;
+  appliedDateText?: string;
+  gmailReceivedDateText?: string;
+  now: Date;
+  timezone: string;
+}): { date: Date; isToday: boolean; label: string } {
+  const todayLocalDate = formatDateInTimezone(input.now, input.timezone);
+
+  if (/\b(today|hoy|avui)\b/i.test(input.message)) {
+    return { date: input.now, isToday: true, label: "today" };
+  }
+
+  const bodyDate = input.appliedDateText ? parseStatedDateText(input.appliedDateText) : undefined;
+  if (bodyDate) {
+    return buildResolvedEmailProgressDate(bodyDate, todayLocalDate, input.timezone);
+  }
+
+  if (input.gmailReceivedDateText) {
+    const parsed = new Date(input.gmailReceivedDateText);
+    if (!Number.isNaN(parsed.getTime())) {
+      return buildResolvedEmailProgressDate(formatDateInTimezone(parsed, input.timezone), todayLocalDate, input.timezone);
+    }
+  }
+
+  return { date: input.now, isToday: true, label: "today" };
+}
+
+function buildResolvedEmailProgressDate(isoLocalDate: string, todayLocalDate: string, timezone: string): { date: Date; isToday: boolean; label: string } {
+  const date = localDateTimeToUtc(isoLocalDate, "12:00", timezone);
+  const isToday = isoLocalDate === todayLocalDate;
+  return { date, isToday, label: isToday ? "today" : formatShortDateLabel(date, timezone) };
+}
+
+function formatShortDateLabel(date: Date, timezone: string): string {
+  return new Intl.DateTimeFormat("en-GB", { timeZone: timezone, day: "numeric", month: "short" }).format(date);
+}
+
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 3/4): the shared
+// full-body detail/explanation flow behind both gmail.review.detail and gmail.review.inspect
+// (which is now a thin alias — see the switch case above). Readonly Gmail refetch → clean/redact
+// → understand → (Task 3) write back a corrected classification when the review's stored label is
+// stale — never touches `status`, never approves/rejects/logs anything on its own.
+async function buildGmailReviewDetailResult(input: {
+  tool: string;
+  userId: string;
+  review: EmailReviewItem;
+  fullText: boolean;
+  context: ContextBundle;
+}): Promise<ExecutedOperation> {
+  const { tool, userId, review, fullText, context } = input;
+
+  const visibleReviewEntities = context.session.visibleEntities.filter((entity) => entity.type === "gmail_review");
+  const existingEntity = visibleReviewEntities.find((entity) => entity.id === review.id);
+  const number = existingEntity?.index ?? visibleReviewEntities.length + 1;
+
+  const { refetch, cleanedSubject, cleanedBody, linkedGoal, understandingResult } = await fetchAndUnderstandGmailReview(userId, review, context, { fullText });
 
   const title = truncateForChat(cleanedSubject || gmailReviewChatLabel(review, context.gmailRules), 100);
   const importantText = cleanedBody || "I don't have enough content to show for this email.";
@@ -3767,9 +3905,7 @@ async function buildGmailReviewDetailResult(input: {
   const whyItMatters = understanding.why.length > 0 ? understanding.why.join("; ") : understanding.summary;
   const currentClassification =
     understanding.emailKind !== "unknown" ? humanEmailKindLabel(understanding.emailKind) : gmailReviewSignalTypeLabel(review);
-  const suggestedAction = humanSuggestedActionLabel(
-    understandingResult.status === "needs_clarification" ? "ask_clarification" : understanding.suggestedUserAction
-  );
+  const suggestedAction = suggestedActionCopyForEmailKind(understanding.emailKind, understandingResult.status);
 
   // fix/private-alpha-email-review-resolution-and-stale-classification (Task 3): a real
   // reported bug — a review created before a classifier fix kept its OLD, stale reason/
@@ -3806,6 +3942,7 @@ async function buildGmailReviewDetailResult(input: {
       currentClassification,
       linkedGoalTitle: linkedGoal?.title,
       whyItMatters,
+      keyDetailLines: keyDetailLinesFromUnderstanding(understanding),
       importantText,
       suggestedAction
     }),
@@ -3823,53 +3960,45 @@ async function buildGmailReviewDetailResult(input: {
   };
 }
 
-// fix/private-alpha-email-review-resolution-and-stale-classification (Task 6): after a classifier
-// fix ships, old pending reviews can keep a stale stored label forever unless the user happens to
-// open each one's detail individually. This is the explicit "refresh email reviews" path — the
-// preferred bounded/capped option (never runs unprompted on every gmail.review.list, which would
-// mean a readonly Gmail refetch + LLM call per pending row on every single list view). Reuses the
-// exact same refetch → clean → understand → refresh logic as buildGmailReviewDetailResult, minus
-// the human-readable detail response nobody asked for here — only ever touches classification
-// metadata on reviews that are still pending, never status, never approves/rejects/logs anything,
-// and a single failed refetch/understanding for one review is skipped rather than aborting the rest.
+// fix/private-alpha-email-review-resolution-and-stale-classification (Task 6), broadened by
+// fix/private-alpha-email-progress-count-and-review-ux (Task 8): after a classifier fix ships, old
+// pending reviews can keep a stale stored label forever unless the user happens to open each one's
+// detail individually. Reuses the exact same refetch → clean → understand → refresh logic as
+// buildGmailReviewDetailResult — only ever touches classification metadata on reviews that are
+// still pending, never status, never approves/rejects/logs anything, and a single failed
+// refetch/understanding for one review is skipped rather than aborting the rest. Two callers:
+// the explicit "refresh email reviews" command (all pending, capped at 8) and gmail.review.list's
+// own bounded auto-refresh (only rows that already LOOK stale/uncertain, capped much lower at 3,
+// so an ordinary "show email reviews" never pays for a live Gmail+LLM round trip per row — see
+// looksLikeStaleGmailReviewClassification and its call site below).
 const GMAIL_REVIEW_REFRESH_MAX_ITEMS = 8;
+const GMAIL_REVIEW_LIST_AUTO_REFRESH_MAX_ITEMS = 3;
+
+// A row is a candidate for auto-refresh on LIST only when its stored classification is itself
+// uncertain/generic — never re-checks a row that already reads as a specific, confident
+// classification (application_confirmation, recruiter_reply, ...), which would just be wasted
+// latency for a row the list already displays correctly.
+const STALE_LOOKING_GMAIL_REVIEW_REASONS = new Set(["uncertain signal", "unknown", "rule_classification", "rules_match", "custom_rule_match"]);
+
+function looksLikeStaleGmailReviewClassification(review: Pick<EmailReviewItem, "reason">): boolean {
+  return STALE_LOOKING_GMAIL_REVIEW_REASONS.has(review.reason);
+}
 
 async function refreshStaleGmailReviewClassifications(
   userId: string,
-  context: ContextBundle
-): Promise<{ refreshedCount: number; checkedCount: number }> {
-  const pending = await getEmailReviewItems(userId, { status: "pending", limit: GMAIL_REVIEW_REFRESH_MAX_ITEMS });
-  let refreshedCount = 0;
+  context: ContextBundle,
+  options: { candidates?: EmailReviewItem[] } = {}
+): Promise<{ refreshedCount: number; checkedCount: number; refreshedItems: EmailReviewItem[] }> {
+  const pending = options.candidates ?? (await getEmailReviewItems(userId, { status: "pending", limit: GMAIL_REVIEW_REFRESH_MAX_ITEMS }));
+  const refreshedItems: EmailReviewItem[] = [];
 
   for (const review of pending) {
-    const rule = context.gmailRules.find((item) => item.id === review.ruleId);
-    const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
-    const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
-
     try {
-      const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
-      const usedLiveContent = refetch.status === "ok" && Boolean(refetch.content.rawBodyText);
-      if (!usedLiveContent) {
+      const { refetch, cleanedBody, understandingResult } = await fetchAndUnderstandGmailReview(userId, review, context);
+      if (refetch.status !== "ok" || !Boolean(refetch.content.rawBodyText)) {
         continue;
       }
-      const cleanedSubject = cleanEmailBodyForDisplay(refetch.content.subject, { maxLength: 300 });
-      const cleanedBody = cleanEmailBodyForDisplay(refetch.content.rawBodyText, {
-        isHtml: refetch.content.isHtml,
-        maxLength: DEFAULT_EMAIL_DETAIL_LENGTH
-      });
-      const senderDomain = refetch.content.from.split("@").pop()?.replace(/[>\s]+$/g, "") ?? "";
-
-      const raw = await understandEmail({
-        subject: cleanedSubject,
-        bodyExcerpt: cleanedBody,
-        senderDomain,
-        date: refetch.content.date,
-        linkedGoal: linkedGoal ? { title: linkedGoal.title, category: linkedGoal.category ?? undefined } : undefined,
-        activeWatcherDescription: rule?.description || rule?.name,
-        currentCandidateClassification: review.reason
-      });
-      const understandingResult = validateEmailUnderstanding(raw, `${cleanedSubject} ${cleanedBody}`);
-      if (understandingResult.status !== "ok" || !understandingResult.understanding) {
+      if (!understandingResult || understandingResult.status !== "ok" || !understandingResult.understanding) {
         continue;
       }
 
@@ -3885,14 +4014,14 @@ async function refreshStaleGmailReviewClassifications(
         evidence: cleanedBody.slice(0, 300)
       });
       if (refreshed) {
-        refreshedCount += 1;
+        refreshedItems.push(refreshed);
       }
     } catch {
       continue;
     }
   }
 
-  return { refreshedCount, checkedCount: pending.length };
+  return { refreshedCount: refreshedItems.length, checkedCount: pending.length, refreshedItems };
 }
 
 // Task 3/4 (launch-readiness): returns the specific clarification (e.g. a weekday/day-of-month
@@ -5017,7 +5146,15 @@ function countLabel(metric: GoalMetric, count: number): string {
  */
 function formatGoalStatusForChat(
   goal: Goal,
-  input: { openActions: ActionItem[]; gmailReviews: EmailReviewItem[]; gmailRules: EmailSignalRule[]; recentEvents: StoredEvent[]; timezone: string; todayLocalDate: string }
+  input: {
+    openActions: ActionItem[];
+    gmailReviews: EmailReviewItem[];
+    gmailRules: EmailSignalRule[];
+    recentEvents: StoredEvent[];
+    timezone: string;
+    todayLocalDate: string;
+    scope?: "today";
+  }
 ): string {
   const metrics = goal.targetMetrics ?? [];
   const todayEvents = input.recentEvents.filter((event) => formatDateInTimezone(event.timestamp, input.timezone) === input.todayLocalDate);
@@ -5030,14 +5167,26 @@ function formatGoalStatusForChat(
   // special-casing needed here for either kind, and the metric's own `label` (set at goal
   // creation, from a template or an adaptive goal.create_propose plan) is always what's shown.
   const weekCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, input.recentEvents) })).filter((entry) => entry.count > 0);
-  const todayCounts = metrics.map((metric) => ({ metric, count: countEvidenceForMetric(metric, todayEvents) })).filter((entry) => entry.count > 0);
+  // fix/private-alpha-email-progress-count-and-review-ux (Task 4): a real reported bug — the
+  // "Today:" line was only ever shown when at least one metric had a NONZERO count today, so a
+  // day with genuinely zero progress silently dropped the line entirely (rather than saying
+  // "Today: 0 ..."), and a direct "how many CVs did I send today?" question had nothing grounded
+  // to answer from. Now computed for the SAME metrics that have real week activity (so the label
+  // is always meaningful) and always rendered, zero included, whenever there is any week activity
+  // to report at all.
+  const todayCounts = weekCounts.map((entry) => ({ metric: entry.metric, count: countEvidenceForMetric(entry.metric, todayEvents) }));
 
   const lines = [`"${goal.title}" (${goal.category}):`];
 
   if (weekCounts.length > 0) {
-    lines.push(`This week: ${weekCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`);
-    if (todayCounts.length > 0) {
-      lines.push(`Today: ${todayCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`);
+    const weekLine = `This week: ${weekCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`;
+    const todayLine = `Today: ${todayCounts.map((entry) => `${entry.count} ${countLabel(entry.metric, entry.count)}`).join(", ")}.`;
+    // An explicit "today" question leads with Today — otherwise the weekly summary still comes
+    // first, matching this tool's existing default framing for a general status/coaching check-in.
+    if (input.scope === "today") {
+      lines.push(todayLine, weekLine);
+    } else {
+      lines.push(weekLine, todayLine);
     }
   } else {
     lines.push("No logged progress in the last 7 days.");
