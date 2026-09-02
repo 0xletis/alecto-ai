@@ -11,7 +11,12 @@
  * removal) is a structural pattern that applies to any email, not a job-search-specific rule.
  */
 
-export const DEFAULT_EMAIL_DETAIL_LENGTH = 1200;
+// fix/private-alpha-email-progress-count-and-review-ux (Task 7): a real reported bug — the
+// DEFAULT detail view (1200 chars, before this change) still surfaced most of a noisy email's
+// content even after cleaning; a genuinely SHORT default is what makes "key useful content, not
+// messy full body" true in practice, deferring more to the explicit "show full cleaned text"
+// request (FULL_EMAIL_DETAIL_LENGTH, unchanged).
+export const DEFAULT_EMAIL_DETAIL_LENGTH = 500;
 export const FULL_EMAIL_DETAIL_LENGTH = 4000;
 export const CLASSIFIER_BODY_LENGTH = 3000;
 
@@ -38,7 +43,10 @@ export function cleanEmailBodyForDisplay(rawBody: string, options: CleanEmailBod
   text = removeInvisibleCharacters(text);
   text = stripQuotedReplyChain(text);
   text = stripFooterNoise(text);
+  text = stripRecommendationNoise(text);
   text = redactSecrets(text);
+  text = stripTrackingUrls(text);
+  text = stripSeparatorLines(text);
   text = collapseWhitespace(text);
 
   return truncateWithEllipsis(text, maxLength);
@@ -140,6 +148,51 @@ function stripFooterNoise(text: string): string {
     }
   }
   return text.slice(0, cutIndex);
+}
+
+// fix/private-alpha-email-progress-count-and-review-ux (Task 7): a real reported bug — the default
+// detail view for a LinkedIn/ATS application-confirmation email included a full "jobs you may be
+// interested in" / "people also viewed" recommendations block after the real confirmation content.
+// Structural, not sender-specific (ATS platforms, job boards, and newsletters all use some variant
+// of this heading), same cut-at-first-match reasoning as stripFooterNoise above — everything past
+// this point is a recommendation/listing block, never the sender's own new message content.
+const RECOMMENDATION_MARKERS: RegExp[] = [
+  /\b(jobs|roles|positions|people|articles)\s+you\s+(may|might)\s+(also\s+)?(be interested in|like|want to see)\b/i,
+  /\b(recommended|similar)\s+(jobs|roles|for you)\b/i,
+  /\bmore\s+jobs\s+for\s+you\b/i,
+  /\bpeople\s+(also\s+viewed|from\s+your\s+(university|school|network))\b/i,
+  /\bother\s+jobs\s+you\s+may\s+like\b/i,
+  /\bjobs\s+near\s+you\b/i
+];
+
+function stripRecommendationNoise(text: string): string {
+  let cutIndex = text.length;
+  for (const pattern of RECOMMENDATION_MARKERS) {
+    const match = pattern.exec(text);
+    if (match && match.index < cutIndex) {
+      cutIndex = match.index;
+    }
+  }
+  return text.slice(0, cutIndex);
+}
+
+// A short, clean URL (e.g. a plain "https://example.com/page") is left as-is — genuinely useful
+// context. Anything with a query string, or long enough to obviously be a tracking/redirect link
+// (LinkedIn "comm/jobs/view/...?trk=...&refId=...", mail-merge redirect wrappers, etc.), is
+// collapsed to a short placeholder instead — never shown raw in either the default or full-text
+// detail view, per the "no giant tracking URLs" rule.
+function stripTrackingUrls(text: string): string {
+  return text.replace(/https?:\/\/[^\s<>()]+/gi, (url) => (url.includes("?") || url.length > 60 ? "[link removed]" : url));
+}
+
+// Decorative separator lines ("----------", "==========", "* * * * *", a line of underscores) are
+// pure visual noise once the text is plain — collapsed away entirely rather than left as dangling
+// punctuation runs in an already-cleaned message.
+function stripSeparatorLines(text: string): string {
+  return text
+    .split("\n")
+    .filter((line) => !/^[\s\-=_*~.·•]{3,}$/.test(line))
+    .join("\n");
 }
 
 /**

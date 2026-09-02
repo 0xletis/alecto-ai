@@ -245,7 +245,7 @@ test("E. compound with read-only status: 'show me email reviews and when do you 
     assertNoGenericAgentError(reply);
     assertNoDuplicateToolSummary(reply, "E");
     assertNoSilentPartialHandling(reply, 2, "E");
-    assertCompoundReplyAccountsFor(reply, [/pending gmail reviews/i, /weekly digest/i, /alerts are/i], "E");
+    assertCompoundReplyAccountsFor(reply, [/pending gmail reviews?/i, /weekly digest/i, /alerts are/i], "E");
 
     const tools = reply.operationsPlanned.map((operation) => operation.tool);
     assert.deepEqual(tools.sort(), ["gmail.autonomy.status", "gmail.review.list"]);

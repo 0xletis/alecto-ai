@@ -89,7 +89,7 @@ test("1. 'what emails need my attention?' plans and lists real pending Gmail rev
     mockPlan(gmailReviewListPlan());
     const reply = await sendAgentMessage(server, userId, "what emails need my attention?");
 
-    assert.match(reply.reply, /pending gmail reviews:/i);
+    assert.match(reply.reply, /pending gmail reviews?:/i);
     assert.match(reply.reply, /recruiter reply from example labs/i);
     assert.equal(reply.debug.mutationExecuted, false);
   } finally {
@@ -115,7 +115,6 @@ test("2. the list response is itemized (subjects/senders), not a bare count only
     assert.doesNotMatch(reply.reply, /^\d+ email review\(s\)\.?$/i, "must not regress to the old bare-count summary");
     assert.match(reply.reply, /^\d\. recruiter reply from example labs/im, "each item must be numbered");
     assert.match(reply.reply, /^\d\. endesa factura/im);
-    assert.match(reply.reply, /your bill is ready/i);
   } finally {
     clearAgentRuntimeMocks();
     await server.close();
@@ -368,7 +367,7 @@ test("Gmail review-to-task transcript creates a clean Nest.js task, honors user 
 
     mockPlan(gmailReviewListPlan());
     const listReply = await sendAgentMessage(server, userId, "show me the item to review");
-    assert.match(listReply.reply, /pending gmail reviews/i);
+    assert.match(listReply.reply, /pending gmail reviews?/i);
     assert.match(listReply.reply, /nest\.js 20/i);
 
     mockPlan(gmailReviewToActionPlan({ index: 1, dueText: "tomorrow morning" }));

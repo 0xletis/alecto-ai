@@ -1282,6 +1282,20 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, goalRestoreShortcut, "goal_restore");
   }
 
+  // fix/private-alpha-email-progress-count-and-review-ux (Task 4): a real reported bug — "how many
+  // CVs did I send today?" and "show today goal progress" answered weekly-only, or (worse, caught
+  // via real-planner reproduction while investigating) sometimes got planned as goal.log_evidence,
+  // a MUTATING tool, purely because the message mentions a count and "today" — the planner reading
+  // a QUESTION about today's count as a STATEMENT that progress just happened. Routed
+  // deterministically to the read-only goal.status(scope: "today") BEFORE the planner ever sees it,
+  // exactly the same reasoning as goalLifecycleShortcut/goalRestoreShortcut above. Never matches a
+  // genuine logging statement ("I sent 3 CVs today") — every branch requires an actual question
+  // shape (how many / today progress / cuántos.../quants...), not just the word "today".
+  const goalTodayProgressShortcut = goalTodayProgressShortcutOperation(message);
+  if (goalTodayProgressShortcut) {
+    return finalizeDeterministicOperation(context, message, goalTodayProgressShortcut, "goal_status");
+  }
+
   if (!pending) {
     // Checked before actionCompletionShortcutOperation below: "move it later this week"/"bring it
     // back later this week"-shaped messages have a real deferral verb but NO actual day named, so
@@ -4044,6 +4058,26 @@ function goalRestoreShortcutOperation(message: string): PlannedOperation | undef
     tool: "goal.restore_propose",
     args: { goalRef: rest.length > 0 ? rest : undefined },
     rationale: "deterministic goal restore shortcut"
+  };
+}
+
+// fix/private-alpha-email-progress-count-and-review-ux (Task 4): question-shaped only, in English,
+// Spanish, and Catalan, plus tolerance for a doubled-letter typo ("progrress") — every branch
+// requires an actual interrogative/status-check shape, never just the bare word "today", so a real
+// logging statement like "I sent 3 CVs today" never matches any of these.
+const GOAL_TODAY_PROGRESS_RE =
+  /\btoday'?s?\b[\s\S]{0,15}\bprogr+ess\b|\bhow many\b[\s\S]{0,50}\btoday\b|\bcu[aá]ntos?\b[\s\S]{0,50}\bhoy\b|\bhoy\b[\s\S]{0,20}\bcu[aá]ntos?\b|\bquants?\b[\s\S]{0,50}\bavui\b|\bavui\b[\s\S]{0,20}\bquants?\b/i;
+
+function goalTodayProgressShortcutOperation(message: string): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text || !GOAL_TODAY_PROGRESS_RE.test(text)) {
+    return undefined;
+  }
+
+  return {
+    tool: "goal.status",
+    args: { scope: "today" },
+    rationale: "user asked a read-only question about today's progress specifically"
   };
 }
 

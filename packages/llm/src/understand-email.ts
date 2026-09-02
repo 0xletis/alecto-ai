@@ -42,6 +42,22 @@ export const RELEVANCE_LEVELS = ["high", "medium", "low", "noise"] as const;
 export const GOAL_RELEVANCE_LEVELS = ["direct", "indirect", "unrelated", "unclear"] as const;
 export const SUGGESTED_USER_ACTIONS = ["approve", "ignore", "turn_into_action", "ask_clarification", "monitor"] as const;
 
+// fix/private-alpha-email-progress-count-and-review-ux (Task 7): structured facts, extracted once
+// here rather than left for the user to dig out of a noisy full body. `keyDetails` is the
+// job-application-shaped case (company/role/location/status/next step, plus the date the email
+// ITSELF states the application/submission happened on, in the sender's own wording — used by the
+// date policy in email-review-service.ts, never re-derived from "now"). `keyFacts` is the general
+// fallback for every other domain (an invoice's amount/due date, a flight's new time, ...) so this
+// stays useful outside job search too, never job-search-only.
+const EmailKeyDetailsSchema = z.object({
+  company: z.string().max(120).nullable(),
+  role: z.string().max(160).nullable(),
+  location: z.string().max(120).nullable(),
+  appliedDate: z.string().max(60).nullable(),
+  status: z.string().max(120).nullable(),
+  nextStep: z.string().max(200).nullable()
+});
+
 const EmailUnderstandingLLMSchema = z.object({
   emailKind: z.enum(EMAIL_KINDS),
   relevance: z.enum(RELEVANCE_LEVELS),
@@ -49,7 +65,9 @@ const EmailUnderstandingLLMSchema = z.object({
   summary: z.string().min(1).max(300),
   why: z.array(z.string().min(1).max(160)).min(1).max(5),
   suggestedUserAction: z.enum(SUGGESTED_USER_ACTIONS),
-  confidence: z.number()
+  confidence: z.number(),
+  keyDetails: EmailKeyDetailsSchema.nullable(),
+  keyFacts: z.array(z.string().min(1).max(160)).max(4)
 });
 
 export type EmailUnderstanding = z.infer<typeof EmailUnderstandingLLMSchema>;
@@ -128,7 +146,13 @@ function sanitizeInput(input: UnderstandEmailInput): Record<string, unknown> {
 }
 
 function normalizeRawUnderstanding(raw: unknown): EmailUnderstanding {
-  return EmailUnderstandingLLMSchema.parse(raw);
+  // Defaults keyDetails/keyFacts when absent — keeps every existing EMAIL_UNDERSTANDING_MOCK_RESPONSE
+  // test fixture (written before this task added these two fields) valid without a mass rewrite.
+  const withDefaults =
+    raw && typeof raw === "object"
+      ? { keyDetails: null, keyFacts: [], ...(raw as Record<string, unknown>) }
+      : raw;
+  return EmailUnderstandingLLMSchema.parse(withDefaults);
 }
 
 function buildEmailUnderstandingPrompt(): string {
@@ -144,7 +168,9 @@ function buildEmailUnderstandingPrompt(): string {
     "suggestedUserAction: 'approve' only for something safe to log/confirm as-is (e.g. a clear booking/application confirmation), 'ignore' for noise/marketing/security codes, 'turn_into_action' when the email itself asks the user to do something with a deadline, 'monitor' for an informational update worth knowing about but with nothing to decide right now, 'ask_clarification' whenever you are genuinely unsure what this is or how it relates to the user's goals.",
     "confidence is 0 to 1, calibrated — do not default to a high number; genuinely ambiguous emails should score low.",
     "Never invent a company, amount, date, or fact not present in the given subject/bodyExcerpt.",
-    "Do not assume you have the full raw email — you only see a cleaned, redacted excerpt; never claim to have read a security code, password, or token (it is already redacted)."
+    "Do not assume you have the full raw email — you only see a cleaned, redacted excerpt; never claim to have read a security code, password, or token (it is already redacted).",
+    "keyDetails: ONLY for a job-application-shaped email (application_confirmation, recruiter_reply, interview, offer, rejection) — company/role/location/status/nextStep if actually stated (each null if not present), and appliedDate set to the DATE THE EMAIL ITSELF SAYS THE APPLICATION/SUBMISSION HAPPENED (in whatever wording it used, e.g. 'September 1, 2026' or '1 de septiembre de 2026') — null if the email states no such date (do NOT default this to today or to the email's received date; that is decided elsewhere, not by you). For every other emailKind, keyDetails must be null.",
+    "keyFacts: for any NON-job-application email (invoice, travel, insurance, admin, receipt, subscription, appointment, ...), 0-4 short factual phrases actually stated in the email (e.g. 'Amount due: 84.20 EUR', 'Payment due September 15', 'New departure time: 14:20') — the general-purpose equivalent of keyDetails for every other domain. Empty array for a job-application-shaped email (use keyDetails instead) or when nothing concrete is stated."
   ].join("\n");
 }
 
@@ -152,7 +178,7 @@ function buildEmailUnderstandingJsonSchema() {
   return {
     type: "object",
     additionalProperties: false,
-    required: ["emailKind", "relevance", "goalRelevance", "summary", "why", "suggestedUserAction", "confidence"],
+    required: ["emailKind", "relevance", "goalRelevance", "summary", "why", "suggestedUserAction", "confidence", "keyDetails", "keyFacts"],
     properties: {
       emailKind: { type: "string", enum: [...EMAIL_KINDS] },
       relevance: { type: "string", enum: [...RELEVANCE_LEVELS] },
@@ -160,7 +186,26 @@ function buildEmailUnderstandingJsonSchema() {
       summary: { type: "string", maxLength: 300 },
       why: { type: "array", minItems: 1, maxItems: 5, items: { type: "string", maxLength: 160 } },
       suggestedUserAction: { type: "string", enum: [...SUGGESTED_USER_ACTIONS] },
-      confidence: { type: "number", minimum: 0, maximum: 1 }
+      confidence: { type: "number", minimum: 0, maximum: 1 },
+      keyDetails: {
+        anyOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["company", "role", "location", "appliedDate", "status", "nextStep"],
+            properties: {
+              company: { anyOf: [{ type: "string", maxLength: 120 }, { type: "null" }] },
+              role: { anyOf: [{ type: "string", maxLength: 160 }, { type: "null" }] },
+              location: { anyOf: [{ type: "string", maxLength: 120 }, { type: "null" }] },
+              appliedDate: { anyOf: [{ type: "string", maxLength: 60 }, { type: "null" }] },
+              status: { anyOf: [{ type: "string", maxLength: 120 }, { type: "null" }] },
+              nextStep: { anyOf: [{ type: "string", maxLength: 200 }, { type: "null" }] }
+            }
+          },
+          { type: "null" }
+        ]
+      },
+      keyFacts: { type: "array", minItems: 0, maxItems: 4, items: { type: "string", maxLength: 160 } }
     }
   };
 }
@@ -188,7 +233,12 @@ export type EmailUnderstandingValidationResult =
  * guess as fact.
  */
 export function validateEmailUnderstanding(raw: unknown, groundingText: string): EmailUnderstandingValidationResult {
-  const parsed = EmailUnderstandingLLMSchema.safeParse(raw);
+  // Same keyDetails/keyFacts defaulting as normalizeRawUnderstanding above — this is also a
+  // boundary real callers (and every existing test fixture written before this task added these
+  // two fields) can hand a "raw" object straight to, not only the live LLM response path.
+  const withDefaults =
+    raw && typeof raw === "object" ? { keyDetails: null, keyFacts: [], ...(raw as Record<string, unknown>) } : raw;
+  const parsed = EmailUnderstandingLLMSchema.safeParse(withDefaults);
   if (!parsed.success) {
     return { status: "needs_clarification", reason: "The email understanding result used an unsupported category or shape." };
   }
