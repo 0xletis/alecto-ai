@@ -358,7 +358,7 @@ test("2A. a successful log writes a structured diagnostic including event id and
         capture.restore();
       }
 
-      const resultLog = capture.logs.find((entry) => entry[0] === "[gmail.review.log_progress] result");
+      const resultLog = capture.logs.find((entry) => entry[0] === "[executeProgressCommand] result");
       assert.ok(resultLog, "expected a structured result diagnostic to be logged");
       const payload = resultLog![1] as Record<string, unknown>;
       assert.ok(payload.eventIds, "diagnostic must include the created event id(s)");
@@ -417,7 +417,7 @@ test("2B. a duplicate attempt logs duplicate response path, no false 'logged' cl
       }
 
       assert.doesNotMatch(reply.reply, /^Logged 1/i);
-      const resultLog = capture.logs.find((entry) => entry[0] === "[gmail.review.log_progress] result");
+      const resultLog = capture.logs.find((entry) => entry[0] === "[executeProgressCommand] result");
       assert.ok(resultLog, "expected a structured result diagnostic on the duplicate path too");
       const payload = resultLog![1] as Record<string, unknown>;
       assert.equal(payload.responsePath, "duplicate");
@@ -458,7 +458,7 @@ test("2C. a forced verification failure logs verified false, review remains pend
       }
 
       assert.doesNotMatch(reply.reply, /^Logged/i);
-      const resultLog = capture.logs.find((entry) => entry[0] === "[gmail.review.log_progress] result");
+      const resultLog = capture.logs.find((entry) => entry[0] === "[executeProgressCommand] result");
       assert.ok(resultLog, "expected a structured result diagnostic on the failure path");
       const payload = resultLog![1] as Record<string, unknown>;
       assert.equal(payload.verified, false);

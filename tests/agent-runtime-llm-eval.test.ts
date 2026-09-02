@@ -17953,7 +17953,7 @@ test(
     const userId = `llm-eval-477-${randomUUID()}`;
     const trace = new EvalTrace("477-read-after-write-today-and-week", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
     const restoreKey = installEvalGmailEncryptionKey();
-    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-477-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud. Technical Solutions Blockchain." }]);
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-477-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Gracias por aplicar. Hemos recibido tu solicitud para el puesto en Technical Solutions Blockchain. Este es un mensaje automático de confirmación." }]);
 
     try {
       await seedUser(userId);
@@ -17994,7 +17994,7 @@ test(
     const userId = `llm-eval-478-${randomUUID()}`;
     const trace = new EvalTrace("478-duplicate-no-false-logged", ["email-progress-count-consistency"], userId);
     const restoreKey = installEvalGmailEncryptionKey();
-    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-478-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud." }]);
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-478-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Gracias por aplicar. Hemos recibido tu solicitud para el puesto en Technical Solutions Blockchain. Este es un mensaje automático de confirmación." }]);
 
     try {
       await seedUser(userId);
@@ -18051,7 +18051,7 @@ test(
     const userId = `llm-eval-479-${randomUUID()}`;
     const trace = new EvalTrace("479-verification-failure-no-false-claim", ["email-progress-read-after-write"], userId);
     const restoreKey = installEvalGmailEncryptionKey();
-    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-479-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud." }]);
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-479-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Gracias por aplicar. Hemos recibido tu solicitud para el puesto en Technical Solutions Blockchain. Este es un mensaje automático de confirmación." }]);
 
     try {
       await seedUser(userId);
@@ -18284,7 +18284,7 @@ test(
     const userId = `llm-eval-485-${randomUUID()}`;
     const trace = new EvalTrace("485-spanish-verified-update", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
     const restoreKey = installEvalGmailEncryptionKey();
-    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-485-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud." }]);
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-485-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Gracias por aplicar. Hemos recibido tu solicitud para el puesto en Technical Solutions Blockchain. Este es un mensaje automático de confirmación." }]);
 
     try {
       await seedUser(userId);
@@ -18322,7 +18322,7 @@ test(
     const userId = `llm-eval-486-${randomUUID()}`;
     const trace = new EvalTrace("486-catalan-verified-update", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
     const restoreKey = installEvalGmailEncryptionKey();
-    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-486-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "S'ha rebut la teva sol·licitud." }]);
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-486-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Gràcies per aplicar. S'ha rebut la teva sol·licitud per al lloc a Technical Solutions Blockchain. Aquest és un missatge automàtic de confirmació." }]);
 
     try {
       await seedUser(userId);
@@ -18809,6 +18809,361 @@ test(
         const showsToday1 = /today[^\n]*\b1\b/i.test(t4.reply);
         trace.checkpoint("the verified count is visible in the follow-up daily status", showsToday1, t4.reply);
         assert.ok(showsToday1, `got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// --- refactor/private-alpha-canonical-progress-command-engine (Task 10): the canonical
+// ProgressCommand engine — one write/verify path for every progress-writing route, an eligibility
+// guard so an email review can't log CV-sent progress unless it's actually eligible, and natural
+// classification/date-filtered review reference resolution ("details for an application
+// confirmation from today"). Scenarios 497/498 deliberately seed a goal with BOTH an "Applications
+// sent" AND an "Application to Interview" signalKey metric — the exact live shape that made the
+// PREVIOUS metric-bridge keyword match too loose to tell them apart.
+
+async function seedGoalWithBothMetricsForEval(userId: string, title: string) {
+  const result = await createGoal(userId, {
+    title,
+    category: "career",
+    targetMetrics: [
+      { key: "applications_sent", label: "Applications sent", labelSingular: "Application sent", signalKey: "applications_sent", aggregation: "count", window: "weekly" },
+      { key: "application_to_interview", label: "Application to Interview", labelSingular: "Application to Interview", signalKey: "application_to_interview", aggregation: "count", window: "weekly" }
+    ]
+  });
+  if (result.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+  return result.goal;
+}
+
+test(
+  "497. 'details for an application confirmation from today' selects Okify, not the LinkedIn personal message (email-review-reference-resolution A)",
+  { ...llmEvalOptions(["email-review-reference-resolution", "canonical-progress-command"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-497-${randomUUID()}`;
+    const trace = new EvalTrace("497-semantic-reference-resolution", ["email-review-reference-resolution", "canonical-progress-command"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([
+      { id: "eval-497-okify", subject: "Okify", from: "no-reply@okify.example", body: "Se ha enviado tu solicitud a Okify." },
+      { id: "eval-497-li", subject: "Miquel, añade a Dario Lo Buglio", from: "invitations@linkedin.com", body: "Miquel quiere añadir a Dario Lo Buglio a su red de LinkedIn." }
+    ]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedGoalWithBothMetricsForEval(userId, "Find a fully remote developer job");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-497-okify", subject: "Okify", from: "no-reply@okify.example", reason: "application_confirmation" });
+      await prisma.emailReviewItem.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          ruleId: rule.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          providerMessageId: "eval-497-li",
+          externalId: `gmail-review:${rule.id}:eval-497-li`,
+          status: "pending",
+          subject: "Miquel, añade a Dario Lo Buglio",
+          from: "invitations@linkedin.com",
+          confidence: 0.6,
+          reason: "job_offer",
+          proposedEventType: "career.offer_received",
+          priority: "high",
+          extracted: {}
+        }
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for an application confirmation from today", await sendAgentMessage(server, userId, "details for an application confirmation from today"));
+        assertNoGenericAgentError(t2);
+        const selectedOkify = /Okify/i.test(t2.reply) && !/Dario Lo Buglio/i.test(t2.reply);
+        trace.checkpoint("selects the real application confirmation, never the stale/mislabelled personal message", selectedOkify, t2.reply);
+        assert.ok(selectedOkify, `got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "498. mark as CV sent verifiably updates Today/Week and never creates an Application to Interview entry (email-progress-production-invariant F / application-to-interview-precision A)",
+  { ...llmEvalOptions(["email-progress-production-invariant", "application-to-interview-precision", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-498-${randomUUID()}`;
+    const trace = new EvalTrace("498-no-application-to-interview-leak", ["email-progress-production-invariant", "application-to-interview-precision", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-498-okify", subject: "Okify", from: "no-reply@okify.example", body: "Se ha enviado tu solicitud a Okify." }]);
+
+    try {
+      await seedUser(userId);
+      const goal = await seedGoalWithBothMetricsForEval(userId, "Find a fully remote developer job");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRuleForGoal(userId, connection.id, goal.id);
+      for (let i = 0; i < 16; i += 1) {
+        await createEvent(userId, { type: "custom.goal_progress_logged", source: "manual", confidence: 1, timestamp: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000), data: { signalKey: "applications_sent" } });
+      }
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-498-okify", subject: "Okify", from: "no-reply@okify.example", reason: "application_confirmation" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark as cv sent", await sendAgentMessage(server, userId, "mark as cv sent"));
+        assertNoGenericAgentError(t3);
+        const claimedLogged = /^logged 1/i.test(t3.reply.trim());
+        trace.checkpoint("claims logged only for a genuine successful write", claimedLogged, t3.reply);
+        assert.ok(claimedLogged, `got: ${t3.reply}`);
+
+        const t4 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+        const showsToday1AndWeek17 = /today[^\n]*\b1\b/i.test(t4.reply) && /week[^\n]*\b17\b/i.test(t4.reply);
+        const mentionsInterview = /application to interview/i.test(t4.reply);
+        trace.checkpoint("Today: 1, This week: 17, and Application to Interview never appears", showsToday1AndWeek17 && !mentionsInterview, t4.reply);
+        assert.ok(showsToday1AndWeek17, `got: ${t4.reply}`);
+        assert.ok(!mentionsInterview, `a CV-sent command must never touch the Application to Interview metric — got: ${t4.reply}`);
+
+        const wrongMetricEvents = await prisma.event.findMany({ where: { userId, type: "custom.goal_progress_logged" } });
+        const leaked = wrongMetricEvents.some((event) => (event.data as Record<string, unknown>)?.signalKey === "application_to_interview");
+        trace.checkpoint("no event was ever written against the application_to_interview signalKey", !leaked, `leaked=${leaked}`);
+        assert.ok(!leaked);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "499. a personal message/LinkedIn connection suggestion refuses CV-sent progress (email-review-eligibility A)",
+  { ...llmEvalOptions(["email-review-eligibility"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-499-${randomUUID()}`;
+    const trace = new EvalTrace("499-personal-message-refused", ["email-review-eligibility"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-499-li", subject: "Miquel, añade a Dario Lo Buglio", from: "invitations@linkedin.com", body: "Miquel quiere añadir a Dario Lo Buglio a su red de LinkedIn." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-499-li", subject: "Miquel, añade a Dario Lo Buglio", from: "invitations@linkedin.com", reason: "job_offer", proposedEventType: "career.offer_received" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+        assertNoGenericAgentError(t3);
+
+        const claimedLogged = /^logged/i.test(t3.reply.trim());
+        trace.checkpoint("never claims 'logged' for an ineligible personal message", !claimedLogged, t3.reply);
+        assert.ok(!claimedLogged, `got: ${t3.reply}`);
+
+        const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        trace.checkpoint("the review stays pending, not silently resolved", after?.status === "pending", after?.status);
+        assert.equal(after?.status, "pending");
+
+        const events = await prisma.event.count({ where: { userId } });
+        trace.checkpoint("no progress event of any kind was written", events === 0, `count=${events}`);
+        assert.equal(events, 0);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "500. 'mark as cv sent' twice never double-counts — the second attempt says already counted (email-review-eligibility B / email-progress-production-invariant G)",
+  { ...llmEvalOptions(["email-review-eligibility", "email-progress-production-invariant"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-500-${randomUUID()}`;
+    const trace = new EvalTrace("500-no-double-count", ["email-review-eligibility", "email-progress-production-invariant"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-500-okify", subject: "Okify", from: "no-reply@okify.example", body: "Se ha enviado tu solicitud a Okify." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-500-okify", subject: "Okify", from: "no-reply@okify.example", reason: "application_confirmation" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark as cv sent", await sendAgentMessage(server, userId, "mark as cv sent"));
+        assert.match(t3.reply.trim(), /^logged 1/i);
+
+        const t4 = trace.record("mark as cv sent again", await sendAgentMessage(server, userId, "mark as cv sent again"));
+        const falselyLogged = /^logged 1/i.test(t4.reply.trim());
+        trace.checkpoint("the second attempt never claims a fresh 'Logged 1'", !falselyLogged, t4.reply);
+        assert.ok(!falselyLogged, `got: ${t4.reply}`);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("exactly one canonical event exists", events === 1, `count=${events}`);
+        assert.equal(events, 1);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "501. 'Okify ha visto tu solicitud' (viewed, not interview) never creates an interview event (application-to-interview-precision B)",
+  { ...llmEvalOptions(["application-to-interview-precision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-501-${randomUUID()}`;
+    const trace = new EvalTrace("501-viewed-not-interview", ["application-to-interview-precision"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-501-okify", subject: "Okify", from: "no-reply@okify.example", body: "Okify ha visto tu solicitud." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-501-okify", subject: "Okify", from: "no-reply@okify.example", reason: "recruiter_reply", proposedEventType: "career.recruiter_reply_received" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const claimsInterview = /interview/i.test(t2.reply);
+        trace.checkpoint("a viewed-application status is never described as an interview", !claimsInterview, t2.reply);
+        assert.ok(!claimsInterview, `got: ${t2.reply}`);
+
+        const interviewEvents = await prisma.event.count({ where: { userId, type: "career.interview_scheduled" } });
+        trace.checkpoint("no interview_scheduled event was created merely from a 'viewed' status", interviewEvents === 0, `count=${interviewEvents}`);
+        assert.equal(interviewEvents, 0);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "502. 'we'd like to schedule an interview' is real interview/progression evidence (application-to-interview-precision C)",
+  { ...llmEvalOptions(["application-to-interview-precision"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-502-${randomUUID()}`;
+    const trace = new EvalTrace("502-real-interview-evidence", ["application-to-interview-precision"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-502-okify", subject: "Okify - Next steps", from: "no-reply@okify.example", body: "We would like to schedule an interview with you for the Backend Engineer role." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-502-okify", subject: "Okify - Next steps", from: "no-reply@okify.example", reason: "interview", proposedEventType: "career.interview_scheduled" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        const t2 = trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        assertNoGenericAgentError(t2);
+
+        const mentionsInterview = /interview/i.test(t2.reply);
+        trace.checkpoint("a genuine interview invitation is recognized as such", mentionsInterview, t2.reply);
+        assert.ok(mentionsInterview, `got: ${t2.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "503. Spanish: 'márcalo como CV enviado' works on an eligible application confirmation (email-review-eligibility C)",
+  { ...llmEvalOptions(["email-review-eligibility", "email-progress-production-invariant"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-503-${randomUUID()}`;
+    const trace = new EvalTrace("503-spanish-eligible-confirmation", ["email-review-eligibility", "email-progress-production-invariant"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-503-okify", subject: "Okify", from: "no-reply@okify.example", body: "Se ha enviado tu solicitud a Okify." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-503-okify", subject: "Okify", from: "no-reply@okify.example", reason: "application_confirmation" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("márcalo como CV enviado", await sendAgentMessage(server, userId, "márcalo como CV enviado"));
+        assertNoGenericAgentError(t3);
+        const claimedLogged = /^logged 1/i.test(t3.reply.trim());
+        trace.checkpoint("an eligible confirmation logs successfully in Spanish", claimedLogged, t3.reply);
+        assert.ok(claimedLogged, `got: ${t3.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "504. Catalan: 'marca-ho com a CV enviat' is refused on an ineligible job-alert email, never a false 'logged' claim (email-review-eligibility D)",
+  { ...llmEvalOptions(["email-review-eligibility"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-504-${randomUUID()}`;
+    const trace = new EvalTrace("504-catalan-ineligible-refused", ["email-review-eligibility"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-504-kraken", subject: "3 noves ofertes que et poden interessar", from: "jobs-noreply@linkedin.com", body: "Nous llocs de treball aquesta setmana: Enginyer Backend a Kraken, i altres." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-504-kraken", subject: "3 noves ofertes que et poden interessar", from: "jobs-noreply@linkedin.com", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("marca-ho com a CV enviat", await sendAgentMessage(server, userId, "marca-ho com a CV enviat"));
+        assertNoGenericAgentError(t3);
+
+        const claimedLogged = /^logged/i.test(t3.reply.trim());
+        trace.checkpoint("a job-listing digest is never logged as CV sent, even in Catalan", !claimedLogged, t3.reply);
+        assert.ok(!claimedLogged, `got: ${t3.reply}`);
+
+        const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+        trace.checkpoint("the review stays pending", after?.status === "pending", after?.status);
+        assert.equal(after?.status, "pending");
       });
     } finally {
       restoreFetch();

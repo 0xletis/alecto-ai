@@ -110,6 +110,7 @@ import {
   getRelevantMemories,
   findExternalEvent,
   findGmailSemanticDuplicateEvent,
+  findGmailDuplicateReviewItemByProviderMessageId,
   findGmailSemanticDuplicateReviewItem,
   findCompanyRoleDayDuplicateReviewItem,
   findCompanyRoleDayDuplicateEvent,
@@ -5080,6 +5081,29 @@ async function createEmailReviewItemForClassification(input: {
     actionRequired,
     semanticKey
   };
+
+  // refactor/private-alpha-canonical-progress-command-engine (Task 8): a real reported "duplicate
+  // Kraken listing" bug — a generic job-listing/newsletter broadcast has no specific proposedEventType,
+  // and findGmailSemanticDuplicateReviewItem below immediately no-ops without one, so two rules (or
+  // two sync passes) matching the exact same message produced two separate pending rows. Checked
+  // first, unconditionally, scoped to the exact underlying Gmail message — never a fuzzy match.
+  const exactDuplicate = await findGmailDuplicateReviewItemByProviderMessageId({
+    userId: input.userId,
+    provider: "gmail",
+    providerMessageId: input.message.id
+  });
+
+  if (exactDuplicate) {
+    if (exactDuplicate.status === "pending") {
+      return { status: "semantic_pending" as const, item: exactDuplicate, debug: { ...baseDebug, decision: "existing_pending_exact_message", matchedReviewId: exactDuplicate.id, matchedReviewStatus: exactDuplicate.status } };
+    }
+    if (exactDuplicate.status === "rejected") {
+      return { status: "semantic_rejected" as const, item: exactDuplicate, debug: { ...baseDebug, decision: "existing_rejected_exact_message", matchedReviewId: exactDuplicate.id, matchedReviewStatus: exactDuplicate.status } };
+    }
+    if (exactDuplicate.status === "approved") {
+      return { status: "semantic_approved" as const, item: exactDuplicate, debug: { ...baseDebug, decision: "existing_approved_exact_message", matchedReviewId: exactDuplicate.id, matchedReviewStatus: exactDuplicate.status } };
+    }
+  }
 
   if (EventTypeSchema.safeParse(proposedEventType).success) {
     const activeEvent = await findGmailSemanticDuplicateEvent({

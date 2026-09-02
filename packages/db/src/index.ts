@@ -841,6 +841,37 @@ export async function findCompanyRoleDayDuplicateEvent(input: CompanyRoleDayDupl
   return duplicate ? toStoredEvent(duplicate) : undefined;
 }
 
+/**
+ * refactor/private-alpha-canonical-progress-command-engine (Task 8): findGmailSemanticDuplicateReviewItem
+ * below immediately returns undefined whenever `proposedEventType` is absent — which is exactly the
+ * shape of a generic job-listing/newsletter broadcast with no specific career eventType, so two
+ * separate rules (or two sync passes) both matching the SAME underlying Gmail message got two
+ * separate pending review rows with no dedupe check running at all — a real reported "duplicate
+ * Kraken listing" bug. This is a narrower, unconditional check scoped to the exact provider message
+ * (never a fuzzy subject/company match) that runs regardless of whether a proposedEventType exists,
+ * so the two dedupe paths are complementary: semantic for a real signal that might arrive under
+ * slightly different wording, this one for the exact-same-email case semantic dedupe skips.
+ */
+export async function findGmailDuplicateReviewItemByProviderMessageId(input: {
+  userId: string;
+  provider: string;
+  providerMessageId: string;
+}): Promise<EmailReviewItem | undefined> {
+  await ensureUser(input.userId);
+
+  const items = await prisma.emailReviewItem.findMany({
+    where: { userId: input.userId, provider: input.provider, providerMessageId: input.providerMessageId },
+    orderBy: { updatedAt: "desc" }
+  });
+
+  const duplicate =
+    items.find((item) => normalizeEmailReviewStatus(item.status) === "pending") ??
+    items.find((item) => normalizeEmailReviewStatus(item.status) === "rejected") ??
+    items.find((item) => normalizeEmailReviewStatus(item.status) === "approved");
+
+  return duplicate ? toEmailReviewItem(duplicate) : undefined;
+}
+
 export async function findGmailSemanticDuplicateReviewItem(
   input: GmailSemanticReviewDedupeInput
 ): Promise<EmailReviewItem | undefined> {

@@ -1,4 +1,4 @@
-import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, getOrCreateNotificationSettings, rejectPendingAction, type PendingAction } from "@operator-agent/db";
+import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, getOrCreateNotificationSettings, rejectPendingAction, type EmailReviewItem, type PendingAction } from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
 import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetime.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
@@ -23,7 +23,7 @@ import {
   parseGmailReviewInstructionWithLLM,
   validateGmailReviewInstructionOperations
 } from "./gmail-review-instruction-parser.js";
-import { gmailReviewPresentationCategory } from "../email-reviews/email-review-service.js";
+import { gmailReviewPresentationCategory, isHighPriorityGmailReview } from "../email-reviews/email-review-service.js";
 import { planMessage } from "./planner.js";
 import { composeReply, isGroundTruthOnlyTool, summarizePendingOperations } from "./response-composer.js";
 import {
@@ -1376,6 +1376,32 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
       });
     }
 
+    // refactor/private-alpha-canonical-progress-command-engine (Task 4): a real reported bug —
+    // "details for an application confirmation from today" fell all the way through to the
+    // last-focused-review fallback below (no number, no strong label-token match) and silently
+    // opened a STALE, unrelated review instead of respecting the classification/date filter the
+    // user actually named. Checked BEFORE the plain label/number/focus resolution below — only ever
+    // engages when the message both looks like a detail request AND names a recognizable
+    // classification/date filter; a plain "details for 3" or "show the Okify application" never
+    // matches here and falls through unchanged.
+    const semanticSelection = await gmailReviewSemanticReferenceOperation(message, context);
+    if (semanticSelection) {
+      if (semanticSelection.reply) {
+        return finalize(context, {
+          reply: semanticSelection.reply,
+          operationsPlanned: [],
+          executedOps: [],
+          plannerUsed: "none",
+          llmPlannerAttempted: false,
+          toolValidationPassed: true,
+          topic: "gmail_reviews"
+        });
+      }
+      if (semanticSelection.operations.length > 0) {
+        return finalizeDeterministicOperations(context, message, semanticSelection.operations, "gmail_reviews");
+      }
+    }
+
     const gmailReviewDetailShortcuts = gmailReviewDetailShortcutOperation(message, context);
     if (gmailReviewDetailShortcuts.length > 0) {
       return finalizeDeterministicOperations(context, message, gmailReviewDetailShortcuts, "gmail_reviews");
@@ -2081,6 +2107,11 @@ const GMAIL_REVIEW_DETAIL_TRIGGER_RE = new RegExp(
   [
     "\\bdetails?\\b[\\s\\S]{0,15}\\b(for|of|about)\\b",
     "\\bshow( me)?\\b[\\s\\S]{0,20}\\b(more about|full text for|important text for|review)\\b",
+    // refactor/private-alpha-canonical-progress-command-engine (Task 4): "open the recruiter
+    // reply," "show the Okify application" — task's own supported-phrase list; "open" alone was
+    // never a recognized trigger verb before this branch.
+    "\\bopen\\b[\\s\\S]{0,20}\\b(the|review|application|recruiter|offer|confirmation|reply)\\b",
+    "\\bshow( me)?\\b[\\s\\S]{0,20}\\bthe\\b[\\s\\S]{0,20}\\bapplication\\b",
     "\\bwhat is email\\b",
     "\\bwhat is\\b[\\s\\S]{0,10}\\d",
     "\\bexplain review\\b",
@@ -2105,6 +2136,124 @@ const GMAIL_REVIEW_DETAIL_FULL_TEXT_RE = /\b(full text|show me everything|texto 
 // email reviews" — the bounded, capped alternative to auto-refreshing on every gmail.review.list.
 const GMAIL_REVIEW_REFRESH_RE =
   /\b(refresh|recheck|re-check|update)\b[\s\S]{0,20}\b(email|mail|gmail)\s*reviews?\b|\bactualiza(r)?\b[\s\S]{0,20}\brevisiones\b|\bactualitza(r)?\b[\s\S]{0,20}\brevisions\b/i;
+
+// refactor/private-alpha-canonical-progress-command-engine (Task 4): recognizable classification/
+// category words the task's own supported-phrase list names ("details for the application
+// confirmation", "open the recruiter reply", "details for the noise item", "details for the high
+// priority one"). "noise"/"high_priority" are PRESENTATION categories (gmailReviewPresentationCategory
+// / isHighPriorityGmailReview), computed fresh from each review's own current data — never a guess
+// — everything else matches the review's own stored `reason`, which (per
+// emailReviewClassificationFromUnderstanding) already equals the EmailKind string directly for
+// every kind that isn't folded into a noise reason.
+const REVIEW_CLASSIFICATION_FILTER_PATTERNS: Array<{ key: string; pattern: RegExp }> = [
+  { key: "application_confirmation", pattern: /\bapplication\s+confirmations?\b|\bconfirmaci[oó]n(es)?\s+de\s+solicitud\b/i },
+  { key: "recruiter_reply", pattern: /\brecruiter'?s?\s+repl(y|ies)\b|\brespuestas?\s+del\s+reclutador\b/i },
+  { key: "offer", pattern: /\bjob\s+offers?\b|\bthe\s+offers?\b|\bofertas?\s+de\s+trabajo\b/i },
+  { key: "interview", pattern: /\binterviews?\b|\bentrevistas?\b/i },
+  { key: "rejection", pattern: /\brejections?\b|\brechazos?\b/i },
+  { key: "personal_message", pattern: /\bpersonal\s+(messages?|ones?)\b|\bnetworking\s+(suggestions?|ones?)\b/i },
+  { key: "__noise__", pattern: /\bnoise(\s+items?|\s+ones?)?\b|\bruido\b/i },
+  { key: "__high_priority__", pattern: /\bhigh[\s-]priority(\s+one)?\b|\balta\s+prioridad\b/i }
+];
+const REVIEW_TODAY_FILTER_RE = /\bfrom\s+today\b|\btoday\b|\bde\s+hoy\b|\bd'avui\b|\bavui\b/i;
+
+function parseReviewSemanticFilter(text: string): { classificationKey?: string; requireToday: boolean } | undefined {
+  const classificationKey = REVIEW_CLASSIFICATION_FILTER_PATTERNS.find(({ pattern }) => pattern.test(text))?.key;
+  const requireToday = REVIEW_TODAY_FILTER_RE.test(text);
+  if (!classificationKey && !requireToday) {
+    return undefined;
+  }
+  return { classificationKey, requireToday };
+}
+
+function reviewMatchesSemanticFilter(
+  review: EmailReviewItem,
+  filter: { classificationKey?: string; requireToday: boolean },
+  timezone: string,
+  todayLocalDate: string
+): boolean {
+  if (filter.classificationKey === "__noise__" && gmailReviewPresentationCategory(review) !== "noise") {
+    return false;
+  }
+  if (filter.classificationKey === "__high_priority__" && !isHighPriorityGmailReview(review)) {
+    return false;
+  }
+  if (filter.classificationKey && filter.classificationKey !== "__noise__" && filter.classificationKey !== "__high_priority__" && review.reason !== filter.classificationKey) {
+    return false;
+  }
+  if (filter.requireToday && formatDateInTimezone(review.createdAt, timezone) !== todayLocalDate) {
+    return false;
+  }
+  return true;
+}
+
+interface SemanticReviewSelection {
+  operations: PlannedOperation[];
+  reply?: string;
+}
+
+/**
+ * The classification/date-filtered counterpart to gmailReviewDetailShortcutOperation's plain
+ * number/label matching below — handles "details for an application confirmation from today,"
+ * "open the recruiter reply," "details for the noise item," "details for the high priority one."
+ * Returns undefined (never engages) unless the message BOTH looks like a detail request AND names
+ * a recognizable classification/date filter — a plain "details for 3" or a company-name reference
+ * ("show the Okify application") is left entirely to the existing label/number resolution.
+ */
+async function gmailReviewSemanticReferenceOperation(message: string, context: ContextBundle): Promise<SemanticReviewSelection | undefined> {
+  const visibleReviews = context.session.visibleEntities.filter(
+    (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+  );
+  if (visibleReviews.length === 0) {
+    return undefined;
+  }
+
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_REVIEW_DETAIL_TRIGGER_RE.test(text)) {
+    return undefined;
+  }
+
+  // An explicit number ("why is 3 noise?", "details for 2") always wins and is left entirely to
+  // the existing index-based resolution below — a real regression this exact guard fixes: "why is
+  // 3 noise?" was being intercepted here, its classification filter ("noise") found zero matches
+  // among the OTHER visible reviews, and it replied "none match" instead of opening review 3.
+  const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index));
+  if (extractIndexesFromText(text, visibleIndexSet).length > 0) {
+    return undefined;
+  }
+
+  const filter = parseReviewSemanticFilter(text);
+  if (!filter) {
+    return undefined;
+  }
+
+  const reviewsById = new Map(context.gmailReviews.map((review) => [review.id, review] as const));
+  const timezone = await getUserTimezone(context.session.userId);
+  const todayLocalDate = formatDateInTimezone(new Date(), timezone);
+  const fullText = GMAIL_REVIEW_DETAIL_FULL_TEXT_RE.test(text);
+
+  const matches = visibleReviews.filter((entity) => {
+    const review = reviewsById.get(entity.id);
+    return review ? reviewMatchesSemanticFilter(review, filter, timezone, todayLocalDate) : false;
+  });
+
+  if (matches.length === 1) {
+    return {
+      operations: [{ tool: "gmail.review.detail", args: { index: matches[0]!.index, ...(fullText ? { fullText: true } : {}) }, rationale: "user asked for details on the one visible review matching the stated classification/date filter" }]
+    };
+  }
+
+  if (matches.length > 1) {
+    const named = matches.map((entity) => `${entity.index} ${entity.label}`).join(", ");
+    return { operations: [], reply: `I found ${matches.length} matching reviews today: ${named}. Which one?` };
+  }
+
+  const closest = visibleReviews.slice(0, 3).map((entity) => `${entity.index} ${entity.label}`).join(", ");
+  return {
+    operations: [],
+    reply: closest ? `None of the visible reviews match that — closest options: ${closest}.` : "None of the visible reviews match that."
+  };
+}
 
 function gmailReviewDetailShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
   const visibleReviews = context.session.visibleEntities.filter(
@@ -2214,17 +2363,35 @@ const GMAIL_REVIEW_MARK_PROGRESS_RE = new RegExp(
   [
     "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b",
     "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\bsent\\b",
+    // refactor/private-alpha-canonical-progress-command-engine: the object-free form — "mark as cv
+    // sent," "count as cv sent" — with no "it"/"this"/number at all, implicitly meaning the
+    // currently focused/visible review. This is the EXACT phrasing the live transcript this branch
+    // fixes used ("mark as cv sent"), which the two patterns above (both requiring an explicit
+    // this/it/digit object) never matched, silently falling through to the real LLM planner instead
+    // of resolving deterministically.
+    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,10}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b",
     "\\bm[aá]rca(lo|la|ho)?\\b[\\s\\S]{0,20}\\bcv enviado\\b",
     "\\bmarca'?(ho|l|la)?\\b[\\s\\S]{0,20}\\bcv enviat\\b"
   ].join("|"),
   "i"
 );
 
+// refactor/private-alpha-canonical-progress-command-engine (Task 3): the eligibility guard's own
+// override escape hatch ("yes, count it anyway as a CV sent") — the user re-confirming after
+// already being told once why an email was refused. Deliberately narrow (anyway/regardless/
+// override/"do it anyway") rather than trusting a bare repeat of the same mark-as-cv-sent phrasing,
+// since a SECOND plain "mark it as cv sent" with no acknowledgement of the refusal is more likely a
+// user who didn't read the refusal than a deliberate override.
+const GMAIL_REVIEW_MARK_PROGRESS_OVERRIDE_RE = /\banyway\b|\bregardless\b|\boverride\b|\bdo it anyway\b|\bigual(mente)?\b|\bde totes maneres\b/i;
+
 function gmailReviewMarkProgressShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
   const text = normalizeIntentText(message);
   if (!text || !GMAIL_REVIEW_MARK_PROGRESS_RE.test(text)) {
     return [];
   }
+
+  const explicitOverride = GMAIL_REVIEW_MARK_PROGRESS_OVERRIDE_RE.test(text);
+  const overrideArgs = explicitOverride ? { explicitOverride: true } : {};
 
   const visibleReviews = context.session.visibleEntities.filter(
     (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
@@ -2234,12 +2401,12 @@ function gmailReviewMarkProgressShortcutOperation(message: string, context: Cont
     const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index));
     const indexes = extractIndexesFromText(text, visibleIndexSet);
     if (indexes.length > 0) {
-      return [{ tool: "gmail.review.log_progress", args: { index: indexes[0] }, rationale: "user explicitly said this visible Gmail review is a CV/application sent" }];
+      return [{ tool: "gmail.review.log_progress", args: { index: indexes[0], ...overrideArgs }, rationale: "user explicitly said this visible Gmail review is a CV/application sent" }];
     }
 
     const selected = selectVisibleEntityMention(text, visibleReviews);
     if (selected) {
-      return [{ tool: "gmail.review.log_progress", args: visibleEntityToGmailReviewRef(selected), rationale: "user explicitly said this visible Gmail review is a CV/application sent" }];
+      return [{ tool: "gmail.review.log_progress", args: { ...visibleEntityToGmailReviewRef(selected), ...overrideArgs }, rationale: "user explicitly said this visible Gmail review is a CV/application sent" }];
     }
   }
 
@@ -2247,7 +2414,7 @@ function gmailReviewMarkProgressShortcutOperation(message: string, context: Cont
   if (focused) {
     const stillVisible = context.session.visibleEntities.some((entity) => entity.type === "gmail_review" && entity.id === focused.id);
     if (stillVisible) {
-      return [{ tool: "gmail.review.log_progress", args: { ref: "this" }, rationale: "user explicitly said the last-detailed Gmail review is a CV/application sent" }];
+      return [{ tool: "gmail.review.log_progress", args: { ref: "this", ...overrideArgs }, rationale: "user explicitly said the last-detailed Gmail review is a CV/application sent" }];
     }
   }
 
