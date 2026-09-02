@@ -44,8 +44,10 @@ export function cleanEmailBodyForDisplay(rawBody: string, options: CleanEmailBod
   text = stripQuotedReplyChain(text);
   text = stripFooterNoise(text);
   text = stripRecommendationNoise(text);
+  text = stripMarkdownLinkResidue(text);
   text = redactSecrets(text);
   text = stripTrackingUrls(text);
+  text = stripDanglingTrackingParams(text);
   text = stripSeparatorLines(text);
   text = collapseWhitespace(text);
 
@@ -162,7 +164,15 @@ const RECOMMENDATION_MARKERS: RegExp[] = [
   /\bmore\s+jobs\s+for\s+you\b/i,
   /\bpeople\s+(also\s+viewed|from\s+your\s+(university|school|network))\b/i,
   /\bother\s+jobs\s+you\s+may\s+like\b/i,
-  /\bjobs\s+near\s+you\b/i
+  /\bjobs\s+near\s+you\b/i,
+  // fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 8): a real reported
+  // bug — a Spanish LinkedIn job-alert email's detail still showed "Mira a quién ha contratado..."
+  // (LinkedIn's "see who was hired" teaser) and "Solicitar con perfil y CV" (an apply-button caption
+  // from a DIFFERENT, recommended listing, not the email's own real subject) after the real content.
+  /\bmira a qui[eé]n ha contratado\b/i,
+  /\bsolicitar con perfil y cv\b/i,
+  /\b(empleos|ofertas|vacantes)\s+(recomendad[oa]s|similares|que\s+te\s+pueden\s+interesar)\b/i,
+  /\bpersonas\s+tambi[eé]n\s+vieron\b/i
 ];
 
 function stripRecommendationNoise(text: string): string {
@@ -174,6 +184,22 @@ function stripRecommendationNoise(text: string): string {
     }
   }
   return text.slice(0, cutIndex);
+}
+
+// fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 8): a real reported
+// bug — even after URL stripping, a markdown-style link ("[NodeJS](https://...)") left its bracket
+// syntax AND the query-string tail LinkedIn tacks on directly after the closing paren with no space
+// ("...)&lipi=abc123&trk=xyz") — that tail sits OUTSIDE the URL itself, so URL-matching alone can
+// never catch it. Markdown links collapse to just their visible label (the URL was never useful to
+// show anyway — stripTrackingUrls already guarantees that); dangling "&key=value" query fragments
+// wherever they appear (never legitimate in real prose — that shape is exclusively URL-query syntax)
+// are removed outright.
+function stripMarkdownLinkResidue(text: string): string {
+  return text.replace(/\[([^\]\n]{0,160})\]\([^)\n]*\)/g, "$1");
+}
+
+function stripDanglingTrackingParams(text: string): string {
+  return text.replace(/(?:[&?][A-Za-z_][\w-]*=[^\s&?]*){1,}/g, "");
 }
 
 // A short, clean URL (e.g. a plain "https://example.com/page") is left as-is — genuinely useful

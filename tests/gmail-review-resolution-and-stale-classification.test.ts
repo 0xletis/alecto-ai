@@ -58,7 +58,13 @@ function installGmailFullFetchMock(messages: SeededGmailMessage[]): () => void {
           headers: [
             { name: "Subject", value: message.subject },
             { name: "From", value: message.from },
-            { name: "Date", value: "Thu, 20 Aug 2026 09:00:00 +0200" }
+            // fix/private-alpha-email-progress-invariant-and-review-list-stability: was a fixed
+            // fixture date — once gmail.review.log_progress started verifying its own writes
+            // against getEventsSince's real 7-day window, a message dated further back than that
+            // (as this fixed date now silently drifts to be) made every genuinely-successful write
+            // look unverifiable, since the created event fell outside the very window being
+            // checked. "Now" here, same as the LLM eval file's installEvalGmailFetchMockDatedNow.
+            { name: "Date", value: new Date().toUTCString() }
           ],
           body: { data: Buffer.from(message.body, "utf8").toString("base64url") }
         }

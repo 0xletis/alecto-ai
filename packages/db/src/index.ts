@@ -753,11 +753,18 @@ export async function findGmailSemanticDuplicateEvent(
     orderBy: { timestamp: "desc" }
   });
 
+  // fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 7): a real reported
+  // bug — the same OpenZeppelin email, matched by two separate active rules on the same account,
+  // produced two identical "[High priority] OpenZeppelin — job offer" pending reviews, because this
+  // match was scoped to `input.ruleId` — each rule's own classification pass only ever checked
+  // ITS OWN prior matches for a semantic duplicate, never the other rule's. Scoped to the user now,
+  // not the rule: the same real-world email/opportunity (exact normalized subject + sender +
+  // company/role/project/deadline/actionRequired match — already a strict fingerprint) must never
+  // produce two pending rows just because two different rules both happened to flag it.
   const duplicate = events.find((event) => {
     const data = toRecord(event.data);
 
     return (
-      data.ruleId === input.ruleId &&
       normalizeSemanticText(readString(data.subject)) === subject &&
       normalizeEmailAddress(readString(data.from)) === from &&
       normalizeSemanticText(readString(data.company)) === company &&
@@ -850,10 +857,14 @@ export async function findGmailSemanticDuplicateReviewItem(
     return undefined;
   }
 
+  // fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 7): scoped to the
+  // user, not the rule — see findGmailSemanticDuplicateEvent's own matching comment above for the
+  // exact live bug (two rules, one real email, two identical pending reviews) this closes. The
+  // strict semantic match below (exact normalized subject + sender + company/role/project/deadline/
+  // actionRequired) is what actually decides "same real opportunity," not which rule saw it first.
   const items = await prisma.emailReviewItem.findMany({
     where: {
       userId: input.userId,
-      ruleId: input.ruleId,
       adapterId: input.adapterId,
       provider: input.provider,
       proposedEventType: input.proposedEventType,
