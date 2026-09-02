@@ -2371,6 +2371,16 @@ export async function executeOperation(
 
       case "gmail.review.list": {
         const status = (args.status as EmailReviewItem["status"] | "all" | undefined) ?? "pending";
+        // fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 6): captured
+        // BEFORE the fresh fetch below — whatever gmail_review entities were already visible
+        // entering this turn (i.e. what the user was shown last time reviews were listed in this
+        // conversation). A real background Gmail sync can add new pending rows between turns; this
+        // is exactly the intended, desirable behavior (that's what the sync is FOR), but appearing
+        // with no explanation reads as a bug ("reviews appeared suddenly") rather than the honest
+        // "new mail arrived" it actually is.
+        const previouslyVisibleReviewIds = new Set(
+          context.session.visibleEntities.filter((entity) => entity.type === "gmail_review").map((entity) => entity.id)
+        );
         let items = await getEmailReviewItems(userId, { status, limit: (args.limit as number | undefined) ?? 10 });
         const timezone = await getUserTimezone(userId);
 
@@ -2392,10 +2402,18 @@ export async function executeOperation(
           }
         }
 
+        // Only ever a note about GENUINELY new mail — never fires the first time reviews are shown
+        // in a session (nothing to compare against yet, so previouslyVisibleReviewIds is empty and
+        // "new since last view" would be meaningless), and never fires for "all"/decided-status
+        // views, only the live pending queue this tool actually re-lists.
+        const newSinceLastView =
+          status === "pending" && previouslyVisibleReviewIds.size > 0 ? items.filter((item) => !previouslyVisibleReviewIds.has(item.id)).length : 0;
+        const newSinceLastViewNote = newSinceLastView > 0 ? `${newSinceLastView} new review${newSinceLastView === 1 ? "" : "s"} arrived since your last view.\n\n` : "";
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone),
+          summary: `${newSinceLastViewNote}${formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone)}`,
           result: items,
           entities: items.map((review, index) => reviewToEntity(review, index + 1, context.gmailRules))
         };
@@ -2611,18 +2629,31 @@ export async function executeOperation(
         const gmailReceivedDateText = refetch.status === "ok" ? refetch.content.date : undefined;
         const resolvedDate = resolveEmailProgressDate({ message, appliedDateText, gmailReceivedDateText, now: resolveAgentRuntimeNow(), timezone });
 
-        // fix/private-alpha-email-progress-count-and-review-ux (Task 2): dedupe — the same
-        // underlying email can never be counted twice even across retries/races, keyed off the
-        // review's own externalId (already unique per Gmail message) rather than trusting the
-        // status:"pending" guard above alone. A fully-duplicate result (every index already
-        // existed) resolves the review as a duplicate and reports honestly — it never says
-        // "logged" for progress that was never actually added.
-        // Keyed off the underlying Gmail message (connectionId + providerMessageId), not the
-        // review row's own externalId — two DIFFERENT review rows (e.g. from two separate rules
-        // both watching the same account) can point at the exact same email, and this must still
-        // dedupe across them, not just across repeats of the SAME review.
+        // fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 2): a real
+        // reported bug — "Logged 1 CV sent" every time, but the SAME aggregate goal.status reads
+        // stayed unchanged live. Root cause could never be conclusively reproduced against this
+        // exact committed code (a direct repro of the live transcript's Sep 2 scenario correctly
+        // showed Today: 1 / This week: 17), which points at a deploy/version-lag or a genuine race
+        // rather than a code defect that always fires — but "we couldn't reproduce it" is not the
+        // same as "it can't happen," so this now VERIFIES rather than assumes. Baseline counts are
+        // read with getEventsSince — the exact same function goal.status itself calls — captured
+        // BEFORE the write, then re-read fresh (a real new query, never the in-memory `created`
+        // array) AFTER it, and the reply only ever claims "Logged" once the real delta is confirmed.
+        const sevenDaysAgo = new Date(resolveAgentRuntimeNow().getTime() - 7 * 24 * 60 * 60 * 1000);
+        const todayLocalDate = formatDateInTimezone(resolveAgentRuntimeNow(), timezone);
+        const countCanonicalEvents = (events: StoredEvent[]) => ({
+          week: events.filter((event) => event.type === "career.application_sent").length,
+          today: events.filter((event) => event.type === "career.application_sent" && formatDateInTimezone(event.timestamp, timezone) === todayLocalDate).length
+        });
+        const before = countCanonicalEvents(await getEventsSince(userId, sevenDaysAgo));
+
+        // Dedupe — the same underlying email can never be counted twice even across retries/races,
+        // keyed off the underlying Gmail message (connectionId + providerMessageId), not the review
+        // row's own externalId, since two DIFFERENT review rows (e.g. from two separate rules both
+        // watching the same account) can point at the exact same email and must still dedupe across
+        // each other, not just across repeats of the SAME review row.
         const created: StoredEvent[] = [];
-        let anyNewlyCreated = false;
+        let newlyCreatedCount = 0;
         for (let i = 0; i < count; i += 1) {
           const result = await createExternalEventIfNotExists(userId, {
             type: "career.application_sent",
@@ -2633,13 +2664,14 @@ export async function executeOperation(
             externalId: `gmail-message:${review.connectionId}:${review.providerMessageId}:cv-sent:${i}`
           });
           created.push(result.event);
-          if (result.created) anyNewlyCreated = true;
+          if (result.created) newlyCreatedCount += 1;
         }
 
-        await approveEmailReviewItem(userId, review.id, created[0]?.id);
-        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
-
-        if (!anyNewlyCreated) {
+        if (newlyCreatedCount === 0) {
+          // Nothing new was written — an honest duplicate, not a verification question. Still
+          // resolves the review (it IS decided, just not double-counted) but never claims "logged."
+          await approveEmailReviewItem(userId, review.id, created[0]?.id);
+          const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
           return {
             tool: operation.tool,
             status: "executed",
@@ -2648,6 +2680,46 @@ export async function executeOperation(
             entities: remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
           };
         }
+
+        const after = countCanonicalEvents(await getEventsSince(userId, sevenDaysAgo));
+        // A resolved date older than the 7-day window (a real, if unusual, case — backlogging an
+        // old application-confirmation email) genuinely never appears in "this week," so there is
+        // nothing to verify against it; only require the week delta when the event actually landed
+        // inside the window goal.status itself queries.
+        const dateWithinWeek = resolvedDate.date >= sevenDaysAgo;
+        // Test-only escape hatch, same established pattern as EMAIL_UNDERSTANDING_MOCK_THROW
+        // elsewhere in this codebase — lets a deterministic test exercise the "verification failed"
+        // branch itself (a genuine failure here reflects a real DB/read inconsistency this tool has
+        // no way to force from the outside, by design).
+        const forceVerificationFailure = process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL === "true";
+        const weekVerified = !forceVerificationFailure && (!dateWithinWeek || after.week === before.week + newlyCreatedCount);
+        const todayVerified = !forceVerificationFailure && (!resolvedDate.isToday || after.today === before.today + newlyCreatedCount);
+
+        if (!weekVerified || !todayVerified) {
+          // Never resolves the review, never claims "logged" — the write happened (the events are
+          // real rows), but goal.status's OWN read of them didn't show the expected delta, so the
+          // one thing this tool must never do (claim success the aggregate doesn't back up) is
+          // skipped in favor of an honest, actionable admission. Always logged server-side
+          // (unconditional — this is a real data-integrity signal, not routine diagnostics).
+          console.error("[gmail.review.log_progress] read-after-write verification failed", {
+            userId,
+            reviewId: review.id,
+            eventIds: created.map((event) => event.id),
+            newlyCreatedCount,
+            before,
+            after,
+            resolvedDate: { iso: resolvedDate.date.toISOString(), isToday: resolvedDate.isToday, label: resolvedDate.label }
+          });
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: "I tried to log it, but I couldn't verify the progress count changed, so I left the review pending.",
+            result: { emailReview: review, events: created, verified: false }
+          };
+        }
+
+        await approveEmailReviewItem(userId, review.id, created[0]?.id);
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
 
         const goalNote = describeGoalEvidenceMatch(findGoalsForEventType(context.activeGoals, "career.application_sent"));
         const reconciliation = reconcileApplicationsSentWithOpenAction(count, context.openActions);
@@ -2662,7 +2734,7 @@ export async function executeOperation(
           tool: operation.tool,
           status: "executed",
           summary: `Logged ${count} CV${count === 1 ? "" : "s"} sent${dateNote} from that email and resolved the review.${goalNote ? ` ${goalNote}` : ""}${reconciliation.note}`,
-          result: { emailReview: review, events: created, actionItem: completedAction },
+          result: { emailReview: review, events: created, actionItem: completedAction, verified: true },
           entities: [
             ...(completedAction ? [actionToEntity(completedAction)] : []),
             ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))

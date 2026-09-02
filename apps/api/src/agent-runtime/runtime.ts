@@ -1898,7 +1898,17 @@ async function finalizeDeterministicOperations(
   });
 }
 
-function looksLikeGmailReviewListRequest(text: string, context?: ContextBundle): boolean {
+// fix/private-alpha-email-progress-invariant-and-review-list-stability (Task 5): a real reported
+// gap — "show email reviws" (a one-letter-dropped typo) fell all the way through to the real
+// planner, which without a reliable model call available degrades to "I couldn't reason through
+// the email request cleanly" instead of showing the list. Corrected to the real word before any of
+// the phrase matching below runs, rather than trying to make every pattern typo-tolerant itself.
+function correctCommonReviewTypos(text: string): string {
+  return text.replace(/\breviws\b/g, "reviews");
+}
+
+function looksLikeGmailReviewListRequest(rawText: string, context?: ContextBundle): boolean {
+  const text = correctCommonReviewTypos(rawText);
   return (
     // "mail reviews" (bare "mail," not just "email"/"gmail") — a real requested phrasing: "show
     // me mail reviews" means the review queue exactly like "show me email reviews" does.
@@ -4068,17 +4078,36 @@ function goalRestoreShortcutOperation(message: string): PlannedOperation | undef
 const GOAL_TODAY_PROGRESS_RE =
   /\btoday'?s?\b[\s\S]{0,15}\bprogr+ess\b|\bhow many\b[\s\S]{0,50}\btoday\b|\bcu[aá]ntos?\b[\s\S]{0,50}\bhoy\b|\bhoy\b[\s\S]{0,20}\bcu[aá]ntos?\b|\bquants?\b[\s\S]{0,50}\bavui\b|\bavui\b[\s\S]{0,20}\bquants?\b/i;
 
+// fix/private-alpha-email-progress-invariant-and-review-list-stability: the "this must never rely
+// on the real planner for a pure progress question" rule applies just as much to a WEEK-scoped
+// question as a day-scoped one — the exact live replay this task fixes includes "show this week
+// goal progress" as its own turn. Same question-shaped-only guard as GOAL_TODAY_PROGRESS_RE above.
+const GOAL_WEEK_PROGRESS_RE =
+  /\bthis\s+week'?s?\b[\s\S]{0,15}\bprogr+ess\b|\bhow many\b[\s\S]{0,50}\bthis\s+week\b|\bcu[aá]ntos?\b[\s\S]{0,50}\besta\s+semana\b|\besta\s+semana\b[\s\S]{0,20}\bcu[aá]ntos?\b|\bquants?\b[\s\S]{0,50}\baquesta\s+setmana\b|\baquesta\s+setmana\b[\s\S]{0,20}\bquants?\b/i;
+
 function goalTodayProgressShortcutOperation(message: string): PlannedOperation | undefined {
   const text = normalizeIntentText(message);
-  if (!text || !GOAL_TODAY_PROGRESS_RE.test(text)) {
+  if (!text) {
     return undefined;
   }
 
-  return {
-    tool: "goal.status",
-    args: { scope: "today" },
-    rationale: "user asked a read-only question about today's progress specifically"
-  };
+  if (GOAL_TODAY_PROGRESS_RE.test(text)) {
+    return {
+      tool: "goal.status",
+      args: { scope: "today" },
+      rationale: "user asked a read-only question about today's progress specifically"
+    };
+  }
+
+  if (GOAL_WEEK_PROGRESS_RE.test(text)) {
+    return {
+      tool: "goal.status",
+      args: {},
+      rationale: "user asked a read-only question about this week's progress specifically"
+    };
+  }
+
+  return undefined;
 }
 
 function looksLikeGmailAlertSettingsRequest(text: string): boolean {

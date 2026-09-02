@@ -17925,3 +17925,429 @@ test(
     }
   }
 );
+
+// --- fix/private-alpha-email-progress-invariant-and-review-list-stability: the hard consistency
+// failure — "Logged 1 CV sent" claimed while goal.status's own aggregate stayed unchanged. Covers
+// the new read-after-write invariant, cross-rule review dedupe (the live "OpenZeppelin x2" report),
+// review-list stability/typo-tolerance, and further detail cleanup. Real planner + real
+// understanding throughout — no mocks for those two, only Gmail fetch + (where used) the
+// EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL test-only escape hatch.
+
+const tsbEvalUnderstanding = {
+  emailKind: "application_confirmation",
+  relevance: "medium",
+  goalRelevance: "direct",
+  summary: "Technical Solutions Blockchain confirmed receipt of your application.",
+  why: ["hemos recibido tu solicitud", "Technical Solutions Blockchain"],
+  suggestedUserAction: "approve",
+  confidence: 0.9,
+  keyDetails: { company: "Technical Solutions Blockchain", role: null, location: null, appliedDate: null, status: null, nextStep: null },
+  keyFacts: []
+};
+
+test(
+  "477. a Sep-2-dated application review, marked as CV sent, verifiably increments Today and This week (email-progress-read-after-write A / goal-progress-daily-scope A)",
+  { ...llmEvalOptions(["email-progress-read-after-write", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-477-${randomUUID()}`;
+    const trace = new EvalTrace("477-read-after-write-today-and-week", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-477-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud. Technical Solutions Blockchain." }]);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-477-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+        assertNoGenericAgentError(t3);
+        const claimedLogged = /^logged 1/i.test(t3.reply.trim());
+        trace.checkpoint("only claims 'logged' when it actually happened", claimedLogged, t3.reply);
+        assert.ok(claimedLogged, `expected a genuine successful log to say so — got: ${t3.reply}`);
+
+        const t4 = trace.record("show today goal progress", await sendAgentMessage(server, userId, "show today goal progress"));
+        const showsToday1 = /today[^\n]*\b1\b/i.test(t4.reply);
+        trace.checkpoint("the real read-after-write aggregate shows Today: 1", showsToday1, t4.reply);
+        assert.ok(showsToday1, `expected the verified write to be visible as Today: 1 — got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "478. a duplicate review never produces a false 'logged' claim (email-progress-count-consistency E)",
+  { ...llmEvalOptions(["email-progress-count-consistency"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-478-${randomUUID()}`;
+    const trace = new EvalTrace("478-duplicate-no-false-logged", ["email-progress-count-consistency"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-478-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-478-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", reason: "uncertain signal", updatedAt: new Date(Date.now() - 1000) });
+      const rule2 = await seedResolutionEvalReviewRule(userId, connection.id);
+      await prisma.emailReviewItem.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          ruleId: rule2.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          providerMessageId: "eval-478-tsb",
+          externalId: `gmail-review:${rule2.id}:eval-478-tsb`,
+          status: "pending",
+          subject: "Technical Solutions Blockchain",
+          from: "no-reply@tsb.example",
+          confidence: 0.6,
+          reason: "uncertain signal",
+          extracted: {}
+        }
+      });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("mark 1 as cv sent", await sendAgentMessage(server, userId, "mark 1 as cv sent"));
+        const t3 = trace.record("mark 1 as cv sent (again)", await sendAgentMessage(server, userId, "mark 1 as cv sent"));
+        assertNoGenericAgentError(t3);
+
+        const falselyLogged = /^logged 1/i.test(t3.reply.trim());
+        trace.checkpoint("the duplicate never claims a fresh 'Logged 1'", !falselyLogged, t3.reply);
+        assert.ok(!falselyLogged, `a duplicate must never falsely claim new progress — got: ${t3.reply}`);
+
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent" } });
+        trace.checkpoint("exactly one CV-sent event exists across both review rows", events === 1, `count=${events}`);
+        assert.equal(events, 1, `expected the same email to count once — got ${events}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "479. a forced verification failure never claims 'logged' and leaves the review pending (email-progress-read-after-write B)",
+  { ...llmEvalOptions(["email-progress-read-after-write"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-479-${randomUUID()}`;
+    const trace = new EvalTrace("479-verification-failure-no-false-claim", ["email-progress-read-after-write"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-479-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud." }]);
+
+    try {
+      await seedUser(userId);
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      const review = await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-479-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", reason: "uncertain signal" });
+
+      process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL = "true";
+      try {
+        await trace.guard(async () => {
+          trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+          trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+          const t3 = trace.record("mark it as cv sent", await sendAgentMessage(server, userId, "mark it as cv sent"));
+          assertNoGenericAgentError(t3);
+
+          const claimedLogged = /^logged/i.test(t3.reply.trim());
+          trace.checkpoint("never claims 'logged' when verification failed", !claimedLogged, t3.reply);
+          assert.ok(!claimedLogged, `a failed verification must never claim success — got: ${t3.reply}`);
+
+          const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
+          trace.checkpoint("the review stays pending when verification failed", after?.status === "pending", after?.status);
+          assert.equal(after?.status, "pending", `expected the review to stay pending — got: ${after?.status}`);
+        });
+      } finally {
+        delete process.env.EMAIL_PROGRESS_VERIFICATION_FORCE_FAIL;
+      }
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "480. 'how many CVs did I send today?' never calls a mutating tool (goal-progress-daily-scope C)",
+  { ...llmEvalOptions(["goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-480-${randomUUID()}`;
+    const trace = new EvalTrace("480-daily-query-never-mutates", ["goal-progress-daily-scope"], userId);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+
+      await trace.guard(async () => {
+        const t1 = trace.record("how many CVs did I send today?", await sendAgentMessage(server, userId, "how many CVs did I send today?"));
+        assertNoGenericAgentError(t1);
+
+        const mutatingToolCalled = t1.operationsExecuted.some((entry) => entry.tool === "goal.log_evidence" || entry.tool === "event.log_job_applications");
+        trace.checkpoint("a pure question never calls a mutating logging tool", !mutatingToolCalled, JSON.stringify(t1.operationsPlanned));
+        assert.ok(!mutatingToolCalled, `a pure daily-progress question must never mutate — got operations: ${JSON.stringify(t1.operationsPlanned)}`);
+
+        const events = await prisma.event.count({ where: { userId } });
+        assert.equal(events, 0, "a pure question must never create a real event");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "481. typo 'show email reviws' uses the new formatter, not a fallback/error reply (email-review-list-stability A)",
+  { ...llmEvalOptions(["email-review-list-stability"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-481-${randomUUID()}`;
+    const trace = new EvalTrace("481-typo-uses-new-formatter", ["email-review-list-stability"], userId);
+
+    try {
+      await seedUser(userId);
+      const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, {
+        providerMessageId: "eval-481-tsb",
+        subject: "Technical Solutions Blockchain",
+        from: "no-reply@tsb.example",
+        reason: "application_confirmation",
+        proposedEventType: "career.application_confirmation_received"
+      });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show email reviws", await sendAgentMessage(server, userId, "show email reviws"));
+        assertNoGenericAgentError(t1);
+
+        const showsList = /pending gmail review/i.test(t1.reply);
+        trace.checkpoint("the typo still produces the real review list, not a fallback reply", showsList, t1.reply);
+        assert.ok(showsList, `expected the typo to still list real reviews — got: ${t1.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "482. the old canned footer string is absent from a real review list (email-review-list-ux C)",
+  { ...llmEvalOptions(["email-review-list-ux"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-482-${randomUUID()}`;
+    const trace = new EvalTrace("482-old-footer-absent", ["email-review-list-ux"], userId);
+
+    try {
+      await seedUser(userId);
+      const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-482-m1", subject: "Mira vacantes de Exoticca", from: "jobs@exoticca.example", reason: "uncertain signal" });
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-482-m2", subject: "¡Bienvenido!", from: "welcome@example.com", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        const t1 = trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        assertNoGenericAgentError(t1);
+
+        const oldFooter = /reject the endesa one|turn the recruiter one into a task/i.test(t1.reply);
+        trace.checkpoint("the old canned example footer never appears", !oldFooter, t1.reply);
+        assert.ok(!oldFooter, `the old canned footer must never appear — got: ${t1.reply}`);
+
+        const fabricatedNumber = /details for 3/i.test(t1.reply);
+        trace.checkpoint("no fabricated review number 3 with only 2 reviews visible", !fabricatedNumber, t1.reply);
+        assert.ok(!fabricatedNumber, `must never reference a number that doesn't exist — got: ${t1.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "483. the same real opportunity matched by two rules never shows as two duplicate pending reviews (email-review-dedupe A)",
+  { ...llmEvalOptions(["email-review-dedupe"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-483-${randomUUID()}`;
+    const trace = new EvalTrace("483-cross-rule-dedupe", ["email-review-dedupe"], userId);
+
+    try {
+      await seedUser(userId);
+      const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const { findGmailSemanticDuplicateReviewItem } = await import("../packages/db/src/index.ts");
+      const ruleA = await seedResolutionEvalReviewRule(userId, connection.id);
+      const ruleB = await seedResolutionEvalReviewRule(userId, connection.id);
+      const firstReview = await prisma.emailReviewItem.create({
+        data: {
+          userId,
+          connectionId: connection.id,
+          ruleId: ruleA.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          providerMessageId: "eval-483-oz",
+          externalId: `gmail-review:${ruleA.id}:eval-483-oz`,
+          status: "pending",
+          subject: "Your offer from OpenZeppelin",
+          from: "hr@openzeppelin.example",
+          confidence: 0.7,
+          reason: "job_offer",
+          proposedEventType: "career.offer_received",
+          extracted: { company: "OpenZeppelin", role: "Smart Contract Engineer" }
+        }
+      });
+
+      await trace.guard(async () => {
+        const duplicate = await findGmailSemanticDuplicateReviewItem({
+          userId,
+          ruleId: ruleB.id,
+          adapterId: "job_search_email",
+          provider: "gmail",
+          proposedEventType: "career.offer_received",
+          subject: "Your offer from OpenZeppelin",
+          from: "hr@openzeppelin.example",
+          company: "OpenZeppelin",
+          role: "Smart Contract Engineer"
+        });
+        trace.checkpoint("a second rule's classification finds the first rule's review as a duplicate", duplicate?.id === firstReview.id, duplicate?.id);
+        assert.equal(duplicate?.id, firstReview.id, "the cross-rule semantic duplicate must be found");
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "484. background-sync-added reviews are explained as new since the last view (email-review-list-stability B)",
+  { ...llmEvalOptions(["email-review-list-stability"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-484-${randomUUID()}`;
+    const trace = new EvalTrace("484-new-since-last-view", ["email-review-list-stability"], userId);
+
+    try {
+      await seedUser(userId);
+      const connection = await prisma.integrationConnection.create({ data: { userId, integrationId: "gmail", status: "active", config: {} } });
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-484-m1", subject: "First review", from: "a@example.com", reason: "application_confirmation", proposedEventType: "career.application_confirmation_received" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+
+        // Simulates a background Gmail sync adding a new pending row between the two turns.
+        await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-484-m2", subject: "Second review (new)", from: "b@example.com", reason: "application_confirmation", proposedEventType: "career.application_confirmation_received" });
+
+        const t2 = trace.record("show email reviews (again)", await sendAgentMessage(server, userId, "show email reviews"));
+        assertNoGenericAgentError(t2);
+
+        const explainsNew = /new review[s]?\s+arrived since your last view/i.test(t2.reply);
+        trace.checkpoint("the newly-arrived review is explained, not just silently present", explainsNew, t2.reply);
+        assert.ok(explainsNew, `expected an explicit 'new since last view' note — got: ${t2.reply}`);
+      });
+    } finally {
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "485. Spanish: 'márcalo como CV enviado' verifiably updates today's count (email-progress-read-after-write C)",
+  { ...llmEvalOptions(["email-progress-read-after-write", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-485-${randomUUID()}`;
+    const trace = new EvalTrace("485-spanish-verified-update", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-485-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "Hemos recibido tu solicitud." }]);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-485-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("márcalo como CV enviado", await sendAgentMessage(server, userId, "márcalo como CV enviado"));
+        const t4 = trace.record("cuántos CVs he enviado hoy", await sendAgentMessage(server, userId, "cuántos CVs he enviado hoy"));
+        assertNoGenericAgentError(t4);
+
+        const answersToday1 = /\b1\b/.test(t4.reply);
+        trace.checkpoint("the verified count is visible in the Spanish daily query", answersToday1, t4.reply);
+        assert.ok(answersToday1, `expected the Spanish daily query to reflect the verified write — got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+test(
+  "486. Catalan: 'marca-ho com a CV enviat' verifiably updates today's count (email-progress-read-after-write D)",
+  { ...llmEvalOptions(["email-progress-read-after-write", "goal-progress-daily-scope"]), timeout: EVAL_TIMEOUT_MS },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-eval-486-${randomUUID()}`;
+    const trace = new EvalTrace("486-catalan-verified-update", ["email-progress-read-after-write", "goal-progress-daily-scope"], userId);
+    const restoreKey = installEvalGmailEncryptionKey();
+    const restoreFetch = installEvalGmailFetchMockDatedNow([{ id: "eval-486-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", body: "S'ha rebut la teva sol·licitud." }]);
+
+    try {
+      await seedUser(userId);
+      const jobSearchResult = await createGoal(userId, { title: "Find a new developer job", category: "career", templateId: "career.job_search" });
+      if (jobSearchResult.duplicate) throw new Error("unexpected duplicate goal in eval setup");
+      const connection = await seedEvalGmailConnectionWithToken(userId);
+      const rule = await seedResolutionEvalReviewRule(userId, connection.id);
+      await seedResolutionEvalReview(userId, connection.id, rule.id, { providerMessageId: "eval-486-tsb", subject: "Technical Solutions Blockchain", from: "no-reply@tsb.example", reason: "uncertain signal" });
+
+      await trace.guard(async () => {
+        trace.record("show email reviews", await sendAgentMessage(server, userId, "show email reviews"));
+        trace.record("details for 1", await sendAgentMessage(server, userId, "details for 1"));
+        trace.record("marca-ho com a CV enviat", await sendAgentMessage(server, userId, "marca-ho com a CV enviat"));
+        const t4 = trace.record("quants CVs he enviat avui", await sendAgentMessage(server, userId, "quants CVs he enviat avui"));
+        assertNoGenericAgentError(t4);
+
+        const answersToday1 = /\b1\b/.test(t4.reply);
+        trace.checkpoint("the verified count is visible in the Catalan daily query", answersToday1, t4.reply);
+        assert.ok(answersToday1, `expected the Catalan daily query to reflect the verified write — got: ${t4.reply}`);
+      });
+    } finally {
+      restoreFetch();
+      restoreKey();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);

@@ -59,7 +59,10 @@ function installGmailFullFetchMock(messages: SeededGmailMessage[]): () => void {
           headers: [
             { name: "Subject", value: message.subject },
             { name: "From", value: message.from },
-            { name: "Date", value: "Wed, 02 Sep 2026 09:00:00 +0200" }
+            // A fixed date drifts stale relative to whatever "now" the suite actually runs at —
+            // see fix/private-alpha-email-progress-invariant-and-review-list-stability's own
+            // read-after-write invariant, which checks a real 7-day/today window against this.
+            { name: "Date", value: new Date().toUTCString() }
           ],
           body: { data: Buffer.from(message.body, "utf8").toString("base64url") }
         }
