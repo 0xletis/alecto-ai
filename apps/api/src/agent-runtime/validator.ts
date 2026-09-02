@@ -64,6 +64,28 @@ function looksLikeBareEvidenceCountQuestion(message: string): boolean {
 const EVIDENCE_QUESTION_CLARIFICATION =
   "I don't want to guess — tell me plainly what you did (e.g. \"log 20 minutes of reading\") and I'll log it for real. Just asking whether something counts doesn't log anything on its own.";
 
+// refactor/private-alpha-canonical-progress-command-engine (Task 2): every phrasing this task's own
+// test list names for CV/application-sent progress — a first-person statement ("I sent 1 CV today",
+// "sent 3 applications"), an explicit mark/count/log-as instruction ("mark it as cv sent", "count
+// this as application sent"), or the Spanish/Catalan equivalents ("márcalo como CV enviado",
+// "marca-ho com a CV enviat"). Deliberately does not try to also cover "log this application
+// confirmation" as a STATEMENT shape (that phrasing is about a Gmail REVIEW, already handled
+// deterministically by runtime.ts's own GMAIL_REVIEW_MARK_PROGRESS_RE before the planner ever runs)
+// — this regex exists purely as the goal.log_evidence backstop for messages that reach the real
+// planner.
+const CV_SENT_STATEMENT_RE = new RegExp(
+  [
+    "\\b(sent|submitted)\\b[\\s\\S]{0,20}\\b\\d+\\b[\\s\\S]{0,15}\\b(cvs?|applications?|resumes?)\\b",
+    "\\b\\d+\\b[\\s\\S]{0,15}\\b(cvs?|applications?)\\b[\\s\\S]{0,10}\\b(sent|submitted|out)\\b",
+    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b",
+    "\\bcount(ed)?\\s+this\\s+as\\s+(an?\\s+)?applications?\\s+sent\\b",
+    "\\bm[aá]rca(lo|la|ho)?\\b[\\s\\S]{0,20}\\bcv enviado\\b",
+    "\\bmarca'?(ho|l|la)?\\b[\\s\\S]{0,20}\\bcv enviat\\b",
+    "\\bhe enviado\\b[\\s\\S]{0,15}\\b(cv|cvs|solicitud(es)?|candidatura)"
+  ].join("|"),
+  "i"
+);
+
 // Only these explicit words/phrases justify action.list showing anything beyond the default
 // "open" status — a bare "show me my actions"/"what are my tasks" must never widen to archived or
 // completed items just because the planner guessed differently or a recent turn mentioned "all".
@@ -718,6 +740,28 @@ function validateOperation(operation: PlannedOperation, context: ContextBundle, 
       clarificationQuestion: EVIDENCE_QUESTION_CLARIFICATION,
       rationale: operation.rationale
     };
+  }
+
+  // refactor/private-alpha-canonical-progress-command-engine (Task 2): the live report this branch
+  // fixes ended with "the planner/event mapper/progress bridge is still allowed to choose the wrong
+  // metric" — the LLM must never be free to pick an arbitrary DB event type for a CV/application-
+  // sent statement. goal.log_evidence's OWN executor case already redirects a CORRECTLY-guessed
+  // career.application_sent eventType through the canonical engine, but that does nothing if the
+  // planner guesses a DIFFERENT eventType/signalKey entirely for what is unambiguously a CV-sent
+  // statement (e.g. picks career.interview_scheduled for "I sent 1 CV today") — exactly the shape
+  // of bug this task's brief warns about. Deterministic, checked against the RAW message text, never
+  // the planner's own reasoning: any message shaped like a CV/application-sent statement or
+  // instruction that reaches goal.log_evidence is unconditionally remapped to
+  // event.log_job_applications (re-validated recursively, so it gets that tool's own schema check,
+  // requiresConfirmation flag, etc.) — the one tool whose only possible event type is the canonical
+  // one, never an LLM-selected field.
+  if (tool.name === "goal.log_evidence" && CV_SENT_STATEMENT_RE.test(message)) {
+    return validateOperation(
+      { tool: "event.log_job_applications", args: { count: (args.count as number | undefined) ?? 1 }, rationale: operation.rationale },
+      context,
+      message,
+      options
+    );
   }
 
   if (ACTION_REFERENCE_TOOLS.has(tool.name) && args.actionId) {

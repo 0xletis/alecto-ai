@@ -244,6 +244,19 @@ export interface CanonicalEventMetricBridge {
   /** Matched against a candidate signalKey metric's own LABEL (never its key) when no exact
    * eventType match exists on the goal. */
   labelKeywords: RegExp;
+  /**
+   * refactor/private-alpha-canonical-progress-command-engine: a real live regression —
+   * `labelKeywords: /\b(applications?|cvs?)\b/i` alone also matches a DIFFERENT metric's label,
+   * "Application to Interview" (a later-lifecycle signal a user had separately described), because
+   * that label also contains the word "application." A goal with both "Applications sent" and
+   * "Application to Interview" as signalKey metrics let `metrics.find` silently pick whichever one
+   * happened to come first — the exact "planner/event mapper/progress bridge chooses the wrong
+   * metric" bug this field exists to close off. Checked BEFORE labelKeywords on every candidate: a
+   * label matching this pattern is never eligible for this bridge, no matter how well it also
+   * matches labelKeywords. Optional so a bridge with no realistic same-domain collision doesn't
+   * need to declare one.
+   */
+  excludeLabelKeywords?: RegExp;
 }
 
 export function resolveGoalMetricForCanonicalEvent<T extends Pick<Goal, "targetMetrics">>(
@@ -256,5 +269,11 @@ export function resolveGoalMetricForCanonicalEvent<T extends Pick<Goal, "targetM
     return exact;
   }
 
-  return metrics.find((metric) => metric.signalKey && isProgressShapedSignalText(metric.label) && bridge.labelKeywords.test(metric.label));
+  return metrics.find(
+    (metric) =>
+      metric.signalKey &&
+      isProgressShapedSignalText(metric.label) &&
+      bridge.labelKeywords.test(metric.label) &&
+      !(bridge.excludeLabelKeywords && bridge.excludeLabelKeywords.test(metric.label))
+  );
 }
