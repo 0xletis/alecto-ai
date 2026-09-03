@@ -1,4 +1,13 @@
-import { CUSTOM_SIGNAL_EVENT_TYPE, EventTypeSchema, HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES, parseActionDueDate, type Goal, type StoredEvent } from "@operator-agent/core";
+import {
+  CUSTOM_SIGNAL_EVENT_TYPE,
+  EventTypeSchema,
+  HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES,
+  groupEmailIntelligenceItems,
+  parseActionDueDate,
+  type EmailIntelligenceSourceItem,
+  type Goal,
+  type StoredEvent
+} from "@operator-agent/core";
 import {
   approveEmailReviewItem,
   createActionItemIfNotExists,
@@ -696,13 +705,16 @@ const KNOWN_NON_EVENT_REASON_LABELS: Record<string, string> = {
 };
 
 /** Real signal-type name when the classifier proposed one; a known non-eventType reason's own
- * label when that's what this is; an honest "uncertain signal" (never a guessed category)
+ * label when that's what this is; "needs decision" (never a guessed category, and never the old
+ * lazy "uncertain signal" catch-all — refactor/private-alpha-general-email-intelligence-workflow
+ * Task 2: a bare "uncertain" label states confusion without direction, "needs decision" says what
+ * Alecto actually knows — it has no determinable event type, so a human call is what's missing)
  * otherwise — e.g. an "action required" email with no determinable event type. */
 export function gmailReviewSignalTypeLabel(review: Pick<EmailReviewItem, "proposedEventType" | "reason">): string {
   if (review.proposedEventType) {
     return humanEmailReviewEventLabel(review.proposedEventType);
   }
-  return KNOWN_NON_EVENT_REASON_LABELS[review.reason] ?? "uncertain signal";
+  return KNOWN_NON_EVENT_REASON_LABELS[review.reason] ?? "needs decision";
 }
 
 export type GmailReviewPresentationCategory = "confirmation" | "needs_review" | "noise";
@@ -865,6 +877,134 @@ function groupSimilarEntriesForDisplay(
   return result;
 }
 
+// refactor/private-alpha-general-email-intelligence-workflow — Stage E of the email intelligence
+// pipeline: the DEFAULT presentation for a pending queue, replacing a flat "10+ uncertain rows"
+// dump with grouped, actionable decisions. Never shown for anything but the live PENDING queue —
+// "show raw email reviews"/"show queue"/"show all emails" (runtime.ts's own explicit escape hatch)
+// still get the plain formatGmailReviewListForChat list below, unchanged.
+const NOISE_BUCKET_PLURAL_LABELS: Record<string, string> = {
+  job_alert: "job alert",
+  profile_status: "profile/status notification",
+  connection_suggestion: "connection suggestion",
+  security_auth: "security code",
+  onboarding: "onboarding email",
+  marketing: "marketing email",
+  receipt: "receipt",
+  filtered_marketing: "job alert/marketing email",
+  security_auth_noise: "security code",
+  onboarding_noise: "onboarding email",
+  filtered_non_action_email: "filtered email"
+};
+
+function pluralNoiseLabel(reason: string, count: number): string {
+  const singular = NOISE_BUCKET_PLURAL_LABELS[reason] ?? "email";
+  return count === 1 ? singular : `${singular}${singular.endsWith("s") ? "es" : "s"}`;
+}
+
+export function formatEmailIntelligenceSummaryForChat(reviews: EmailReviewItem[], timezone: string): string {
+  if (reviews.length === 0) {
+    return "No email reviews are waiting.";
+  }
+
+  const numbered = reviews.map((review, index) => ({ review, index: index + 1 }));
+  const sourceItems: EmailIntelligenceSourceItem[] = numbered.map(({ review, index }) => ({
+    id: review.id,
+    index,
+    subject: review.subject ?? "",
+    from: review.from ?? "",
+    reason: review.reason,
+    proposedEventType: review.proposedEventType,
+    extracted: (review.extracted ?? {}) as Record<string, unknown>,
+    createdAt: review.createdAt,
+    priority: review.priority
+  }));
+
+  const groups = groupEmailIntelligenceItems(sourceItems, timezone);
+  const reviewsById = new Map(reviews.map((review) => [review.id, review] as const));
+  const today = formatDateInTimezone(new Date(), timezone);
+
+  const dateLabelFor = (group: (typeof groups)[number]) => (formatDateInTimezone(group.occurredAt, timezone) === today ? "today" : formatDateInTimezone(group.occurredAt, timezone));
+
+  const lines: string[] = [`Gmail found ${reviews.length} relevant email${reviews.length === 1 ? "" : "s"}.`];
+
+  const newApplications = groups.filter((group) => group.bucket === "count_ready" && !group.isDuplicateGroup);
+  const duplicateApplications = groups.filter((group) => group.bucket === "count_ready" && group.isDuplicateGroup);
+  const statusUpdates = groups.filter((group) => group.bucket === "status_update");
+  const actionWorthy = groups.filter((group) => group.bucket === "action_worthy");
+  const needsDecision = groups.filter((group) => group.bucket === "needs_decision");
+  const noise = groups.filter((group) => group.bucket === "noise");
+
+  if (newApplications.length > 0) {
+    lines.push("", "Likely new applications:");
+    for (const group of newApplications) {
+      lines.push(`${group.memberIndexes[0]}. ${group.title} — ${dateLabelFor(group)}`);
+    }
+  }
+
+  if (duplicateApplications.length > 0) {
+    lines.push("", "Possible duplicate confirmations:");
+    for (const group of duplicateApplications) {
+      lines.push(`${group.memberIndexes[0]}. ${group.entity ?? group.title} — ${group.memberReviewIds.length} confirmation emails, likely 1 application`);
+    }
+  }
+
+  if (statusUpdates.length > 0) {
+    lines.push("", "Status updates:");
+    for (const group of statusUpdates) {
+      const review = reviewsById.get(group.primaryReviewId);
+      const label = review ? gmailReviewSignalTypeLabel(review) : "status update";
+      lines.push(`${group.memberIndexes[0]}. ${group.entity ?? group.title} ${label === "application viewed" ? "viewed your application" : label}`);
+    }
+  }
+
+  if (actionWorthy.length > 0) {
+    lines.push("", "Action-worthy:");
+    for (const group of actionWorthy) {
+      const review = reviewsById.get(group.primaryReviewId);
+      const label = review ? gmailReviewSignalTypeLabel(review) : "needs review";
+      lines.push(`${group.memberIndexes[0]}. ${group.title} — ${label}`);
+    }
+  }
+
+  if (needsDecision.length > 0) {
+    lines.push("", "Needs decision:");
+    for (const group of needsDecision) {
+      lines.push(`${group.memberIndexes[0]}. ${group.title} — not enough evidence to classify confidently; open details for N to see why`);
+    }
+  }
+
+  if (noise.length > 0) {
+    const byReason = new Map<string, number>();
+    for (const group of noise) {
+      const review = reviewsById.get(group.primaryReviewId);
+      const reason = review?.reason ?? "unknown";
+      byReason.set(reason, (byReason.get(reason) ?? 0) + 1);
+    }
+    lines.push("", "Noise hidden:");
+    for (const [reason, count] of byReason) {
+      lines.push(`- ${count} ${pluralNoiseLabel(reason, count)}`);
+    }
+  }
+
+  const totalApplications = newApplications.length + duplicateApplications.length;
+  if (totalApplications > 0) {
+    const rawEmailCount = newApplications.length + duplicateApplications.reduce((sum, group) => sum + group.memberReviewIds.length, 0);
+    lines.push(
+      "",
+      "Suggested:",
+      rawEmailCount === totalApplications
+        ? `Count ${totalApplications} application${totalApplications === 1 ? "" : "s"}, or review details first?`
+        : `Count ${totalApplications} unique application${totalApplications === 1 ? "" : "s"}, or count ${rawEmailCount} confirmation emails/manual applications?`
+    );
+  } else if (needsDecision.length > 0) {
+    lines.push("", "Say \"details for N\" to look at any of these, or \"ignore the noise\" to clear what's left.");
+  }
+
+  lines.push("", 'Say "show raw email reviews" to see every item individually.');
+
+  return lines.join("\n");
+}
+
 export function formatGmailReviewListForChat(
   reviews: EmailReviewItem[],
   rules: EmailSignalRule[],
@@ -954,10 +1094,15 @@ export function humanEmailKindLabel(kind: EmailKind): string {
     subscription: "subscription",
     personal_message: "personal message",
     marketing: "marketing",
-    unknown: "uncertain signal"
+    // refactor/private-alpha-general-email-intelligence-workflow (Task 2): "unknown" here means the
+    // LLM understanding layer genuinely could not classify this email from the available body/
+    // context — reserved for that specific case, never a lazy default. "needs details" says what's
+    // actually missing (more of the body, or context this label alone can't supply) rather than the
+    // old bare "uncertain signal," which stated confusion without saying what was unsure.
+    unknown: "needs details"
   };
 
-  return labels[kind] ?? "uncertain signal";
+  return labels[kind] ?? "needs details";
 }
 
 /** fix/private-alpha-email-review-resolution-and-stale-classification: the general emailKind the

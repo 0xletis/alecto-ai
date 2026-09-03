@@ -1196,6 +1196,18 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     return finalizeDeterministicOperation(context, message, gmailSyncDebugShortcut, "gmail_sync_debug");
   }
 
+  // refactor/private-alpha-general-email-intelligence-workflow: "sync mail and review" (this
+  // branch's own acceptance-test phrasing) — a real sync followed immediately by the grouped
+  // summary in the SAME turn, rather than requiring a separate follow-up "show email reviews".
+  // Checked ahead of the plain sync shortcut below, which explicitly bails out on any message
+  // containing "review(s)" (deferring to the review-queue shortcuts instead) — that guard exists
+  // for "refresh email reviews" (queue-only, no real sync), not for a genuine "sync AND review"
+  // compound request, which needs its own explicit handling here.
+  const gmailSyncAndReviewShortcut = gmailSyncAndReviewShortcutOperation(message);
+  if (gmailSyncAndReviewShortcut) {
+    return finalizeDeterministicOperations(context, message, gmailSyncAndReviewShortcut, "gmail_reviews");
+  }
+
   const gmailSyncShortcut = gmailSyncShortcutOperation(message);
   if (gmailSyncShortcut) {
     return finalizeDeterministicOperation(context, message, gmailSyncShortcut, "gmail_sync");
@@ -1414,6 +1426,15 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
     // explicitly stated) or, for "mark ...", not match anything there at all and fall through to the
     // real planner with no review-linking tool available (the exact live-reported bug: progress got
     // logged via event.log_job_applications while the review it came from stayed pending forever).
+    // refactor/private-alpha-general-email-intelligence-workflow (Task 5): bulk count commands —
+    // checked ahead of the single-review mark-progress shortcut below, since "count all
+    // applications"/"1,2,3,4,6 are cvs i sent" name MULTIPLE items at once, which that shortcut's
+    // single-index resolution was never designed for.
+    const gmailReviewBulkCountShortcut = gmailReviewBulkCountShortcutOperation(message, context);
+    if (gmailReviewBulkCountShortcut) {
+      return finalizeDeterministicOperations(context, message, [gmailReviewBulkCountShortcut], "gmail_reviews");
+    }
+
     const gmailReviewMarkProgressShortcuts = gmailReviewMarkProgressShortcutOperation(message, context);
     if (gmailReviewMarkProgressShortcuts.length > 0) {
       return finalizeDeterministicOperations(context, message, gmailReviewMarkProgressShortcuts, "gmail_reviews");
@@ -1938,7 +1959,7 @@ function looksLikeGmailReviewListRequest(rawText: string, context?: ContextBundl
   return (
     // "mail reviews" (bare "mail," not just "email"/"gmail") — a real requested phrasing: "show
     // me mail reviews" means the review queue exactly like "show me email reviews" does.
-    /\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b[\s\S]{0,50}\b(mail reviews?|email reviews?|gmail reviews?|emails? to review|items? to review)\b/.test(text) ||
+    /\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b[\s\S]{0,50}\b(mail reviews?|email reviews?|gmail reviews?|emails? to review|items? to review|the queue|raw queue|all emails|every review)\b/.test(text) ||
     /\b(mail reviews?|email reviews?|gmail reviews?|emails? to review|items? to review)\b[\s\S]{0,50}\b(show|list|see|view|open|pending|waiting|need|needs|attention)\b/.test(text) ||
     /^email reviews?$/.test(text) ||
     /\bwhat emails? need (my )?attention\b/.test(text) ||
@@ -1952,13 +1973,20 @@ function looksLikeGmailReviewListRequest(rawText: string, context?: ContextBundl
   );
 }
 
+// refactor/private-alpha-general-email-intelligence-workflow: the explicit escape hatch out of the
+// new default grouped summary (Stage E) — "show raw email reviews," "show the queue," "show all
+// emails," "show every review." Deliberately narrow (raw/queue/individually/one by one), never
+// triggered by the plain "show email reviews" phrasing itself, which stays grouped by default.
+const GMAIL_REVIEW_RAW_VIEW_RE = /\b(raw|queue|individually|one by one|every( single)? (review|email))\b/i;
+
 function gmailReviewListShortcutOperation(message: string, context?: ContextBundle): PlannedOperation | undefined {
   const text = normalizeIntentText(message);
   if (!text || !looksLikeGmailReviewListRequest(text, context)) {
     return undefined;
   }
 
-  return { tool: "gmail.review.list", args: { status: "pending" }, rationale: "user asked to see pending Gmail reviews" };
+  const viewMode = GMAIL_REVIEW_RAW_VIEW_RE.test(text) ? "raw" : undefined;
+  return { tool: "gmail.review.list", args: { status: "pending", ...(viewMode ? { viewMode } : {}) }, rationale: "user asked to see pending Gmail reviews" };
 }
 
 /**
@@ -2427,6 +2455,70 @@ const GMAIL_REVIEW_MARK_PROGRESS_OVERRIDE_RE = /\banyway\b|\bregardless\b|\bover
 // did NOT already match (that one still bypasses immediately, unchanged).
 const GMAIL_REVIEW_OVERRIDE_JUSTIFICATION_RE =
   /\bi (already |also )?sent\b[\s\S]{0,25}\b(cv|resume|r[eé]sum[eé]|application)\b|\bi did send\b[\s\S]{0,20}\b(cv|resume|application)\b|\benvi[eé]\b[\s\S]{0,20}\b(mi\s+)?(cv|curr[ií]culum|solicitud)\b|\bhe enviado\b[\s\S]{0,20}\b(mi\s+)?(cv|curr[ií]culum)\b|\bhe enviat\b[\s\S]{0,20}\b(el meu\s+)?(cv|curr[ií]culum)\b/i;
+
+// refactor/private-alpha-general-email-intelligence-workflow (Task 5): bulk count phrasing —
+// "count all applications," "count the unique applications," "count 7" (a bare number with no
+// list, matching the SUGGESTED unique count Stage E's own summary just offered — the number is
+// confirmatory, not a selection), "1,2,3,4,6 are cvs i sent," "count all except Exoticca," "count
+// GoMining only," "count 9 manually"/"I actually sent 9" (an explicit override number, always
+// routed as a manual statement, never tied to specific reviews).
+const GMAIL_REVIEW_BULK_COUNT_ALL_RE = /\bcount\b[\s\S]{0,15}\b(all|every|the unique|unique)\b[\s\S]{0,20}\b(applications?|cvs?|confirmations?)\b/i;
+const GMAIL_REVIEW_BULK_COUNT_BARE_NUMBER_RE = /^count(ed)?\s+(the\s+)?(\d+)\.?\s*$/i;
+const GMAIL_REVIEW_BULK_COUNT_EXCEPT_RE = /\bcount\b[\s\S]{0,25}\b(all|everything)\b[\s\S]{0,15}\bexcept\b[\s\S]{0,40}$/i;
+const GMAIL_REVIEW_BULK_COUNT_ONLY_RE = /\bcount\b[\s\S]{0,60}\bonly\b|\bcount only\b[\s\S]{0,60}/i;
+const GMAIL_REVIEW_BULK_COUNT_MANUAL_RE = /\bcount(ed)?\s+(\d+)\s+manually\b|\bi\s+(actually\s+)?sent\s+(\d+)\b|\bi\s+sent\s+(\d+)\s+(today|this week|manually)\b|\bhe\s+enviado\s+(\d+)\b|\bhe\s+enviat\s+(\d+)\b/i;
+const GMAIL_REVIEW_BULK_COUNT_LIST_RE = /\b(\d+\s*,\s*)+\d+\b[\s\S]{0,40}\b(cvs?|applications?)\b[\s\S]{0,10}\b(sent|enviad[oa]s?|enviats?)\b|\bcount\b[\s\S]{0,10}\b(\d+\s*,\s*)+\d+\b/i;
+
+function gmailReviewBulkCountShortcutOperation(message: string, context: ContextBundle): PlannedOperation | undefined {
+  const text = normalizeIntentText(message);
+  if (!text) return undefined;
+
+  const visibleReviews = context.session.visibleEntities.filter(
+    (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+  );
+  if (visibleReviews.length === 0) {
+    return undefined;
+  }
+
+  // Manual-override numbers are checked first — "I sent 10 today"/"count 9 manually" always means
+  // a plain user statement, regardless of what's currently visible in the review list.
+  const manualMatch = text.match(GMAIL_REVIEW_BULK_COUNT_MANUAL_RE);
+  if (manualMatch) {
+    const manualCount = Number(manualMatch[2] ?? manualMatch[3] ?? manualMatch[4] ?? manualMatch[5] ?? manualMatch[6]);
+    if (manualCount > 0) {
+      return { tool: "gmail.review.count_applications", args: { selection: "manual_count", manualCount }, rationale: "user explicitly stated a manual application-sent count, independent of specific emails" };
+    }
+  }
+
+  if (GMAIL_REVIEW_BULK_COUNT_ALL_RE.test(text) || GMAIL_REVIEW_BULK_COUNT_BARE_NUMBER_RE.test(text)) {
+    return { tool: "gmail.review.count_applications", args: { selection: "unique" }, rationale: "user asked to count all/the unique visible applications" };
+  }
+
+  if (GMAIL_REVIEW_BULK_COUNT_EXCEPT_RE.test(text)) {
+    const exceptMatch = text.match(/\bexcept\b\s+(.+)$/i);
+    const excludeRef = exceptMatch?.[1]?.trim();
+    if (excludeRef) {
+      return { tool: "gmail.review.count_applications", args: { selection: "all_except", excludeRef }, rationale: "user asked to count everything except one named item" };
+    }
+  }
+
+  if (GMAIL_REVIEW_BULK_COUNT_LIST_RE.test(text)) {
+    const visibleIndexSet = new Set(visibleReviews.map((entity) => entity.index));
+    const indexes = extractIndexesFromText(text, visibleIndexSet);
+    if (indexes.length > 0) {
+      return { tool: "gmail.review.count_applications", args: { selection: "indexes", indexes }, rationale: "user named specific visible items to count as CVs sent" };
+    }
+  }
+
+  if (GMAIL_REVIEW_BULK_COUNT_ONLY_RE.test(text)) {
+    const selected = selectVisibleEntityMention(text, visibleReviews);
+    if (selected) {
+      return { tool: "gmail.review.count_applications", args: { selection: "indexes", indexes: [selected.index] }, rationale: "user asked to count only one named item" };
+    }
+  }
+
+  return undefined;
+}
 
 function gmailReviewMarkProgressShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
   const text = normalizeIntentText(message);
@@ -3954,6 +4046,25 @@ async function gmailGoalUsageStatusResponse(context: ContextBundle, message: str
     toolValidationPassed: true,
     topic: canProposeRuleNow ? "gmail_status" : context.session.topic ?? "gmail_status"
   });
+}
+
+// refactor/private-alpha-general-email-intelligence-workflow: "sync mail and review," "sync gmail
+// and show me reviews," "check email and review it" — a genuine compound request, distinct from
+// "refresh email reviews" (queue-reclassification only, no real sync — GMAIL_REVIEW_REFRESH_RE
+// elsewhere already owns that). Requires an explicit sync verb AND an explicit review/list verb in
+// the SAME message, not just the bare word "review" appearing incidentally.
+const GMAIL_SYNC_AND_REVIEW_RE =
+  /\b(sync|check|refresh|update)\b[\s\S]{0,20}\b(gmail|email|emails|mail|mails|correo|correos)\b[\s\S]{0,30}\b(and|then|y|i)\b[\s\S]{0,15}\b(review|reviews|revisa|revisar)\b/i;
+
+function gmailSyncAndReviewShortcutOperation(message: string): PlannedOperation[] | undefined {
+  const text = normalizeIntentText(message);
+  if (!text || !GMAIL_SYNC_AND_REVIEW_RE.test(text)) {
+    return undefined;
+  }
+  return [
+    { tool: "gmail.sync", args: {}, rationale: "user explicitly asked to sync Gmail as part of a sync-and-review request" },
+    { tool: "gmail.review.list", args: { status: "pending" }, rationale: "user explicitly asked to review after syncing, in the same request" }
+  ];
 }
 
 function gmailSyncShortcutOperation(message: string): PlannedOperation | undefined {

@@ -612,12 +612,13 @@ export const toolCatalog: ToolDefinition[] = [
   {
     name: "gmail.review.list",
     description:
-      "List pending Gmail email reviews awaiting a decision — shows each item's real subject/sender and a short snippet so the user can reference one naturally afterward (e.g. 'turn the recruiter one into a task'). Use for 'what emails need my attention?', 'what Gmail reviews are waiting?', 'show pending email reviews', 'anything important in Gmail?'.",
+      "List pending Gmail email reviews awaiting a decision. DEFAULT (viewMode omitted or 'grouped') presents a grouped, actionable summary — likely new applications, possible duplicate confirmations, status updates, action-worthy items, items needing a decision, and a noise count — never a flat 10+ row dump. Use viewMode 'raw' ONLY when the user explicitly asks to see every item individually: 'show raw email reviews', 'show the queue', 'show all emails', 'show me every review'. Use for 'what emails need my attention?', 'sync mail and review', 'show pending email reviews', 'anything important in Gmail?'.",
     mutates: false,
     requiresConfirmation: false,
     argsSchema: z.object({
       status: z.enum(["pending", "approved", "rejected", "archived", "all"]).optional(),
-      limit: z.number().int().positive().max(50).optional()
+      limit: z.number().int().positive().max(50).optional(),
+      viewMode: z.enum(["grouped", "raw"]).optional().describe("'raw' only when the user explicitly asked for the individual/raw/queue view. Omit for the default grouped summary.")
     })
   },
   {
@@ -717,6 +718,19 @@ export const toolCatalog: ToolDefinition[] = [
       count: z.number().int().positive().max(20).optional().describe("How many CVs/applications this one email represents evidence for. Defaults to 1 — only set higher if the user explicitly said a number."),
       explicitOverride: z.boolean().optional().describe("Only true when the user explicitly re-confirmed logging an email this tool already refused once (e.g. 'yes, count it anyway as a CV sent'). Never set on a first attempt."),
       confirmOverrideJustification: z.boolean().optional().describe("Only true when the user justified why an ineligible email should count ('I sent a CV related to that mail so mark it as CV sent') without yet confirming — asks a confirming question and proposes the override rather than logging immediately.")
+    })
+  },
+  {
+    name: "gmail.review.count_applications",
+    description:
+      "Bulk-count pending application-confirmation emails as CVs sent, in ONE call, from the most recently shown grouped or raw review list. Groups duplicate confirmations for the same real application (same company+role+day) into ONE counted application with the other emails attached as evidence — never double-counts. Use for: 'count all applications'/'count the unique applications'/'count the 7' -> selection 'unique' (every count-ready group once, the default and by far the most common case); 'count all except X' -> selection 'all_except' with excludeRef; 'count GoMining only' -> selection 'indexes' with indexes resolved to that one group; '1,2,3,4,6 are CVs I sent'/'count 1,2,3,4,6' -> selection 'indexes' with the exact indexes named — an index belonging to an ineligible item (job alert, recruiter reply, status update, personal message) is skipped with an explanation, never silently counted; 'count 9 manually'/'I actually sent 9' (a number that does NOT match the unique-application count) -> selection 'manual_count' with manualCount set to that number — this logs a plain manual statement (source: user, not email evidence), never tied to specific reviews. Never invent indexes or a company name not actually visible in the list.",
+    mutates: true,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      selection: z.enum(["unique", "indexes", "all_except", "manual_count"]),
+      indexes: z.array(z.number().int().positive()).optional().describe("Required for selection 'indexes' — the exact 1-based indexes the user named or that resolve to the one company they named."),
+      excludeRef: z.string().min(1).optional().describe("Required for selection 'all_except' — the company/item name to exclude, in the user's own words."),
+      manualCount: z.number().int().positive().max(200).optional().describe("Required for selection 'manual_count' — the exact number the user explicitly stated, independent of email evidence.")
     })
   },
   {

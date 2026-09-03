@@ -1,7 +1,7 @@
 import { createOpenAIClient } from "@operator-agent/llm";
 import type { EmailReviewItem, EmailSignalRule } from "@operator-agent/db";
 import type { Goal } from "@operator-agent/core";
-import { extractSafeSenderLabel, humanEmailReviewEventLabel } from "../email-reviews/email-review-service.js";
+import { extractSafeSenderLabel, gmailReviewSignalTypeLabel } from "../email-reviews/email-review-service.js";
 import { truncatePlainText } from "../utils/text.js";
 import { withPlannerTimeout } from "./planner.js";
 
@@ -60,7 +60,7 @@ export function buildVisibleReviewSummaries(reviews: EmailReviewItem[], rules: E
       number: index + 1,
       subject: review.subject ? truncatePlainText(review.subject, 100) : "(no subject)",
       sender: review.from ? extractSafeSenderLabel(review.from) : "(unknown sender)",
-      signalLabel: review.proposedEventType ? humanEmailReviewEventLabel(review.proposedEventType) : "uncertain signal",
+      signalLabel: gmailReviewSignalTypeLabel(review),
       linkedGoal: linkedGoal?.title
     };
   });

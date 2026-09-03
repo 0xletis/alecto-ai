@@ -9,6 +9,7 @@ export * from "./daily-priority.js";
 export * from "./daily-coach.js";
 export * from "./email-classification.js";
 export * from "./email-content-cleaner.js";
+export * from "./email-intelligence-grouping.js";
 export * from "./env-flags.js";
 export * from "./event-registry.js";
 export * from "./events.js";

@@ -64,6 +64,7 @@ import {
   getEmailAdapterDefinition,
   gmailScheduledSyncRuntimeFromEnv,
   goalHasOnlyCompletionSignals,
+  groupEmailIntelligenceItems,
   isProgressShapedSignalText,
   localDateTimeToUtc,
   parseActionDueDate,
@@ -79,6 +80,8 @@ import {
   RESUME_UP_TO_DATE_RE,
   RESUME_UPDATE_SUGGESTION_RE,
   writeGmailAutonomyPreferences,
+  type EmailIntelligenceGroup,
+  type EmailIntelligenceSourceItem,
   type EventTypeId,
   type Goal,
   type GoalMetric,
@@ -125,6 +128,7 @@ import {
   createActionItemFromEmailReview,
   emailReviewClassificationFromUnderstanding,
   formatGmailReviewDetailResponse,
+  formatEmailIntelligenceSummaryForChat,
   formatGmailReviewListForChat,
   gmailReviewChatLabel,
   gmailReviewSignalTypeLabel,
@@ -2478,7 +2482,15 @@ export async function executeOperation(
         const previouslyVisibleReviewIds = new Set(
           context.session.visibleEntities.filter((entity) => entity.type === "gmail_review").map((entity) => entity.id)
         );
-        let items = await getEmailReviewItems(userId, { status, limit: (args.limit as number | undefined) ?? 10 });
+        // refactor/private-alpha-general-email-intelligence-workflow (Stage E): the raw per-row view
+        // caps at 10 to keep a flat list readable, but the grouped view's whole point is compressing
+        // a bigger batch into a handful of real-world items/noise-counts — capping the underlying
+        // fetch at 10 there would silently drop pending mail before grouping ever saw it (a real
+        // "sync mail and review" with 14 pending emails must show "Gmail found 14 relevant emails,"
+        // not silently 10). Only the grouped, live-pending-queue path gets the higher ceiling.
+        const requestedViewMode = (args.viewMode as "grouped" | "raw" | undefined) ?? "grouped";
+        const defaultLimit = requestedViewMode === "grouped" && status === "pending" ? 100 : 10;
+        let items = await getEmailReviewItems(userId, { status, limit: (args.limit as number | undefined) ?? defaultLimit });
         const timezone = await getUserTimezone(userId);
 
         // fix/private-alpha-email-progress-count-and-review-ux (Task 8): a real reported bug — the
@@ -2507,10 +2519,26 @@ export async function executeOperation(
           status === "pending" && previouslyVisibleReviewIds.size > 0 ? items.filter((item) => !previouslyVisibleReviewIds.has(item.id)).length : 0;
         const newSinceLastViewNote = newSinceLastView > 0 ? `${newSinceLastView} new review${newSinceLastView === 1 ? "" : "s"} arrived since your last view.\n\n` : "";
 
+        // refactor/private-alpha-general-email-intelligence-workflow (Stage E): grouped summary is
+        // the default for a genuinely BIG live pending queue — a flat "10+ uncertain rows" dump is
+        // exactly what this branch replaces. Per this task's own UX standard ("many emails -> default
+        // grouped summary; few emails -> concise list with labels/actions"), a small handful of
+        // pending items is already perfectly readable as the plain per-row list — wrapping 1-5 items
+        // in bucket headers ("Likely new applications:" for a single row) is noise, not compression,
+        // so the threshold only ever engages grouping once there's an actual batch to compress. Also
+        // falls back to the plain list for an explicit "show raw email reviews"/"show queue" (viewMode:
+        // "raw") or a non-pending status view (approved/rejected/archived/all history has no
+        // "count-ready vs noise" decision to group).
+        const GROUPED_VIEW_MIN_ITEMS = 6;
+        const useGroupedView = requestedViewMode === "grouped" && status === "pending" && items.length >= GROUPED_VIEW_MIN_ITEMS;
+        const listBody = useGroupedView
+          ? formatEmailIntelligenceSummaryForChat(items, timezone)
+          : formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone);
+
         return {
           tool: operation.tool,
           status: "executed",
-          summary: `${newSinceLastViewNote}${formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone)}`,
+          summary: `${newSinceLastViewNote}${listBody}`,
           result: items,
           entities: items.map((review, index) => reviewToEntity(review, index + 1, context.gmailRules))
         };
@@ -2840,6 +2868,188 @@ export async function executeOperation(
           result: { emailReview: review, events: result.events, actionItem: result.completedAction, verified: true },
           entities: [
             ...(result.completedAction ? [actionToEntity(result.completedAction)] : []),
+            ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
+          ]
+        };
+      }
+
+      // refactor/private-alpha-general-email-intelligence-workflow (Stage D+, bulk handling): the
+      // ONE bulk-count entry point — counts UNIQUE real-world applications, not raw emails, by
+      // default. Every write still goes through executeProgressCommand (never a parallel write
+      // path) — this case only ever RESOLVES which reviews to count and orchestrates one
+      // executeProgressCommand call per unique application, attaching any other same-application
+      // emails as evidence via approveEmailReviewItem with the SAME event id (no second write).
+      case "gmail.review.count_applications": {
+        const selection = args.selection as "unique" | "indexes" | "all_except" | "manual_count";
+        const timezone = await getUserTimezone(userId);
+
+        if (selection === "manual_count") {
+          const manualCount = args.manualCount as number;
+          const result = await executeProgressCommand({
+            userId,
+            activityKind: "application_sent",
+            quantity: manualCount,
+            occurredAt: resolveAgentRuntimeNow(),
+            now: resolveAgentRuntimeNow(),
+            timezone,
+            source: "manual",
+            targetGoals: context.activeGoals,
+            evidence: [`user explicitly stated ${manualCount} applications sent`, message].filter(Boolean) as string[],
+            openActions: context.openActions
+          });
+          if (result.status !== "logged") {
+            return { tool: operation.tool, status: "executed", summary: "I tried to log it, but I couldn't verify the progress count changed, so I didn't count it.", result: { verified: false } };
+          }
+          return {
+            tool: operation.tool,
+            status: "executed",
+            summary: `Logged ${manualCount} application${manualCount === 1 ? "" : "s"} sent, based on your own statement — not tied to specific emails. Today: ${result.todayCount} CVs sent. This week: ${result.weekCount} CVs sent.`,
+            result: { events: result.events, verified: true }
+          };
+        }
+
+        const visibleReviewEntities = context.session.visibleEntities.filter(
+          (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"
+        );
+        if (visibleReviewEntities.length === 0) {
+          return failed(operation.tool, 'I don\'t have a Gmail review list in view right now — say "show email reviews" first.');
+        }
+
+        const pendingById = new Map((await getEmailReviewItems(userId, { status: "pending", limit: 50 })).map((review) => [review.id, review] as const));
+        const sourceItems: EmailIntelligenceSourceItem[] = visibleReviewEntities
+          .filter((entity) => pendingById.has(entity.id))
+          .map((entity) => {
+            const review = pendingById.get(entity.id)!;
+            return {
+              id: review.id,
+              index: entity.index,
+              subject: review.subject ?? "",
+              from: review.from ?? "",
+              reason: review.reason,
+              proposedEventType: review.proposedEventType,
+              extracted: (review.extracted ?? {}) as Record<string, unknown>,
+              createdAt: review.createdAt,
+              priority: review.priority
+            };
+          });
+
+        if (sourceItems.length === 0) {
+          return failed(operation.tool, "Nothing from that list is still pending — say \"show email reviews\" to see what's current.");
+        }
+
+        const groups = groupEmailIntelligenceItems(sourceItems, timezone);
+        const countReadyGroups = groups.filter((group) => group.bucket === "count_ready");
+
+        let targetGroups: EmailIntelligenceGroup[] = [];
+        const skipped: Array<{ label: string; reason: string }> = [];
+
+        if (selection === "unique") {
+          targetGroups = countReadyGroups;
+        } else if (selection === "all_except") {
+          const excludeRef = ((args.excludeRef as string | undefined) ?? "").toLowerCase();
+          targetGroups = countReadyGroups.filter((group) => !(group.entity ?? group.title).toLowerCase().includes(excludeRef));
+        } else {
+          // selection === "indexes"
+          const requestedIndexes = (args.indexes as number[] | undefined) ?? [];
+          const resolvedGroupKeys = new Set<string>();
+          for (const idx of requestedIndexes) {
+            const group = groups.find((candidate) => candidate.memberIndexes.includes(idx));
+            if (!group) {
+              skipped.push({ label: `#${idx}`, reason: "not in the current visible list" });
+              continue;
+            }
+            if (group.bucket !== "count_ready") {
+              const review = pendingById.get(group.primaryReviewId);
+              const label = review ? gmailReviewSignalTypeLabel(review) : "not an application confirmation";
+              skipped.push({ label: group.title, reason: `it's a ${label}, not an application confirmation` });
+              continue;
+            }
+            resolvedGroupKeys.add(group.key);
+          }
+          targetGroups = countReadyGroups.filter((group) => resolvedGroupKeys.has(group.key));
+        }
+
+        if (targetGroups.length === 0) {
+          const skippedNote = skipped.length > 0 ? ` I didn't count ${skipped.map((entry) => `${entry.label} (${entry.reason})`).join(", ")}.` : "";
+          return { tool: operation.tool, status: "executed", summary: `Nothing eligible to count.${skippedNote}`, result: { counted: [], skipped } };
+        }
+
+        const counted: Array<{ title: string; index: number }> = [];
+        let lastResultCounts: { today: number; week: number } | undefined;
+        let anyCompletedAction: ActionItem | undefined;
+
+        for (const group of targetGroups) {
+          const primaryReview = pendingById.get(group.primaryReviewId);
+          if (!primaryReview) continue;
+
+          const { refetch, understandingResult, linkedGoal } = await fetchAndUnderstandGmailReview(userId, primaryReview, context);
+          const appliedDateText = understandingResult?.understanding?.keyDetails?.appliedDate ?? undefined;
+          const gmailReceivedDateText = refetch.status === "ok" ? refetch.content.date : undefined;
+          const resolvedDate = resolveEmailProgressDate({ message, appliedDateText, gmailReceivedDateText, now: resolveAgentRuntimeNow(), timezone });
+
+          const result = await executeProgressCommand({
+            userId,
+            activityKind: "application_sent",
+            quantity: 1,
+            occurredAt: resolvedDate.date,
+            now: resolveAgentRuntimeNow(),
+            timezone,
+            source: "gmail_review",
+            targetGoals: linkedGoal ? [linkedGoal] : [],
+            evidence: [gmailReviewChatLabel(primaryReview, context.gmailRules), message].filter(Boolean) as string[],
+            externalIdBase: `gmail-message:${primaryReview.connectionId}:${primaryReview.providerMessageId}:cv-sent`,
+            sourceReviewId: primaryReview.id,
+            sourceProviderMessageId: primaryReview.providerMessageId,
+            reviewClassification: {
+              emailKind: understandingResult?.understanding?.emailKind,
+              understandingStatus: understandingResult ? understandingResult.status : "unavailable",
+              fallbackReason: primaryReview.reason,
+              fallbackProposedEventType: primaryReview.proposedEventType
+            },
+            openActions: context.openActions
+          });
+
+          if (result.status === "ineligible") {
+            skipped.push({ label: group.title, reason: result.reason });
+            continue;
+          }
+          if (result.status === "verification_failed") {
+            skipped.push({ label: group.title, reason: "the count couldn't be verified" });
+            continue;
+          }
+
+          // "duplicate" (the underlying message was already counted elsewhere) still resolves the
+          // review honestly — same as the single-review gmail.review.log_progress case — it just
+          // never contributes to this turn's Today/Week readback below.
+          const primaryEventId = result.events[0]?.id;
+          await approveEmailReviewItem(userId, primaryReview.id, primaryEventId);
+
+          // Every OTHER member of a duplicate group attaches as evidence for the SAME counted
+          // application — never a second executeProgressCommand call, never a second event.
+          for (const memberId of group.memberReviewIds) {
+            if (memberId === primaryReview.id) continue;
+            await approveEmailReviewItem(userId, memberId, primaryEventId);
+          }
+
+          counted.push({ title: group.title, index: group.memberIndexes[0]! });
+          if (result.status === "logged") {
+            lastResultCounts = { today: result.todayCount, week: result.weekCount };
+            if (result.completedAction) anyCompletedAction = result.completedAction;
+          }
+        }
+
+        const remaining = await getEmailReviewItems(userId, { status: "pending", limit: 10 });
+        const countedLines = counted.map((entry) => `- ${entry.index} ${entry.title}`).join("\n");
+        const skippedNote = skipped.length > 0 ? `\n\nSkipped:\n${skipped.map((entry) => `- ${entry.label} (${entry.reason})`).join("\n")}` : "";
+        const statusLine = lastResultCounts ? `\n\nToday: ${lastResultCounts.today} CVs sent. This week: ${lastResultCounts.week} CVs sent.` : "";
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Counted ${counted.length} application${counted.length === 1 ? "" : "s"}:\n${countedLines}${skippedNote}${statusLine}`,
+          result: { counted, skipped },
+          entities: [
+            ...(anyCompletedAction ? [actionToEntity(anyCompletedAction)] : []),
             ...remaining.map((item, index) => reviewToEntity(item, index + 1, context.gmailRules))
           ]
         };
