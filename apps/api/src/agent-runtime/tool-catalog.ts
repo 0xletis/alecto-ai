@@ -318,6 +318,27 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "event.list_recent_progress",
+    description:
+      "List the user's own real, recently logged progress events (real database rows — never invented), numbered, with what each one is, when it happened, and which goal it counts toward. Use for 'show recent progress events', 'what progress have I logged', 'show my logged events' — read-only, changes nothing. This is how the user finds a SPECIFIC wrong/legacy event to correct with event.undo_progress (e.g. a stale 'Application to Interview' entry that was never real).",
+    mutates: false,
+    requiresConfirmation: false,
+    argsSchema: z.object({
+      limit: z.number().int().positive().max(30).optional().describe("How many recent events to show. Defaults to 10.")
+    })
+  },
+  {
+    name: "event.undo_progress",
+    description:
+      "Permanently archive (soft-delete) ONE specific, already-logged progress event the user just saw via event.list_recent_progress — e.g. 'undo the Application to Interview one', 'that Application to Interview is wrong, remove it', 'undo event 2'. Reference the item by `index` (its number in the most recently shown event.list_recent_progress list) — never invent an eventId, and never guess which event when the user hasn't named one specifically enough to resolve to exactly one (ask instead). This is a real historical correction, not a routine action — always requires the user's explicit confirmation before it runs (built into this tool, do not additionally ask yourself). Never deletes Gmail, never touches any OTHER event, and never changes CV-sent/application-sent counts unless the user is specifically undoing one of those.",
+    mutates: true,
+    requiresConfirmation: true,
+    argsSchema: z.object({
+      index: z.number().int().positive().describe("1-based position in the most recently shown event.list_recent_progress list."),
+      reason: z.string().max(200).optional().describe("Why this is being undone, e.g. 'stale Application to Interview event from a previous bug' — shown back to the user and stored on the archived event.")
+    })
+  },
+  {
     name: "event.log_workout",
     description: "Log a completed workout/training session.",
     mutates: true,
@@ -694,7 +715,8 @@ export const toolCatalog: ToolDefinition[] = [
       index: z.number().int().positive().optional().describe("1-based position in the most recently shown Gmail review list."),
       ref: z.string().min(1).optional().describe("The item's own visible wording (subject/sender/rule name) when referenced by words instead of a number."),
       count: z.number().int().positive().max(20).optional().describe("How many CVs/applications this one email represents evidence for. Defaults to 1 — only set higher if the user explicitly said a number."),
-      explicitOverride: z.boolean().optional().describe("Only true when the user explicitly re-confirmed logging an email this tool already refused once (e.g. 'yes, count it anyway as a CV sent'). Never set on a first attempt.")
+      explicitOverride: z.boolean().optional().describe("Only true when the user explicitly re-confirmed logging an email this tool already refused once (e.g. 'yes, count it anyway as a CV sent'). Never set on a first attempt."),
+      confirmOverrideJustification: z.boolean().optional().describe("Only true when the user justified why an ineligible email should count ('I sent a CV related to that mail so mark it as CV sent') without yet confirming — asks a confirming question and proposes the override rather than logging immediately.")
     })
   },
   {

@@ -2166,6 +2166,23 @@ function parseReviewSemanticFilter(text: string): { classificationKey?: string; 
   return { classificationKey, requireToday };
 }
 
+// fix/private-alpha-email-review-router-cleanup: a real reported bug — "details for an application
+// confirmation from today" said "none match" while the visibly-listed review 3 ("... — application
+// confirmation — Gmail, 2026-09-02") was RIGHT THERE. review.reason is NOT reliably the clean
+// EmailKind string this filter assumed: the sync-time classifier (classify-email.ts) stores reason
+// as either the matched eventType itself or a free-form LLM sentence, never guaranteed to equal
+// "application_confirmation" literally — only the ON-DEMAND refresh path
+// (emailReviewClassificationFromUnderstanding) produces that clean string. proposedEventType is the
+// schema-backed field the review's OWN displayed label (gmailReviewSignalTypeLabel) actually reads,
+// so a classification match must check it too, not just reason.
+const REVIEW_CLASSIFICATION_KEY_TO_EVENT_TYPE: Record<string, string> = {
+  application_confirmation: "career.application_confirmation_received",
+  recruiter_reply: "career.recruiter_reply_received",
+  offer: "career.offer_received",
+  interview: "career.interview_scheduled",
+  rejection: "career.rejection_received"
+};
+
 function reviewMatchesSemanticFilter(
   review: EmailReviewItem,
   filter: { classificationKey?: string; requireToday: boolean },
@@ -2178,8 +2195,12 @@ function reviewMatchesSemanticFilter(
   if (filter.classificationKey === "__high_priority__" && !isHighPriorityGmailReview(review)) {
     return false;
   }
-  if (filter.classificationKey && filter.classificationKey !== "__noise__" && filter.classificationKey !== "__high_priority__" && review.reason !== filter.classificationKey) {
-    return false;
+  if (filter.classificationKey && filter.classificationKey !== "__noise__" && filter.classificationKey !== "__high_priority__") {
+    const matchesReason = review.reason === filter.classificationKey;
+    const matchesEventType = review.proposedEventType === REVIEW_CLASSIFICATION_KEY_TO_EVENT_TYPE[filter.classificationKey];
+    if (!matchesReason && !matchesEventType) {
+      return false;
+    }
   }
   if (filter.requireToday && formatDateInTimezone(review.createdAt, timezone) !== todayLocalDate) {
     return false;
@@ -2359,17 +2380,31 @@ function gmailReviewThisFollowupShortcutOperation(message: string, context: Cont
 // explicitly stated outcome ("mark it/this/2 as a CV sent", "count this as an application sent")
 // always routes to gmail.review.log_progress — never gmail.review.approve, which would instead log
 // whatever the review's OWN (possibly unrelated) classification says. English + Spanish + Catalan.
+// fix/private-alpha-email-review-router-cleanup: a real reported bug — "mask as CV sent" (a plain
+// typo for "mark") never matched the strict "\bmark\b" literal, fell through to the real planner,
+// which chose event.log_job_applications (manual logging — the count moved) instead of
+// gmail.review.log_progress, leaving the focused, eligible review pending forever. VERB_RE tolerates
+// the exact typo variants this task's own test list names (mask, marc, mak, makr) alongside the
+// correctly-spelled verbs, so a typo never silently downgrades a review-linked command into an
+// unlinked one.
+const GMAIL_REVIEW_MARK_PROGRESS_VERB_RE = "(mark|mask|marc|makr|mak|count|log|flag)";
 const GMAIL_REVIEW_MARK_PROGRESS_RE = new RegExp(
   [
-    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b",
-    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\bsent\\b",
+    `\\b${GMAIL_REVIEW_MARK_PROGRESS_VERB_RE}\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b`,
+    `\\b${GMAIL_REVIEW_MARK_PROGRESS_VERB_RE}\\b[\\s\\S]{0,20}\\b(this|it|\\d+)\\b[\\s\\S]{0,20}\\bas\\b[\\s\\S]{0,15}\\bsent\\b`,
     // refactor/private-alpha-canonical-progress-command-engine: the object-free form — "mark as cv
     // sent," "count as cv sent" — with no "it"/"this"/number at all, implicitly meaning the
     // currently focused/visible review. This is the EXACT phrasing the live transcript this branch
     // fixes used ("mark as cv sent"), which the two patterns above (both requiring an explicit
     // this/it/digit object) never matched, silently falling through to the real LLM planner instead
     // of resolving deterministically.
-    "\\b(mark|count|log|flag)\\b[\\s\\S]{0,10}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b",
+    `\\b${GMAIL_REVIEW_MARK_PROGRESS_VERB_RE}\\b[\\s\\S]{0,10}\\bas\\b[\\s\\S]{0,15}\\b(a\\s+)?(cv|application)s?\\s+sent\\b`,
+    // fix/private-alpha-email-review-router-cleanup (Task 3): the bare "count it"/"count this"/"log
+    // this application" shapes this task's own test list names — no "as ... sent" suffix at all,
+    // relying entirely on there being a focused/visible review to mark. Only ever produces an
+    // operation when gmailReviewMarkProgressShortcutOperation itself resolves a real target review
+    // (index/name/focus) below — a bare "count it" with no review in context safely falls through.
+    "\\b(count|log)\\b[\\s\\S]{0,5}\\b(this|it)\\b(?:[\\s\\S]{0,15}\\bapplication\\b)?\\s*[.!]?\\s*$",
     "\\bm[aá]rca(lo|la|ho)?\\b[\\s\\S]{0,20}\\bcv enviado\\b",
     "\\bmarca'?(ho|l|la)?\\b[\\s\\S]{0,20}\\bcv enviat\\b"
   ].join("|"),
@@ -2384,6 +2419,15 @@ const GMAIL_REVIEW_MARK_PROGRESS_RE = new RegExp(
 // user who didn't read the refusal than a deliberate override.
 const GMAIL_REVIEW_MARK_PROGRESS_OVERRIDE_RE = /\banyway\b|\bregardless\b|\boverride\b|\bdo it anyway\b|\bigual(mente)?\b|\bde totes maneres\b/i;
 
+// fix/private-alpha-email-review-router-cleanup (Task 4): a JUSTIFICATION statement ("I sent a CV
+// related to that mail so mark it as CV sent") is different from a bare re-confirmation ("count it
+// anyway") — the user is claiming something happened OUTSIDE what the email itself shows, which is
+// worth one confirming question before writing anything ("should I log 1 CV sent and ignore this
+// review?"), never an immediate silent log. Only engages when the override-anyway phrasing above
+// did NOT already match (that one still bypasses immediately, unchanged).
+const GMAIL_REVIEW_OVERRIDE_JUSTIFICATION_RE =
+  /\bi (already |also )?sent\b[\s\S]{0,25}\b(cv|resume|r[eé]sum[eé]|application)\b|\bi did send\b[\s\S]{0,20}\b(cv|resume|application)\b|\benvi[eé]\b[\s\S]{0,20}\b(mi\s+)?(cv|curr[ií]culum|solicitud)\b|\bhe enviado\b[\s\S]{0,20}\b(mi\s+)?(cv|curr[ií]culum)\b|\bhe enviat\b[\s\S]{0,20}\b(el meu\s+)?(cv|curr[ií]culum)\b/i;
+
 function gmailReviewMarkProgressShortcutOperation(message: string, context: ContextBundle): PlannedOperation[] {
   const text = normalizeIntentText(message);
   if (!text || !GMAIL_REVIEW_MARK_PROGRESS_RE.test(text)) {
@@ -2391,7 +2435,8 @@ function gmailReviewMarkProgressShortcutOperation(message: string, context: Cont
   }
 
   const explicitOverride = GMAIL_REVIEW_MARK_PROGRESS_OVERRIDE_RE.test(text);
-  const overrideArgs = explicitOverride ? { explicitOverride: true } : {};
+  const confirmOverrideJustification = !explicitOverride && GMAIL_REVIEW_OVERRIDE_JUSTIFICATION_RE.test(text);
+  const overrideArgs = explicitOverride ? { explicitOverride: true } : confirmOverrideJustification ? { confirmOverrideJustification: true } : {};
 
   const visibleReviews = context.session.visibleEntities.filter(
     (entity): entity is AgentEntity & { index: number } => entity.type === "gmail_review" && typeof entity.index === "number"

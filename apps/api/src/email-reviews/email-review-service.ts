@@ -685,10 +685,24 @@ export function isHighPriorityGmailReview(review: Pick<EmailReviewItem, "propose
   return Boolean(review.proposedEventType && HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES.has(review.proposedEventType));
 }
 
-/** Real signal-type name when the classifier proposed one; an honest "uncertain signal" (never a
- * guessed category) when it didn't — e.g. an "action required" email with no determinable event type. */
-export function gmailReviewSignalTypeLabel(review: Pick<EmailReviewItem, "proposedEventType">): string {
-  return review.proposedEventType ? humanEmailReviewEventLabel(review.proposedEventType) : "uncertain signal";
+// fix/private-alpha-email-review-router-cleanup: known non-eventType `reason` values that still
+// deserve a real, specific display label — without this, "Okify ha visto tu solicitud" (reason
+// "application_viewed", deliberately no proposedEventType — it's informational, not a real career
+// event) rendered as the same generic "uncertain signal" text a genuinely unclassifiable email
+// gets, which is exactly the "misclassified" symptom this task's live report complained about even
+// after the underlying classification itself was fixed.
+const KNOWN_NON_EVENT_REASON_LABELS: Record<string, string> = {
+  application_viewed: "application viewed"
+};
+
+/** Real signal-type name when the classifier proposed one; a known non-eventType reason's own
+ * label when that's what this is; an honest "uncertain signal" (never a guessed category)
+ * otherwise — e.g. an "action required" email with no determinable event type. */
+export function gmailReviewSignalTypeLabel(review: Pick<EmailReviewItem, "proposedEventType" | "reason">): string {
+  if (review.proposedEventType) {
+    return humanEmailReviewEventLabel(review.proposedEventType);
+  }
+  return KNOWN_NON_EVENT_REASON_LABELS[review.reason] ?? "uncertain signal";
 }
 
 export type GmailReviewPresentationCategory = "confirmation" | "needs_review" | "noise";
@@ -707,7 +721,7 @@ export type GmailReviewPresentationCategory = "confirmation" | "needs_review" | 
  * anything real.
  */
 export function gmailReviewPresentationCategory(review: Pick<EmailReviewItem, "reason" | "proposedEventType" | "confidence">): GmailReviewPresentationCategory {
-  const NOISE_REASONS = new Set(["security_auth", "onboarding_noise", "filtered_marketing", "filtered_non_action_email", "unknown"]);
+  const NOISE_REASONS = new Set(["security_auth", "onboarding_noise", "filtered_marketing", "filtered_non_action_email", "unknown", "application_viewed"]);
 
   if (review.reason === "application_confirmation") {
     return "confirmation";
@@ -754,7 +768,7 @@ function gmailReviewRowLine(
   rules: EmailSignalRule[],
   activeGoals: Goal[],
   timezone: string,
-  number: number
+  numbers: number[]
 ): string {
   const extracted = (review.extracted ?? {}) as Record<string, unknown>;
   const company = typeof extracted.company === "string" && extracted.company.trim() ? extracted.company.trim() : undefined;
@@ -767,9 +781,15 @@ function gmailReviewRowLine(
   const linkedGoal = linkedGoalId ? activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
   const priorityPrefix = isHighPriorityGmailReview(review) ? "[High priority] " : "";
 
+  // fix/private-alpha-email-review-router-cleanup (Task 7): 2+ numbers means
+  // groupSimilarEntriesForDisplay collapsed several same-subject/sender/day rows into one combined
+  // line — every individual number stays addressable ("details for 5"), the text is just shared.
+  const numberPrefix = numbers.length > 1 ? numbers.join(", ") : String(numbers[0]);
+  const countPrefix = numbers.length > 1 ? `${numbers.length} similar ` : "";
+
   const parts = [label, role, signalType].filter((part): part is string => Boolean(part));
 
-  return `${number}. ${priorityPrefix}${parts.join(" — ")} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`;
+  return `${numberPrefix}. ${priorityPrefix}${countPrefix}${parts.join(" — ")} — Gmail, ${received}${linkedGoal ? ` — linked to "${linkedGoal.title}"` : ""}`;
 }
 
 // fix/private-alpha-email-progress-count-and-review-ux (Task 5): a real reported bug — the old
@@ -795,6 +815,54 @@ function gmailReviewListFooter(reviewCount: number, groups: Array<{ category: Gm
   }
 
   return suggestions.length > 0 ? `${base} You can also say ${suggestions.join(" or ")}.` : base;
+}
+
+// fix/private-alpha-email-review-router-cleanup (Task 7): a real reported bug — a job-listing
+// digest with no specific proposedEventType skips BOTH existing dedupe paths (findGmailSemanticDuplicateReviewItem
+// requires one; the exact-providerMessageId check only ever catches the literal same message), so
+// three genuinely different "new roles this week" emails for the same posting showed as three
+// identical, undifferentiated "Engineering Manager - Frontend - Consumer en Kraken" rows. This
+// groups same-subject/same-sender/same-calendar-day entries into ONE display line — never
+// collapsing the underlying numbering itself, so "details for 2"/"ignore 2" still addresses that
+// EXACT review individually; only the rendered TEXT is combined.
+function groupSimilarEntriesForDisplay(
+  entries: Array<{ review: EmailReviewItem; number: number }>,
+  timezone: string
+): Array<{ numbers: number[]; review: EmailReviewItem }> {
+  const keyFor = (review: EmailReviewItem) =>
+    `${(review.subject ?? "").trim().toLowerCase()}|${(review.from ?? "").trim().toLowerCase()}|${formatDateInTimezone(review.createdAt, timezone)}`;
+
+  const groupedByKey = new Map<string, Array<{ review: EmailReviewItem; number: number }>>();
+  for (const entry of entries) {
+    const key = keyFor(entry.review);
+    const existing = groupedByKey.get(key);
+    if (existing) existing.push(entry);
+    else groupedByKey.set(key, [entry]);
+  }
+
+  // Preserves the original entries' relative order — Map iteration order follows insertion order,
+  // and each group's first-seen entry determines where its combined line appears. Only collapses
+  // at 3+ members, deliberately not 2 — a real pre-existing test caught this: two DIFFERENT
+  // security-advisory emails (different repos, genuinely worth seeing individually) happened to
+  // share the exact same subject template, and collapsing a mere pair hid one of them. Three or
+  // more identical subject/sender/day rows is the clearer, safer signal of an actual broadcast
+  // digest (the live-reported "3 Kraken listings" shape), never a coincidence worth flattening.
+  const seenKeys = new Set<string>();
+  const result: Array<{ numbers: number[]; review: EmailReviewItem }> = [];
+  for (const entry of entries) {
+    const key = keyFor(entry.review);
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const group = groupedByKey.get(key)!;
+    if (group.length >= 3) {
+      result.push({ numbers: group.map((item) => item.number), review: group[0]!.review });
+    } else {
+      for (const item of group) {
+        result.push({ numbers: [item.number], review: item.review });
+      }
+    }
+  }
+  return result;
 }
 
 export function formatGmailReviewListForChat(
@@ -825,8 +893,8 @@ export function formatGmailReviewListForChat(
       lines.push("", `${group.label}:`);
     }
 
-    for (const { review, number } of group.entries) {
-      lines.push(gmailReviewRowLine(review, rules, activeGoals, timezone, number));
+    for (const { numbers, review } of groupSimilarEntriesForDisplay(group.entries, timezone)) {
+      lines.push(gmailReviewRowLine(review, rules, activeGoals, timezone, numbers));
     }
   }
 
@@ -869,6 +937,7 @@ export function humanEmailKindLabel(kind: EmailKind): string {
   const labels: Record<EmailKind, string> = {
     application_confirmation: "application confirmation",
     recruiter_reply: "recruiter reply",
+    application_viewed: "application viewed",
     interview: "interview",
     offer: "job offer",
     rejection: "rejection",
@@ -957,6 +1026,7 @@ export function suggestedActionCopyForEmailKind(kind: EmailKind, understandingSt
   const copyByKind: Partial<Record<EmailKind, string>> = {
     application_confirmation: "Mark as CV sent if not already counted, or ignore if already counted.",
     recruiter_reply: "Turn this into a follow-up action, or ignore if already handled.",
+    application_viewed: "Nothing to do — just a status update. Ignore, or monitor for a real reply.",
     interview: "Turn this into a follow-up action, or ignore if already handled.",
     offer: "Turn this into a follow-up action, or ignore if already handled.",
     rejection: "Log this outcome, or ignore if already noted.",

@@ -173,6 +173,7 @@ const PROGRESS_ACTIVITIES: Record<ProgressActivityKind, ProgressActivityDefiniti
     eligibility: {
       application_confirmation: { eligible: true, suggestion: "none" },
       recruiter_reply: APPLICATION_SENT_INELIGIBLE("This is a recruiter reply, not an application confirmation.", "turn_into_action"),
+      application_viewed: APPLICATION_SENT_INELIGIBLE("This is just a status ping saying your application was viewed — nothing new was sent."),
       interview: APPLICATION_SENT_INELIGIBLE("This is about an interview, not a CV being sent.", "turn_into_action"),
       offer: APPLICATION_SENT_INELIGIBLE("This is a job offer, not a CV being sent.", "turn_into_action"),
       rejection: APPLICATION_SENT_INELIGIBLE("This is a rejection, not a CV being sent — I won't log it as progress."),
