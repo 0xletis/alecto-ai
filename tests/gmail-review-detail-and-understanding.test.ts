@@ -502,7 +502,13 @@ test("8B. 'details for 3' -> 'count this' approves/logs that review", async () =
       await sendAgentMessage(server, userId, "details for 1");
       const reply = await sendAgentMessage(server, userId, "count this");
 
-      assert.ok(reply.operationsExecuted.some((entry) => entry.tool === "gmail.review.approve"));
+      // fix/private-alpha-email-review-router-cleanup (Task 3): "count this" for a focused,
+      // application-confirmation-eligible review now routes through the SAME canonical
+      // gmail.review.log_progress/executeProgressCommand path "mark it as cv sent" already used —
+      // never the older gmail.review.approve, which trusted the review's own classification without
+      // the eligibility guard, verified count, or metric-bridge fix. Same end state (resolved/
+      // approved), a materially safer mechanism to get there.
+      assert.ok(reply.operationsExecuted.some((entry) => entry.tool === "gmail.review.log_progress"));
       const after = await prisma.emailReviewItem.findUnique({ where: { id: review.id } });
       assert.equal(after?.status, "approved");
     });

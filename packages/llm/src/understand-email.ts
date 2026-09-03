@@ -20,6 +20,13 @@ export const EMAIL_KINDS = [
   "interview",
   "offer",
   "rejection",
+  // fix/private-alpha-email-review-router-cleanup: a real reported bug — "Okify ha visto tu
+  // solicitud" / "Iqana ha visto tu solicitud" (an automated "your application was viewed" status
+  // notification, no human wrote it) was classifying as recruiter_reply, which is wrong on its own
+  // terms (no reply was actually sent) and made it eligible for a "turn into action" follow-up
+  // suggestion that doesn't apply to a passive status ping. A distinct kind for this — no real
+  // human contact, no career eventType, informational only.
+  "application_viewed",
   "job_alert",
   "security_auth",
   "onboarding",
@@ -163,6 +170,7 @@ function buildEmailUnderstandingPrompt(): string {
     `emailKind must be exactly one of: ${EMAIL_KINDS.join(", ")}. Pick the closest real fit; use "unknown" only when genuinely none fit.`,
     "'offer' means the email explicitly offers a job, a role, or an interview/next-step invitation — a generic recruiter opportunity, a job-board/newsletter listing, or cold outreach with no concrete offer is 'recruiter_reply' or 'job_alert', never 'offer'.",
     "A LinkedIn/job-platform ACCOUNT or PROFILE status notification (e.g. 'you are no longer showing recruiters you're open to work', an Open-to-Work visibility/privacy-setting change) is about the user's OWN account settings, not a real job-search event — use 'marketing' or 'personal_message' (whichever fits closer), never 'application_confirmation', 'recruiter_reply', or 'offer', even though the wording mentions job searching.",
+    "An automated 'your application was viewed' status ping (e.g. 'Okify ha visto tu solicitud', 'Iqana ha visto tu solicitud', 'your application was viewed', 'a recruiter viewed your application') is 'application_viewed' — NOT 'recruiter_reply' (no human actually wrote back), NOT 'interview', NOT 'offer', NOT 'application_confirmation' (nothing was just submitted), and NOT 'marketing' unless the email is genuinely also a promotional pitch. suggestedUserAction for 'application_viewed' is 'monitor' (nothing to decide), never 'turn_into_action' or 'approve'.",
     "relevance is how much this email matters in general (high/medium/low/noise) — a verification code or a bulk newsletter is noise regardless of sender; a genuine booking confirmation, invoice, or personal reply is at least medium.",
     "goalRelevance is ONLY about the linkedGoal/activeWatcherDescription given to you, if any — 'direct' if the email is clearly what that goal/watcher is tracking, 'indirect' if related but not a direct match, 'unrelated' if the email is about something else entirely, 'unclear' if you cannot tell. If no goal/watcher was given, use 'unclear'.",
     "summary is one or two plain sentences describing what the email actually says.",

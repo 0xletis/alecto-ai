@@ -3,6 +3,7 @@ import {
   approveEmailReviewItem,
   archiveActionItem,
   archiveEmailSignalRule,
+  archiveEvent,
   archiveIntegrationConnection,
   completeActionItem,
   createActionItem,
@@ -18,6 +19,7 @@ import {
   getEmailReviewItems,
   getEmailSignalRules,
   getEventsSince,
+  getRecentEvents,
   getGoals,
   getIntegrationConnection,
   getIntegrationConnections,
@@ -1264,6 +1266,64 @@ export async function executeOperation(
           summary: `Logged ${count} job application${count === 1 ? "" : "s"} sent.${goalNote ? ` ${goalNote}` : ""}${result.reconciliationNote}${coachingNote}`,
           result: result.events,
           entities: result.completedAction ? [actionToEntity(result.completedAction)] : undefined
+        };
+      }
+
+      // fix/private-alpha-email-review-router-cleanup (Task 6): a real, safe correction path for a
+      // legacy wrong progress event (e.g. a stale "Application to Interview" entry from before the
+      // metric-bridge bug was fixed) — never a silent delete. Read-only list, numbered exactly like
+      // every other visible-entity list in this codebase, so event.undo_progress can resolve a
+      // specific one deterministically the same way "details for 2" already does for reviews.
+      case "event.list_recent_progress": {
+        const limit = (args.limit as number | undefined) ?? 10;
+        const timezone = await getUserTimezone(userId);
+        const recent = await getRecentEvents(userId, limit);
+
+        if (recent.length === 0) {
+          return { tool: operation.tool, status: "executed", summary: "No recent progress events found.", result: [] };
+        }
+
+        const lines = recent.map((event, index) => {
+          const signalKey = typeof event.data?.signalKey === "string" ? event.data.signalKey : undefined;
+          const matchedGoal = signalKey ? findGoalsForSignalKey(context.activeGoals, signalKey)[0] : findGoalsForEventType(context.activeGoals, event.type)[0];
+          const label = describeSignalCount(matchedGoal, event.type, signalKey, 1);
+          const when = formatShortDateLabel(event.timestamp, timezone);
+          return `${index + 1}. ${label} — ${when}${matchedGoal ? ` — "${matchedGoal.title}"` : ""} — ${event.source}`;
+        });
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Recent progress events:\n${lines.join("\n")}\n\nSay "undo the N one" or "undo event N" to correct a specific one.`,
+          result: recent,
+          entities: recent.map((event, index) => ({ type: "event" as const, id: event.id, label: `${event.type}${event.data?.signalKey ? ` (${event.data.signalKey})` : ""}`, index: index + 1 }))
+        };
+      }
+
+      case "event.undo_progress": {
+        const index = args.index as number;
+        const reason = (args.reason as string | undefined) ?? "removed by user as incorrect";
+
+        const visibleEvents = context.session.visibleEntities.filter((entity) => entity.type === "event" && entity.index === index);
+        const targetId = visibleEvents[0]?.id;
+        if (!targetId) {
+          return failed(operation.tool, `I don't see a "${index}" in the most recently shown progress-event list — say "show recent progress events" first.`);
+        }
+
+        const archived = await archiveEvent(userId, targetId, reason);
+        if (!archived) {
+          return failed(operation.tool, "That event no longer exists or was already undone.");
+        }
+
+        const signalKey = typeof archived.data?.signalKey === "string" ? archived.data.signalKey : undefined;
+        const matchedGoal = signalKey ? findGoalsForSignalKey(context.activeGoals, signalKey)[0] : findGoalsForEventType(context.activeGoals, archived.type)[0];
+        const label = describeSignalCount(matchedGoal, archived.type, signalKey, 1);
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Undone: ${label}${matchedGoal ? ` from "${matchedGoal.title}"` : ""}. It no longer counts toward any goal's progress. This never touched Gmail or any other event.`,
+          result: { archived }
         };
       }
 
@@ -2698,6 +2758,34 @@ export async function executeOperation(
         });
 
         if (result.status === "ineligible") {
+          // fix/private-alpha-email-review-router-cleanup (Task 4): a JUSTIFICATION statement ("I
+          // sent a CV related to that mail so mark it as CV sent") gets ONE confirming question
+          // rather than an immediate log — the user is claiming something the email itself doesn't
+          // show, so this proposes logging it as a MANUAL/user-stated CV sent (not evidence from the
+          // email) and asks before writing anything. A bare "yes" resolves it via the SAME
+          // pendingOperation mechanism every other confirm flow in this codebase already uses,
+          // re-invoking this exact tool with explicitOverride: true.
+          if (args.confirmOverrideJustification) {
+            return {
+              tool: operation.tool,
+              status: "executed",
+              summary: "I can count this as a manual CV sent based on your statement, not as evidence from the email. Should I log 1 CV sent and ignore this review?",
+              result: { emailReview: review, ineligible: true, emailKind: result.emailKind, awaitingOverrideConfirmation: true },
+              pendingOperationUpdate: {
+                topic: "gmail_reviews",
+                summary: "confirm a manual CV-sent override for an ineligible email review",
+                operations: [
+                  {
+                    tool: "gmail.review.log_progress",
+                    args: { reviewId: review.id, explicitOverride: true },
+                    status: "valid",
+                    requiresConfirmation: false
+                  }
+                ]
+              }
+            };
+          }
+
           // Never writes an event, never resolves the review — the review stays pending exactly as
           // it was, so a follow-up "yes, count it anyway as a CV sent" can still resolve it via the
           // SAME focused review (explicitOverride) rather than the user having to re-find it.
@@ -4073,8 +4161,21 @@ const GMAIL_REVIEW_LIST_AUTO_REFRESH_MAX_ITEMS = 3;
 // the explicit "refresh email reviews" command — both already existing, uncapped-frequency paths.
 const STALE_LOOKING_GMAIL_REVIEW_REASONS = new Set(["uncertain signal", "unknown", "rule_classification", "rules_match", "custom_rule_match"]);
 
-function looksLikeStaleGmailReviewClassification(review: Pick<EmailReviewItem, "reason">): boolean {
-  return STALE_LOOKING_GMAIL_REVIEW_REASONS.has(review.reason);
+// fix/private-alpha-email-review-router-cleanup (Task 8): a narrow, SUBJECT-pattern-based addition
+// to the auto-refresh candidacy above — these specific shapes were confidently misclassified (not
+// "uncertain"), so the reason-based check alone would never flag them, yet they're exactly the
+// live-reported cases ("ha visto tu solicitud" stored as recruiter_reply, Open-to-Work status
+// stored as needs-review) worth the bounded refresh cost. Kept deliberately narrow — matching only
+// the specific risky subject phrasing this task's brief names, never a broad heuristic — so this
+// stays within the SAME small, bounded cap as the reason-based check, not an unbounded new cost.
+const STALE_LOOKING_GMAIL_REVIEW_SUBJECT_RE =
+  /\bha visto tu solicitud\b|\bviewed your application\b|\byour application was viewed\b|\brecruiter viewed\b|\bopen[\s-]to[\s-]work\b|\ba (afegit|añadido)\b.*\bxarxa\b/i;
+
+function looksLikeStaleGmailReviewClassification(review: Pick<EmailReviewItem, "reason" | "subject">): boolean {
+  if (STALE_LOOKING_GMAIL_REVIEW_REASONS.has(review.reason)) {
+    return true;
+  }
+  return Boolean(review.subject && STALE_LOOKING_GMAIL_REVIEW_SUBJECT_RE.test(review.subject));
 }
 
 async function refreshStaleGmailReviewClassifications(
