@@ -25,6 +25,7 @@ import {
   setVisibleEntities
 } from "./conversation-session.js";
 import { composeGmailGoalUsageStatusReply, executeOperation, formatShortDateLabel, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
+import { resolveApplicationSentBridgeSignalKeys } from "./progress-command.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import {
   buildVisibleReviewSummaries,
@@ -4381,6 +4382,24 @@ async function dateCorrectionShortcutOperation(message: string, context: Context
 
   const recentEvents = await getEventsSince(userId, new Date(now.getTime() - 4 * 24 * 60 * 60 * 1000));
   const activeApplicationSent = recentEvents.filter((event) => event.type === "career.application_sent" && event.status === "active");
+  // refactor/private-alpha-general-email-intelligence-workflow (gate 3 hardening): an adaptive
+  // goal's own metric writes a BRIDGED custom.goal_progress_logged{signalKey} event alongside the
+  // canonical career.application_sent one (see executeProgressCommand's own bridge-write loop in
+  // progress-command.ts) — moving only the canonical side would leave the adaptive goal's displayed
+  // Today/Week count stuck on the wrong day. Never a hardcoded signalKey string — derived from the
+  // user's own currently active goals' declared metrics, so this works for any adaptive goal, not
+  // just one named "applications_sent".
+  const bridgeSignalKeys = new Set(resolveApplicationSentBridgeSignalKeys(context.activeGoals));
+  const activeBridgeEvents =
+    bridgeSignalKeys.size > 0
+      ? recentEvents.filter(
+          (event) =>
+            event.type === "custom.goal_progress_logged" &&
+            event.status === "active" &&
+            typeof event.data?.signalKey === "string" &&
+            bridgeSignalKeys.has(event.data.signalKey as string)
+        )
+      : [];
 
   let sourceLocalDate: string | undefined;
   for (let offset = 0; offset <= 3; offset += 1) {
@@ -4396,10 +4415,14 @@ async function dateCorrectionShortcutOperation(message: string, context: Context
     return undefined;
   }
 
-  const eventsToMove = activeApplicationSent.filter((event) => formatDateInTimezone(event.timestamp, timezone) === sourceLocalDate);
-  if (eventsToMove.length === 0) {
+  const canonicalEventsToMove = activeApplicationSent.filter((event) => formatDateInTimezone(event.timestamp, timezone) === sourceLocalDate);
+  if (canonicalEventsToMove.length === 0) {
     return undefined;
   }
+  const bridgeEventsToMove = activeBridgeEvents.filter((event) => formatDateInTimezone(event.timestamp, timezone) === sourceLocalDate);
+  // The displayed "N CVs" count is always the canonical count — a bridge event is the adaptive
+  // goal's own parallel record of the SAME real CV, never an additional one.
+  const eventsToMove = [...canonicalEventsToMove, ...bridgeEventsToMove];
 
   const sourceLabel = sourceLocalDate === todayLocalDate ? `today (${formatShortDateLabel(new Date(`${sourceLocalDate}T12:00:00Z`), timezone)})` : formatShortDateLabel(new Date(`${sourceLocalDate}T12:00:00Z`), timezone);
   const targetLabel = formatShortDateLabel(new Date(`${targetLocalDate}T12:00:00Z`), timezone);
@@ -4415,9 +4438,9 @@ async function dateCorrectionShortcutOperation(message: string, context: Context
     return undefined;
   }
 
-  const summary = `Move ${eventsToMove.length} CV${eventsToMove.length === 1 ? "" : "s"} from ${sourceLabel} to ${targetLabel}`;
+  const summary = `Move ${canonicalEventsToMove.length} CV${canonicalEventsToMove.length === 1 ? "" : "s"} from ${sourceLabel} to ${targetLabel}`;
   setPendingOperation(context.session, createPendingOperationRecord("date_correction", summary, [correctOp]));
-  const reply = `Do you want me to move the ${eventsToMove.length} CV${eventsToMove.length === 1 ? "" : "s"} from ${sourceLabel} to ${targetLabel}?`;
+  const reply = `Do you want me to move the ${canonicalEventsToMove.length} CV${canonicalEventsToMove.length === 1 ? "" : "s"} from ${sourceLabel} to ${targetLabel}?`;
 
   return finalize(context, {
     reply,
@@ -4436,8 +4459,17 @@ async function dateCorrectionShortcutOperation(message: string, context: Context
 // the live-reported trigger phrase ("Application to interview is fake u can delete it") never says
 // it — "fake"/"wrong"/"never happened"/"mistake" paired with a correction verb is itself the
 // signal, since no other domain in this codebase describes an ACTION or a GMAIL REVIEW as "fake."
+// refactor/private-alpha-general-email-intelligence-workflow (gate 4 hardening): a real bug found
+// while hardening this path — "undo the Application to Interview one" (no "fake"/"wrong" wording
+// at all) was falling through every deterministic shortcut and reaching the goal-avoidance
+// guardrail, which hard-blocked it as conflicting with the user's own job-search goal. Two new
+// alternatives cover the plain "undo the X one"/"undo event N" phrasing this task's own hardening
+// scenario needs, without widening scope to bare "undo" (which could mean an action, a message, ...
+// — every branch here still only ever CONFIRMS a real, name-matched candidate from
+// event.list_recent_progress; a message that matches this regex but names nothing recognizable
+// still safely falls through to "which one is wrong?", never a wrong guess).
 const PROGRESS_CORRECTION_RE =
-  /\b(fake|not real|never happened|isn'?t real|wasn'?t real|wrong|incorrect|a mistake)\b[\s\S]{0,40}\b(delete|remove|undo|void|correct|fix|get rid of)\b|\b(delete|remove|undo|void|correct|fix|get rid of)\b[\s\S]{0,40}\b(fake|not real|never happened|isn'?t real|wasn'?t real|wrong|incorrect|a mistake)\b|\bundo (that|this|the) (progress|event|metric)\b|\b(that|this) (progress|event|metric) (is|was) (wrong|fake|incorrect|not real)\b/i;
+  /\b(fake|not real|never happened|isn'?t real|wasn'?t real|wrong|incorrect|a mistake)\b[\s\S]{0,40}\b(delete|remove|undo|void|correct|fix|get rid of)\b|\b(delete|remove|undo|void|correct|fix|get rid of)\b[\s\S]{0,40}\b(fake|not real|never happened|isn'?t real|wasn'?t real|wrong|incorrect|a mistake)\b|\bundo (that|this|the) (progress|event|metric)\b|\b(that|this) (progress|event|metric) (is|was) (wrong|fake|incorrect|not real)\b|\bundo\b[\s\S]{0,10}\b(the|that|this)\b[\s\S]{2,60}\bone\b\s*$|\bundo (event|entry|progress event) \d+\b/i;
 
 function normalizeForProgressCorrectionMatch(value: string): string[] {
   return value

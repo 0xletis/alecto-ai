@@ -83,6 +83,7 @@ import {
   RESUME_UP_TO_DATE_RE,
   RESUME_UPDATE_SUGGESTION_RE,
   writeGmailAutonomyPreferences,
+  type BatchReconciler,
   type EmailIntelligenceGroup,
   type EmailIntelligenceSourceItem,
   type EventTypeId,
@@ -94,7 +95,7 @@ import {
   type StoredEvent,
   type UserOperatingProfile
 } from "@operator-agent/core";
-import { understandEmail, validateEmailUnderstanding } from "@operator-agent/llm";
+import { assessGoalRelevance, reconcileEmailBatch, understandEmail, validateEmailUnderstanding } from "@operator-agent/llm";
 import { inferActionGoalLink } from "../utils/action-goal-link.js";
 import type { ActionHygieneAction, NextWeekPlanSuggestion, PlanWindowKind, WeeklyReviewContext, WeeklyReviewDraft } from "../server-types.js";
 import { actionHygieneVisibleActions, analyzeActionHygiene } from "../actions/hygiene-session.js";
@@ -2573,7 +2574,7 @@ export async function executeOperation(
         const GROUPED_VIEW_MIN_ITEMS = 6;
         const useGroupedView = requestedViewMode === "grouped" && status === "pending" && items.length >= GROUPED_VIEW_MIN_ITEMS;
         const listBody = useGroupedView
-          ? formatEmailIntelligenceSummaryForChat(items, timezone)
+          ? await formatEmailIntelligenceSummaryForChat(items, timezone, { reconcile: batchReconcilerAdapter })
           : formatGmailReviewListForChat(items, context.gmailRules, context.activeGoals, timezone);
 
         return {
@@ -2981,7 +2982,7 @@ export async function executeOperation(
           return failed(operation.tool, "Nothing from that list is still pending — say \"show email reviews\" to see what's current.");
         }
 
-        const groups = groupEmailIntelligenceItems(sourceItems, timezone);
+        const groups = await groupEmailIntelligenceItems(sourceItems, timezone, { reconcile: batchReconcilerAdapter });
         const countReadyGroups = groups.filter((group) => group.bucket === "count_ready");
 
         let targetGroups: EmailIntelligenceGroup[] = [];
@@ -4209,10 +4210,16 @@ async function fetchAndUnderstandGmailReview(
   rule: EmailSignalRule | undefined;
   linkedGoal: Goal | undefined;
   understandingResult: ReturnType<typeof validateEmailUnderstanding> | undefined;
+  /** refactor/private-alpha-general-email-intelligence-workflow (gate 1 hardening): set only when
+   * Stage C's goal-relevance module was actually consulted (the rule-based resolution below found
+   * nothing) and came back indirect/unclear/needing confirmation rather than a confident direct
+   * link — a specific, user-showable reason, never a silent non-link. Undefined whenever the rule
+   * already resolved a goal (the common, already-well-tested path) or there was nothing to assess. */
+  goalRelevanceNeedsDecision: string | undefined;
 }> {
   const rule = context.gmailRules.find((item) => item.id === review.ruleId);
   const linkedGoalId = rule ? [...resolveActiveGoalIdsForGmailRule(rule, context.activeGoals)][0] : undefined;
-  const linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
+  let linkedGoal = linkedGoalId ? context.activeGoals.find((goal) => goal.id === linkedGoalId) : undefined;
 
   const refetch = await refetchGmailReviewContentForAgentRuntime(userId, review);
   const maxLength = options.fullText ? FULL_EMAIL_DETAIL_LENGTH : DEFAULT_EMAIL_DETAIL_LENGTH;
@@ -4241,7 +4248,42 @@ async function fetchAndUnderstandGmailReview(
     understandingResult = undefined;
   }
 
-  return { refetch, cleanedSubject, cleanedBody, senderDomain, rule, linkedGoal, understandingResult };
+  // refactor/private-alpha-general-email-intelligence-workflow (gate 1 hardening): Stage C, wired
+  // into the default path — but ONLY as a fallback when the existing, heavily-tested rule-based
+  // resolution above found nothing (never overrides a rule's own configured/inferred goalId), and
+  // only when there's real ambiguity worth resolving (2+ active goals). A confident "direct" verdict
+  // for a goal id that's actually among the real candidates becomes the linked goal; anything else
+  // (indirect/unrelated/unclear, low confidence, or a goalId the LLM invented) leaves linkedGoal
+  // exactly as it was — undefined, the same safe default as before this ever ran — and is instead
+  // surfaced as a specific "needs decision" reason. This module never writes anything; a caller
+  // deciding to act on the resulting linkedGoal still goes through the normal confirmation/write
+  // path exactly as it did for a rule-resolved goal.
+  let goalRelevanceNeedsDecision: string | undefined;
+  if (!linkedGoal && understandingResult?.understanding && context.activeGoals.length >= 1) {
+    try {
+      const relevance = await assessGoalRelevance({
+        realWorldEvent: understandingResult.understanding.realWorldEvent,
+        summary: understandingResult.understanding.summary,
+        emailKind: understandingResult.understanding.emailKind,
+        candidateGoals: context.activeGoals.map((goal) => ({ id: goal.id, title: goal.title, category: goal.category ?? undefined, description: goal.why ?? undefined })),
+        openActionTitles: context.openActions.map((action) => action.title)
+      });
+
+      const validCandidateIds = new Set(context.activeGoals.map((goal) => goal.id));
+      const candidateGoal = relevance.bestGoalId && validCandidateIds.has(relevance.bestGoalId) ? context.activeGoals.find((goal) => goal.id === relevance.bestGoalId) : undefined;
+
+      if (candidateGoal && relevance.verdict === "direct" && !relevance.requiresConfirmation) {
+        linkedGoal = candidateGoal;
+      } else if (candidateGoal || relevance.verdict !== "unrelated") {
+        goalRelevanceNeedsDecision = relevance.reason;
+      }
+    } catch {
+      // Graceful degradation, matching every other LLM call site in this file — leaves linkedGoal
+      // undefined and goalRelevanceNeedsDecision unset rather than guessing.
+    }
+  }
+
+  return { refetch, cleanedSubject, cleanedBody, senderDomain, rule, linkedGoal, understandingResult, goalRelevanceNeedsDecision };
 }
 
 // fix/private-alpha-email-progress-count-and-review-ux (Task 3): date policy for an email-derived
@@ -4306,7 +4348,7 @@ async function buildGmailReviewDetailResult(input: {
   const existingEntity = visibleReviewEntities.find((entity) => entity.id === review.id);
   const number = existingEntity?.index ?? visibleReviewEntities.length + 1;
 
-  const { refetch, cleanedSubject, cleanedBody, linkedGoal, understandingResult } = await fetchAndUnderstandGmailReview(userId, review, context, { fullText });
+  const { refetch, cleanedSubject, cleanedBody, linkedGoal, understandingResult, goalRelevanceNeedsDecision } = await fetchAndUnderstandGmailReview(userId, review, context, { fullText });
 
   const title = truncateForChat(cleanedSubject || gmailReviewChatLabel(review, context.gmailRules), 100);
   const importantText = cleanedBody || "I don't have enough content to show for this email.";
@@ -4317,6 +4359,7 @@ async function buildGmailReviewDetailResult(input: {
       title,
       currentClassification: gmailReviewSignalTypeLabel(review),
       linkedGoalTitle: linkedGoal?.title,
+      goalRelevanceNeedsDecision,
       whyItMatters: "I couldn't confidently work out why this matters — here's the important text so you can decide.",
       importantText,
       suggestedAction: humanSuggestedActionLabel("ask_clarification")
@@ -4387,6 +4430,7 @@ async function buildGmailReviewDetailResult(input: {
       title,
       currentClassification,
       linkedGoalTitle: linkedGoal?.title,
+      goalRelevanceNeedsDecision,
       whyItMatters,
       keyDetailLines: keyDetailLinesFromUnderstanding(understanding),
       importantText,
@@ -5133,6 +5177,21 @@ function gmailRuleToEntity(rule: EmailSignalRule, index?: number): AgentEntity {
 function reviewToEntity(review: EmailReviewItem, index: number, rules: EmailSignalRule[]): AgentEntity {
   return { type: "gmail_review", id: review.id, label: gmailReviewChatLabel(review, rules), index };
 }
+
+// refactor/private-alpha-general-email-intelligence-workflow (gate 2 hardening): adapts
+// packages/llm's reconcileEmailBatch (its own real prompt/schema shape) to the local,
+// dependency-free BatchReconciler shape packages/core/src/email-intelligence-grouping.ts's Stage D
+// entry point accepts — the one place in the whole codebase these two independently-scoped shapes
+// touch. `id` is required by ReconciliationCandidateItem but never actually read by
+// reconcileEmailBatch itself (it only ever echoes pairId back), so a placeholder is harmless here.
+const batchReconcilerAdapter: BatchReconciler = (pairs) =>
+  reconcileEmailBatch(
+    pairs.map((pair) => ({
+      pairId: pair.pairId,
+      a: { id: "", title: pair.a.title, entity: pair.a.entity, secondary: pair.a.secondary, occurredAt: pair.a.occurredAt },
+      b: { id: "", title: pair.b.title, entity: pair.b.entity, secondary: pair.b.secondary, occurredAt: pair.b.occurredAt }
+    }))
+  );
 
 function hygieneActionLabel(action: ActionHygieneAction): string {
   return action.daysOverdue !== undefined && action.daysOverdue >= 1 ? `${action.title} — overdue` : action.title;

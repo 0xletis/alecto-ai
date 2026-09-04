@@ -109,7 +109,17 @@ export async function reconcileEmailBatch(pairs: ReconciliationCandidatePair[], 
   const mockResponse = process.env.BATCH_RECONCILIATION_MOCK_RESPONSE;
   if (mockResponse) {
     const parsed = ReconciliationResponseSchema.safeParse(JSON.parse(mockResponse));
-    return parsed.success ? parsed.data.results : fallback;
+    if (!parsed.success) {
+      return fallback;
+    }
+    // Test ergonomics: a mock fixture cannot know the real (dynamically generated) pairId ahead of
+    // time, so a mock result's OWN pairId is never trusted here — each is matched to the actual
+    // requested pairs by position instead, always echoing the REAL pairId back. The real (non-mock)
+    // API path below is unaffected and still validates every pairId for real.
+    return pairs.map((pair, index) => {
+      const mockResult = parsed.data.results[index] ?? parsed.data.results[0];
+      return mockResult ? { pairId: pair.pairId, verdict: mockResult.verdict, reason: mockResult.reason } : { pairId: pair.pairId, verdict: "unclear" as const, reason: "No mock result provided." };
+    });
   }
   if (process.env.BATCH_RECONCILIATION_MOCK_THROW === "true") {
     return fallback;

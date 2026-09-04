@@ -2,6 +2,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { encryptSecretJson } from "../packages/core/src/index.ts";
+import { createGoal } from "../packages/db/src/index.ts";
 import { understandEmail, validateEmailUnderstanding, type EmailKind, type SignalBucket } from "../packages/llm/src/index.ts";
 import { buildServer, clearAgentRuntimeMocks, prisma, seedUser, sendAgentMessage } from "./helpers/agent-runtime-test-helpers.ts";
 import { llmEvalOptions } from "./helpers/llm-eval-helpers.ts";
@@ -339,7 +340,7 @@ const ACCEPTANCE_BATCH: SeededGmailMessage[] = [
 ];
 
 test(
-  "gate 9: LLM-backed 12-email acceptance replay — real classifications group into a coherent unique-application count",
+  "gate 9 (resiliency variant): LLM-backed 12-email acceptance replay — real classifications group into a coherent unique-application count, OR an honest needs-decision if genuinely degraded",
   { ...llmEvalOptions(["general-email-intelligence", "gmail"]), timeout: 180_000 },
   async () => {
     const server = buildServer();
@@ -415,6 +416,113 @@ test(
           const events = await prisma.event.count({ where: { userId, type: "career.application_sent", status: "active" } });
           assert.equal(events, 0, "a needs-decision batch must never silently count anything");
         }
+      });
+    } finally {
+      restoreFetch?.();
+      clearAgentRuntimeMocks();
+      await server.close();
+      await prisma.user.deleteMany({ where: { id: userId } });
+    }
+  }
+);
+
+// --- Gate 5 hardening: the resiliency variant above is deliberately loose (a legitimate real-model
+// degradation must not fail the suite). This is the actual QUALITY gate: a successful classification
+// pass — no needs-decision fallback triggered — must produce EXACTLY 7 unique applications, never a
+// silently-accepted 5/6/8/9. Only a genuine, EXPLAINED needs-decision (or a hard failure) is allowed
+// to skip the exact-7 assertion; anything in between (a "Count N" suggestion with N != 7) is now a
+// real test failure, not tolerated noise. ---
+
+test(
+  "gate 9 (quality gate): a successful high-confidence classification of the 12-email batch must produce EXACTLY 7 unique applications",
+  { ...llmEvalOptions(["general-email-intelligence", "gmail"]), timeout: 180_000 },
+  async () => {
+    const server = buildServer();
+    const userId = `llm-quality-gate-${randomUUID()}`;
+    let restoreFetch: (() => void) | undefined;
+
+    try {
+      await withGmailEncryptionKey(async () => {
+        await seedUser(userId);
+        // E. goal.status needs a real active goal, with a metric actually mapped to
+        // career.application_sent, to verify the count against.
+        await createGoal(userId, {
+          title: "Find a fully remote developer job",
+          category: "career",
+          targetMetrics: [{ key: "cv_sent", label: "Applications sent", labelSingular: "Application sent", eventType: "career.application_sent", aggregation: "count", window: "weekly" }]
+        });
+        const connection = await seedGmailConnectionWithToken(userId);
+        const rule = await prisma.emailSignalRule.create({
+          data: { userId, connectionId: connection.id, adapterId: "job_search_email", name: "Job search", status: "active", createdBy: "user" }
+        });
+
+        for (const message of ACCEPTANCE_BATCH) {
+          await prisma.emailReviewItem.create({
+            data: {
+              userId,
+              connectionId: connection.id,
+              ruleId: rule.id,
+              adapterId: "job_search_email",
+              provider: "gmail",
+              providerMessageId: message.id,
+              externalId: `gmail-review:${rule.id}:${message.id}`,
+              subject: message.subject,
+              from: message.from,
+              snippet: message.body.slice(0, 120),
+              evidence: message.body.slice(0, 120),
+              confidence: 0.5,
+              reason: "unknown",
+              extracted: {},
+              status: "pending",
+              priority: "normal"
+            }
+          });
+        }
+
+        restoreFetch = installLlmEvalGmailFetchMock(ACCEPTANCE_BATCH);
+
+        await sendAgentMessage(server, userId, "refresh email reviews");
+        await sendAgentMessage(server, userId, "refresh email reviews");
+
+        const listReply = await sendAgentMessage(server, userId, "show email reviews");
+        const suggestedMatch = listReply.reply.match(/Count (\d+) (?:unique )?application/i);
+
+        if (!suggestedMatch) {
+          // A. Only acceptable when the model itself explicitly says why — a bare fallback with no
+          // explanation is a real failure here, not a free pass.
+          assert.match(listReply.reply, /Needs decision:.+\S/i, `a degraded run without an explicit reason is not an acceptable outcome. Full reply:\n${listReply.reply}`);
+          return;
+        }
+
+        // B/C. A "Count N" suggestion was actually produced — this run was NOT degraded, so N must
+        // be exactly 7. No silent 5, 6, 8, or 9.
+        const suggestedCount = Number(suggestedMatch[1]);
+        assert.equal(suggestedCount, 7, `a successful classification pass must produce exactly 7 unique applications (Jiga, Cohere, Lightdash, cander, Conquer AI, GoMining, Exoticca), got ${suggestedCount}. Full reply:\n${listReply.reply}`);
+
+        // Technical Solutions Blockchain's "solicita ya" prompt-to-apply must not be counted as a
+        // confirmed application.
+        assert.doesNotMatch(listReply.reply, /Technical Solutions Blockchain.*(?:new applications|duplicate confirmations)/is);
+
+        const countReply = await sendAgentMessage(server, userId, "count 7");
+        assert.match(countReply.reply, /Counted 7 application/i);
+
+        // D. Duplicate evidence: GoMining's two emails, and Exoticca's two emails, must each resolve
+        // to the exact SAME written event — never two separate counted applications.
+        const reviews = await prisma.emailReviewItem.findMany({ where: { userId } });
+        const goMiningReviews = reviews.filter((review) => (review.extracted as Record<string, unknown> | null)?.company === "GoMining");
+        const exoticcaReviews = reviews.filter((review) => (review.extracted as Record<string, unknown> | null)?.company === "Exoticca");
+        if (goMiningReviews.length === 2) {
+          assert.equal(new Set(goMiningReviews.map((review) => review.eventId)).size, 1, "GoMining's two confirmation emails must share the same event id");
+        }
+        if (exoticcaReviews.length === 2) {
+          assert.equal(new Set(exoticcaReviews.map((review) => review.eventId)).size, 1, "Exoticca's two confirmation emails must share the same event id");
+        }
+
+        // E. goal.status verifies the exact same count the user was just told.
+        const events = await prisma.event.count({ where: { userId, type: "career.application_sent", status: "active" } });
+        assert.equal(events, 7);
+        const statusReply = await sendAgentMessage(server, userId, "show today goal progress");
+        assert.match(statusReply.reply, /week[^\n]*\b7\b/i, `goal.status must verify the same count just claimed. Full reply:\n${statusReply.reply}`);
       });
     } finally {
       restoreFetch?.();

@@ -204,6 +204,25 @@ function resolveVerificationMetrics(targetGoals: Goal[], bridge: CanonicalEventM
     .filter((entry): entry is ProgressVerificationMetric => Boolean(entry));
 }
 
+/**
+ * refactor/private-alpha-general-email-intelligence-workflow (gate 3 hardening): the exact same
+ * signalKey resolution executeProgressCommand's own bridge-write loop uses (the `!metric.signalKey
+ * || metric.eventType === activity.canonicalEventType` exclusion below is copied verbatim from
+ * there) — exposed so a date CORRECTION can find and move the bridged custom.goal_progress_logged
+ * events an adaptive goal's own metric writes alongside the canonical career.application_sent
+ * event, not just the canonical one. Never hardcodes a signalKey string (a real deployment's
+ * adaptive goal can name its own signalKey anything) — always derived from the user's actual active
+ * goals' own declared metrics.
+ */
+export function resolveApplicationSentBridgeSignalKeys(activeGoals: Goal[]): string[] {
+  const activity = PROGRESS_ACTIVITIES.application_sent;
+  const metrics = resolveVerificationMetrics(activeGoals, activity.metricBridge);
+  const signalKeys = metrics
+    .filter((entry) => entry.metric.signalKey && entry.metric.eventType !== activity.canonicalEventType)
+    .map((entry) => entry.metric.signalKey!);
+  return [...new Set(signalKeys)];
+}
+
 function countProgress(events: StoredEvent[], canonicalEventType: EventTypeId, verificationMetrics: ProgressVerificationMetric[]): number {
   if (verificationMetrics.length === 0) {
     return events.filter((event) => event.type === canonicalEventType).length;

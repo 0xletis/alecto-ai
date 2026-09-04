@@ -6,6 +6,7 @@ import {
   groupEmailIntelligenceItems,
   parseActionDueDate,
   signalBucketFromExtracted,
+  type BatchReconciler,
   type EmailIntelligenceSourceItem,
   type Goal,
   type StoredEvent
@@ -903,7 +904,11 @@ function pluralNoiseLabel(reason: string, count: number): string {
   return count === 1 ? singular : `${singular}${singular.endsWith("s") ? "es" : "s"}`;
 }
 
-export function formatEmailIntelligenceSummaryForChat(reviews: EmailReviewItem[], timezone: string): string {
+export async function formatEmailIntelligenceSummaryForChat(
+  reviews: EmailReviewItem[],
+  timezone: string,
+  options: { reconcile?: BatchReconciler } = {}
+): Promise<string> {
   if (reviews.length === 0) {
     return "No email reviews are waiting.";
   }
@@ -926,7 +931,7 @@ export function formatEmailIntelligenceSummaryForChat(reviews: EmailReviewItem[]
     };
   });
 
-  const groups = groupEmailIntelligenceItems(sourceItems, timezone);
+  const groups = await groupEmailIntelligenceItems(sourceItems, timezone, options);
   const reviewsById = new Map(reviews.map((review) => [review.id, review] as const));
   const today = formatDateInTimezone(new Date(), timezone);
 
@@ -1210,6 +1215,12 @@ export interface GmailReviewDetailResponseInput {
   title: string;
   currentClassification: string;
   linkedGoalTitle?: string;
+  /** refactor/private-alpha-general-email-intelligence-workflow (gate 1 hardening): Stage C's own
+   * specific reason when goal-relevance was assessed but came back genuinely undecided (indirect/
+   * unclear, or a low-confidence "direct") — never a linkedGoalTitle guessed from this, and never a
+   * bare "uncertain," per this task's own gate 2. Omitted whenever a goal linked confidently or
+   * relevance was never assessed at all (e.g. the rule already resolved one). */
+  goalRelevanceNeedsDecision?: string;
   whyItMatters: string;
   /** fix/private-alpha-email-progress-count-and-review-ux (Task 7): already-formatted "Label:
    * value" lines (e.g. "Company: Iqana", "Applied: 1 Sep 2026") from EmailUnderstanding's
@@ -1230,6 +1241,8 @@ export function formatGmailReviewDetailResponse(input: GmailReviewDetailResponse
 
   if (input.linkedGoalTitle) {
     lines.push(`Linked goal: ${input.linkedGoalTitle}`);
+  } else if (input.goalRelevanceNeedsDecision) {
+    lines.push(`Needs decision — which goal: ${input.goalRelevanceNeedsDecision}`);
   }
 
   lines.push(`Why it matters: ${input.whyItMatters}`);

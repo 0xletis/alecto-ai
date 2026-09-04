@@ -24,6 +24,7 @@ import {
   updateUserOperatingProfile,
   type PendingAction
 } from "@operator-agent/db";
+import { runExclusive } from "../agent-runtime/user-lock.js";
 import { buildGmailAutonomyState, formatIntervalMinutes } from "../conversation/gmail-autonomy.js";
 import { formatGmailEmailRuleSelectionLines } from "../gmail/gmail-rule-service.js";
 import { applyActionHygieneBatchOperations, readActionHygieneBatchOperations } from "../actions/hygiene.js";
@@ -54,49 +55,60 @@ export function registerPendingActionRoutes(server: FastifyInstance): void {
     pendingActions: await getPendingActions(request.params.userId)
   }));
 
+  // refactor/private-alpha-general-email-intelligence-workflow (gate 7 hardening): this legacy
+  // pending-decision flow used its own DB writes with no concurrency control of its own, unlike
+  // /agent/message (handleAgentMessage -> runExclusive, see apps/api/src/agent-runtime/runtime.ts).
+  // Two confirm/reject calls for the SAME user arriving close together could otherwise interleave
+  // (both read the same pending action before either resolves it, a race the v3 path already closed
+  // for the exact same class of bug). Wrapping the whole handler body in the SAME per-user queue
+  // primitive serializes this legacy path the identical way, whether or not TELEGRAM_AGENT_RUNTIME_
+  // V3_ENABLED is set — never mutates concurrently with itself OR with a v3 /agent/message call for
+  // the same user, since both now share the same underlying queue keyed by userId.
   server.post<{ Params: { userId: string; pendingActionId: string } }>(
     "/users/:userId/pending-actions/:pendingActionId/confirm",
-    async (request, reply) => {
-      const pendingAction = await findPendingAction(request.params.userId, request.params.pendingActionId);
+    async (request, reply) =>
+      runExclusive(request.params.userId, async () => {
+        const pendingAction = await findPendingAction(request.params.userId, request.params.pendingActionId);
 
-      if (!pendingAction) {
-        return reply.status(404).send({
-          error: "Pending action not found"
-        });
-      }
+        if (!pendingAction) {
+          return reply.status(404).send({
+            error: "Pending action not found"
+          });
+        }
 
-      if (pendingAction.type === "action_target_clarification") {
-        return reply.status(400).send({
-          error: "Reply with the number of the action you mean, or cancel."
-        });
-      }
+        if (pendingAction.type === "action_target_clarification") {
+          return reply.status(400).send({
+            error: "Reply with the number of the action you mean, or cancel."
+          });
+        }
 
-      const applied = await applyPendingAction(request.params.userId, pendingAction);
-      const confirmedAction = await confirmPendingAction(request.params.userId, pendingAction.id);
+        const applied = await applyPendingAction(request.params.userId, pendingAction);
+        const confirmedAction = await confirmPendingAction(request.params.userId, pendingAction.id);
 
-      return {
-        pendingAction: confirmedAction,
-        reply: applied.reply
-      };
-    }
+        return {
+          pendingAction: confirmedAction,
+          reply: applied.reply
+        };
+      })
   );
 
   server.post<{ Params: { userId: string; pendingActionId: string } }>(
     "/users/:userId/pending-actions/:pendingActionId/reject",
-    async (request, reply) => {
-      const pendingAction = await rejectPendingAction(request.params.userId, request.params.pendingActionId);
+    async (request, reply) =>
+      runExclusive(request.params.userId, async () => {
+        const pendingAction = await rejectPendingAction(request.params.userId, request.params.pendingActionId);
 
-      if (!pendingAction) {
-        return reply.status(404).send({
-          error: "Pending action not found"
-        });
-      }
+        if (!pendingAction) {
+          return reply.status(404).send({
+            error: "Pending action not found"
+          });
+        }
 
-      return {
-        pendingAction,
-        reply: "Cancelled. I did not change anything."
-      };
-    }
+        return {
+          pendingAction,
+          reply: "Cancelled. I did not change anything."
+        };
+      })
   );
 }
 
