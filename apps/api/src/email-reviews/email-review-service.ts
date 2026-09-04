@@ -2,8 +2,10 @@ import {
   CUSTOM_SIGNAL_EVENT_TYPE,
   EventTypeSchema,
   HIGH_SIGNAL_JOB_SEARCH_EVENT_TYPES,
+  ambiguityFromExtracted,
   groupEmailIntelligenceItems,
   parseActionDueDate,
+  signalBucketFromExtracted,
   type EmailIntelligenceSourceItem,
   type Goal,
   type StoredEvent
@@ -907,17 +909,22 @@ export function formatEmailIntelligenceSummaryForChat(reviews: EmailReviewItem[]
   }
 
   const numbered = reviews.map((review, index) => ({ review, index: index + 1 }));
-  const sourceItems: EmailIntelligenceSourceItem[] = numbered.map(({ review, index }) => ({
-    id: review.id,
-    index,
-    subject: review.subject ?? "",
-    from: review.from ?? "",
-    reason: review.reason,
-    proposedEventType: review.proposedEventType,
-    extracted: (review.extracted ?? {}) as Record<string, unknown>,
-    createdAt: review.createdAt,
-    priority: review.priority
-  }));
+  const sourceItems: EmailIntelligenceSourceItem[] = numbered.map(({ review, index }) => {
+    const extracted = (review.extracted ?? {}) as Record<string, unknown>;
+    return {
+      id: review.id,
+      index,
+      subject: review.subject ?? "",
+      from: review.from ?? "",
+      reason: review.reason,
+      proposedEventType: review.proposedEventType,
+      extracted,
+      createdAt: review.createdAt,
+      priority: review.priority,
+      signalBucket: signalBucketFromExtracted(extracted),
+      ambiguity: ambiguityFromExtracted(extracted)
+    };
+  });
 
   const groups = groupEmailIntelligenceItems(sourceItems, timezone);
   const reviewsById = new Map(reviews.map((review) => [review.id, review] as const));
@@ -969,7 +976,12 @@ export function formatEmailIntelligenceSummaryForChat(reviews: EmailReviewItem[]
   if (needsDecision.length > 0) {
     lines.push("", "Needs decision:");
     for (const group of needsDecision) {
-      lines.push(`${group.memberIndexes[0]}. ${group.title} — not enough evidence to classify confidently; open details for N to see why`);
+      // refactor/private-alpha-general-email-intelligence-workflow (gate 2): the specific
+      // ambiguity Stage B's own understanding call gave, when available — never the old lazy
+      // "uncertain signal" catch-all. Falls back to a still-specific (not bare) generic line only
+      // for a legacy/stale row with no fresh understanding to draw from.
+      const why = group.ambiguity ?? "not enough evidence to classify confidently — open details for N to see why";
+      lines.push(`${group.memberIndexes[0]}. ${group.title} — Needs decision: ${why}`);
     }
   }
 

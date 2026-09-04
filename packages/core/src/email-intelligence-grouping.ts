@@ -27,9 +27,23 @@ export interface EmailIntelligenceSourceItem {
   subject: string;
   from: string;
   /** The item's own stored classification — the EmailKind-shaped string OR a legacy/free-form
-   * value; unrecognized values fall into "needs_decision", never silently treated as noise. */
+   * value; unrecognized values fall into "needs_decision", never silently treated as noise. Used
+   * only when signalBucket (below) is unavailable. */
   reason: string;
   proposedEventType?: string;
+  /** refactor/private-alpha-general-email-intelligence-workflow (gate 1): Stage B's OWN direct
+   * bucket answer (packages/llm/src/prompts/email-understanding.prompt.ts's SignalBucket), when a
+   * fresh understanding call produced one — preferred over the reason-string lookup table below
+   * when present, since it's the LLM's own reasoned judgment rather than a static mapping. Absent
+   * for a review whose classification is legacy/stale (no fresh understanding available), in which
+   * case bucketForReason falls back to the reason-string table exactly as before. "new" and
+   * "duplicate_evidence" both still land in count_ready here — Stage D's own dedupe key remains the
+   * AUTHORITATIVE duplicate decision (this task's own core principle: deterministic code groups and
+   * dedupes), the LLM's own duplicate opinion is informative only. */
+  signalBucket?: "new" | "duplicate_evidence" | "status_update" | "action_worthy" | "noise" | "needs_decision";
+  /** Stage B's specific ambiguity explanation, when signalBucket is "needs_decision" — replaces the
+   * old lazy "uncertain signal" catch-all with what is ACTUALLY unsure about this one item. */
+  ambiguity?: string | null;
   /** Structured facts already extracted at classification time — company/role for job search,
    * vendor/amount for finance, etc. Only `company`/`vendor`/`role`/`amount` are read here, by
    * whichever key is actually present; nothing about this function assumes job search specifically. */
@@ -58,6 +72,10 @@ export interface EmailIntelligenceGroup {
   primaryReviewId: string;
   occurredAt: Date;
   isDuplicateGroup: boolean;
+  /** Gate 2 ("no lazy uncertain signal"): the primary member's own specific ambiguity explanation,
+   * carried through for a "needs_decision" group so the presentation layer can show WHAT is unsure
+   * instead of a bare label. Undefined/null for every other bucket. */
+  ambiguity?: string | null;
 }
 
 /**
@@ -103,8 +121,20 @@ const KIND_TO_BUCKET: Record<string, EmailIntelligenceBucket> = {
   application_action_required: "action_worthy"
 };
 
-function bucketForReason(reason: string): EmailIntelligenceBucket {
-  return KIND_TO_BUCKET[reason] ?? "needs_decision";
+const SIGNAL_BUCKET_TO_GROUP_BUCKET: Record<string, EmailIntelligenceBucket> = {
+  new: "count_ready",
+  duplicate_evidence: "count_ready",
+  status_update: "status_update",
+  action_worthy: "action_worthy",
+  noise: "noise",
+  needs_decision: "needs_decision"
+};
+
+function bucketForItem(item: EmailIntelligenceSourceItem): EmailIntelligenceBucket {
+  if (item.signalBucket) {
+    return SIGNAL_BUCKET_TO_GROUP_BUCKET[item.signalBucket] ?? "needs_decision";
+  }
+  return KIND_TO_BUCKET[item.reason] ?? "needs_decision";
 }
 
 function readStringFact(extracted: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -115,6 +145,23 @@ function readStringFact(extracted: Record<string, unknown>, ...keys: string[]): 
     }
   }
   return undefined;
+}
+
+const VALID_SIGNAL_BUCKETS = new Set(["new", "duplicate_evidence", "status_update", "action_worthy", "noise", "needs_decision"]);
+
+/** Reads back the signalBucket/ambiguity this task's own Stage B extension stashes into a review's
+ * existing `extracted` JSON blob on refresh (see executor.ts's refreshEmailReviewClassification
+ * call sites) — callers building an EmailIntelligenceSourceItem from a stored review use this
+ * rather than reading `extracted` ad hoc, so an invalid/legacy value never silently produces a
+ * wrong bucket (falls back to undefined, which bucketForItem then resolves via the reason table). */
+export function signalBucketFromExtracted(extracted: Record<string, unknown>): EmailIntelligenceSourceItem["signalBucket"] {
+  const value = extracted.signalBucket;
+  return typeof value === "string" && VALID_SIGNAL_BUCKETS.has(value) ? (value as EmailIntelligenceSourceItem["signalBucket"]) : undefined;
+}
+
+export function ambiguityFromExtracted(extracted: Record<string, unknown>): string | null | undefined {
+  const value = extracted.ambiguity;
+  return typeof value === "string" ? value : value === null ? null : undefined;
 }
 
 function normalizeForKey(value: string): string {
@@ -163,7 +210,7 @@ export function groupEmailIntelligenceItems(items: EmailIntelligenceSourceItem[]
   const dedupeClusters = new Map<string, EmailIntelligenceSourceItem[]>();
 
   for (const item of items) {
-    const bucket = bucketForReason(item.reason);
+    const bucket = bucketForItem(item);
     if (bucket !== "count_ready") {
       const { title, entity, secondary } = titleFor(item);
       singletons.push({
@@ -176,7 +223,8 @@ export function groupEmailIntelligenceItems(items: EmailIntelligenceSourceItem[]
         memberIndexes: [item.index],
         primaryReviewId: item.id,
         occurredAt: item.createdAt,
-        isDuplicateGroup: false
+        isDuplicateGroup: false,
+        ambiguity: bucket === "needs_decision" ? item.ambiguity : undefined
       });
       continue;
     }

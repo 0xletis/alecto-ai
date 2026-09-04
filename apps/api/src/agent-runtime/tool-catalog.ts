@@ -339,6 +339,18 @@ export const toolCatalog: ToolDefinition[] = [
     })
   },
   {
+    name: "event.correct_date",
+    description:
+      "INTERNAL/deterministic-only — never planned by the LLM. Moves one or more already-logged progress events from one calendar day to another (e.g. correcting '10 CVs' mistakenly logged as today onto the day they actually happened) — each event is individually corrected via the existing correctEvent DB primitive (archives the original as status 'corrected' with an audit link, writes ONE replacement event on the new date with the same type/data/evidence), so the total across both days together never changes and nothing is double-counted. Always requires confirmation.",
+    mutates: true,
+    requiresConfirmation: true,
+    argsSchema: z.object({
+      eventIds: z.array(z.string().min(1)).min(1).max(200),
+      toLocalDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      reason: z.string().max(200).optional()
+    })
+  },
+  {
     name: "event.log_workout",
     description: "Log a completed workout/training session.",
     mutates: true,

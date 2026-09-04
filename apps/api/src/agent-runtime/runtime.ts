@@ -1,6 +1,15 @@
-import { createMemory, getActionItem, getMostRecentlyRemindedActionItem, getOrCreateNotificationSettings, rejectPendingAction, type EmailReviewItem, type PendingAction } from "@operator-agent/db";
+import {
+  createMemory,
+  getActionItem,
+  getEventsSince,
+  getMostRecentlyRemindedActionItem,
+  getOrCreateNotificationSettings,
+  rejectPendingAction,
+  type EmailReviewItem,
+  type PendingAction
+} from "@operator-agent/db";
 import { loadContext } from "./context-loader.js";
-import { addDaysToLocalDateString, formatDateInTimezone } from "../utils/datetime.js";
+import { addDaysToLocalDateString, formatDateInTimezone, parseOptionalNow } from "../utils/datetime.js";
 import { parseGmailAutonomyPreference, type GmailAutonomyPreferenceRequest } from "../legacy/gmail-conversation.js";
 import {
   appendMessage,
@@ -15,7 +24,7 @@ import {
   setTopic,
   setVisibleEntities
 } from "./conversation-session.js";
-import { composeGmailGoalUsageStatusReply, executeOperation, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
+import { composeGmailGoalUsageStatusReply, executeOperation, formatShortDateLabel, parentActionIdFromReminderSourceId, resolveCurrentFocusGoal } from "./executor.js";
 import { checkGoalGuardrail, type GuardrailResult } from "./goal-guardrails.js";
 import {
   buildVisibleReviewSummaries,
@@ -1241,6 +1250,33 @@ async function processAgentMessageInner(request: AgentMessageRequest): Promise<A
   const meetingListShortcut = actionMeetingListShortcutOperation(message);
   if (meetingListShortcut) {
     return finalizeDeterministicOperation(context, message, meetingListShortcut, "actions");
+  }
+
+  // refactor/private-alpha-general-email-intelligence-workflow (gate 3): "today I meant Wednesday"
+  // — a date correction for progress ALREADY logged, never a fresh log of a new statement. Checked
+  // before progressCorrectionShortcutOperation below since both start from similarly-shaped
+  // correction language, and before every action-shaped shortcut for the same reason gate 4's own
+  // shortcut is.
+  if (!pending) {
+    const dateCorrectionResponse = await dateCorrectionShortcutOperation(message, context);
+    if (dateCorrectionResponse) {
+      return dateCorrectionResponse;
+    }
+  }
+
+  // refactor/private-alpha-general-email-intelligence-workflow (gate 4): a real reported bug —
+  // "Application to interview is fake u can delete it" landed on archiving the "Send 10 CVs"
+  // ACTION instead of correcting the wrong PROGRESS METRIC. Checked deterministically, ahead of
+  // every action-shaped shortcut below (goalLifecycleShortcut's archive-verb match, and
+  // bulkActionCleanupShortcut's delete/remove matching), specifically because "delete"/"remove"
+  // language describing a METRIC as fake/wrong must never fall through to those — this owns
+  // "fake"/"wrong"/"never happened" + a correction verb before anything else gets a chance to
+  // misread it as an action-management command.
+  if (!pending) {
+    const progressCorrectionResponse = await progressCorrectionShortcutOperation(message, context);
+    if (progressCorrectionResponse) {
+      return progressCorrectionResponse;
+    }
   }
 
   // Deterministic, not left to the planner's judgment — a real Telegram smoke test found "delete
@@ -4264,6 +4300,280 @@ function isExplicitActionMutationGuardrailBypass(message: string, context: Conte
 
   const hasVisibleAction = context.session.visibleEntities.some((entity) => entity.type === "action");
   return hasVisibleAction || ACTION_TARGET_REFERENCE_RE.test(text);
+}
+
+function agentRuntimeNowForRuntime(): Date {
+  return parseOptionalNow(process.env.AGENT_RUNTIME_TEST_NOW) ?? new Date();
+}
+
+// refactor/private-alpha-general-email-intelligence-workflow (gate 3): the live-reported bug — "Ive
+// sent 10 today" (logged as today), then later "Today I meant Wednesday 2 u counted that day" —
+// treated as a NEW statement instead of a correction of the first one. A correction phrase paired
+// with a resolvable target date (a weekday name, "yesterday," or an explicit date) in EN/ES/CA.
+// Deliberately does NOT require the word "progress" — none of the task's own example phrasings say
+// it.
+const DATE_CORRECTION_PHRASE_RE =
+  /\b(i meant|meant to say|actually meant|counted that day|move (?:those|that|it) to|should (?:have )?be(?:en)?)\b|\bquise decir\b|\bme refer[íi]a a\b|\ben realidad (?:era|fue)\b|\bcont(?:é|e) ese d[íi]a\b|\bvolia dir\b|\ben realitat (?:era|va ser)\b|\bvaig comptar aquell dia\b/i;
+
+const WEEKDAY_NAME_MAP: Record<string, number> = {
+  sunday: 0, monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6,
+  domingo: 0, lunes: 1, martes: 2, "miércoles": 3, miercoles: 3, jueves: 4, viernes: 5, "sábado": 6, sabado: 6,
+  diumenge: 0, dilluns: 1, dimarts: 2, dimecres: 3, dijous: 4, divendres: 5, dissabte: 6
+};
+
+/**
+ * Resolves a correction message's TARGET date — "yesterday"/"ayer"/"ahir" is always today-1; a
+ * named weekday resolves to the most recent PAST occurrence of that weekday (never today itself —
+ * a correction always names a DIFFERENT day than what was originally logged), searched up to 7
+ * days back. Returns undefined when the message names no resolvable date at all, so the caller
+ * falls through rather than guessing.
+ */
+function resolveDateCorrectionTargetLocalDate(text: string, todayLocalDate: string): string | undefined {
+  if (/\b(yesterday|ayer|ahir)\b/.test(text)) {
+    return addDaysToLocalDateString(todayLocalDate, -1);
+  }
+
+  const weekdayMatch = text.match(/\b(sunday|monday|tuesday|wednesday|thursday|friday|saturday|domingo|lunes|martes|mi[ée]rcoles|jueves|viernes|s[áa]bado|diumenge|dilluns|dimarts|dimecres|dijous|divendres|dissabte)\b/);
+  if (!weekdayMatch) {
+    return undefined;
+  }
+  const targetDow = WEEKDAY_NAME_MAP[weekdayMatch[1]!.toLowerCase()];
+  if (targetDow === undefined) {
+    return undefined;
+  }
+
+  for (let offset = 1; offset <= 7; offset += 1) {
+    const candidateDate = addDaysToLocalDateString(todayLocalDate, -offset);
+    const candidateDow = new Date(`${candidateDate}T12:00:00Z`).getUTCDay();
+    if (candidateDow === targetDow) {
+      return candidateDate;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Routes "today I meant Wednesday" / "I sent 10 today, actually that was Wednesday" to a real date
+ * MOVE, never a duplicate new log. The SOURCE day is the most recent local date (searched back up
+ * to 3 days, so it still resolves correctly even if the correction message itself arrives after
+ * local midnight relative to when the original statement was made) that has active
+ * career.application_sent events — deliberately NOT always "today" by literal clock time, which is
+ * what makes this work across a midnight boundary. Confirms before moving anything; the actual
+ * write goes through event.correct_date (executor.ts), which uses correctEvent — archives each
+ * original with an audit link, writes one replacement on the new date, never a second/duplicate
+ * event.
+ */
+async function dateCorrectionShortcutOperation(message: string, context: ContextBundle): Promise<AgentMessageResponse | undefined> {
+  const text = normalizeIntentText(message);
+  if (!text || !DATE_CORRECTION_PHRASE_RE.test(text)) {
+    return undefined;
+  }
+
+  const { userId } = context.session;
+  const timezone = await getUserTimezone(userId);
+  const now = agentRuntimeNowForRuntime();
+  const todayLocalDate = formatDateInTimezone(now, timezone);
+
+  const targetLocalDate = resolveDateCorrectionTargetLocalDate(text, todayLocalDate);
+  if (!targetLocalDate) {
+    return undefined;
+  }
+
+  const recentEvents = await getEventsSince(userId, new Date(now.getTime() - 4 * 24 * 60 * 60 * 1000));
+  const activeApplicationSent = recentEvents.filter((event) => event.type === "career.application_sent" && event.status === "active");
+
+  let sourceLocalDate: string | undefined;
+  for (let offset = 0; offset <= 3; offset += 1) {
+    const candidateDate = addDaysToLocalDateString(todayLocalDate, -offset);
+    if (candidateDate === targetLocalDate) continue;
+    if (activeApplicationSent.some((event) => formatDateInTimezone(event.timestamp, timezone) === candidateDate)) {
+      sourceLocalDate = candidateDate;
+      break;
+    }
+  }
+
+  if (!sourceLocalDate) {
+    return undefined;
+  }
+
+  const eventsToMove = activeApplicationSent.filter((event) => formatDateInTimezone(event.timestamp, timezone) === sourceLocalDate);
+  if (eventsToMove.length === 0) {
+    return undefined;
+  }
+
+  const sourceLabel = sourceLocalDate === todayLocalDate ? `today (${formatShortDateLabel(new Date(`${sourceLocalDate}T12:00:00Z`), timezone)})` : formatShortDateLabel(new Date(`${sourceLocalDate}T12:00:00Z`), timezone);
+  const targetLabel = formatShortDateLabel(new Date(`${targetLocalDate}T12:00:00Z`), timezone);
+
+  const [correctOp] = validateOperations(
+    [{ tool: "event.correct_date", args: { eventIds: eventsToMove.map((event) => event.id), toLocalDate: targetLocalDate, reason: "user corrected the date" } }],
+    context,
+    message,
+    { deterministicSource: true }
+  );
+
+  if (correctOp?.status !== "needs_confirmation") {
+    return undefined;
+  }
+
+  const summary = `Move ${eventsToMove.length} CV${eventsToMove.length === 1 ? "" : "s"} from ${sourceLabel} to ${targetLabel}`;
+  setPendingOperation(context.session, createPendingOperationRecord("date_correction", summary, [correctOp]));
+  const reply = `Do you want me to move the ${eventsToMove.length} CV${eventsToMove.length === 1 ? "" : "s"} from ${sourceLabel} to ${targetLabel}?`;
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [{ tool: "event.correct_date", args: { eventIds: eventsToMove.map((event) => event.id), toLocalDate: targetLocalDate } }],
+    executedOps: [],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: "date_correction"
+  });
+}
+
+// refactor/private-alpha-general-email-intelligence-workflow (gate 4): "X is fake, delete it" /
+// "remove fake X" / "undo that progress" / "that progress is wrong" — a metric-correction
+// statement, never an action-management one. Deliberately does NOT require the word "progress" —
+// the live-reported trigger phrase ("Application to interview is fake u can delete it") never says
+// it — "fake"/"wrong"/"never happened"/"mistake" paired with a correction verb is itself the
+// signal, since no other domain in this codebase describes an ACTION or a GMAIL REVIEW as "fake."
+const PROGRESS_CORRECTION_RE =
+  /\b(fake|not real|never happened|isn'?t real|wasn'?t real|wrong|incorrect|a mistake)\b[\s\S]{0,40}\b(delete|remove|undo|void|correct|fix|get rid of)\b|\b(delete|remove|undo|void|correct|fix|get rid of)\b[\s\S]{0,40}\b(fake|not real|never happened|isn'?t real|wasn'?t real|wrong|incorrect|a mistake)\b|\bundo (that|this|the) (progress|event|metric)\b|\b(that|this) (progress|event|metric) (is|was) (wrong|fake|incorrect|not real)\b/i;
+
+function normalizeForProgressCorrectionMatch(value: string): string[] {
+  return value
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .split(/\s+/)
+    .filter((word) => word.length >= 4);
+}
+
+/**
+ * Resolves WHICH recently-logged progress event the user means, from the numbered lines of
+ * event.list_recent_progress's own summary text ("1. Application to Interview — Sep 2 — ..."),
+ * by normalized-word overlap against the full message — the same forgiving, cheap grounding
+ * technique packages/llm/src/understand-email.ts's isGroundedInText already uses. Picks a single
+ * STRICT best match (score strictly higher than every other candidate); returns undefined for a
+ * tie or zero matches so the caller asks instead of guessing.
+ */
+function resolveProgressCorrectionCandidate(
+  message: string,
+  listSummary: string,
+  recent: Array<{ type: string; data?: Record<string, unknown> }>
+): { index: number; label: string } | undefined {
+  const messageWords = new Set(normalizeForProgressCorrectionMatch(message));
+  const candidates = [...listSummary.matchAll(/^(\d+)\.\s(.+)$/gm)].map((match) => ({ index: Number(match[1]), label: match[2]!.trim() }));
+
+  const scored = candidates.map((candidate) => {
+    // The displayed label falls back to a generic "N <eventType> event" string when no goal's
+    // metric maps to this event (describeSignalCount's own fallback in executor.ts) — matching
+    // against the label ALONE would then miss an otherwise-obvious reference like "Application to
+    // Interview is fake." The underlying event's own type/signalKey are included here too so
+    // resolution stays reliable even without a matching goal.
+    const source = recent[candidate.index - 1];
+    const signalKey = typeof source?.data?.signalKey === "string" ? source.data.signalKey : "";
+    const labelWords = new Set([...normalizeForProgressCorrectionMatch(candidate.label), ...normalizeForProgressCorrectionMatch(`${signalKey} ${source?.type ?? ""}`)]);
+    const score = [...labelWords].filter((word) => messageWords.has(word)).length;
+    return { ...candidate, score };
+  });
+
+  const withMatches = scored.filter((candidate) => candidate.score > 0).sort((a, b) => b.score - a.score);
+  if (withMatches.length === 0) {
+    return undefined;
+  }
+  if (withMatches.length > 1 && withMatches[0]!.score === withMatches[1]!.score) {
+    return undefined;
+  }
+  return withMatches[0];
+}
+
+/**
+ * Routes "X is fake, delete it"/"undo that progress" to a real progress correction: shows the
+ * recent-events list (event.list_recent_progress), resolves which one deterministically from the
+ * message text, and — only for a single, unambiguous match — queues event.undo_progress as a
+ * normal pendingConfirmationOp (the tool itself already requires confirmation; this never bypasses
+ * that). Never touches action.archive, never mutates without the user then saying "yes", and never
+ * changes CV-sent/application-sent counts on its own — only the ONE specific event the user named.
+ */
+async function progressCorrectionShortcutOperation(message: string, context: ContextBundle): Promise<AgentMessageResponse | undefined> {
+  const text = normalizeIntentText(message);
+  if (!text || !PROGRESS_CORRECTION_RE.test(text)) {
+    return undefined;
+  }
+
+  const { userId } = context.session;
+  const [listOp] = validateOperations([{ tool: "event.list_recent_progress", args: {} }], context, message, { deterministicSource: true });
+  if (listOp?.status !== "valid") {
+    return undefined;
+  }
+
+  const executedListOp = await executeOperation(userId, listOp, context, message);
+  applyExecutionSideEffects(context.session, [executedListOp]);
+
+  const recent = Array.isArray(executedListOp.result) ? executedListOp.result : [];
+  if (recent.length === 0) {
+    return finalize(context, {
+      reply: "You don't have any recent progress events to correct.",
+      operationsPlanned: [listOp],
+      executedOps: [executedListOp],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: "progress_correction"
+    });
+  }
+
+  const candidate = resolveProgressCorrectionCandidate(message, executedListOp.summary, recent);
+  if (!candidate) {
+    return finalize(context, {
+      reply: `${executedListOp.summary}\n\nWhich one is wrong? Say "undo the N one."`,
+      operationsPlanned: [listOp],
+      executedOps: [executedListOp],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: "progress_correction"
+    });
+  }
+
+  const [undoOp] = validateOperations(
+    [{ tool: "event.undo_progress", args: { index: candidate.index, reason: "user said this is fake/incorrect" } }],
+    context,
+    message,
+    { deterministicSource: true }
+  );
+
+  if (undoOp?.status !== "needs_confirmation") {
+    return finalize(context, {
+      reply: `${executedListOp.summary}\n\nWhich one is wrong? Say "undo the N one."`,
+      operationsPlanned: [listOp],
+      executedOps: [executedListOp],
+      plannerUsed: "none",
+      llmPlannerAttempted: false,
+      toolValidationPassed: true,
+      topic: "progress_correction"
+    });
+  }
+
+  // Bypasses composeReply's generic "Shall I go ahead?" confirmation text — it has no per-tool
+  // knowledge of event.undo_progress, so it would name only the tool, not the actual candidate.
+  // The "yes"/"no" continuation itself is driven entirely by session.pendingOperation STATE (set
+  // via setPendingOperation below), never by re-parsing this reply text, so customizing it here is
+  // safe and does not affect finalizeDeterministicConfirmation's own resolution.
+  const summary = `Undo "${candidate.label}"`;
+  setPendingOperation(context.session, createPendingOperationRecord("progress_correction", summary, [undoOp]));
+  const reply = `Found it: ${candidate.label}. Do you want me to undo this progress entry? It will no longer count toward any goal. This will not touch your actions or any other progress.`;
+
+  return finalize(context, {
+    reply,
+    operationsPlanned: [listOp, { tool: "event.undo_progress", args: { index: candidate.index } }],
+    executedOps: [executedListOp],
+    plannerUsed: "none",
+    llmPlannerAttempted: false,
+    toolValidationPassed: true,
+    topic: "progress_correction"
+  });
 }
 
 /**

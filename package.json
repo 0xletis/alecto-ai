@@ -15,7 +15,7 @@
     "pretest": "pnpm --filter @operator-agent/core build && pnpm --filter @operator-agent/db build && pnpm --filter @operator-agent/llm build",
     "test": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && tsx --test tests/*.test.ts",
     "pretest:llm": "pnpm --filter @operator-agent/core build && pnpm --filter @operator-agent/db build && pnpm --filter @operator-agent/llm build",
-    "test:llm": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && RUN_LLM_EVALS=true tsx --test tests/agent-runtime-llm-eval.test.ts"
+    "test:llm": "export DATABASE_URL=\"${DATABASE_URL:-postgresql://postgres:postgres@localhost:5432/alecto_ai?schema=public}\" && RUN_LLM_EVALS=true tsx --test tests/agent-runtime-llm-eval.test.ts tests/email-understanding-llm-eval.test.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

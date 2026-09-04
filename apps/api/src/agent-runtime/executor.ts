@@ -6,6 +6,7 @@ import {
   archiveEvent,
   archiveIntegrationConnection,
   completeActionItem,
+  correctEvent,
   createActionItem,
   createActionItemIfNotExists,
   createEmailSignalRule,
@@ -52,6 +53,7 @@ import {
   CUSTOM_SIGNAL_EVENT_TYPE,
   DEFAULT_EMAIL_DETAIL_LENGTH,
   FULL_EMAIL_DETAIL_LENGTH,
+  ambiguityFromExtracted,
   describeGoalEvidenceMatch,
   effectiveGmailSyncIntervalMinutes,
   ensureBookGoalProgressSignal,
@@ -66,6 +68,7 @@ import {
   goalHasOnlyCompletionSignals,
   groupEmailIntelligenceItems,
   isProgressShapedSignalText,
+  signalBucketFromExtracted,
   localDateTimeToUtc,
   parseActionDueDate,
   parseStatedDateText,
@@ -175,7 +178,7 @@ import {
   generateAndSaveWeeklyReview,
   generateDeterministicWeeklyReview
 } from "../weekly-review/review.js";
-import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime, parseOptionalNow, startOfLocalWeek } from "../utils/datetime.js";
+import { addDaysToLocalDateString, formatDateInTimezone, formatLocalDateTime, localDateStartUtc, parseOptionalNow, startOfLocalWeek } from "../utils/datetime.js";
 import { getUserTimezone } from "../utils/user-timezone.js";
 import { wasCapabilityProposalRecentlyDeferred } from "./conversation-session.js";
 import { executeProgressCommand } from "./progress-command.js";
@@ -1328,6 +1331,44 @@ export async function executeOperation(
           status: "executed",
           summary: `Undone: ${label}${matchedGoal ? ` from "${matchedGoal.title}"` : ""}. It no longer counts toward any goal's progress. This never touched Gmail or any other event.`,
           result: { archived }
+        };
+      }
+
+      // refactor/private-alpha-general-email-intelligence-workflow (gate 3): moves each named event
+      // to a new calendar day via the existing correctEvent DB primitive — never a second
+      // createEvent, so the source day's count decreases by exactly as much as the target day's
+      // increases and the 7-day/weekly total is unaffected. Every eventId here was already resolved
+      // deterministically by dateCorrectionShortcutOperation (runtime.ts) against real, currently-
+      // active events before this ever ran — never planned by the LLM (see tool-catalog.ts).
+      case "event.correct_date": {
+        const eventIds = args.eventIds as string[];
+        const toLocalDate = args.toLocalDate as string;
+        const reason = (args.reason as string | undefined) ?? "date corrected by user";
+        const timezone = await getUserTimezone(userId);
+        const targetDayStartUtc = localDateStartUtc(toLocalDate, timezone);
+
+        const allEvents = await getEventsSince(userId, new Date(0));
+        const eventIdSet = new Set(eventIds);
+        const moved: StoredEvent[] = [];
+        for (const existing of allEvents.filter((event) => eventIdSet.has(event.id) && event.status === "active")) {
+          const sourceLocalDate = formatDateInTimezone(existing.timestamp, timezone);
+          const sourceDayStartUtc = localDateStartUtc(sourceLocalDate, timezone);
+          const timeOfDayOffsetMs = existing.timestamp.getTime() - sourceDayStartUtc.getTime();
+          const newTimestamp = new Date(targetDayStartUtc.getTime() + timeOfDayOffsetMs);
+
+          const result = await correctEvent(userId, existing.id, { data: existing.data, timestamp: newTimestamp, reason });
+          if (result) moved.push(result.replacement);
+        }
+
+        if (moved.length === 0) {
+          return failed(operation.tool, "Those events no longer exist or were already corrected.");
+        }
+
+        return {
+          tool: operation.tool,
+          status: "executed",
+          summary: `Moved ${moved.length} event${moved.length === 1 ? "" : "s"} to ${toLocalDate}. Nothing was added or removed — this only changed which day ${moved.length === 1 ? "it" : "they"} count toward.`,
+          result: { moved }
         };
       }
 
@@ -2920,6 +2961,7 @@ export async function executeOperation(
           .filter((entity) => pendingById.has(entity.id))
           .map((entity) => {
             const review = pendingById.get(entity.id)!;
+            const extracted = (review.extracted ?? {}) as Record<string, unknown>;
             return {
               id: review.id,
               index: entity.index,
@@ -2927,9 +2969,11 @@ export async function executeOperation(
               from: review.from ?? "",
               reason: review.reason,
               proposedEventType: review.proposedEventType,
-              extracted: (review.extracted ?? {}) as Record<string, unknown>,
+              extracted,
               createdAt: review.createdAt,
-              priority: review.priority
+              priority: review.priority,
+              signalBucket: signalBucketFromExtracted(extracted),
+              ambiguity: ambiguityFromExtracted(extracted)
             };
           });
 
@@ -4240,7 +4284,7 @@ function buildResolvedEmailProgressDate(isoLocalDate: string, todayLocalDate: st
   return { date, isToday, label: isToday ? "today" : formatShortDateLabel(date, timezone) };
 }
 
-function formatShortDateLabel(date: Date, timezone: string): string {
+export function formatShortDateLabel(date: Date, timezone: string): string {
   return new Intl.DateTimeFormat("en-GB", { timeZone: timezone, day: "numeric", month: "short" }).format(date);
 }
 
@@ -4302,6 +4346,7 @@ async function buildGmailReviewDetailResult(input: {
   // classification/evidence metadata — never `status`, never approves/rejects/logs anything.
   let updatedReview = review;
   let classificationCorrectionNote: string | undefined;
+  const freshExtracted = { ...(review.extracted as Record<string, unknown>), signalBucket: understanding.signalBucket, ambiguity: understanding.ambiguity, realWorldEvent: understanding.realWorldEvent };
   if (understandingResult.status === "ok") {
     const refreshedClassification = emailReviewClassificationFromUnderstanding(understanding.emailKind);
     const staleReason = review.reason;
@@ -4311,12 +4356,28 @@ async function buildGmailReviewDetailResult(input: {
         reason: refreshedClassification.reason,
         proposedEventType: refreshedClassification.proposedEventType,
         confidence: understanding.confidence,
-        evidence: importantText.slice(0, 300)
+        evidence: importantText.slice(0, 300),
+        // refactor/private-alpha-general-email-intelligence-workflow (gate 1): stashes Stage B's
+        // own direct bucket/ambiguity signal into the existing `extracted` JSON blob (no new
+        // migration) so Stage D's grouping (email-intelligence-grouping.ts) can read it back on
+        // the next list view, and gate 2's "no lazy uncertain signal" replacement has a specific
+        // reason to show instead of the generic fallback.
+        extracted: freshExtracted
       });
       if (refreshed) {
         updatedReview = refreshed;
         classificationCorrectionNote = `Updated classification: ${staleLabel} → ${currentClassification}.`;
       }
+    }
+  } else if (understanding.signalBucket === "needs_decision" && understanding.ambiguity) {
+    // refactor/private-alpha-general-email-intelligence-workflow (gate 2): a genuinely ambiguous
+    // result ("needs_clarification" — appropriately low confidence, or an unresolved "unknown"
+    // kind) never reclassifies reason/proposedEventType (that stays conservative, confidence-gated
+    // above), but its specific ambiguity explanation IS worth persisting — this is exactly the case
+    // "no lazy uncertain signal" replaces: showing WHAT is unsure instead of a bare label.
+    const refreshed = await refreshEmailReviewClassification(userId, review.id, { extracted: freshExtracted });
+    if (refreshed) {
+      updatedReview = refreshed;
     }
   }
 
@@ -4415,7 +4476,13 @@ async function refreshStaleGmailReviewClassifications(
         reason: refreshedClassification.reason,
         proposedEventType: refreshedClassification.proposedEventType,
         confidence: understandingResult.understanding.confidence,
-        evidence: cleanedBody.slice(0, 300)
+        evidence: cleanedBody.slice(0, 300),
+        extracted: {
+          ...(review.extracted as Record<string, unknown>),
+          signalBucket: understandingResult.understanding.signalBucket,
+          ambiguity: understandingResult.understanding.ambiguity,
+          realWorldEvent: understandingResult.understanding.realWorldEvent
+        }
       });
       if (refreshed) {
         refreshedItems.push(refreshed);
